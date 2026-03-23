@@ -1,0 +1,30 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('pd_dog_coi_cache', function (Blueprint $table) {
+            $table->bigIncrements('id');
+
+            $table->unsignedBigInteger('dog_id');
+            $table->decimal('coi', 8, 4)->nullable();
+            $table->unsignedInteger('generations')->default(5);
+
+            $table->timestamp('calculated_at')->nullable();
+
+            $table->timestamps();
+
+            $table->index(['dog_id'], 'idx_pd_coi_dog');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('pd_dog_coi_cache');
+    }
+};
