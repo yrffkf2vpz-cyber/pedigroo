@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Models;
+namespace App\Domain\Dog\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Carbon\Carbon;
