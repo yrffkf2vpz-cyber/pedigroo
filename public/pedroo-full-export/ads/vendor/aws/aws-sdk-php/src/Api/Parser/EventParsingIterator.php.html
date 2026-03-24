@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Api/Parser/EventParsingIterator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Aws\Api\Parser;
+
+use \Iterator;
+use Aws\Exception\EventStreamDataException;
+use Aws\Api\Parser\Exception\ParserException;
+use Aws\Api\StructureShape;
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * @internal Implements a decoder for a binary encoded event stream that will
+ * decode, validate, and provide individual events from the stream.
+ */
+class EventParsingIterator implements Iterator
+{
+    /** @var StreamInterface */
+    private $decodingIterator;
+
+    /** @var StructureShape */
+    private $shape;
+
+    /** @var AbstractParser */
+    private $parser;
+
+    public function __construct(
+        StreamInterface $stream,
+        StructureShape $shape,
+        AbstractParser $parser
+    ) {
+        $this-&gt;decodingIterator = $this-&gt;chooseDecodingIterator($stream);
+        $this-&gt;shape = $shape;
+        $this-&gt;parser = $parser;
+    }
+
+    /**
+     * This method choose a decoding iterator implementation based on if the stream
+     * is seekable or not.
+     *
+     * @param $stream
+     *
+     * @return Iterator
+     */
+    private function chooseDecodingIterator($stream)
+    {
+        if ($stream-&gt;isSeekable()) {
+            return new DecodingEventStreamIterator($stream);
+        } else {
+            return new NonSeekableStreamDecodingEventStreamIterator($stream);
+        }
+    }
+
+    /**
+     * @return mixed
+     */
+    #[\ReturnTypeWillChange]
+    public function current()
+    {
+        return $this-&gt;parseEvent($this-&gt;decodingIterator-&gt;current());
+    }
+
+    /**
+     * @return mixed
+     */
+    #[\ReturnTypeWillChange]
+    public function key()
+    {
+        return $this-&gt;decodingIterator-&gt;key();
+    }
+
+    /**
+     * @return void
+     */
+    #[\ReturnTypeWillChange]
+    public function next()
+    {
+        $this-&gt;decodingIterator-&gt;next();
+    }
+
+    /**
+     * @return void
+     */
+    #[\ReturnTypeWillChange]
+    public function rewind()
+    {
+        $this-&gt;decodingIterator-&gt;rewind();
+    }
+
+    /**
+     * @return bool
+     */
+    #[\ReturnTypeWillChange]
+    public function valid()
+    {
+        return $this-&gt;decodingIterator-&gt;valid();
+    }
+
+    private function parseEvent(array $event)
+    {
+        if (!empty($event[&#039;headers&#039;][&#039;:message-type&#039;])) {
+            if ($event[&#039;headers&#039;][&#039;:message-type&#039;] === &#039;error&#039;) {
+                return $this-&gt;parseError($event);
+            }
+
+            if ($event[&#039;headers&#039;][&#039;:message-type&#039;] === &#039;exception&#039;) {
+                return $this-&gt;parseException($event);
+            }
+
+            if ($event[&#039;headers&#039;][&#039;:message-type&#039;] !== &#039;event&#039;) {
+                throw new ParserException(&#039;Failed to parse unknown message type.&#039;);
+            }
+        }
+
+        $eventType = $event[&#039;headers&#039;][&#039;:event-type&#039;] ?? null;
+        if (empty($eventType)) {
+            throw new ParserException(&#039;Failed to parse without event type.&#039;);
+        }
+
+        $eventPayload = $event[&#039;payload&#039;];
+        if ($eventType === &#039;initial-response&#039;) {
+            return $this-&gt;parseInitialResponseEvent($eventPayload);
+        }
+
+        $eventShape = $this-&gt;shape-&gt;getMember($eventType);
+
+        return [
+            $eventType =&gt; array_merge(
+                $this-&gt;parseEventHeaders($event[&#039;headers&#039;], $eventShape),
+                $this-&gt;parseEventPayload($eventPayload, $eventShape)
+            )
+        ];
+    }
+
+    /**
+     * @param $headers
+     * @param $eventShape
+     *
+     * @return array
+     */
+    private function parseEventHeaders($headers, $eventShape): array
+    {
+        $parsedHeaders = [];
+        foreach ($eventShape-&gt;getMembers() as $memberName =&gt; $memberProps) {
+            if (isset($memberProps[&#039;eventheader&#039;])) {
+                $parsedHeaders[$memberName] = $headers[$memberName];
+            }
+        }
+
+        return $parsedHeaders;
+    }
+
+    /**
+     * @param $payload
+     * @param $eventShape
+     *
+     * @return array
+     */
+    private function parseEventPayload($payload, $eventShape): array
+    {
+        $parsedPayload = [];
+        foreach ($eventShape-&gt;getMembers() as $memberName =&gt; $memberProps) {
+            $memberShape = $eventShape-&gt;getMember($memberName);
+            if (isset($memberProps[&#039;eventpayload&#039;])) {
+                if ($memberShape-&gt;getType() === &#039;blob&#039;) {
+                    $parsedPayload[$memberName] = $payload;
+                } else {
+                    $parsedPayload[$memberName] = $this-&gt;parser-&gt;parseMemberFromStream(
+                        $payload,
+                        $memberShape,
+                        null
+                    );
+                }
+
+                break;
+            }
+        }
+
+        if (empty($parsedPayload) &amp;&amp; !empty($payload-&gt;getContents())) {
+            /**
+             * If we did not find a member with an eventpayload trait, then we should deserialize the payload
+             * using the event&#039;s shape.
+             */
+            $parsedPayload = $this-&gt;parser-&gt;parseMemberFromStream($payload, $eventShape, null);
+        }
+
+        return $parsedPayload;
+    }
+
+    private function parseError(array $event)
+    {
+        throw new EventStreamDataException(
+            $event[&#039;headers&#039;][&#039;:error-code&#039;],
+            $event[&#039;headers&#039;][&#039;:error-message&#039;]
+        );
+    }
+
+    private function parseException(array $event) {
+        $payload = $event[&#039;payload&#039;]?-&gt;getContents();
+        $parsedPayload = json_decode($payload, true);
+
+        throw new EventStreamDataException(
+            $event[&#039;headers&#039;][&#039;:exception-type&#039;] ?? &#039;Unknown&#039;,
+            $parsedPayload[&#039;message&#039;] ?? $payload,
+        );
+    }
+
+    private function parseInitialResponseEvent($payload): array
+    {
+        return [&#039;initial-response&#039; =&gt; json_decode($payload, true)];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Api/Parser/Exception/ParserException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Api/Parser/Exception -->
+
+</body>
+</html>

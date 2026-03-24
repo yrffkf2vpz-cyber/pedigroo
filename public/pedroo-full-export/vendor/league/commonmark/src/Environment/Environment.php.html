@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/league/commonmark/src/Environment/Environment.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the league/commonmark package.
+ *
+ * (c) Colin O&#039;Dell &lt;colinodell@gmail.com&gt;
+ *
+ * Original code based on the CommonMark JS reference parser (https://bitly.com/commonmark-js)
+ *  - (c) John MacFarlane
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace League\CommonMark\Environment;
+
+use League\CommonMark\Delimiter\DelimiterParser;
+use League\CommonMark\Delimiter\Processor\DelimiterProcessorCollection;
+use League\CommonMark\Delimiter\Processor\DelimiterProcessorInterface;
+use League\CommonMark\Event\DocumentParsedEvent;
+use League\CommonMark\Event\ListenerData;
+use League\CommonMark\Exception\AlreadyInitializedException;
+use League\CommonMark\Extension\CommonMark\CommonMarkCoreExtension;
+use League\CommonMark\Extension\ConfigurableExtensionInterface;
+use League\CommonMark\Extension\ExtensionInterface;
+use League\CommonMark\Extension\GithubFlavoredMarkdownExtension;
+use League\CommonMark\Normalizer\SlugNormalizer;
+use League\CommonMark\Normalizer\TextNormalizerInterface;
+use League\CommonMark\Normalizer\UniqueSlugNormalizer;
+use League\CommonMark\Normalizer\UniqueSlugNormalizerInterface;
+use League\CommonMark\Parser\Block\BlockStartParserInterface;
+use League\CommonMark\Parser\Block\SkipLinesStartingWithLettersParser;
+use League\CommonMark\Parser\Inline\InlineParserInterface;
+use League\CommonMark\Renderer\NodeRendererInterface;
+use League\CommonMark\Util\HtmlFilter;
+use League\CommonMark\Util\PrioritizedList;
+use League\Config\Configuration;
+use League\Config\ConfigurationAwareInterface;
+use League\Config\ConfigurationInterface;
+use Nette\Schema\Expect;
+use Psr\EventDispatcher\EventDispatcherInterface;
+use Psr\EventDispatcher\ListenerProviderInterface;
+use Psr\EventDispatcher\StoppableEventInterface;
+
+final class Environment implements EnvironmentInterface, EnvironmentBuilderInterface, ListenerProviderInterface
+{
+    /**
+     * @var ExtensionInterface[]
+     *
+     * @psalm-readonly-allow-private-mutation
+     */
+    private array $extensions = [];
+
+    /**
+     * @var ExtensionInterface[]
+     *
+     * @psalm-readonly-allow-private-mutation
+     */
+    private array $uninitializedExtensions = [];
+
+    /** @psalm-readonly-allow-private-mutation */
+    private bool $extensionsInitialized = false;
+
+    /**
+     * @var PrioritizedList&lt;BlockStartParserInterface&gt;
+     *
+     * @psalm-readonly
+     */
+    private PrioritizedList $blockStartParsers;
+
+    /**
+     * @var PrioritizedList&lt;InlineParserInterface&gt;
+     *
+     * @psalm-readonly
+     */
+    private PrioritizedList $inlineParsers;
+
+    /** @psalm-readonly */
+    private DelimiterProcessorCollection $delimiterProcessors;
+
+    /**
+     * @var array&lt;string, PrioritizedList&lt;NodeRendererInterface&gt;&gt;
+     *
+     * @psalm-readonly-allow-private-mutation
+     */
+    private array $renderersByClass = [];
+
+    /**
+     * @var PrioritizedList&lt;ListenerData&gt;
+     *
+     * @psalm-readonly-allow-private-mutation
+     */
+    private PrioritizedList $listenerData;
+
+    private ?EventDispatcherInterface $eventDispatcher = null;
+
+    /** @psalm-readonly */
+    private Configuration $config;
+
+    private ?TextNormalizerInterface $slugNormalizer = null;
+
+    /**
+     * @param array&lt;string, mixed&gt; $config
+     */
+    public function __construct(array $config = [])
+    {
+        $this-&gt;config = self::createDefaultConfiguration();
+        $this-&gt;config-&gt;merge($config);
+
+        $this-&gt;blockStartParsers   = new PrioritizedList();
+        $this-&gt;inlineParsers       = new PrioritizedList();
+        $this-&gt;listenerData        = new PrioritizedList();
+        $this-&gt;delimiterProcessors = new DelimiterProcessorCollection();
+
+        // Performance optimization: always include a block &quot;parser&quot; that aborts parsing if a line starts with a letter
+        // and is therefore unlikely to match any lines as a block start.
+        $this-&gt;addBlockStartParser(new SkipLinesStartingWithLettersParser(), 249);
+    }
+
+    public function getConfiguration(): ConfigurationInterface
+    {
+        return $this-&gt;config-&gt;reader();
+    }
+
+    /**
+     * @deprecated Environment::mergeConfig() is deprecated since league/commonmark v2.0 and will be removed in v3.0. Configuration should be set when instantiating the environment instead.
+     *
+     * @param array&lt;string, mixed&gt; $config
+     */
+    public function mergeConfig(array $config): void
+    {
+        @\trigger_error(&#039;Environment::mergeConfig() is deprecated since league/commonmark v2.0 and will be removed in v3.0. Configuration should be set when instantiating the environment instead.&#039;, \E_USER_DEPRECATED);
+
+        $this-&gt;assertUninitialized(&#039;Failed to modify configuration.&#039;);
+
+        $this-&gt;config-&gt;merge($config);
+    }
+
+    public function addBlockStartParser(BlockStartParserInterface $parser, int $priority = 0): EnvironmentBuilderInterface
+    {
+        $this-&gt;assertUninitialized(&#039;Failed to add block start parser.&#039;);
+
+        $this-&gt;blockStartParsers-&gt;add($parser, $priority);
+        $this-&gt;injectEnvironmentAndConfigurationIfNeeded($parser);
+
+        return $this;
+    }
+
+    public function addInlineParser(InlineParserInterface $parser, int $priority = 0): EnvironmentBuilderInterface
+    {
+        $this-&gt;assertUninitialized(&#039;Failed to add inline parser.&#039;);
+
+        $this-&gt;inlineParsers-&gt;add($parser, $priority);
+        $this-&gt;injectEnvironmentAndConfigurationIfNeeded($parser);
+
+        return $this;
+    }
+
+    public function addDelimiterProcessor(DelimiterProcessorInterface $processor): EnvironmentBuilderInterface
+    {
+        $this-&gt;assertUninitialized(&#039;Failed to add delimiter processor.&#039;);
+        $this-&gt;delimiterProcessors-&gt;add($processor);
+        $this-&gt;injectEnvironmentAndConfigurationIfNeeded($processor);
+
+        return $this;
+    }
+
+    public function addRenderer(string $nodeClass, NodeRendererInterface $renderer, int $priority = 0): EnvironmentBuilderInterface
+    {
+        $this-&gt;assertUninitialized(&#039;Failed to add renderer.&#039;);
+
+        if (! isset($this-&gt;renderersByClass[$nodeClass])) {
+            $this-&gt;renderersByClass[$nodeClass] = new PrioritizedList();
+        }
+
+        $this-&gt;renderersByClass[$nodeClass]-&gt;add($renderer, $priority);
+        $this-&gt;injectEnvironmentAndConfigurationIfNeeded($renderer);
+
+        return $this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getBlockStartParsers(): iterable
+    {
+        if (! $this-&gt;extensionsInitialized) {
+            $this-&gt;initializeExtensions();
+        }
+
+        return $this-&gt;blockStartParsers-&gt;getIterator();
+    }
+
+    public function getDelimiterProcessors(): DelimiterProcessorCollection
+    {
+        if (! $this-&gt;extensionsInitialized) {
+            $this-&gt;initializeExtensions();
+        }
+
+        return $this-&gt;delimiterProcessors;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getRenderersForClass(string $nodeClass): iterable
+    {
+        if (! $this-&gt;extensionsInitialized) {
+            $this-&gt;initializeExtensions();
+        }
+
+        // If renderers are defined for this specific class, return them immediately
+        if (isset($this-&gt;renderersByClass[$nodeClass])) {
+            return $this-&gt;renderersByClass[$nodeClass];
+        }
+
+        /** @psalm-suppress TypeDoesNotContainType -- Bug: https://github.com/vimeo/psalm/issues/3332 */
+        while (\class_exists($parent ??= $nodeClass) &amp;&amp; $parent = \get_parent_class($parent)) {
+            if (! isset($this-&gt;renderersByClass[$parent])) {
+                continue;
+            }
+
+            // &quot;Cache&quot; this result to avoid future loops
+            return $this-&gt;renderersByClass[$nodeClass] = $this-&gt;renderersByClass[$parent];
+        }
+
+        return [];
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getExtensions(): iterable
+    {
+        return $this-&gt;extensions;
+    }
+
+    /**
+     * Add a single extension
+     *
+     * @return $this
+     */
+    public function addExtension(ExtensionInterface $extension): EnvironmentBuilderInterface
+    {
+        $this-&gt;assertUninitialized(&#039;Failed to add extension.&#039;);
+
+        $this-&gt;extensions[]              = $extension;
+        $this-&gt;uninitializedExtensions[] = $extension;
+
+        if ($extension instanceof ConfigurableExtensionInterface) {
+            $extension-&gt;configureSchema($this-&gt;config);
+        }
+
+        return $this;
+    }
+
+    private function initializeExtensions(): void
+    {
+        // Initialize the slug normalizer
+        $this-&gt;getSlugNormalizer();
+
+        // Ask all extensions to register their components
+        while (\count($this-&gt;uninitializedExtensions) &gt; 0) {
+            foreach ($this-&gt;uninitializedExtensions as $i =&gt; $extension) {
+                $extension-&gt;register($this);
+                unset($this-&gt;uninitializedExtensions[$i]);
+            }
+        }
+
+        $this-&gt;extensionsInitialized = true;
+
+        // Create the special delimiter parser if any processors were registered
+        if ($this-&gt;delimiterProcessors-&gt;count() &gt; 0) {
+            $this-&gt;inlineParsers-&gt;add(new DelimiterParser($this-&gt;delimiterProcessors), PHP_INT_MIN);
+        }
+    }
+
+    private function injectEnvironmentAndConfigurationIfNeeded(object $object): void
+    {
+        if ($object instanceof EnvironmentAwareInterface) {
+            $object-&gt;setEnvironment($this);
+        }
+
+        if ($object instanceof ConfigurationAwareInterface) {
+            $object-&gt;setConfiguration($this-&gt;config-&gt;reader());
+        }
+    }
+
+    /**
+     * @deprecated Instantiate the environment and add the extension yourself
+     *
+     * @param array&lt;string, mixed&gt; $config
+     */
+    public static function createCommonMarkEnvironment(array $config = []): Environment
+    {
+        $environment = new self($config);
+        $environment-&gt;addExtension(new CommonMarkCoreExtension());
+
+        return $environment;
+    }
+
+    /**
+     * @deprecated Instantiate the environment and add the extension yourself
+     *
+     * @param array&lt;string, mixed&gt; $config
+     */
+    public static function createGFMEnvironment(array $config = []): Environment
+    {
+        $environment = new self($config);
+        $environment-&gt;addExtension(new CommonMarkCoreExtension());
+        $environment-&gt;addExtension(new GithubFlavoredMarkdownExtension());
+
+        return $environment;
+    }
+
+    public function addEventListener(string $eventClass, callable $listener, int $priority = 0): EnvironmentBuilderInterface
+    {
+        $this-&gt;assertUninitialized(&#039;Failed to add event listener.&#039;);
+
+        $this-&gt;listenerData-&gt;add(new ListenerData($eventClass, $listener), $priority);
+
+        if (\is_object($listener)) {
+            $this-&gt;injectEnvironmentAndConfigurationIfNeeded($listener);
+        } elseif (\is_array($listener) &amp;&amp; \is_object($listener[0])) {
+            $this-&gt;injectEnvironmentAndConfigurationIfNeeded($listener[0]);
+        }
+
+        return $this;
+    }
+
+    public function dispatch(object $event): object
+    {
+        if (! $this-&gt;extensionsInitialized) {
+            $this-&gt;initializeExtensions();
+        }
+
+        if ($this-&gt;eventDispatcher !== null) {
+            return $this-&gt;eventDispatcher-&gt;dispatch($event);
+        }
+
+        foreach ($this-&gt;getListenersForEvent($event) as $listener) {
+            if ($event instanceof StoppableEventInterface &amp;&amp; $event-&gt;isPropagationStopped()) {
+                return $event;
+            }
+
+            $listener($event);
+        }
+
+        return $event;
+    }
+
+    public function setEventDispatcher(EventDispatcherInterface $dispatcher): void
+    {
+        $this-&gt;eventDispatcher = $dispatcher;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @return iterable&lt;callable&gt;
+     */
+    public function getListenersForEvent(object $event): iterable
+    {
+        foreach ($this-&gt;listenerData as $listenerData) {
+            \assert($listenerData instanceof ListenerData);
+
+            /** @psalm-suppress ArgumentTypeCoercion */
+            if (! \is_a($event, $listenerData-&gt;getEvent())) {
+                continue;
+            }
+
+            yield function (object $event) use ($listenerData) {
+                if (! $this-&gt;extensionsInitialized) {
+                    $this-&gt;initializeExtensions();
+                }
+
+                return \call_user_func($listenerData-&gt;getListener(), $event);
+            };
+        }
+    }
+
+    /**
+     * @return iterable&lt;InlineParserInterface&gt;
+     */
+    public function getInlineParsers(): iterable
+    {
+        if (! $this-&gt;extensionsInitialized) {
+            $this-&gt;initializeExtensions();
+        }
+
+        return $this-&gt;inlineParsers-&gt;getIterator();
+    }
+
+    public function getSlugNormalizer(): TextNormalizerInterface
+    {
+        if ($this-&gt;slugNormalizer === null) {
+            $normalizer = $this-&gt;config-&gt;get(&#039;slug_normalizer/instance&#039;);
+            \assert($normalizer instanceof TextNormalizerInterface);
+            $this-&gt;injectEnvironmentAndConfigurationIfNeeded($normalizer);
+
+            if ($this-&gt;config-&gt;get(&#039;slug_normalizer/unique&#039;) !== UniqueSlugNormalizerInterface::DISABLED &amp;&amp; ! $normalizer instanceof UniqueSlugNormalizer) {
+                $normalizer = new UniqueSlugNormalizer($normalizer);
+            }
+
+            if ($normalizer instanceof UniqueSlugNormalizer) {
+                if ($this-&gt;config-&gt;get(&#039;slug_normalizer/unique&#039;) === UniqueSlugNormalizerInterface::PER_DOCUMENT) {
+                    $this-&gt;addEventListener(DocumentParsedEvent::class, [$normalizer, &#039;clearHistory&#039;], -1000);
+                }
+            }
+
+            $this-&gt;slugNormalizer = $normalizer;
+        }
+
+        return $this-&gt;slugNormalizer;
+    }
+
+    /**
+     * @throws AlreadyInitializedException
+     */
+    private function assertUninitialized(string $message): void
+    {
+        if ($this-&gt;extensionsInitialized) {
+            throw new AlreadyInitializedException($message . &#039; Extensions have already been initialized.&#039;);
+        }
+    }
+
+    public static function createDefaultConfiguration(): Configuration
+    {
+        return new Configuration([
+            &#039;html_input&#039; =&gt; Expect::anyOf(HtmlFilter::STRIP, HtmlFilter::ALLOW, HtmlFilter::ESCAPE)-&gt;default(HtmlFilter::ALLOW),
+            &#039;allow_unsafe_links&#039; =&gt; Expect::bool(true),
+            &#039;max_nesting_level&#039; =&gt; Expect::type(&#039;int&#039;)-&gt;default(PHP_INT_MAX),
+            &#039;max_delimiters_per_line&#039; =&gt; Expect::type(&#039;int&#039;)-&gt;default(PHP_INT_MAX),
+            &#039;renderer&#039; =&gt; Expect::structure([
+                &#039;block_separator&#039; =&gt; Expect::string(&quot;\n&quot;),
+                &#039;inner_separator&#039; =&gt; Expect::string(&quot;\n&quot;),
+                &#039;soft_break&#039; =&gt; Expect::string(&quot;\n&quot;),
+            ]),
+            &#039;slug_normalizer&#039; =&gt; Expect::structure([
+                &#039;instance&#039; =&gt; Expect::type(TextNormalizerInterface::class)-&gt;default(new SlugNormalizer()),
+                &#039;max_length&#039; =&gt; Expect::int()-&gt;min(0)-&gt;default(255),
+                &#039;unique&#039; =&gt; Expect::anyOf(UniqueSlugNormalizerInterface::DISABLED, UniqueSlugNormalizerInterface::PER_ENVIRONMENT, UniqueSlugNormalizerInterface::PER_DOCUMENT)-&gt;default(UniqueSlugNormalizerInterface::PER_DOCUMENT),
+            ]),
+        ]);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/league/commonmark/src/Environment/EnvironmentAwareInterface.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/league/commonmark/src/Event -->
+
+</body>
+</html>

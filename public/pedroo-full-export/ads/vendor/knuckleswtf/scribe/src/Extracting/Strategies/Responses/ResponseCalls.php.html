@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/Responses/ResponseCalls.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Extracting\Strategies\Responses;
+
+use Exception;
+use Illuminate\Contracts\Http\Kernel;
+use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Routing\Route;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Str;
+use Knuckles\Camel\Extraction\ExtractedEndpointData;
+use Knuckles\Scribe\Extracting\DatabaseTransactionHelpers;
+use Knuckles\Scribe\Extracting\ParamHelpers;
+use Knuckles\Scribe\Extracting\Strategies\Strategy;
+use Knuckles\Scribe\Tools\ConsoleOutputUtils as c;
+use Knuckles\Scribe\Tools\ErrorHandlingUtils as e;
+use Knuckles\Scribe\Tools\Globals;
+use Knuckles\Scribe\Tools\Utils;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+/**
+ * Make a call to the route and retrieve its response.
+ */
+class ResponseCalls extends Strategy
+{
+    use ParamHelpers, DatabaseTransactionHelpers;
+
+    protected array $previousConfigs = [];
+
+    public function __invoke(ExtractedEndpointData $endpointData, array $settings = []): ?array
+    {
+        // Don&#039;t attempt a response call if there are already successful responses
+        if ($endpointData-&gt;responses-&gt;hasSuccessResponse()) {
+            return null;
+        }
+
+        return $this-&gt;makeResponseCall($endpointData, $settings);
+    }
+
+    public function makeResponseCall(ExtractedEndpointData $endpointData, array $settings): ?array
+    {
+        $this-&gt;configureEnvironment($settings);
+
+        // Mix in parsed parameters with manually specified parameters.
+        $bodyParameters = array_merge($endpointData-&gt;cleanBodyParameters, $settings[&#039;bodyParams&#039;] ?? []);
+        $queryParameters = array_merge($endpointData-&gt;cleanQueryParameters, $settings[&#039;queryParams&#039;] ?? []);
+        $urlParameters = $endpointData-&gt;cleanUrlParameters;
+        $headers = $endpointData-&gt;headers;
+
+        if ($endpointData-&gt;auth) {
+            [$where, $name, $value] = $endpointData-&gt;auth;
+            switch ($where) {
+                case &#039;queryParameters&#039;:
+                    $queryParameters[$name] = $value;
+                    break;
+                case &#039;bodyParameters&#039;:
+                    $bodyParameters[$name] = $value;
+                    break;
+                case &#039;headers&#039;:
+                    $headers[$name] = $value;
+                    break;
+                default:
+                    throw new \InvalidArgumentException(&quot;Unknown auth location: $where&quot;);
+            }
+        }
+
+        $hardcodedFileParams = $settings[&#039;fileParams&#039;] ?? [];
+        $hardcodedFileParams = collect($hardcodedFileParams)-&gt;map(function ($filePath) {
+            $fileName = basename($filePath);
+            return new UploadedFile(
+                $filePath, $fileName, mime_content_type($filePath), test: true
+            );
+        })-&gt;toArray();
+        $fileParameters = array_merge($endpointData-&gt;fileParameters, $hardcodedFileParams);
+
+        $request = $this-&gt;prepareRequest(
+            $endpointData-&gt;route, $endpointData-&gt;uri, $settings, $urlParameters,
+            $bodyParameters, $queryParameters, $fileParameters, $headers
+        );
+
+        $this-&gt;runPreRequestHook($request, $endpointData);
+
+        try {
+            $response = $this-&gt;makeApiCall($request, $endpointData-&gt;route);
+
+            $this-&gt;runPostRequestHook($request, $endpointData, $response);
+
+            $response = [
+                [
+                    &#039;status&#039; =&gt; $response-&gt;getStatusCode(),
+                    &#039;content&#039; =&gt; $this-&gt;getContentFromResponse($response),
+                    &#039;headers&#039; =&gt; $this-&gt;getResponseHeaders($response),
+                ],
+            ];
+        } catch (Exception $e) {
+            c::warn(&#039;Exception thrown during response call for&#039; . $endpointData-&gt;name());
+            e::dumpExceptionIfVerbose($e);
+
+            $response = null;
+        } finally {
+            $this-&gt;finish();
+        }
+
+        return $response;
+    }
+
+    /**
+     * @param array $settings
+     *
+     * @return void
+     */
+    private function configureEnvironment(array $settings)
+    {
+        $this-&gt;startDbTransaction();
+        $this-&gt;setLaravelConfigs($settings[&#039;config&#039;] ?? []);
+    }
+
+    /**
+     * @param Route $route
+     * @param array $settings
+     * @param array $urlParams
+     * @param array $bodyParams
+     * @param array $queryParams
+     *
+     * @param array $fileParameters
+     * @param array $headers
+     *
+     * @return Request
+     */
+    protected function prepareRequest(
+        Route $route, string $url, array $settings, array $urlParams,
+        array $bodyParams, array $queryParams, array $fileParameters, array $headers
+    ): Request
+    {
+        $uri = Utils::getUrlWithBoundParameters($url, $urlParams);
+        $routeMethods = $this-&gt;getMethods($route);
+        $method = array_shift($routeMethods);
+        $cookies = $settings[&#039;cookies&#039;] ?? [];
+
+        // Note that we initialise the request with the bodyParams here
+        // and later still add them to the ParameterBag (`addBodyParameters`)
+        // The first is so the body params get added to the request content
+        // (where Laravel reads body from)
+        // The second is so they get added to the request bag
+        // (where Symfony usually reads from and Laravel sometimes does)
+        // Adding to both ensures consistency
+
+        // Always use the current app domain for response calls
+        $rootUrl = config(&#039;app.url&#039;);
+        $request = Request::create(
+            &quot;$rootUrl/$uri&quot;, $method, [], $cookies, $fileParameters,
+            $this-&gt;transformHeadersToServerVars($headers), json_encode($bodyParams)
+        );
+        // Add headers again to catch any ones we didn&#039;t transform properly.
+        $this-&gt;addHeaders($request, $route, $headers);
+        $this-&gt;addQueryParameters($request, $queryParams);
+        $this-&gt;addBodyParameters($request, $bodyParams);
+
+        return $request;
+    }
+
+    protected function runPreRequestHook(Request $request, ExtractedEndpointData $endpointData): void
+    {
+        if (is_callable(Globals::$__beforeResponseCall)) {
+            call_user_func_array(Globals::$__beforeResponseCall, [$request, $endpointData]);
+        }
+    }
+
+    protected function runPostRequestHook(Request $request, ExtractedEndpointData $endpointData, mixed $response): void
+    {
+        if (is_callable(Globals::$__afterResponseCall)) {
+            call_user_func_array(Globals::$__afterResponseCall, [$request, $endpointData, $response]);
+        }
+    }
+
+    private function setLaravelConfigs(array $config)
+    {
+        if (empty($config)) {
+            return;
+        }
+
+        foreach ($config as $name =&gt; $value) {
+            $this-&gt;previousConfigs[$name] = Config::get($name);
+            Config::set([$name =&gt; $value]);
+        }
+    }
+
+    private function rollbackLaravelConfigChanges()
+    {
+        foreach ($this-&gt;previousConfigs as $name =&gt; $value) {
+            Config::set([$name =&gt; $value]);
+        }
+    }
+
+    private function finish()
+    {
+        $this-&gt;endDbTransaction();
+        $this-&gt;rollbackLaravelConfigChanges();
+    }
+
+    public function getMethods(Route $route): array
+    {
+        return array_diff($route-&gt;methods(), [&#039;HEAD&#039;]);
+    }
+
+    private function addHeaders(Request $request, Route $route, ?array $headers): void
+    {
+        // Set the proper domain
+        if ($route-&gt;getDomain()) {
+            $request-&gt;headers-&gt;add([
+                &#039;HOST&#039; =&gt; $route-&gt;getDomain(),
+            ]);
+            $request-&gt;server-&gt;add([
+                &#039;HTTP_HOST&#039; =&gt; $route-&gt;getDomain(),
+                &#039;SERVER_NAME&#039; =&gt; $route-&gt;getDomain(),
+            ]);
+        }
+
+        $headers = collect($headers);
+
+        if (($headers-&gt;get(&#039;Accept&#039;) ?: $headers-&gt;get(&#039;accept&#039;)) === &#039;application/json&#039;) {
+            $request-&gt;setRequestFormat(&#039;json&#039;);
+        }
+    }
+
+    private function addQueryParameters(Request $request, array $query): void
+    {
+        $request-&gt;query-&gt;add($query);
+        $request-&gt;server-&gt;add([&#039;QUERY_STRING&#039; =&gt; http_build_query($query)]);
+    }
+
+    private function addBodyParameters(Request $request, array $body): void
+    {
+        $request-&gt;request-&gt;add($body);
+    }
+
+    /**
+     * @param Request $request
+     *
+     * @param Route $route
+     *
+     * @return Response
+     * @throws Exception
+     */
+    protected function makeApiCall(Request $request, Route $route)
+    {
+        return $this-&gt;callLaravelRoute($request);
+    }
+
+    protected function callLaravelRoute(Request $request): Response
+    {
+        /** @var \Illuminate\Foundation\Http\Kernel $kernel */
+        $kernel = app(Kernel::class);
+        $response = $kernel-&gt;handle($request);
+        $kernel-&gt;terminate($request, $response);
+
+        return $response;
+    }
+
+    /**
+     * Transform headers array to array of $_SERVER vars with HTTP_* format.
+     */
+    protected function transformHeadersToServerVars(array $headers): array
+    {
+        $server = [];
+        $prefix = &#039;HTTP_&#039;;
+        foreach ($headers as $name =&gt; $value) {
+            $name = strtr(strtoupper($name), &#039;-&#039;, &#039;_&#039;);
+            if (!Str::startsWith($name, $prefix) &amp;&amp; $name !== &#039;CONTENT_TYPE&#039;) {
+                $name = $prefix . $name;
+            }
+            $server[$name] = $value;
+        }
+
+        return $server;
+    }
+
+    protected function getResponseHeaders($response): array
+    {
+        $headers = $response-&gt;headers-&gt;all();
+        $formattedHeaders = [];
+
+        foreach ($headers as $header =&gt; $values) {
+            $formattedHeaders[$header] = implode(&#039;; &#039;, $values);
+        }
+
+        return $formattedHeaders;
+    }
+
+    /**
+     * @param array $only The routes which this strategy should be applied to. Can not be specified with $except.
+     *   Specify route names (&quot;users.index&quot;, &quot;users.*&quot;), or method and path (&quot;GET *&quot;, &quot;POST /safe/*&quot;).
+     * @param array $except The routes which this strategy should be applied to. Can not be specified with $only.
+     *   Specify route names (&quot;users.index&quot;, &quot;users.*&quot;), or method and path (&quot;GET *&quot;, &quot;POST /safe/*&quot;).
+     * @param array $config Any extra Laravel config() values to before starting the response call.
+     * @param array $queryParams Query params to always send with the response call. Key-value array.
+     * @param array $bodyParams Body params to always send with the response call. Key-value array.
+     * @param array $fileParams File params to always send with the response call. Key-value array. Key is param name, value is file path.
+     * @param array $cookies Cookies to always send with the response call. Key-value array.
+     * @return array
+     */
+    public static function withSettings(
+        array $only = [],
+        array $except = [],
+        array $config = [],
+        array $queryParams = [],
+        array $bodyParams = [],
+        array $fileParams = [
+            // &#039;key&#039; =&gt; &#039;storage/app/image.png&#039;,
+        ],
+        array $cookies = [],
+    ): array
+    {
+        return static::wrapWithSettings(
+            only: $only,
+            except: $except,
+            otherSettings: compact(
+                &#039;config&#039;,
+                &#039;queryParams&#039;,
+                &#039;bodyParams&#039;,
+                &#039;fileParams&#039;,
+                &#039;cookies&#039;,
+            ));
+    }
+
+    protected function getContentFromResponse(Response $response): string|false
+    {
+        if (!$response instanceof StreamedResponse) {
+            return $response-&gt;getContent();
+        }
+
+        // For streamed responses, the content is null, and only output directly via &quot;echo&quot; when we call &quot;sendContent&quot;.
+        // We use output buffering to capture the output into a new fake response.
+        $renderedResponse = new Response(&#039;&#039;, $response-&gt;getStatusCode());
+        $originalCallback = $response-&gt;getCallback();
+        $response-&gt;setCallback(function () use ($originalCallback, $renderedResponse) {
+            ob_start(function ($output) use ($renderedResponse) {
+                $renderedResponse-&gt;setContent($output);
+            });
+            $originalCallback();
+            ob_end_flush();
+        });
+        $response-&gt;sendContent();
+        $renderedResponse-&gt;headers = $response-&gt;headers;
+        return $renderedResponse-&gt;getContent();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/Responses/UseApiResourceTags.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/UrlParameters -->
+
+</body>
+</html>

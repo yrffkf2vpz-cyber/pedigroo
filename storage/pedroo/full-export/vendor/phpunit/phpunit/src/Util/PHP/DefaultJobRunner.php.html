@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpunit/phpunit/src/Util/PHP/DefaultJobRunner.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of PHPUnit.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace PHPUnit\Util\PHP;
+
+use const PHP_BINARY;
+use const PHP_SAPI;
+use function array_keys;
+use function array_merge;
+use function array_values;
+use function assert;
+use function fclose;
+use function file_put_contents;
+use function function_exists;
+use function fwrite;
+use function ini_get_all;
+use function is_array;
+use function is_resource;
+use function proc_close;
+use function proc_open;
+use function str_starts_with;
+use function stream_get_contents;
+use function sys_get_temp_dir;
+use function tempnam;
+use function trim;
+use function unlink;
+use function xdebug_is_debugger_active;
+use PHPUnit\Event\Facade;
+use PHPUnit\Runner\CodeCoverage;
+use SebastianBergmann\Environment\Runtime;
+
+/**
+ * @no-named-arguments Parameter names are not covered by the backward compatibility promise for PHPUnit
+ *
+ * @internal This class is not covered by the backward compatibility promise for PHPUnit
+ */
+final readonly class DefaultJobRunner extends JobRunner
+{
+    /**
+     * @throws PhpProcessException
+     */
+    public function run(Job $job): Result
+    {
+        $temporaryFile = null;
+
+        if ($job-&gt;hasInput()) {
+            $temporaryFile = tempnam(sys_get_temp_dir(), &#039;phpunit_&#039;);
+
+            if ($temporaryFile === false ||
+                file_put_contents($temporaryFile, $job-&gt;code()) === false) {
+                // @codeCoverageIgnoreStart
+                throw new PhpProcessException(
+                    &#039;Unable to write temporary file&#039;,
+                );
+                // @codeCoverageIgnoreEnd
+            }
+
+            $job = new Job(
+                $job-&gt;input(),
+                $job-&gt;phpSettings(),
+                $job-&gt;environmentVariables(),
+                $job-&gt;arguments(),
+                null,
+                $job-&gt;redirectErrors(),
+                $job-&gt;requiresXdebug(),
+            );
+        }
+
+        assert($temporaryFile !== &#039;&#039;);
+
+        return $this-&gt;runProcess($job, $temporaryFile);
+    }
+
+    /**
+     * @param ?non-empty-string $temporaryFile
+     *
+     * @throws PhpProcessException
+     */
+    private function runProcess(Job $job, ?string $temporaryFile): Result
+    {
+        $environmentVariables = null;
+
+        if ($job-&gt;hasEnvironmentVariables()) {
+            /** @phpstan-ignore nullCoalesce.variable */
+            $environmentVariables = $_SERVER ?? [];
+
+            unset($environmentVariables[&#039;argv&#039;], $environmentVariables[&#039;argc&#039;]);
+
+            $environmentVariables = array_merge($environmentVariables, $job-&gt;environmentVariables());
+
+            foreach ($environmentVariables as $key =&gt; $value) {
+                if (is_array($value)) {
+                    unset($environmentVariables[$key]);
+                }
+            }
+
+            unset($key, $value);
+        }
+
+        $pipeSpec = [
+            0 =&gt; [&#039;pipe&#039;, &#039;r&#039;],
+            1 =&gt; [&#039;pipe&#039;, &#039;w&#039;],
+            2 =&gt; [&#039;pipe&#039;, &#039;w&#039;],
+        ];
+
+        if ($job-&gt;redirectErrors()) {
+            $pipeSpec[2] = [&#039;redirect&#039;, 1];
+        }
+
+        $process = proc_open(
+            $this-&gt;buildCommand($job, $temporaryFile),
+            $pipeSpec,
+            $pipes,
+            null,
+            $environmentVariables,
+        );
+
+        if (!is_resource($process)) {
+            // @codeCoverageIgnoreStart
+            throw new PhpProcessException(
+                &#039;Unable to spawn worker process&#039;,
+            );
+            // @codeCoverageIgnoreEnd
+        }
+
+        Facade::emitter()-&gt;childProcessStarted();
+
+        fwrite($pipes[0], $job-&gt;code());
+        fclose($pipes[0]);
+
+        $stdout = &#039;&#039;;
+        $stderr = &#039;&#039;;
+
+        if (isset($pipes[1])) {
+            $stdout = stream_get_contents($pipes[1]);
+
+            fclose($pipes[1]);
+        }
+
+        if (isset($pipes[2])) {
+            $stderr = stream_get_contents($pipes[2]);
+
+            fclose($pipes[2]);
+        }
+
+        proc_close($process);
+
+        if ($temporaryFile !== null) {
+            unlink($temporaryFile);
+        }
+
+        assert($stdout !== false);
+        assert($stderr !== false);
+
+        return new Result($stdout, $stderr);
+    }
+
+    /**
+     * @return non-empty-list&lt;string&gt;
+     */
+    private function buildCommand(Job $job, ?string $file): array
+    {
+        $runtime     = new Runtime;
+        $command     = [PHP_BINARY];
+        $phpSettings = $job-&gt;phpSettings();
+
+        $xdebugModeConfiguredExplicitly = false;
+
+        foreach ($phpSettings as $phpSetting) {
+            if (str_starts_with($phpSetting, &#039;xdebug.mode&#039;)) {
+                $xdebugModeConfiguredExplicitly = true;
+
+                break;
+            }
+        }
+
+        if ($runtime-&gt;hasPCOV()) {
+            $pcovSettings = ini_get_all(&#039;pcov&#039;);
+
+            assert($pcovSettings !== false);
+
+            $phpSettings = array_merge(
+                $phpSettings,
+                $runtime-&gt;getCurrentSettings(
+                    array_keys($pcovSettings),
+                ),
+            );
+        } elseif ($runtime-&gt;hasXdebug()) {
+            assert(function_exists(&#039;xdebug_is_debugger_active&#039;));
+
+            $xdebugSettings = ini_get_all(&#039;xdebug&#039;);
+
+            assert($xdebugSettings !== false);
+
+            $phpSettings = array_merge(
+                $phpSettings,
+                $runtime-&gt;getCurrentSettings(
+                    array_keys($xdebugSettings),
+                ),
+            );
+
+            if (
+                !$xdebugModeConfiguredExplicitly &amp;&amp;
+                !CodeCoverage::instance()-&gt;isActive() &amp;&amp;
+                xdebug_is_debugger_active() === false &amp;&amp;
+                !$job-&gt;requiresXdebug()
+            ) {
+                // disable xdebug to speedup test execution
+                $phpSettings[&#039;xdebug.mode&#039;] = &#039;xdebug.mode=off&#039;;
+            }
+        }
+
+        $command = array_merge($command, $this-&gt;settingsToParameters(array_values($phpSettings)));
+
+        if (PHP_SAPI === &#039;phpdbg&#039;) {
+            $command[] = &#039;-qrr&#039;;
+
+            if ($file === null) {
+                $command[] = &#039;s=&#039;;
+            }
+        }
+
+        if ($file !== null) {
+            $command[] = &#039;-f&#039;;
+            $command[] = $file;
+        }
+
+        if ($job-&gt;hasArguments()) {
+            if ($file === null) {
+                $command[] = &#039;--&#039;;
+            }
+
+            foreach ($job-&gt;arguments() as $argument) {
+                $command[] = trim($argument);
+            }
+        }
+
+        return $command;
+    }
+
+    /**
+     * @param list&lt;string&gt; $settings
+     *
+     * @return list&lt;string&gt;
+     */
+    private function settingsToParameters(array $settings): array
+    {
+        $buffer = [];
+
+        foreach ($settings as $setting) {
+            $buffer[] = &#039;-d&#039;;
+            $buffer[] = $setting;
+        }
+
+        return $buffer;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpunit/phpunit/src/Util/PHP/Job.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpunit/phpunit/src/Util/Xml -->
+
+</body>
+</html>

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/console/Command/TraceableCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Console\Command;
+
+use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Completion\CompletionInput;
+use Symfony\Component\Console\Completion\CompletionSuggestions;
+use Symfony\Component\Console\Helper\HelperInterface;
+use Symfony\Component\Console\Helper\HelperSet;
+use Symfony\Component\Console\Input\InputDefinition;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\ConsoleOutputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Stopwatch\Stopwatch;
+
+/**
+ * @internal
+ *
+ * @author Jules Pietri &lt;jules@heahprod.com&gt;
+ */
+final class TraceableCommand extends Command
+{
+    public readonly Command $command;
+    public int $exitCode;
+    public ?int $interruptedBySignal = null;
+    public bool $ignoreValidation;
+    public bool $isInteractive = false;
+    public string $duration = &#039;n/a&#039;;
+    public string $maxMemoryUsage = &#039;n/a&#039;;
+    public InputInterface $input;
+    public OutputInterface $output;
+    /** @var array&lt;string, mixed&gt; */
+    public array $arguments;
+    /** @var array&lt;string, mixed&gt; */
+    public array $options;
+    /** @var array&lt;string, mixed&gt; */
+    public array $interactiveInputs = [];
+    public array $handledSignals = [];
+    public ?array $invokableCommandInfo = null;
+
+    public function __construct(
+        Command $command,
+        private readonly Stopwatch $stopwatch,
+    ) {
+        if ($command instanceof LazyCommand) {
+            $command = $command-&gt;getCommand();
+        }
+
+        $this-&gt;command = $command;
+
+        // prevent call to self::getDefaultDescription()
+        $this-&gt;setDescription($command-&gt;getDescription());
+
+        parent::__construct($command-&gt;getName());
+
+        // init below enables calling {@see parent::run()}
+        [$code, $processTitle, $ignoreValidationErrors] = \Closure::bind(function () {
+            return [$this-&gt;code, $this-&gt;processTitle, $this-&gt;ignoreValidationErrors];
+        }, $command, Command::class)();
+
+        if (\is_callable($code)) {
+            $this-&gt;setCode($code);
+        }
+
+        if ($processTitle) {
+            parent::setProcessTitle($processTitle);
+        }
+
+        if ($ignoreValidationErrors) {
+            parent::ignoreValidationErrors();
+        }
+
+        $this-&gt;ignoreValidation = $ignoreValidationErrors;
+    }
+
+    public function __call(string $name, array $arguments): mixed
+    {
+        return $this-&gt;command-&gt;{$name}(...$arguments);
+    }
+
+    public function getSubscribedSignals(): array
+    {
+        return $this-&gt;command-&gt;getSubscribedSignals();
+    }
+
+    public function handleSignal(int $signal, int|false $previousExitCode = 0): int|false
+    {
+        $event = $this-&gt;stopwatch-&gt;start($this-&gt;getName().&#039;.handle_signal&#039;);
+
+        $exit = $this-&gt;command-&gt;handleSignal($signal, $previousExitCode);
+
+        $event-&gt;stop();
+
+        if (!isset($this-&gt;handledSignals[$signal])) {
+            $this-&gt;handledSignals[$signal] = [
+                &#039;handled&#039; =&gt; 0,
+                &#039;duration&#039; =&gt; 0,
+                &#039;memory&#039; =&gt; 0,
+            ];
+        }
+
+        ++$this-&gt;handledSignals[$signal][&#039;handled&#039;];
+        $this-&gt;handledSignals[$signal][&#039;duration&#039;] += $event-&gt;getDuration();
+        $this-&gt;handledSignals[$signal][&#039;memory&#039;] = max(
+            $this-&gt;handledSignals[$signal][&#039;memory&#039;],
+            $event-&gt;getMemory() &gt;&gt; 20
+        );
+
+        return $exit;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * Calling parent method is required to be used in {@see parent::run()}.
+     */
+    public function ignoreValidationErrors(): void
+    {
+        $this-&gt;ignoreValidation = true;
+        $this-&gt;command-&gt;ignoreValidationErrors();
+
+        parent::ignoreValidationErrors();
+    }
+
+    public function setApplication(?Application $application = null): void
+    {
+        $this-&gt;command-&gt;setApplication($application);
+    }
+
+    public function getApplication(): ?Application
+    {
+        return $this-&gt;command-&gt;getApplication();
+    }
+
+    public function setHelperSet(HelperSet $helperSet): void
+    {
+        $this-&gt;command-&gt;setHelperSet($helperSet);
+    }
+
+    public function getHelperSet(): ?HelperSet
+    {
+        return $this-&gt;command-&gt;getHelperSet();
+    }
+
+    public function isEnabled(): bool
+    {
+        return $this-&gt;command-&gt;isEnabled();
+    }
+
+    public function complete(CompletionInput $input, CompletionSuggestions $suggestions): void
+    {
+        $this-&gt;command-&gt;complete($input, $suggestions);
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * Calling parent method is required to be used in {@see parent::run()}.
+     */
+    public function setCode(callable $code): static
+    {
+        if ($code instanceof InvokableCommand) {
+            $r = \Closure::bind(function () {
+                return $this-&gt;invokable;
+            }, $code, InvokableCommand::class)();
+
+            $this-&gt;invokableCommandInfo = [
+                &#039;class&#039; =&gt; $r-&gt;getClosureScopeClass()-&gt;name,
+                &#039;file&#039; =&gt; $r-&gt;getFileName(),
+                &#039;line&#039; =&gt; $r-&gt;getStartLine(),
+            ];
+        }
+
+        $this-&gt;command-&gt;setCode($code);
+
+        return parent::setCode(function (InputInterface $input, OutputInterface $output) use ($code): int {
+            $event = $this-&gt;stopwatch-&gt;start($this-&gt;getName().&#039;.code&#039;);
+
+            $this-&gt;exitCode = $code($input, $output);
+
+            $event-&gt;stop();
+
+            return $this-&gt;exitCode;
+        });
+    }
+
+    /**
+     * @internal
+     */
+    public function mergeApplicationDefinition(bool $mergeArgs = true): void
+    {
+        $this-&gt;command-&gt;mergeApplicationDefinition($mergeArgs);
+    }
+
+    public function setDefinition(array|InputDefinition $definition): static
+    {
+        $this-&gt;command-&gt;setDefinition($definition);
+
+        return $this;
+    }
+
+    public function getDefinition(): InputDefinition
+    {
+        return $this-&gt;command-&gt;getDefinition();
+    }
+
+    public function getNativeDefinition(): InputDefinition
+    {
+        return $this-&gt;command-&gt;getNativeDefinition();
+    }
+
+    public function addArgument(string $name, ?int $mode = null, string $description = &#039;&#039;, mixed $default = null, array|\Closure $suggestedValues = []): static
+    {
+        $this-&gt;command-&gt;addArgument($name, $mode, $description, $default, $suggestedValues);
+
+        return $this;
+    }
+
+    public function addOption(string $name, string|array|null $shortcut = null, ?int $mode = null, string $description = &#039;&#039;, mixed $default = null, array|\Closure $suggestedValues = []): static
+    {
+        $this-&gt;command-&gt;addOption($name, $shortcut, $mode, $description, $default, $suggestedValues);
+
+        return $this;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * Calling parent method is required to be used in {@see parent::run()}.
+     */
+    public function setProcessTitle(string $title): static
+    {
+        $this-&gt;command-&gt;setProcessTitle($title);
+
+        return parent::setProcessTitle($title);
+    }
+
+    public function setHelp(string $help): static
+    {
+        $this-&gt;command-&gt;setHelp($help);
+
+        return $this;
+    }
+
+    public function getHelp(): string
+    {
+        return $this-&gt;command-&gt;getHelp();
+    }
+
+    public function getProcessedHelp(): string
+    {
+        return $this-&gt;command-&gt;getProcessedHelp();
+    }
+
+    public function getSynopsis(bool $short = false): string
+    {
+        return $this-&gt;command-&gt;getSynopsis($short);
+    }
+
+    public function addUsage(string $usage): static
+    {
+        $this-&gt;command-&gt;addUsage($usage);
+
+        return $this;
+    }
+
+    public function getUsages(): array
+    {
+        return $this-&gt;command-&gt;getUsages();
+    }
+
+    public function getHelper(string $name): HelperInterface
+    {
+        return $this-&gt;command-&gt;getHelper($name);
+    }
+
+    public function run(InputInterface $input, OutputInterface $output): int
+    {
+        $this-&gt;input = $input;
+        $this-&gt;output = $output;
+        $this-&gt;arguments = $input-&gt;getArguments();
+        $this-&gt;options = $input-&gt;getOptions();
+        $event = $this-&gt;stopwatch-&gt;start($this-&gt;getName(), &#039;command&#039;);
+
+        try {
+            $this-&gt;exitCode = $this-&gt;command-&gt;run($input, $output);
+        } finally {
+            $event-&gt;stop();
+
+            if ($output instanceof ConsoleOutputInterface &amp;&amp; $output-&gt;isDebug()) {
+                $output-&gt;getErrorOutput()-&gt;writeln((string) $event);
+            }
+
+            $this-&gt;duration = $event-&gt;getDuration().&#039; ms&#039;;
+            $this-&gt;maxMemoryUsage = ($event-&gt;getMemory() &gt;&gt; 20).&#039; MiB&#039;;
+
+            if ($this-&gt;isInteractive) {
+                $this-&gt;extractInteractiveInputs($input-&gt;getArguments(), $input-&gt;getOptions());
+            }
+        }
+
+        return $this-&gt;exitCode;
+    }
+
+    protected function initialize(InputInterface $input, OutputInterface $output): void
+    {
+        $event = $this-&gt;stopwatch-&gt;start($this-&gt;getName().&#039;.init&#039;, &#039;command&#039;);
+
+        $this-&gt;command-&gt;initialize($input, $output);
+
+        $event-&gt;stop();
+    }
+
+    protected function interact(InputInterface $input, OutputInterface $output): void
+    {
+        if (!$this-&gt;isInteractive = Command::class !== (new \ReflectionMethod($this-&gt;command, &#039;interact&#039;))-&gt;getDeclaringClass()-&gt;getName()) {
+            return;
+        }
+
+        $event = $this-&gt;stopwatch-&gt;start($this-&gt;getName().&#039;.interact&#039;, &#039;command&#039;);
+
+        $this-&gt;command-&gt;interact($input, $output);
+
+        $event-&gt;stop();
+    }
+
+    protected function execute(InputInterface $input, OutputInterface $output): int
+    {
+        $event = $this-&gt;stopwatch-&gt;start($this-&gt;getName().&#039;.execute&#039;, &#039;command&#039;);
+
+        $exitCode = $this-&gt;command-&gt;execute($input, $output);
+
+        $event-&gt;stop();
+
+        return $exitCode;
+    }
+
+    private function extractInteractiveInputs(array $arguments, array $options): void
+    {
+        foreach ($arguments as $argName =&gt; $argValue) {
+            if (\array_key_exists($argName, $this-&gt;arguments) &amp;&amp; $this-&gt;arguments[$argName] === $argValue) {
+                continue;
+            }
+
+            $this-&gt;interactiveInputs[$argName] = $argValue;
+        }
+
+        foreach ($options as $optName =&gt; $optValue) {
+            if (\array_key_exists($optName, $this-&gt;options) &amp;&amp; $this-&gt;options[$optName] === $optValue) {
+                continue;
+            }
+
+            $this-&gt;interactiveInputs[&#039;--&#039;.$optName] = $optValue;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/console/CommandLoader/CommandLoaderInterface.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/console/CommandLoader -->
+
+</body>
+</html>

@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laminas/laminas-diactoros/src/UriFactory.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Laminas\Diactoros;
+
+use Override;
+use Psr\Http\Message\UriFactoryInterface;
+use Psr\Http\Message\UriInterface;
+
+use function array_change_key_case;
+use function array_key_exists;
+use function assert;
+use function count;
+use function explode;
+use function gettype;
+use function implode;
+use function is_bool;
+use function is_scalar;
+use function is_string;
+use function ltrim;
+use function preg_match;
+use function preg_replace;
+use function sprintf;
+use function str_contains;
+use function strlen;
+use function strrpos;
+use function strtolower;
+use function substr;
+
+use const CASE_LOWER;
+
+class UriFactory implements UriFactoryInterface
+{
+    /**
+     * {@inheritDoc}
+     */
+    #[Override]
+    public function createUri(string $uri = &#039;&#039;): UriInterface
+    {
+        return new Uri($uri);
+    }
+
+    /**
+     * Create a Uri instance based on the headers and $_SERVER data.
+     *
+     * @param array&lt;non-empty-string, list&lt;string&gt;|int|float|string&gt; $server SAPI parameters
+     * @param array&lt;string, string|list&lt;string&gt;&gt; $headers
+     */
+    public static function createFromSapi(array $server, array $headers): Uri
+    {
+        $uri = new Uri(&#039;&#039;);
+
+        $isHttps = false;
+        if (array_key_exists(&#039;HTTPS&#039;, $server)) {
+            $isHttps = self::marshalHttpsValue($server[&#039;HTTPS&#039;]);
+        } elseif (array_key_exists(&#039;https&#039;, $server)) {
+            $isHttps = self::marshalHttpsValue($server[&#039;https&#039;]);
+        }
+        $uri = $uri-&gt;withScheme($isHttps ? &#039;https&#039; : &#039;http&#039;);
+
+        [$host, $port] = self::marshalHostAndPort($server, $headers);
+        if (! empty($host)) {
+            $uri = $uri-&gt;withHost($host);
+            if ($port !== null) {
+                $uri = $uri-&gt;withPort($port);
+            }
+        }
+
+        $path = self::marshalRequestPath($server);
+
+        // Strip query string
+        $path = explode(&#039;?&#039;, $path, 2)[0];
+
+        $query = &#039;&#039;;
+        if (isset($server[&#039;QUERY_STRING&#039;]) &amp;&amp; is_scalar($server[&#039;QUERY_STRING&#039;])) {
+            $query = ltrim((string) $server[&#039;QUERY_STRING&#039;], &#039;?&#039;);
+        }
+
+        $fragment = &#039;&#039;;
+        if (str_contains($path, &#039;#&#039;)) {
+            $parts = explode(&#039;#&#039;, $path, 2);
+            assert(count($parts) &gt;= 2);
+            [$path, $fragment] = $parts;
+        }
+
+        return $uri
+            -&gt;withPath($path)
+            -&gt;withFragment($fragment)
+            -&gt;withQuery($query);
+    }
+
+    /**
+     * Retrieve a header value from an array of headers using a case-insensitive lookup.
+     *
+     * @template T
+     * @param array&lt;string, string|list&lt;string&gt;&gt; $headers Key/value header pairs
+     * @param T $default Default value to return if header not found
+     * @return string|T
+     */
+    private static function getHeaderFromArray(string $name, array $headers, $default = null)
+    {
+        $header  = strtolower($name);
+        $headers = array_change_key_case($headers, CASE_LOWER);
+        if (! array_key_exists($header, $headers)) {
+            return $default;
+        }
+
+        if (is_string($headers[$header])) {
+            return $headers[$header];
+        }
+
+        return implode(&#039;, &#039;, $headers[$header]);
+    }
+
+    /**
+     * Marshal the host and port from the PHP environment.
+     *
+     * @param array&lt;string, string|list&lt;string&gt;&gt; $headers
+     * @return array{0:string, 1:int|null} Array of two items, host and port,
+     *     in that order (can be passed to a list() operation).
+     */
+    private static function marshalHostAndPort(array $server, array $headers): array
+    {
+        /** @var array{string, null} $defaults */
+        static $defaults = [&#039;&#039;, null];
+
+        $host = self::getHeaderFromArray(&#039;host&#039;, $headers, false);
+        if ($host !== false) {
+            // Ignore obviously malformed host headers:
+            // - Whitespace is invalid within a hostname and break the URI representation within HTTP.
+            //   non-printable characters other than SPACE and TAB are already rejected by HeaderSecurity.
+            // - A comma indicates that multiple host headers have been sent which is not legal
+            //   and might be used in an attack where a load balancer sees a different host header
+            //   than Diactoros.
+            if (! preg_match(&#039;/[\\t ,]/&#039;, $host)) {
+                return self::marshalHostAndPortFromHeader($host);
+            }
+        }
+
+        if (! isset($server[&#039;SERVER_NAME&#039;])) {
+            return $defaults;
+        }
+
+        $host = (string) $server[&#039;SERVER_NAME&#039;];
+        $port = isset($server[&#039;SERVER_PORT&#039;]) ? (int) $server[&#039;SERVER_PORT&#039;] : null;
+
+        if (
+            ! isset($server[&#039;SERVER_ADDR&#039;])
+            || ! preg_match(&#039;/^\[[0-9a-fA-F\:]+\]$/&#039;, $host)
+        ) {
+            return [$host, $port];
+        }
+
+        // Misinterpreted IPv6-Address
+        // Reported for Safari on Windows
+        return self::marshalIpv6HostAndPort($server, $port);
+    }
+
+    /**
+     * @return array{string, int|null} Array of two items, host and port,
+     *     in that order (can be passed to a list() operation).
+     */
+    private static function marshalIpv6HostAndPort(array $server, ?int $port): array
+    {
+        $host             = &#039;[&#039; . (string) $server[&#039;SERVER_ADDR&#039;] . &#039;]&#039;;
+        $port           ??= 80;
+        $portSeparatorPos = strrpos($host, &#039;:&#039;);
+
+        if (false === $portSeparatorPos) {
+            return [$host, $port];
+        }
+
+        if ($port . &#039;]&#039; === substr($host, $portSeparatorPos + 1)) {
+            // The last digit of the IPv6-Address has been taken as port
+            // Unset the port so the default port can be used
+            $port = null;
+        }
+        return [$host, $port];
+    }
+
+    /**
+     * Detect the path for the request
+     *
+     * Looks at a variety of criteria in order to attempt to autodetect the base
+     * request path, including:
+     *
+     * - IIS7 UrlRewrite environment
+     * - REQUEST_URI
+     * - ORIG_PATH_INFO
+     */
+    private static function marshalRequestPath(array $server): string
+    {
+        // IIS7 with URL Rewrite: make sure we get the unencoded url
+        // (double slash problem).
+        /** @var string|array&lt;string&gt;|null $iisUrlRewritten */
+        $iisUrlRewritten = $server[&#039;IIS_WasUrlRewritten&#039;] ?? null;
+        /** @var string|array&lt;string&gt; $unencodedUrl */
+        $unencodedUrl = $server[&#039;UNENCODED_URL&#039;] ?? &#039;&#039;;
+        if (&#039;1&#039; === $iisUrlRewritten &amp;&amp; is_string($unencodedUrl) &amp;&amp; &#039;&#039; !== $unencodedUrl) {
+            return $unencodedUrl;
+        }
+
+        /** @var string|array&lt;string&gt;|null $requestUri */
+        $requestUri = $server[&#039;REQUEST_URI&#039;] ?? null;
+
+        if (is_string($requestUri)) {
+            $result = preg_replace(&#039;#^[^/:]+://[^/]+#&#039;, &#039;&#039;, $requestUri);
+            assert($result !== null, &#039;Always true condition for psalm type safety&#039;);
+            return $result;
+        }
+
+        $origPathInfo = $server[&#039;ORIG_PATH_INFO&#039;] ?? &#039;&#039;;
+        if (! is_string($origPathInfo) || &#039;&#039; === $origPathInfo) {
+            return &#039;/&#039;;
+        }
+
+        return $origPathInfo;
+    }
+
+    private static function marshalHttpsValue(mixed $https): bool
+    {
+        if (is_bool($https)) {
+            return $https;
+        }
+
+        if (! is_string($https)) {
+            throw new Exception\InvalidArgumentException(sprintf(
+                &#039;SAPI HTTPS value MUST be a string or boolean; received %s&#039;,
+                gettype($https)
+            ));
+        }
+
+        return &#039;on&#039; === strtolower($https);
+    }
+
+    /**
+     * @internal
+     *
+     * @return array{string, int|null} Array of two items, host and port, in that order (can be
+     *     passed to a list() operation).
+     * @psalm-mutation-free
+     */
+    public static function marshalHostAndPortFromHeader(string $host): array
+    {
+        $port = null;
+
+        // works for regname, IPv4 &amp; IPv6
+        if (preg_match(&#039;|\:(\d+)$|&#039;, $host, $matches)) {
+            $host = substr($host, 0, -1 * (strlen($matches[1]) + 1));
+            $port = (int) $matches[1];
+        }
+
+        return [$host, $port];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laminas/laminas-diactoros/src/functions/create_uploaded_file.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laminas/laminas-diactoros/src/Exception -->
+
+</body>
+</html>

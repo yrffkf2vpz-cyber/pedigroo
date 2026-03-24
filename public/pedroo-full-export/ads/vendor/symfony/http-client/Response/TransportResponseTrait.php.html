@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Response/TransportResponseTrait.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Response;
+
+use Psr\Log\LoggerInterface;
+use Symfony\Component\HttpClient\Chunk\DataChunk;
+use Symfony\Component\HttpClient\Chunk\ErrorChunk;
+use Symfony\Component\HttpClient\Chunk\FirstChunk;
+use Symfony\Component\HttpClient\Chunk\LastChunk;
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Internal\Canary;
+use Symfony\Component\HttpClient\Internal\ClientState;
+
+/**
+ * Implements common logic for transport-level response classes.
+ *
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+trait TransportResponseTrait
+{
+    private Canary $canary;
+    /** @var array&lt;string, list&lt;string&gt;&gt; */
+    private array $headers = [];
+    private array $info = [
+        &#039;response_headers&#039; =&gt; [],
+        &#039;http_code&#039; =&gt; 0,
+        &#039;error&#039; =&gt; null,
+        &#039;canceled&#039; =&gt; false,
+    ];
+
+    /** @var object|resource|null */
+    private $handle;
+    private int|string $id;
+    private ?float $timeout = 0;
+    private \InflateContext|bool|null $inflate = null;
+    private ?array $finalInfo = null;
+    private ?LoggerInterface $logger = null;
+
+    public function getStatusCode(): int
+    {
+        if ($this-&gt;initializer) {
+            self::initialize($this);
+        }
+
+        return $this-&gt;info[&#039;http_code&#039;];
+    }
+
+    public function getHeaders(bool $throw = true): array
+    {
+        if ($this-&gt;initializer) {
+            self::initialize($this);
+        }
+
+        if ($throw) {
+            $this-&gt;checkStatusCode();
+        }
+
+        return $this-&gt;headers;
+    }
+
+    public function cancel(): void
+    {
+        $this-&gt;info[&#039;canceled&#039;] = true;
+        $this-&gt;info[&#039;error&#039;] = &#039;Response has been canceled.&#039;;
+        $this-&gt;close();
+    }
+
+    /**
+     * Closes the response and all its network handles.
+     */
+    protected function close(): void
+    {
+        $this-&gt;canary-&gt;cancel();
+        $this-&gt;inflate = null;
+    }
+
+    /**
+     * Adds pending responses to the activity list.
+     */
+    abstract protected static function schedule(self $response, array &amp;$runningResponses): void;
+
+    /**
+     * Performs all pending non-blocking operations.
+     */
+    abstract protected static function perform(ClientState $multi, array $responses): void;
+
+    /**
+     * Waits for network activity.
+     */
+    abstract protected static function select(ClientState $multi, float $timeout): int;
+
+    private static function addResponseHeaders(array $responseHeaders, array &amp;$info, array &amp;$headers, string &amp;$debug = &#039;&#039;): void
+    {
+        foreach ($responseHeaders as $h) {
+            if (11 &lt;= \strlen($h) &amp;&amp; &#039;/&#039; === $h[4] &amp;&amp; preg_match(&#039;#^HTTP/\d+(?:\.\d+)? (\d\d\d)(?: |$)#&#039;, $h, $m)) {
+                if ($headers) {
+                    $debug .= &quot;&lt; \r\n&quot;;
+                    $headers = [];
+                }
+                $info[&#039;http_code&#039;] = (int) $m[1];
+            } elseif (2 === \count($m = explode(&#039;:&#039;, $h, 2))) {
+                $headers[strtolower($m[0])][] = ltrim($m[1]);
+            }
+
+            $debug .= &quot;&lt; {$h}\r\n&quot;;
+            $info[&#039;response_headers&#039;][] = $h;
+        }
+
+        $debug .= &quot;&lt; \r\n&quot;;
+    }
+
+    /**
+     * Ensures the request is always sent and that the response code was checked.
+     */
+    private function doDestruct(): void
+    {
+        $this-&gt;shouldBuffer = true;
+
+        if ($this-&gt;initializer &amp;&amp; null === $this-&gt;info[&#039;error&#039;]) {
+            self::initialize($this);
+            $this-&gt;checkStatusCode();
+        }
+    }
+
+    /**
+     * Implements an event loop based on a buffer activity queue.
+     *
+     * @param iterable&lt;array-key, self&gt; $responses
+     *
+     * @internal
+     */
+    public static function stream(iterable $responses, ?float $timeout = null): \Generator
+    {
+        $runningResponses = [];
+
+        foreach ($responses as $response) {
+            self::schedule($response, $runningResponses);
+        }
+
+        $lastActivity = hrtime(true) / 1E9;
+        $elapsedTimeout = 0;
+
+        if ((0.0 === $timeout &amp;&amp; &#039;-0&#039; === (string) $timeout) || 0 &gt; $timeout) {
+            $timeout = $timeout ? -$timeout : null;
+
+            /** @var ClientState $multi */
+            foreach ($runningResponses as [$multi]) {
+                if (null !== $multi-&gt;lastTimeout) {
+                    $elapsedTimeout = max($elapsedTimeout, $lastActivity - $multi-&gt;lastTimeout);
+                }
+            }
+        }
+
+        while (true) {
+            $hasActivity = false;
+            $timeoutMax = 0;
+            $timeoutMin = $timeout ?? \INF;
+
+            /** @var ClientState $multi */
+            foreach ($runningResponses as $i =&gt; [$multi, &amp;$responses]) {
+                self::perform($multi, $responses);
+
+                foreach ($responses as $j =&gt; $response) {
+                    $timeoutMax = $timeout ?? max($timeoutMax, $response-&gt;timeout);
+                    $timeoutMin = min($timeoutMin, $response-&gt;timeout, 1);
+                    $chunk = false;
+
+                    if (isset($multi-&gt;handlesActivity[$j])) {
+                        $multi-&gt;lastTimeout = null;
+                        $elapsedTimeout = 0;
+                    } elseif (!isset($multi-&gt;openHandles[$j])) {
+                        $hasActivity = true;
+                        unset($responses[$j]);
+                        continue;
+                    } elseif ($elapsedTimeout &gt;= $timeoutMax) {
+                        $multi-&gt;handlesActivity[$j] = [new ErrorChunk($response-&gt;offset, \sprintf(&#039;Idle timeout reached for &quot;%s&quot;.&#039;, $response-&gt;getInfo(&#039;url&#039;)))];
+                        $multi-&gt;lastTimeout ??= $lastActivity;
+                        $elapsedTimeout = $timeoutMax;
+                    } else {
+                        continue;
+                    }
+
+                    $lastActivity = null;
+                    $hasActivity = true;
+
+                    while ($multi-&gt;handlesActivity[$j] ?? false) {
+                        if (\is_string($chunk = array_shift($multi-&gt;handlesActivity[$j]))) {
+                            if (null !== $response-&gt;inflate &amp;&amp; false === $chunk = @inflate_add($response-&gt;inflate, $chunk)) {
+                                $multi-&gt;handlesActivity[$j] = [null, new TransportException(\sprintf(&#039;Error while processing content unencoding for &quot;%s&quot;.&#039;, $response-&gt;getInfo(&#039;url&#039;)))];
+                                continue;
+                            }
+
+                            if (&#039;&#039; !== $chunk &amp;&amp; null !== $response-&gt;content &amp;&amp; \strlen($chunk) !== fwrite($response-&gt;content, $chunk)) {
+                                $multi-&gt;handlesActivity[$j] = [null, new TransportException(\sprintf(&#039;Failed writing %d bytes to the response buffer.&#039;, \strlen($chunk)))];
+                                continue;
+                            }
+
+                            $chunkLen = \strlen($chunk);
+                            $chunk = new DataChunk($response-&gt;offset, $chunk);
+                            $response-&gt;offset += $chunkLen;
+                        } elseif (null === $chunk) {
+                            $e = $multi-&gt;handlesActivity[$j][0];
+                            unset($responses[$j], $multi-&gt;handlesActivity[$j]);
+                            $response-&gt;close();
+
+                            if (null !== $e) {
+                                $response-&gt;info[&#039;error&#039;] = $e-&gt;getMessage();
+
+                                if ($e instanceof \Error) {
+                                    throw $e;
+                                }
+
+                                $chunk = new ErrorChunk($response-&gt;offset, $e);
+                            } else {
+                                if (0 === $response-&gt;offset &amp;&amp; null === $response-&gt;content) {
+                                    $response-&gt;content = fopen(&#039;php://memory&#039;, &#039;w+&#039;);
+                                }
+
+                                $chunk = new LastChunk($response-&gt;offset);
+                            }
+                        } elseif ($chunk instanceof ErrorChunk) {
+                            unset($responses[$j]);
+                        } elseif ($chunk instanceof FirstChunk) {
+                            if ($response-&gt;logger) {
+                                $info = $response-&gt;getInfo();
+                                $response-&gt;logger-&gt;info(&#039;Response: &quot;{http_code} {url}&quot; {total_time} seconds&#039;, [
+                                    &#039;http_code&#039; =&gt; $info[&#039;http_code&#039;],
+                                    &#039;url&#039; =&gt; $info[&#039;url&#039;],
+                                    &#039;total_time&#039; =&gt; $info[&#039;total_time&#039;],
+                                ]);
+                            }
+
+                            $response-&gt;inflate = \extension_loaded(&#039;zlib&#039;) &amp;&amp; $response-&gt;inflate &amp;&amp; &#039;gzip&#039; === ($response-&gt;headers[&#039;content-encoding&#039;][0] ?? null) ? inflate_init(\ZLIB_ENCODING_GZIP) : null;
+
+                            if ($response-&gt;shouldBuffer instanceof \Closure) {
+                                try {
+                                    $response-&gt;shouldBuffer = ($response-&gt;shouldBuffer)($response-&gt;headers);
+
+                                    if (null !== $response-&gt;info[&#039;error&#039;]) {
+                                        throw new TransportException($response-&gt;info[&#039;error&#039;]);
+                                    }
+                                } catch (\Throwable $e) {
+                                    $response-&gt;close();
+                                    $multi-&gt;handlesActivity[$j] = [null, $e];
+                                }
+                            }
+
+                            if (true === $response-&gt;shouldBuffer) {
+                                $response-&gt;content = fopen(&#039;php://temp&#039;, &#039;w+&#039;);
+                            } elseif (\is_resource($response-&gt;shouldBuffer)) {
+                                $response-&gt;content = $response-&gt;shouldBuffer;
+                            }
+                            $response-&gt;shouldBuffer = null;
+
+                            yield $response =&gt; $chunk;
+
+                            if ($response-&gt;initializer &amp;&amp; null === $response-&gt;info[&#039;error&#039;]) {
+                                // Ensure the HTTP status code is always checked
+                                $response-&gt;getHeaders(true);
+                            }
+
+                            continue;
+                        }
+
+                        yield $response =&gt; $chunk;
+                    }
+
+                    unset($multi-&gt;handlesActivity[$j]);
+
+                    if ($chunk instanceof ErrorChunk &amp;&amp; !$chunk-&gt;didThrow()) {
+                        // Ensure transport exceptions are always thrown
+                        $chunk-&gt;getContent();
+                        throw new \LogicException(&#039;A transport exception should have been thrown.&#039;);
+                    }
+                }
+
+                if (!$responses) {
+                    $hasActivity = true;
+                    unset($runningResponses[$i]);
+                }
+
+                // Prevent memory leaks
+                $multi-&gt;handlesActivity = $multi-&gt;handlesActivity ?: [];
+                $multi-&gt;openHandles = $multi-&gt;openHandles ?: [];
+            }
+
+            if (!$runningResponses) {
+                break;
+            }
+
+            if ($hasActivity) {
+                $lastActivity ??= hrtime(true) / 1E9;
+                continue;
+            }
+
+            if (-1 === self::select($multi, min($timeoutMin, max(0, $timeoutMax - $elapsedTimeout)))) {
+                usleep((int) min(500, 1E6 * $timeoutMin));
+            }
+
+            $elapsedTimeout = hrtime(true) / 1E9 - $lastActivity;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Retry/GenericRetryStrategy.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Retry -->
+
+</body>
+</html>

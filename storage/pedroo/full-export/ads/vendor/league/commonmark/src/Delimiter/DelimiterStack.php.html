@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/commonmark/src/Delimiter/DelimiterStack.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the league/commonmark package.
+ *
+ * (c) Colin O&#039;Dell &lt;colinodell@gmail.com&gt;
+ *
+ * Original code based on the CommonMark JS reference parser (https://bitly.com/commonmark-js)
+ *  - (c) John MacFarlane
+ *
+ * Additional emphasis processing code based on commonmark-java (https://github.com/atlassian/commonmark-java)
+ *  - (c) Atlassian Pty Ltd
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace League\CommonMark\Delimiter;
+
+use League\CommonMark\Delimiter\Processor\CacheableDelimiterProcessorInterface;
+use League\CommonMark\Delimiter\Processor\DelimiterProcessorCollection;
+use League\CommonMark\Node\Inline\AdjacentTextMerger;
+use League\CommonMark\Node\Node;
+
+final class DelimiterStack
+{
+    /** @psalm-readonly-allow-private-mutation */
+    private ?DelimiterInterface $top = null;
+
+    /** @psalm-readonly-allow-private-mutation */
+    private ?Bracket $brackets = null;
+
+    /**
+     * @deprecated This property will be removed in 3.0 once all delimiters MUST have an index/position
+     *
+     * @var \SplObjectStorage&lt;DelimiterInterface, int&gt;|\WeakMap&lt;DelimiterInterface, int&gt;
+     */
+    private $missingIndexCache;
+
+
+    private int $remainingDelimiters = 0;
+
+    public function __construct(int $maximumStackSize = PHP_INT_MAX)
+    {
+        $this-&gt;remainingDelimiters = $maximumStackSize;
+
+        if (\PHP_VERSION_ID &gt;= 80000) {
+            /** @psalm-suppress PropertyTypeCoercion */
+            $this-&gt;missingIndexCache = new \WeakMap(); // @phpstan-ignore-line
+        } else {
+            $this-&gt;missingIndexCache = new \SplObjectStorage(); // @phpstan-ignore-line
+        }
+    }
+
+    public function push(DelimiterInterface $newDelimiter): void
+    {
+        if ($this-&gt;remainingDelimiters-- &lt;= 0) {
+            return;
+        }
+
+        $newDelimiter-&gt;setPrevious($this-&gt;top);
+
+        if ($this-&gt;top !== null) {
+            $this-&gt;top-&gt;setNext($newDelimiter);
+        }
+
+        $this-&gt;top = $newDelimiter;
+    }
+
+    /**
+     * @internal
+     */
+    public function addBracket(Node $node, int $index, bool $image): void
+    {
+        if ($this-&gt;brackets !== null) {
+            $this-&gt;brackets-&gt;setHasNext(true);
+        }
+
+        $this-&gt;brackets = new Bracket($node, $this-&gt;brackets, $index, $image);
+    }
+
+    /**
+     * @psalm-immutable
+     */
+    public function getLastBracket(): ?Bracket
+    {
+        return $this-&gt;brackets;
+    }
+
+    private function findEarliest(int $stackBottom): ?DelimiterInterface
+    {
+        // Move back to first relevant delim.
+        $delimiter   = $this-&gt;top;
+        $lastChecked = null;
+
+        while ($delimiter !== null &amp;&amp; self::getIndex($delimiter) &gt; $stackBottom) {
+            $lastChecked = $delimiter;
+            $delimiter   = $delimiter-&gt;getPrevious();
+        }
+
+        return $lastChecked;
+    }
+
+    /**
+     * @internal
+     */
+    public function removeBracket(): void
+    {
+        if ($this-&gt;brackets === null) {
+            return;
+        }
+
+        $this-&gt;brackets = $this-&gt;brackets-&gt;getPrevious();
+
+        if ($this-&gt;brackets !== null) {
+            $this-&gt;brackets-&gt;setHasNext(false);
+        }
+    }
+
+    public function removeDelimiter(DelimiterInterface $delimiter): void
+    {
+        if ($delimiter-&gt;getPrevious() !== null) {
+            /** @psalm-suppress PossiblyNullReference */
+            $delimiter-&gt;getPrevious()-&gt;setNext($delimiter-&gt;getNext());
+        }
+
+        if ($delimiter-&gt;getNext() === null) {
+            // top of stack
+            $this-&gt;top = $delimiter-&gt;getPrevious();
+        } else {
+            /** @psalm-suppress PossiblyNullReference */
+            $delimiter-&gt;getNext()-&gt;setPrevious($delimiter-&gt;getPrevious());
+        }
+
+        // Nullify all references from the removed delimiter to other delimiters.
+        // All references to this particular delimiter in the linked list should be gone,
+        // but it&#039;s possible we&#039;re still hanging on to other references to things that
+        // have been (or soon will be) removed, which may interfere with efficient
+        // garbage collection by the PHP runtime.
+        // Explicitly releasing these references should help to avoid possible
+        // segfaults like in https://bugs.php.net/bug.php?id=68606.
+        $delimiter-&gt;setPrevious(null);
+        $delimiter-&gt;setNext(null);
+
+        // TODO: Remove the line below once PHP 7.4 support is dropped, as WeakMap won&#039;t hold onto the reference, making this unnecessary
+        unset($this-&gt;missingIndexCache[$delimiter]);
+    }
+
+    private function removeDelimiterAndNode(DelimiterInterface $delimiter): void
+    {
+        $delimiter-&gt;getInlineNode()-&gt;detach();
+        $this-&gt;removeDelimiter($delimiter);
+    }
+
+    private function removeDelimitersBetween(DelimiterInterface $opener, DelimiterInterface $closer): void
+    {
+        $delimiter      = $closer-&gt;getPrevious();
+        $openerPosition = self::getIndex($opener);
+        while ($delimiter !== null &amp;&amp; self::getIndex($delimiter) &gt; $openerPosition) {
+            $previous = $delimiter-&gt;getPrevious();
+            $this-&gt;removeDelimiter($delimiter);
+            $delimiter = $previous;
+        }
+    }
+
+    /**
+     * @param DelimiterInterface|int|null $stackBottom
+     */
+    public function removeAll($stackBottom = null): void
+    {
+        $stackBottomPosition = \is_int($stackBottom) ? $stackBottom : self::getIndex($stackBottom);
+
+        while ($this-&gt;top &amp;&amp; $this-&gt;getIndex($this-&gt;top) &gt; $stackBottomPosition) {
+            $this-&gt;removeDelimiter($this-&gt;top);
+        }
+    }
+
+    /**
+     * @deprecated This method is no longer used internally and will be removed in 3.0
+     */
+    public function removeEarlierMatches(string $character): void
+    {
+        $opener = $this-&gt;top;
+        while ($opener !== null) {
+            if ($opener-&gt;getChar() === $character) {
+                $opener-&gt;setActive(false);
+            }
+
+            $opener = $opener-&gt;getPrevious();
+        }
+    }
+
+    /**
+     * @internal
+     */
+    public function deactivateLinkOpeners(): void
+    {
+        $opener = $this-&gt;brackets;
+        while ($opener !== null &amp;&amp; $opener-&gt;isActive()) {
+            $opener-&gt;setActive(false);
+            $opener = $opener-&gt;getPrevious();
+        }
+    }
+
+    /**
+     * @deprecated This method is no longer used internally and will be removed in 3.0
+     *
+     * @param string|string[] $characters
+     */
+    public function searchByCharacter($characters): ?DelimiterInterface
+    {
+        if (! \is_array($characters)) {
+            $characters = [$characters];
+        }
+
+        $opener = $this-&gt;top;
+        while ($opener !== null) {
+            if (\in_array($opener-&gt;getChar(), $characters, true)) {
+                break;
+            }
+
+            $opener = $opener-&gt;getPrevious();
+        }
+
+        return $opener;
+    }
+
+    /**
+     * @param DelimiterInterface|int|null $stackBottom
+     *
+     * @todo change $stackBottom to an int in 3.0
+     */
+    public function processDelimiters($stackBottom, DelimiterProcessorCollection $processors): void
+    {
+        /** @var array&lt;string, int&gt; $openersBottom */
+        $openersBottom = [];
+
+        $stackBottomPosition = \is_int($stackBottom) ? $stackBottom : self::getIndex($stackBottom);
+
+        // Find first closer above stackBottom
+        $closer = $this-&gt;findEarliest($stackBottomPosition);
+
+        // Move forward, looking for closers, and handling each
+        while ($closer !== null) {
+            $closingDelimiterChar = $closer-&gt;getChar();
+
+            $delimiterProcessor = $processors-&gt;getDelimiterProcessor($closingDelimiterChar);
+            if (! $closer-&gt;canClose() || $delimiterProcessor === null) {
+                $closer = $closer-&gt;getNext();
+                continue;
+            }
+
+            if ($delimiterProcessor instanceof CacheableDelimiterProcessorInterface) {
+                $openersBottomCacheKey = $delimiterProcessor-&gt;getCacheKey($closer);
+            } else {
+                $openersBottomCacheKey = $closingDelimiterChar;
+            }
+
+            $openingDelimiterChar = $delimiterProcessor-&gt;getOpeningCharacter();
+
+            $useDelims            = 0;
+            $openerFound          = false;
+            $potentialOpenerFound = false;
+            $opener               = $closer-&gt;getPrevious();
+            while ($opener !== null &amp;&amp; ($openerPosition = self::getIndex($opener)) &gt; $stackBottomPosition &amp;&amp; $openerPosition &gt;= ($openersBottom[$openersBottomCacheKey] ?? 0)) {
+                if ($opener-&gt;canOpen() &amp;&amp; $opener-&gt;getChar() === $openingDelimiterChar) {
+                    $potentialOpenerFound = true;
+                    $useDelims            = $delimiterProcessor-&gt;getDelimiterUse($opener, $closer);
+                    if ($useDelims &gt; 0) {
+                        $openerFound = true;
+                        break;
+                    }
+                }
+
+                $opener = $opener-&gt;getPrevious();
+            }
+
+            if (! $openerFound) {
+                // Set lower bound for future searches
+                // TODO: Remove this conditional check in 3.0. It only exists to prevent behavioral BC breaks in 2.x.
+                if ($potentialOpenerFound === false || $delimiterProcessor instanceof CacheableDelimiterProcessorInterface) {
+                    $openersBottom[$openersBottomCacheKey] = self::getIndex($closer);
+                }
+
+                if (! $potentialOpenerFound &amp;&amp; ! $closer-&gt;canOpen()) {
+                    // We can remove a closer that can&#039;t be an opener,
+                    // once we&#039;ve seen there&#039;s no matching opener.
+                    $next = $closer-&gt;getNext();
+                    $this-&gt;removeDelimiter($closer);
+                    $closer = $next;
+                } else {
+                    $closer = $closer-&gt;getNext();
+                }
+
+                continue;
+            }
+
+            \assert($opener !== null);
+
+            $openerNode = $opener-&gt;getInlineNode();
+            $closerNode = $closer-&gt;getInlineNode();
+
+            // Remove number of used delimiters from stack and inline nodes.
+            $opener-&gt;setLength($opener-&gt;getLength() - $useDelims);
+            $closer-&gt;setLength($closer-&gt;getLength() - $useDelims);
+
+            $openerNode-&gt;setLiteral(\substr($openerNode-&gt;getLiteral(), 0, -$useDelims));
+            $closerNode-&gt;setLiteral(\substr($closerNode-&gt;getLiteral(), 0, -$useDelims));
+
+            $this-&gt;removeDelimitersBetween($opener, $closer);
+            // The delimiter processor can re-parent the nodes between opener and closer,
+            // so make sure they&#039;re contiguous already. Exclusive because we want to keep opener/closer themselves.
+            AdjacentTextMerger::mergeTextNodesBetweenExclusive($openerNode, $closerNode);
+            $delimiterProcessor-&gt;process($openerNode, $closerNode, $useDelims);
+
+            // No delimiter characters left to process, so we can remove delimiter and the now empty node.
+            if ($opener-&gt;getLength() === 0) {
+                $this-&gt;removeDelimiterAndNode($opener);
+            }
+
+            // phpcs:disable SlevomatCodingStandard.ControlStructures.EarlyExit.EarlyExitNotUsed
+            if ($closer-&gt;getLength() === 0) {
+                $next = $closer-&gt;getNext();
+                $this-&gt;removeDelimiterAndNode($closer);
+                $closer = $next;
+            }
+        }
+
+        // Remove all delimiters
+        $this-&gt;removeAll($stackBottomPosition);
+    }
+
+    /**
+     * @internal
+     */
+    public function __destruct()
+    {
+        while ($this-&gt;top) {
+            $this-&gt;removeDelimiter($this-&gt;top);
+        }
+
+        while ($this-&gt;brackets) {
+            $this-&gt;removeBracket();
+        }
+    }
+
+    /**
+     * @deprecated This method will be dropped in 3.0 once all delimiters MUST have an index/position
+     */
+    private function getIndex(?DelimiterInterface $delimiter): int
+    {
+        if ($delimiter === null) {
+            return -1;
+        }
+
+        if (($index = $delimiter-&gt;getIndex()) !== null) {
+            return $index;
+        }
+
+        if (isset($this-&gt;missingIndexCache[$delimiter])) {
+            return $this-&gt;missingIndexCache[$delimiter];
+        }
+
+        $prev = $delimiter-&gt;getPrevious();
+        $next = $delimiter-&gt;getNext();
+
+        $i = 0;
+        do {
+            $i++;
+            if ($prev === null) {
+                break;
+            }
+
+            if ($prev-&gt;getIndex() !== null) {
+                return $this-&gt;missingIndexCache[$delimiter] = $prev-&gt;getIndex() + $i;
+            }
+        } while ($prev = $prev-&gt;getPrevious());
+
+        $j = 0;
+        do {
+            $j++;
+            if ($next === null) {
+                break;
+            }
+
+            if ($next-&gt;getIndex() !== null) {
+                return $this-&gt;missingIndexCache[$delimiter] = $next-&gt;getIndex() - $j;
+            }
+        } while ($next = $next-&gt;getNext());
+
+        // No index was defined on this delimiter, and none could be guesstimated based on the stack.
+        return $this-&gt;missingIndexCache[$delimiter] = $this-&gt;getIndex($delimiter-&gt;getPrevious()) + 1;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/commonmark/src/Delimiter/Processor/CacheableDelimiterProcessorInterface.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/commonmark/src/Delimiter/Processor -->
+
+</body>
+</html>

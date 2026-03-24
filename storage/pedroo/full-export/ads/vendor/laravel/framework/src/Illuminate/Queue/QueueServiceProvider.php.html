@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Queue/QueueServiceProvider.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Queue;
+
+use Aws\DynamoDb\DynamoDbClient;
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
+use Illuminate\Contracts\Support\DeferrableProvider;
+use Illuminate\Queue\Connectors\BackgroundConnector;
+use Illuminate\Queue\Connectors\BeanstalkdConnector;
+use Illuminate\Queue\Connectors\DatabaseConnector;
+use Illuminate\Queue\Connectors\DeferredConnector;
+use Illuminate\Queue\Connectors\FailoverConnector;
+use Illuminate\Queue\Connectors\NullConnector;
+use Illuminate\Queue\Connectors\RedisConnector;
+use Illuminate\Queue\Connectors\SqsConnector;
+use Illuminate\Queue\Connectors\SyncConnector;
+use Illuminate\Queue\Failed\DatabaseFailedJobProvider;
+use Illuminate\Queue\Failed\DatabaseUuidFailedJobProvider;
+use Illuminate\Queue\Failed\DynamoDbFailedJobProvider;
+use Illuminate\Queue\Failed\FileFailedJobProvider;
+use Illuminate\Queue\Failed\NullFailedJobProvider;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\ServiceProvider;
+use Laravel\SerializableClosure\SerializableClosure;
+
+class QueueServiceProvider extends ServiceProvider implements DeferrableProvider
+{
+    use SerializesAndRestoresModelIdentifiers;
+
+    /**
+     * Register the service provider.
+     *
+     * @return void
+     */
+    public function register()
+    {
+        $this-&gt;configureSerializableClosureUses();
+
+        $this-&gt;registerManager();
+        $this-&gt;registerConnection();
+        $this-&gt;registerWorker();
+        $this-&gt;registerListener();
+        $this-&gt;registerFailedJobServices();
+    }
+
+    /**
+     * Configure serializable closures uses.
+     *
+     * @return void
+     */
+    protected function configureSerializableClosureUses()
+    {
+        SerializableClosure::transformUseVariablesUsing(function ($data) {
+            foreach ($data as $key =&gt; $value) {
+                $data[$key] = $this-&gt;getSerializedPropertyValue($value);
+            }
+
+            return $data;
+        });
+
+        SerializableClosure::resolveUseVariablesUsing(function ($data) {
+            foreach ($data as $key =&gt; $value) {
+                $data[$key] = $this-&gt;getRestoredPropertyValue($value);
+            }
+
+            return $data;
+        });
+    }
+
+    /**
+     * Register the queue manager.
+     *
+     * @return void
+     */
+    protected function registerManager()
+    {
+        $this-&gt;app-&gt;singleton(&#039;queue&#039;, function ($app) {
+            // Once we have an instance of the queue manager, we will register the various
+            // resolvers for the queue connectors. These connectors are responsible for
+            // creating the classes that accept queue configs and instantiate queues.
+            return tap(new QueueManager($app), function ($manager) {
+                $this-&gt;registerConnectors($manager);
+            });
+        });
+    }
+
+    /**
+     * Register the default queue connection binding.
+     *
+     * @return void
+     */
+    protected function registerConnection()
+    {
+        $this-&gt;app-&gt;singleton(&#039;queue.connection&#039;, function ($app) {
+            return $app[&#039;queue&#039;]-&gt;connection();
+        });
+    }
+
+    /**
+     * Register the connectors on the queue manager.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    public function registerConnectors($manager)
+    {
+        foreach ([&#039;Null&#039;, &#039;Sync&#039;, &#039;Deferred&#039;, &#039;Background&#039;, &#039;Failover&#039;, &#039;Database&#039;, &#039;Redis&#039;, &#039;Beanstalkd&#039;, &#039;Sqs&#039;] as $connector) {
+            $this-&gt;{&quot;register{$connector}Connector&quot;}($manager);
+        }
+    }
+
+    /**
+     * Register the Null queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerNullConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;null&#039;, function () {
+            return new NullConnector;
+        });
+    }
+
+    /**
+     * Register the Sync queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerSyncConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;sync&#039;, function () {
+            return new SyncConnector;
+        });
+    }
+
+    /**
+     * Register the Deferred queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerDeferredConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;deferred&#039;, function () {
+            return new DeferredConnector;
+        });
+    }
+
+    /**
+     * Register the Background queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerBackgroundConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;background&#039;, function () {
+            return new BackgroundConnector;
+        });
+    }
+
+    /**
+     * Register the Failover queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerFailoverConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;failover&#039;, function () use ($manager) {
+            return new FailoverConnector(
+                $manager,
+                $this-&gt;app-&gt;make(EventDispatcher::class)
+            );
+        });
+    }
+
+    /**
+     * Register the database queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerDatabaseConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;database&#039;, function () {
+            return new DatabaseConnector($this-&gt;app[&#039;db&#039;]);
+        });
+    }
+
+    /**
+     * Register the Redis queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerRedisConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;redis&#039;, function () {
+            return new RedisConnector($this-&gt;app[&#039;redis&#039;]);
+        });
+    }
+
+    /**
+     * Register the Beanstalkd queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerBeanstalkdConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;beanstalkd&#039;, function () {
+            return new BeanstalkdConnector;
+        });
+    }
+
+    /**
+     * Register the Amazon SQS queue connector.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $manager
+     * @return void
+     */
+    protected function registerSqsConnector($manager)
+    {
+        $manager-&gt;addConnector(&#039;sqs&#039;, function () {
+            return new SqsConnector;
+        });
+    }
+
+    /**
+     * Register the queue worker.
+     *
+     * @return void
+     */
+    protected function registerWorker()
+    {
+        $this-&gt;app-&gt;singleton(&#039;queue.worker&#039;, function ($app) {
+            $isDownForMaintenance = function () {
+                return $this-&gt;app-&gt;isDownForMaintenance();
+            };
+
+            $resetScope = function () use ($app) {
+                if (method_exists($app[&#039;log&#039;], &#039;flushSharedContext&#039;)) {
+                    $app[&#039;log&#039;]-&gt;flushSharedContext();
+                }
+
+                if (method_exists($app[&#039;log&#039;], &#039;withoutContext&#039;)) {
+                    $app[&#039;log&#039;]-&gt;withoutContext();
+                }
+
+                if (method_exists($app[&#039;db&#039;], &#039;getConnections&#039;)) {
+                    foreach ($app[&#039;db&#039;]-&gt;getConnections() as $connection) {
+                        $connection-&gt;resetTotalQueryDuration();
+                        $connection-&gt;allowQueryDurationHandlersToRunAgain();
+                    }
+                }
+
+                $app-&gt;forgetScopedInstances();
+
+                Facade::clearResolvedInstances();
+
+                memory_reset_peak_usage();
+            };
+
+            return new Worker(
+                $app[&#039;queue&#039;],
+                $app[&#039;events&#039;],
+                $app[ExceptionHandler::class],
+                $isDownForMaintenance,
+                $resetScope
+            );
+        });
+    }
+
+    /**
+     * Register the queue listener.
+     *
+     * @return void
+     */
+    protected function registerListener()
+    {
+        $this-&gt;app-&gt;singleton(&#039;queue.listener&#039;, function ($app) {
+            return new Listener($app-&gt;basePath());
+        });
+    }
+
+    /**
+     * Register the failed job services.
+     *
+     * @return void
+     */
+    protected function registerFailedJobServices()
+    {
+        $this-&gt;app-&gt;singleton(&#039;queue.failer&#039;, function ($app) {
+            $config = $app[&#039;config&#039;][&#039;queue.failed&#039;];
+
+            if (array_key_exists(&#039;driver&#039;, $config) &amp;&amp;
+                (is_null($config[&#039;driver&#039;]) || $config[&#039;driver&#039;] === &#039;null&#039;)) {
+                return new NullFailedJobProvider;
+            }
+
+            if (isset($config[&#039;driver&#039;]) &amp;&amp; $config[&#039;driver&#039;] === &#039;file&#039;) {
+                return new FileFailedJobProvider(
+                    $config[&#039;path&#039;] ?? $this-&gt;app-&gt;storagePath(&#039;framework/cache/failed-jobs.json&#039;),
+                    $config[&#039;limit&#039;] ?? 100,
+                    fn () =&gt; $app[&#039;cache&#039;]-&gt;store(&#039;file&#039;),
+                );
+            } elseif (isset($config[&#039;driver&#039;]) &amp;&amp; $config[&#039;driver&#039;] === &#039;dynamodb&#039;) {
+                return $this-&gt;dynamoFailedJobProvider($config);
+            } elseif (isset($config[&#039;driver&#039;]) &amp;&amp; $config[&#039;driver&#039;] === &#039;database-uuids&#039;) {
+                return $this-&gt;databaseUuidFailedJobProvider($config);
+            } elseif (isset($config[&#039;table&#039;])) {
+                return $this-&gt;databaseFailedJobProvider($config);
+            } else {
+                return new NullFailedJobProvider;
+            }
+        });
+    }
+
+    /**
+     * Create a new database failed job provider.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Queue\Failed\DatabaseFailedJobProvider
+     */
+    protected function databaseFailedJobProvider($config)
+    {
+        return new DatabaseFailedJobProvider(
+            $this-&gt;app[&#039;db&#039;], $config[&#039;database&#039;], $config[&#039;table&#039;]
+        );
+    }
+
+    /**
+     * Create a new database failed job provider that uses UUIDs as IDs.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Queue\Failed\DatabaseUuidFailedJobProvider
+     */
+    protected function databaseUuidFailedJobProvider($config)
+    {
+        return new DatabaseUuidFailedJobProvider(
+            $this-&gt;app[&#039;db&#039;], $config[&#039;database&#039;], $config[&#039;table&#039;]
+        );
+    }
+
+    /**
+     * Create a new DynamoDb failed job provider.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Queue\Failed\DynamoDbFailedJobProvider
+     */
+    protected function dynamoFailedJobProvider($config)
+    {
+        $dynamoConfig = [
+            &#039;region&#039; =&gt; $config[&#039;region&#039;],
+            &#039;version&#039; =&gt; &#039;latest&#039;,
+            &#039;endpoint&#039; =&gt; $config[&#039;endpoint&#039;] ?? null,
+        ];
+
+        if (! empty($config[&#039;key&#039;]) &amp;&amp; ! empty($config[&#039;secret&#039;])) {
+            $dynamoConfig[&#039;credentials&#039;] = Arr::only($config, [&#039;key&#039;, &#039;secret&#039;]);
+
+            if (! empty($config[&#039;token&#039;])) {
+                $dynamoConfig[&#039;credentials&#039;][&#039;token&#039;] = $config[&#039;token&#039;];
+            }
+        }
+
+        return new DynamoDbFailedJobProvider(
+            new DynamoDbClient($dynamoConfig),
+            $this-&gt;app[&#039;config&#039;][&#039;app.name&#039;],
+            $config[&#039;table&#039;]
+        );
+    }
+
+    /**
+     * Get the services provided by the provider.
+     *
+     * @return array
+     */
+    public function provides()
+    {
+        return [
+            &#039;queue&#039;,
+            &#039;queue.connection&#039;,
+            &#039;queue.failer&#039;,
+            &#039;queue.listener&#039;,
+            &#039;queue.worker&#039;,
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Queue/README.md -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Queue/Attributes -->
+
+</body>
+</html>

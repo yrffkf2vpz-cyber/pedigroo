@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/S3Transfer/AbstractMultipartUploader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Aws\S3\S3Transfer;
+
+use Aws\CommandInterface;
+use Aws\CommandPool;
+use Aws\ResultInterface;
+use Aws\S3\S3ClientInterface;
+use Aws\S3\S3Transfer\Exception\S3TransferException;
+use Aws\S3\S3Transfer\Models\S3TransferManagerConfig;
+use Aws\S3\S3Transfer\Progress\AbstractTransferListener;
+use Aws\S3\S3Transfer\Progress\TransferListenerNotifier;
+use Aws\S3\S3Transfer\Progress\TransferProgressSnapshot;
+use GuzzleHttp\Promise\Coroutine;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Promise\PromisorInterface;
+use Throwable;
+
+/**
+ * Abstract base class for multipart operations
+ */
+abstract class AbstractMultipartUploader implements PromisorInterface
+{
+    public const PART_MIN_SIZE = 5 * 1024 * 1024; // 5 MiB
+    public const PART_MAX_SIZE = 5 * 1024 * 1024 * 1024; // 5 GiB
+    public const PART_MAX_NUM = 10000;
+
+    /** @var S3ClientInterface */
+    protected readonly S3ClientInterface $s3Client;
+
+    /** @var array */
+    protected readonly array $requestArgs;
+
+    /** @var array */
+    protected readonly array $config;
+
+    /** @var string|null */
+    protected string|null $uploadId;
+
+    /** @var array */
+    protected array $parts;
+
+    /** @var array */
+    protected array $onCompletionCallbacks = [];
+
+    /** @var TransferListenerNotifier|null */
+    protected ?TransferListenerNotifier $listenerNotifier;
+
+    /** Tracking Members */
+    /** @var TransferProgressSnapshot|null */
+    protected ?TransferProgressSnapshot $currentSnapshot;
+
+    /**
+     * @param S3ClientInterface $s3Client
+     * @param array $requestArgs
+     * @param array $config
+     * - target_part_size_bytes: (int, optional)
+     * - concurrency: (int, optional)
+     * @param string|null $uploadId
+     * @param array $parts
+     * @param TransferProgressSnapshot|null $currentSnapshot
+     * @param TransferListenerNotifier|null $listenerNotifier
+     */
+    public function __construct(
+        S3ClientInterface $s3Client,
+        array $requestArgs,
+        array $config = [],
+        ?string $uploadId = null,
+        array $parts = [],
+        ?TransferProgressSnapshot $currentSnapshot = null,
+        ?TransferListenerNotifier $listenerNotifier = null,
+    ) {
+        $this-&gt;s3Client = $s3Client;
+        $this-&gt;requestArgs = $requestArgs;
+        $this-&gt;validateConfig($config);
+        $this-&gt;config = $config;
+        $this-&gt;uploadId = $uploadId;
+        $this-&gt;parts = $parts;
+        $this-&gt;currentSnapshot = $currentSnapshot;
+        $this-&gt;listenerNotifier = $listenerNotifier;
+    }
+
+    /**
+     * @return PromiseInterface
+     */
+    abstract protected function createMultipartOperation(): PromiseInterface;
+
+    /**
+     * @return PromiseInterface
+     */
+    abstract protected function completeMultipartOperation(): PromiseInterface;
+
+    /**
+     * @return PromiseInterface
+     */
+    abstract protected function processMultipartOperation(): PromiseInterface;
+
+    /**
+     * @return int
+     */
+    abstract protected function getTotalSize(): int;
+
+    /**
+     * @param ResultInterface $result
+     *
+     * @return mixed
+     */
+    abstract protected function createResponse(ResultInterface $result): mixed;
+
+    /**
+     * @param array $config
+     *
+     * @return void
+     */
+    protected function validateConfig(array &amp;$config): void
+    {
+        if (!isset($config[&#039;target_part_size_bytes&#039;])) {
+            $config[&#039;target_part_size_bytes&#039;] = S3TransferManagerConfig::DEFAULT_TARGET_PART_SIZE_BYTES;
+        }
+
+        if (!isset($config[&#039;concurrency&#039;])) {
+            $config[&#039;concurrency&#039;] = S3TransferManagerConfig::DEFAULT_CONCURRENCY;
+        }
+
+        $partSize = $config[&#039;target_part_size_bytes&#039;];
+        if ($partSize &lt; self::PART_MIN_SIZE || $partSize &gt; self::PART_MAX_SIZE) {
+            throw new \InvalidArgumentException(
+                &quot;Part size config must be between &quot; . self::PART_MIN_SIZE
+                .&quot; and &quot; . self::PART_MAX_SIZE . &quot; bytes &quot;
+                .&quot;but it is configured to $partSize&quot;
+            );
+        }
+    }
+
+    /**
+     * @return string|null
+     */
+    public function getUploadId(): ?string
+    {
+        return $this-&gt;uploadId;
+    }
+
+    /**
+     * @return array
+     */
+    public function getParts(): array
+    {
+        return $this-&gt;parts;
+    }
+
+    /**
+     * Get the current progress snapshot.
+     * @return TransferProgressSnapshot|null
+     */
+    public function getCurrentSnapshot(): ?TransferProgressSnapshot
+    {
+        return $this-&gt;currentSnapshot;
+    }
+
+    /**
+     * @return PromiseInterface
+     */
+    public function promise(): PromiseInterface
+    {
+        return Coroutine::of(function () {
+            try {
+                yield $this-&gt;createMultipartOperation();
+                yield $this-&gt;processMultipartOperation();
+                yield $this-&gt;completeMultipartOperation();
+            } finally {
+                $this-&gt;callOnCompletionCallbacks();
+            }
+        })-&gt;then(function (ResultInterface $result) {
+            return $this-&gt;createResponse($result);
+        })-&gt;otherwise(function (Throwable $e) {
+            $this-&gt;operationFailed($e);
+
+            throw $e;
+        });
+    }
+
+    /**
+     * @return PromiseInterface
+     */
+    protected function abortMultipartOperation(): PromiseInterface
+    {
+        $abortMultipartUploadArgs = $this-&gt;requestArgs;
+        $abortMultipartUploadArgs[&#039;UploadId&#039;] = $this-&gt;uploadId;
+        $command = $this-&gt;s3Client-&gt;getCommand(
+            &#039;AbortMultipartUpload&#039;,
+            $abortMultipartUploadArgs
+        );
+
+        return $this-&gt;s3Client-&gt;executeAsync($command);
+    }
+
+    /**
+     * @return void
+     */
+    protected function sortParts(): void
+    {
+        usort($this-&gt;parts, function ($partOne, $partTwo) {
+            return $partOne[&#039;PartNumber&#039;] &lt;=&gt; $partTwo[&#039;PartNumber&#039;];
+        });
+    }
+
+    /**
+     * @param ResultInterface $result
+     * @param CommandInterface $command
+     * @return void
+     */
+    protected function collectPart(
+        ResultInterface $result,
+        CommandInterface $command
+    ): void
+    {
+        $checksumResult = match($command-&gt;getName()) {
+            &#039;UploadPart&#039; =&gt; $result,
+            &#039;UploadPartCopy&#039; =&gt; $result[&#039;CopyPartResult&#039;],
+            default =&gt; $result[$command-&gt;getName() . &#039;Result&#039;]
+        };
+
+        $partData = [
+            &#039;PartNumber&#039; =&gt; $command[&#039;PartNumber&#039;],
+            &#039;ETag&#039; =&gt; $checksumResult[&#039;ETag&#039;],
+        ];
+
+        if (isset($command[&#039;ChecksumAlgorithm&#039;])) {
+            $checksumMemberName = &#039;Checksum&#039; . strtoupper($command[&#039;ChecksumAlgorithm&#039;]);
+            $partData[$checksumMemberName] = $checksumResult[$checksumMemberName] ?? null;
+        }
+
+        $this-&gt;parts[] = $partData;
+    }
+
+    /**
+     * @param \Iterator $commands
+     * @param callable $fulfilledCallback
+     * @param callable $rejectedCallback
+     * @return PromiseInterface
+     */
+    protected function createCommandPool(
+        \Iterator $commands,
+        callable $fulfilledCallback,
+        callable $rejectedCallback
+    ): PromiseInterface
+    {
+        return (new CommandPool(
+            $this-&gt;s3Client,
+            $commands,
+            [
+                &#039;concurrency&#039; =&gt; $this-&gt;config[&#039;concurrency&#039;],
+                &#039;fulfilled&#039; =&gt; $fulfilledCallback,
+                &#039;rejected&#039; =&gt; $rejectedCallback
+            ]
+        ))-&gt;promise();
+    }
+
+    /**
+     * @param array $requestArgs
+     * @return void
+     */
+    protected function operationInitiated(array $requestArgs): void
+    {
+        if ($this-&gt;currentSnapshot === null) {
+            $this-&gt;currentSnapshot = new TransferProgressSnapshot(
+                $requestArgs[&#039;Key&#039;],
+                0,
+                $this-&gt;getTotalSize()
+            );
+        }
+
+        $this-&gt;listenerNotifier?-&gt;transferInitiated([
+            AbstractTransferListener::REQUEST_ARGS_KEY =&gt; $requestArgs,
+            AbstractTransferListener::PROGRESS_SNAPSHOT_KEY =&gt; $this-&gt;currentSnapshot
+        ]);
+    }
+
+    /**
+     * @param ResultInterface $result
+     * @return void
+     */
+    protected function operationCompleted(ResultInterface $result): void
+    {
+        $newSnapshot = new TransferProgressSnapshot(
+            $this-&gt;currentSnapshot-&gt;getIdentifier(),
+            $this-&gt;currentSnapshot-&gt;getTransferredBytes(),
+            $this-&gt;currentSnapshot-&gt;getTotalBytes(),
+            $result-&gt;toArray(),
+            $this-&gt;currentSnapshot-&gt;getReason(),
+        );
+
+        $this-&gt;currentSnapshot = $newSnapshot;
+
+        $this-&gt;listenerNotifier?-&gt;transferComplete([
+            AbstractTransferListener::REQUEST_ARGS_KEY =&gt;
+                $this-&gt;requestArgs,
+            AbstractTransferListener::PROGRESS_SNAPSHOT_KEY =&gt; $this-&gt;currentSnapshot
+        ]);
+    }
+
+    /**
+     * @param Throwable $reason
+     * @return void
+     *
+     */
+    protected function operationFailed(Throwable $reason): void
+    {
+        // Event already propagated
+        if ($this-&gt;currentSnapshot?-&gt;getReason() !== null) {
+            return;
+        }
+
+        if ($this-&gt;currentSnapshot === null) {
+            $this-&gt;currentSnapshot = new TransferProgressSnapshot(
+                &#039;Unknown&#039;,
+                0,
+                0,
+            );
+        }
+
+        $this-&gt;currentSnapshot = new TransferProgressSnapshot(
+            $this-&gt;currentSnapshot-&gt;getIdentifier(),
+            $this-&gt;currentSnapshot-&gt;getTransferredBytes(),
+            $this-&gt;currentSnapshot-&gt;getTotalBytes(),
+            $this-&gt;currentSnapshot-&gt;getResponse(),
+            $reason
+        );
+
+        if (!empty($this-&gt;uploadId)) {
+            trigger_error(
+                &quot;Multipart Upload with id: &quot; . $this-&gt;uploadId . &quot; failed&quot;,
+            );
+            $this-&gt;abortMultipartOperation()-&gt;wait();
+        }
+
+        $this-&gt;listenerNotifier?-&gt;transferFail([
+            AbstractTransferListener::REQUEST_ARGS_KEY =&gt;
+                $this-&gt;requestArgs,
+            AbstractTransferListener::PROGRESS_SNAPSHOT_KEY =&gt; $this-&gt;currentSnapshot,
+            &#039;reason&#039; =&gt; $reason,
+        ]);
+    }
+
+    /**
+     * @param int $partSize
+     * @param array $requestArgs
+     * @return void
+     */
+    protected function partCompleted(
+        int $partSize,
+        array $requestArgs
+    ): void
+    {
+        $newSnapshot = new TransferProgressSnapshot(
+            $this-&gt;currentSnapshot-&gt;getIdentifier(),
+            $this-&gt;currentSnapshot-&gt;getTransferredBytes() + $partSize,
+            $this-&gt;currentSnapshot-&gt;getTotalBytes(),
+            $this-&gt;currentSnapshot-&gt;getResponse(),
+            $this-&gt;currentSnapshot-&gt;getReason(),
+        );
+
+        $this-&gt;currentSnapshot = $newSnapshot;
+
+        $this-&gt;listenerNotifier?-&gt;bytesTransferred([
+            AbstractTransferListener::REQUEST_ARGS_KEY =&gt; $requestArgs,
+            AbstractTransferListener::PROGRESS_SNAPSHOT_KEY =&gt; $this-&gt;currentSnapshot
+        ]);
+    }
+
+    /**
+     * @return void
+     */
+    protected function callOnCompletionCallbacks(): void
+    {
+        foreach ($this-&gt;onCompletionCallbacks as $fn) {
+            if (is_callable($fn)) {
+                call_user_func($fn);
+            }
+        }
+
+        $this-&gt;onCompletionCallbacks = [];
+    }
+
+    /**
+     * @param Throwable $reason
+     * @return void
+     */
+    protected function partFailed(Throwable $reason): void
+    {
+        $this-&gt;operationFailed($reason);
+    }
+
+    /**
+     * @return int
+     */
+    protected function calculatePartSize(): int
+    {
+        return max(
+            $this-&gt;getTotalSize() / self::PART_MAX_NUM,
+            $this-&gt;config[&#039;target_part_size_bytes&#039;]
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/S3Transfer/Exception/FileDownloadException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/S3Transfer/Exception -->
+
+</body>
+</html>

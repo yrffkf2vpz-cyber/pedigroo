@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/storage/old_laravel/app/Services/PedrooDogFetcher.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Services;
+
+use App\Models\Dog;
+use App\Models\PedrooDog;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
+use Carbon\Carbon;
+
+// Pedroo modulok
+use App\Services\Pedroo\EventService;
+use App\Services\Pedroo\ShowService;
+use App\Services\Pedroo\ShowResultService;
+use App\Services\Pedroo\DogResultService;
+use App\Services\Pedroo\DogActivationService;
+use App\Services\Pedroo\ParentService;
+use App\Services\Pedroo\KennelService;
+use App\Services\Pedroo\OwnerService;
+use App\Services\Pedroo\BreederService;
+
+class PedrooDogFetcher
+{
+    protected EventService $eventService;
+    protected ShowService $showService;
+    protected ShowResultService $showResultService;
+    protected DogResultService $dogResultService;
+    protected DogActivationService $dogActivationService;
+    protected ParentService $parentService;
+    protected KennelService $kennelService;
+    protected OwnerService $ownerService;
+    protected BreederService $breederService;
+
+    public function __construct()
+    {
+        $this-&gt;eventService        = new EventService();
+        $this-&gt;showService         = new ShowService();
+        $this-&gt;showResultService   = new ShowResultService();
+        $this-&gt;dogResultService    = new DogResultService();
+        $this-&gt;dogActivationService= new DogActivationService();
+        $this-&gt;parentService       = new ParentService();
+        $this-&gt;kennelService       = new KennelService();
+        $this-&gt;ownerService        = new OwnerService();
+        $this-&gt;breederService      = new BreederService();
+    }
+
+    /**
+     * Egy kutya teljes feldolgoz?sa:
+     * - HTML keres?s
+     * - AI parse
+     * - normaliz?l?s
+     * - pedroo_dogs ment?s
+     * - kapcsol?d? entit?sok ment?se (sz?lok, kennel, eredm?nyek, stb.)
+     */
+    public function processOneDog(): ?PedrooDog
+    {
+        $dog = $this-&gt;pickNextDog();
+
+        if (! $dog) {
+            return null;
+        }
+
+        $queries = $this-&gt;buildQueries($dog);
+
+        $bestResult = null;
+
+        foreach ($queries as $query) {
+            $searchResults = $this-&gt;searchOnGoogle($query);
+
+            foreach ($searchResults as $result) {
+                $pageHtml = $this-&gt;fetchPage($result[&#039;url&#039;]);
+
+                if (! $pageHtml) {
+                    continue;
+                }
+
+                $parsed = $this-&gt;parseDogFromHtml($pageHtml);
+
+                if (! $parsed || empty($parsed[&#039;dog&#039;])) {
+                    continue;
+                }
+
+                $normalizedDog = $this-&gt;normalizeDogData($parsed[&#039;dog&#039;]);
+
+                $confidence = $this-&gt;calculateConfidence($dog, $normalizedDog);
+
+                if (! $bestResult || $confidence &gt; $bestResult[&#039;confidence&#039;]) {
+                    $bestResult = [
+                        &#039;dog&#039;        =&gt; $normalizedDog,
+                        &#039;raw&#039;        =&gt; $parsed,
+                        &#039;url&#039;        =&gt; $result[&#039;url&#039;],
+                        &#039;confidence&#039; =&gt; $confidence,
+                        &#039;notes&#039;      =&gt; $parsed[&#039;notes&#039;] ?? null,
+                    ];
+                }
+            }
+        }
+
+        if (! $bestResult) {
+            return PedrooDog::create([
+                &#039;source_dog_id&#039;  =&gt; $dog-&gt;ID,
+                &#039;source_name&#039;    =&gt; $dog-&gt;registered_name,
+                &#039;source_reg_no&#039;  =&gt; $dog-&gt;reg_no,
+                &#039;source_fci_no&#039;  =&gt; $dog-&gt;fci_no,
+                &#039;found_on&#039;       =&gt; null,
+                &#039;confidence&#039;     =&gt; 0,
+                &#039;checked_at&#039;     =&gt; now(),
+                &#039;notes&#039;          =&gt; &#039;No reliable result found&#039;,
+            ]);
+        }
+
+        $d   = $bestResult[&#039;dog&#039;];
+        $raw = $bestResult[&#039;raw&#039;];
+
+        // 1) PedrooDog ment?se
+        $pedrooDog = PedrooDog::create([
+            &#039;source_dog_id&#039;  =&gt; $dog-&gt;ID,
+            &#039;source_name&#039;    =&gt; $dog-&gt;registered_name,
+            &#039;source_reg_no&#039;  =&gt; $dog-&gt;reg_no,
+            &#039;source_fci_no&#039;  =&gt; $dog-&gt;fci_no,
+
+            &#039;real_name&#039;      =&gt; $d[&#039;name&#039;] ?? null,
+            &#039;real_prefix&#039;    =&gt; $d[&#039;prefix&#039;] ?? null,
+            &#039;real_firstname&#039; =&gt; $d[&#039;firstname&#039;] ?? null,
+            &#039;real_lastname&#039;  =&gt; $d[&#039;lastname&#039;] ?? null,
+
+            &#039;real_dob&#039;       =&gt; $d[&#039;dob&#039;] ?? null,
+            &#039;real_sex&#039;       =&gt; $d[&#039;sex&#039;] ?? null,
+            &#039;real_color&#039;     =&gt; $d[&#039;color&#039;] ?? null,
+            &#039;real_breed&#039;     =&gt; $d[&#039;breed&#039;] ?? null,
+            &#039;real_country&#039;   =&gt; $d[&#039;country&#039;] ?? null,
+
+            &#039;real_breeder&#039;   =&gt; $d[&#039;breeder&#039;] ?? null,
+            &#039;real_owner&#039;     =&gt; $d[&#039;owner&#039;] ?? null,
+            &#039;real_kennel&#039;    =&gt; $d[&#039;kennel&#039;] ?? null,
+
+            &#039;found_on&#039;       =&gt; $bestResult[&#039;url&#039;],
+            &#039;confidence&#039;     =&gt; $bestResult[&#039;confidence&#039;],
+            &#039;checked_at&#039;     =&gt; now(),
+            &#039;notes&#039;          =&gt; $bestResult[&#039;notes&#039;],
+        ]);
+
+        // 2) Kapcsol?d? entit?sok feldolgoz?sa
+
+        // 2/A Breeder + Owner + Kennel
+        if (!empty($d[&#039;breeder&#039;])) {
+            $this-&gt;breederService-&gt;activateBreeder($d[&#039;breeder&#039;]);
+        }
+
+        if (!empty($d[&#039;owner&#039;])) {
+            $this-&gt;ownerService-&gt;activateOwner($d[&#039;owner&#039;]);
+        }
+
+        if (!empty($d[&#039;kennel&#039;])) {
+            // kutya m?g pedroo ?llapotban van, kennel csak elok?sz?l
+            $this-&gt;kennelService-&gt;activateKennel($d[&#039;kennel&#039;], null);
+        }
+
+        // 2/B Sz?lok, gyerekek, csal?dfa (csak pedroo_* t?bl?kba, ha ilyen parser adat van)
+        $this-&gt;processFamilyData($pedrooDog, $raw);
+
+        // 2/C Esem?nyek, show-k, eredm?nyek
+        $this-&gt;processResultsData($pedrooDog, $raw);
+
+        return $pedrooDog;
+    }
+
+    protected function pickNextDog(): ?Dog
+    {
+        $alreadyProcessedIds = PedrooDog::pluck(&#039;source_dog_id&#039;)-&gt;toArray();
+
+        return Dog::whereNull(&#039;deleted_at&#039;)
+            -&gt;whereNotIn(&#039;ID&#039;, $alreadyProcessedIds)
+            -&gt;orderBy(&#039;ID&#039;)
+            -&gt;first();
+    }
+
+    protected function buildQueries(Dog $dog): array
+    {
+        $queries = [];
+
+        if ($dog-&gt;registered_name) {
+            $queries[] = $dog-&gt;registered_name;
+            $queries[] = $dog-&gt;registered_name . &#039; dog&#039;;
+            $queries[] = $dog-&gt;registered_name . &#039; pedigree&#039;;
+            $queries[] = $dog-&gt;registered_name . &#039; kennel&#039;;
+        }
+
+        if ($dog-&gt;firstname &amp;&amp; $dog-&gt;lastname) {
+            $queries[] = $dog-&gt;firstname . &#039; &#039; . $dog-&gt;lastname;
+            $queries[] = $dog-&gt;lastname . &#039; &#039; . $dog-&gt;firstname;
+        }
+
+        if ($dog-&gt;reg_no) {
+            $queries[] = $dog-&gt;reg_no;
+            $queries[] = $dog-&gt;reg_no . &#039; dog&#039;;
+        }
+
+        if ($dog-&gt;fci_no) {
+            $queries[] = $dog-&gt;fci_no;
+            $queries[] = $dog-&gt;fci_no . &#039; FCI&#039;;
+        }
+
+        return array_values(array_unique(array_filter($queries)));
+    }
+
+    protected function searchOnGoogle(string $query): array
+    {
+        $apiKey = config(&#039;services.google.key&#039;);
+        $cx     = config(&#039;services.google.cx&#039;);
+
+        $response = Http::get(&#039;https://www.googleapis.com/customsearch/v1&#039;, [
+            &#039;key&#039; =&gt; $apiKey,
+            &#039;cx&#039;  =&gt; $cx,
+            &#039;q&#039;   =&gt; $query,
+        ]);
+
+        if (! $response-&gt;successful()) {
+            return [];
+        }
+
+        return collect($response-&gt;json(&#039;items&#039;, []))
+            -&gt;map(fn($item) =&gt; [
+                &#039;title&#039; =&gt; $item[&#039;title&#039;] ?? null,
+                &#039;url&#039;   =&gt; $item[&#039;link&#039;] ?? null,
+            ])
+            -&gt;toArray();
+    }
+
+    protected function fetchPage(string $url): ?string
+    {
+        try {
+            $response = Http::timeout(10)-&gt;get($url);
+
+            if (! $response-&gt;successful()) {
+                return null;
+            }
+
+            return $response-&gt;body();
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * FONTOS: itt m?r azt k?rj?k az AI-t?l, hogy STRUKT?R?LT JSON-t adjon:
+     * {
+     *   &quot;dog&quot;: {...},
+     *   &quot;parents&quot;: [...],
+     *   &quot;children&quot;: [...],
+     *   &quot;family&quot;: [...],
+     *   &quot;kennel&quot;: {...},
+     *   &quot;breeder&quot;: {...},
+     *   &quot;owner&quot;: {...},
+     *   &quot;show_events&quot;: [...],
+     *   &quot;show_results&quot;: [...],
+     *   &quot;sport_results&quot;: [...],
+     *   &quot;working_results&quot;: [...],
+     *   &quot;behavior_results&quot;: [...],
+     *   &quot;health_records&quot;: [...]
+     * }
+     */
+    protected function parseDogFromHtml(string $html): ?array
+    {
+        $prompt = &lt;&lt;&lt;PROMPT
+You are a strict JSON API. Extract ALL structured dog-related data from this HTML.
+
+Return EXACTLY ONE valid JSON object with this structure:
+
+{
+  &quot;dog&quot;: {
+    &quot;name&quot;: &quot;...&quot;,
+    &quot;prefix&quot;: &quot;...&quot;,
+    &quot;firstname&quot;: &quot;...&quot;,
+    &quot;lastname&quot;: &quot;...&quot;,
+    &quot;dob&quot;: &quot;...&quot;,
+    &quot;sex&quot;: &quot;...&quot;,
+    &quot;color&quot;: &quot;...&quot;,
+    &quot;breed&quot;: &quot;...&quot;,
+    &quot;country&quot;: &quot;...&quot;,
+    &quot;breeder&quot;: &quot;...&quot;,
+    &quot;owner&quot;: &quot;...&quot;,
+    &quot;kennel&quot;: &quot;...&quot;
+  },
+  &quot;parents&quot;: [
+    {&quot;name&quot;: &quot;...&quot;, &quot;relation&quot;: &quot;sire|dam&quot;}
+  ],
+  &quot;children&quot;: [
+    {&quot;name&quot;: &quot;...&quot;}
+  ],
+  &quot;family&quot;: [
+    {&quot;related_name&quot;: &quot;...&quot;, &quot;relation_type&quot;: &quot;sibling|half-sibling|other&quot;}
+  ],
+  &quot;show_events&quot;: [
+    {
+      &quot;name&quot;: &quot;...&quot;,
+      &quot;event_type&quot;: &quot;...&quot;,
+      &quot;country&quot;: &quot;...&quot;,
+      &quot;city&quot;: &quot;...&quot;,
+      &quot;date&quot;: &quot;YYYY-MM-DD&quot;
+    }
+  ],
+  &quot;show_results&quot;: [
+    {
+      &quot;event_name&quot;: &quot;...&quot;,
+      &quot;date&quot;: &quot;YYYY-MM-DD&quot;,
+      &quot;class_type&quot;: &quot;...&quot;,
+      &quot;qualification&quot;: &quot;...&quot;,
+      &quot;placement&quot;: 1,
+      &quot;titles&quot;: [&quot;CAC&quot;, &quot;BOB&quot;],
+      &quot;judge&quot;: &quot;...&quot;,
+      &quot;ring&quot;: &quot;...&quot;
+    }
+  ],
+  &quot;sport_results&quot;: [],
+  &quot;working_results&quot;: [],
+  &quot;behavior_results&quot;: [],
+  &quot;health_records&quot;: [],
+  &quot;notes&quot;: &quot;...&quot;
+}
+
+HTML:
+$html
+PROMPT;
+
+        $response = Http::withToken(env(&#039;OPENAI_KEY&#039;))
+            -&gt;post(&#039;https://api.openai.com/v1/chat/completions&#039;, [
+                &#039;model&#039; =&gt; &#039;gpt-4o-mini&#039;,
+                &#039;messages&#039; =&gt; [
+                    [&#039;role&#039; =&gt; &#039;user&#039;, &#039;content&#039; =&gt; $prompt]
+                ]
+            ]);
+
+        $content = $response-&gt;json()[&#039;choices&#039;][0][&#039;message&#039;][&#039;content&#039;] ?? null;
+
+        if (! $content) {
+            return null;
+        }
+
+        $json = json_decode($content, true);
+
+        return $json ?: null;
+    }
+
+    protected function normalizeDogData(array $parsed): array
+    {
+        $out = $parsed;
+
+        // DOB
+        if (! empty($parsed[&#039;dob&#039;])) {
+            try {
+                $out[&#039;dob&#039;] = Carbon::parse($parsed[&#039;dob&#039;])-&gt;format(&#039;Y-m-d&#039;);
+            } catch (\Throwable $e) {
+                $out[&#039;dob&#039;] = null;
+            }
+        } else {
+            $out[&#039;dob&#039;] = null;
+        }
+
+        // SEX
+        if (! empty($parsed[&#039;sex&#039;])) {
+            $sex = Str::lower($parsed[&#039;sex&#039;]);
+            if (in_array($sex, [&#039;m&#039;, &#039;male&#039;, &#039;kan&#039;])) {
+                $out[&#039;sex&#039;] = &#039;M&#039;;
+            } elseif (in_array($sex, [&#039;f&#039;, &#039;female&#039;, &#039;szuka&#039;])) {
+                $out[&#039;sex&#039;] = &#039;F&#039;;
+            } else {
+                $out[&#039;sex&#039;] = &#039;U&#039;;
+            }
+        } else {
+            $out[&#039;sex&#039;] = &#039;U&#039;;
+        }
+
+        // COUNTRY
+        if (! empty($parsed[&#039;country&#039;])) {
+            $c = Str::lower($parsed[&#039;country&#039;]);
+            if (Str::contains($c, [&#039;hungary&#039;, &#039;magyar&#039;])) {
+                $out[&#039;country&#039;] = &#039;HU&#039;;
+            } elseif (Str::contains($c, [&#039;germany&#039;, &#039;deutsch&#039;])) {
+                $out[&#039;country&#039;] = &#039;DE&#039;;
+            } else {
+                $out[&#039;country&#039;] = strtoupper(substr($parsed[&#039;country&#039;], 0, 2));
+            }
+        } else {
+            $out[&#039;country&#039;] = null;
+        }
+
+        return $out;
+    }
+
+    protected function processFamilyData(PedrooDog $pd, array $raw): void
+    {
+        $dogName = $pd-&gt;real_name;
+
+        // parents ? pedroo_parents
+        foreach ($raw[&#039;parents&#039;] ?? [] as $p) {
+            if (empty($p[&#039;name&#039;]) || empty($p[&#039;relation&#039;])) {
+                continue;
+            }
+
+            DB::table(&#039;pedroo_parents&#039;)-&gt;updateOrInsert(
+                [
+                    &#039;child_name&#039;  =&gt; $dogName,
+                    &#039;parent_name&#039; =&gt; $p[&#039;name&#039;],
+                    &#039;relation&#039;    =&gt; $p[&#039;relation&#039;],
+                ],
+                [
+                    &#039;updated_at&#039; =&gt; now(),
+                    &#039;created_at&#039; =&gt; now(),
+                ]
+            );
+        }
+
+        // children ? pedroo_children
+        foreach ($raw[&#039;children&#039;] ?? [] as $c) {
+            if (empty($c[&#039;name&#039;])) {
+                continue;
+            }
+
+            DB::table(&#039;pedroo_children&#039;)-&gt;updateOrInsert(
+                [
+                    &#039;parent_name&#039; =&gt; $dogName,
+                    &#039;child_name&#039;  =&gt; $c[&#039;name&#039;],
+                ],
+                [
+                    &#039;updated_at&#039; =&gt; now(),
+                    &#039;created_at&#039; =&gt; now(),
+                ]
+            );
+        }
+
+        // family ? pedroo_families
+        foreach ($raw[&#039;family&#039;] ?? [] as $f) {
+            if (empty($f[&#039;related_name&#039;]) || empty($f[&#039;relation_type&#039;])) {
+                continue;
+            }
+
+            DB::table(&#039;pedroo_families&#039;)-&gt;updateOrInsert(
+                [
+                    &#039;dog_name&#039;        =&gt; $dogName,
+                    &#039;related_dog_name&#039;=&gt; $f[&#039;related_name&#039;],
+                    &#039;relation_type&#039;   =&gt; $f[&#039;relation_type&#039;],
+                ],
+                [
+                    &#039;updated_at&#039; =&gt; now(),
+                    &#039;created_at&#039; =&gt; now(),
+                ]
+            );
+        }
+    }
+
+    protected function processResultsData(PedrooDog $pd, array $raw): void
+    {
+        $dogName = $pd-&gt;real_name;
+
+        // 1) Show events + show results
+        foreach ($raw[&#039;show_events&#039;] ?? [] as $event) {
+            if (empty($event[&#039;name&#039;]) || empty($event[&#039;country&#039;]) || empty($event[&#039;date&#039;])) {
+                continue;
+            }
+
+            // orsz?g ID-t itt most felt?telezz?k, hogy m?r tudod kezelni (pl. countries t?bl?b?l)
+            $countryId = DB::table(&#039;countries&#039;)
+                -&gt;whereRaw(&#039;LOWER(name) = ?&#039;, [strtolower($event[&#039;country&#039;])])
+                -&gt;value(&#039;id&#039;);
+
+            if (! $countryId) {
+                continue;
+            }
+
+            $eventId = $this-&gt;eventService-&gt;processEvent((object) [
+                &#039;name&#039;          =&gt; $event[&#039;name&#039;],
+                &#039;event_type_id&#039; =&gt; 35, // pl. cacib_show ? ezt k?sobb finom?thatjuk
+                &#039;country_id&#039;    =&gt; $countryId,
+                &#039;start_date&#039;    =&gt; $event[&#039;date&#039;],
+                &#039;city&#039;          =&gt; $event[&#039;city&#039;] ?? null,
+                &#039;source&#039;        =&gt; &#039;pedroo&#039;,
+            ]);
+
+            $showId = $this-&gt;showService-&gt;processShow((object) [
+                &#039;name&#039;        =&gt; $event[&#039;name&#039;],
+                &#039;country_id&#039;  =&gt; $countryId,
+                &#039;city&#039;        =&gt; $event[&#039;city&#039;] ?? &#039;&#039;,
+                &#039;date&#039;        =&gt; $event[&#039;date&#039;],
+                &#039;source&#039;      =&gt; &#039;pedroo&#039;,
+                &#039;judges&#039;      =&gt; [], // majd a show_results-b?l j?nnek
+            ]);
+
+            // most a show_results-b?l k?tj?k hozz? a konkr?t eredm?nyeket
+            foreach ($raw[&#039;show_results&#039;] ?? [] as $res) {
+                if (($res[&#039;event_name&#039;] ?? null) !== $event[&#039;name&#039;]) {
+                    continue;
+                }
+
+                $classTypeId     = null; // k?sobb: mapping t?bla
+                $qualificationId = null; // k?sobb: mapping t?bla
+                $titlesIds       = [];   // k?sobb: mapping t?bla
+
+                $showResultId = $this-&gt;showResultService-&gt;processShowResult((object) [
+                    &#039;show_id&#039;          =&gt; $showId,
+                    &#039;dog_name&#039;         =&gt; $dogName,
+                    &#039;class_type_id&#039;    =&gt; $classTypeId,
+                    &#039;qualification_id&#039; =&gt; $qualificationId,
+                    &#039;placement&#039;        =&gt; $res[&#039;placement&#039;] ?? null,
+                    &#039;judge_name&#039;       =&gt; $res[&#039;judge&#039;] ?? null,
+                    &#039;ring&#039;             =&gt; $res[&#039;ring&#039;] ?? null,
+                    &#039;titles&#039;           =&gt; $titlesIds,
+                ]);
+
+                $this-&gt;dogResultService-&gt;processDogShowResult((object) [
+                    &#039;dog_name&#039;       =&gt; $dogName,
+                    &#039;show_id&#039;        =&gt; $showId,
+                    &#039;show_result_id&#039; =&gt; $showResultId,
+                ]);
+            }
+        }
+
+        // 2) Sport / working / behavior / health ? most csak v?z, k?sobb finom?thatjuk
+        foreach ($raw[&#039;sport_results&#039;] ?? [] as $sr) {
+            // itt is kell majd event + mapping
+        }
+
+        foreach ($raw[&#039;working_results&#039;] ?? [] as $wr) {
+            // itt is
+        }
+
+        foreach ($raw[&#039;behavior_results&#039;] ?? [] as $br) {
+            // itt is
+        }
+
+        foreach ($raw[&#039;health_records&#039;] ?? [] as $hr) {
+            // itt is
+        }
+    }
+
+    protected function calculateConfidence(Dog $dog, array $data): int
+    {
+        $score = 0;
+
+        if ($dog-&gt;registered_name &amp;&amp; ! empty($data[&#039;name&#039;])) {
+            if (Str::lower($dog-&gt;registered_name) === Str::lower($data[&#039;name&#039;])) {
+                $score += 40;
+            } elseif ($dog-&gt;firstname &amp;&amp; Str::contains(Str::lower($data[&#039;name&#039;]), Str::lower($dog-&gt;firstname))) {
+                $score += 20;
+            }
+        }
+
+        if ($dog-&gt;reg_no &amp;&amp; ! empty($data[&#039;reg_no&#039;]) &amp;&amp; $dog-&gt;reg_no === ($data[&#039;reg_no&#039;] ?? null)) {
+            $score += 30;
+        }
+
+        if ($dog-&gt;fci_no &amp;&amp; ! empty($data[&#039;fci_no&#039;]) &amp;&amp; $dog-&gt;fci_no === ($data[&#039;fci_no&#039;] ?? null)) {
+            $score += 30;
+        }
+
+        return max(0, min(100, $score));
+    }
+}
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /storage/old_laravel/app/Services/Promotion/BreederPromotionService.php -->
+<!-- PEDROO_NEXT_DIR: /storage/old_laravel/app/Services/Activation -->
+
+</body>
+</html>

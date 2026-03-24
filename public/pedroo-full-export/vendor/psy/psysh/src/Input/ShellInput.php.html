@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/psy/psysh/src/Input/ShellInput.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\Input;
+
+use Symfony\Component\Console\Input\InputDefinition;
+use Symfony\Component\Console\Input\StringInput;
+
+/**
+ * A StringInput subclass specialized for code arguments.
+ */
+class ShellInput extends StringInput
+{
+    public const REGEX_STRING = &#039;([^\s]+?)(?:\s|(?&lt;!\\\\)&quot;|(?&lt;!\\\\)\&#039;|$)&#039;;
+
+    private bool $hasCodeArgument = false;
+
+    /**
+     * Unlike the parent implementation&#039;s tokens, this contains an array of
+     * token/rest pairs, so that code arguments can be handled while parsing.
+     */
+    private array $tokenPairs;
+    private array $parsed = [];
+
+    /**
+     * Constructor.
+     *
+     * @param string $input An array of parameters from the CLI (in the argv format)
+     */
+    public function __construct(string $input)
+    {
+        parent::__construct($input);
+
+        $this-&gt;tokenPairs = $this-&gt;tokenize($input);
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @throws \InvalidArgumentException if $definition has CodeArgument before the final argument position
+     */
+    public function bind(InputDefinition $definition): void
+    {
+        $hasCodeArgument = false;
+
+        if ($definition-&gt;getArgumentCount() &gt; 0) {
+            $args = $definition-&gt;getArguments();
+            $lastArg = \array_pop($args);
+            foreach ($args as $arg) {
+                if ($arg instanceof CodeArgument) {
+                    $msg = \sprintf(&#039;Unexpected CodeArgument before the final position: %s&#039;, $arg-&gt;getName());
+                    throw new \InvalidArgumentException($msg);
+                }
+            }
+
+            if ($lastArg instanceof CodeArgument) {
+                $hasCodeArgument = true;
+            }
+        }
+
+        $this-&gt;hasCodeArgument = $hasCodeArgument;
+
+        parent::bind($definition);
+    }
+
+    /**
+     * Tokenizes a string.
+     *
+     * The version of this on StringInput is good, but doesn&#039;t handle code
+     * arguments if they&#039;re at all complicated. This does :)
+     *
+     * @param string $input The input to tokenize
+     *
+     * @return array An array of token/rest pairs
+     *
+     * @throws \InvalidArgumentException When unable to parse input (should never happen)
+     */
+    private function tokenize(string $input): array
+    {
+        $tokens = [];
+        $length = \strlen($input);
+        $cursor = 0;
+        while ($cursor &lt; $length) {
+            if (\preg_match(&#039;/\s+/A&#039;, $input, $match, 0, $cursor)) {
+            } elseif (\preg_match(&#039;/([^=&quot;\&#039;\s]+?)(=?)(&#039;.StringInput::REGEX_QUOTED_STRING.&#039;+)/A&#039;, $input, $match, 0, $cursor)) {
+                $tokens[] = [
+                    $match[1].$match[2].\stripcslashes(\str_replace([&#039;&quot;\&#039;&#039;, &#039;\&#039;&quot;&#039;, &#039;\&#039;\&#039;&#039;, &#039;&quot;&quot;&#039;], &#039;&#039;, \substr($match[3], 1, \strlen($match[3]) - 2))),
+                    \stripcslashes(\substr($input, $cursor)),
+                ];
+            } elseif (\preg_match(&#039;/&#039;.StringInput::REGEX_QUOTED_STRING.&#039;/A&#039;, $input, $match, 0, $cursor)) {
+                $tokens[] = [
+                    \stripcslashes(\substr($match[0], 1, \strlen($match[0]) - 2)),
+                    \stripcslashes(\substr($input, $cursor)),
+                ];
+            } elseif (\preg_match(&#039;/&#039;.self::REGEX_STRING.&#039;/A&#039;, $input, $match, 0, $cursor)) {
+                $tokens[] = [
+                    \stripcslashes($match[1]),
+                    \stripcslashes(\substr($input, $cursor)),
+                ];
+            } else {
+                // should never happen
+                // @codeCoverageIgnoreStart
+                throw new \InvalidArgumentException(\sprintf(&#039;Unable to parse input near &quot;... %s ...&quot;&#039;, \substr($input, $cursor, 10)));
+                // @codeCoverageIgnoreEnd
+            }
+
+            $cursor += \strlen($match[0]);
+        }
+
+        return $tokens;
+    }
+
+    /**
+     * Same as parent, but with some bonus handling for code arguments.
+     */
+    protected function parse(): void
+    {
+        $parseOptions = true;
+        $this-&gt;parsed = $this-&gt;tokenPairs;
+        while (null !== $tokenPair = \array_shift($this-&gt;parsed)) {
+            // token is what you&#039;d expect. rest is the remainder of the input
+            // string, including token, and will be used if this is a code arg.
+            list($token, $rest) = $tokenPair;
+
+            if ($parseOptions &amp;&amp; &#039;&#039; === $token) {
+                $this-&gt;parseShellArgument($token, $rest);
+            } elseif ($parseOptions &amp;&amp; &#039;--&#039; === $token) {
+                $parseOptions = false;
+            } elseif ($parseOptions &amp;&amp; 0 === \strpos($token, &#039;--&#039;)) {
+                $this-&gt;parseLongOption($token);
+            } elseif ($parseOptions &amp;&amp; &#039;-&#039; === $token[0] &amp;&amp; &#039;-&#039; !== $token) {
+                $this-&gt;parseShortOption($token);
+            } else {
+                $this-&gt;parseShellArgument($token, $rest);
+            }
+        }
+    }
+
+    /**
+     * Parses an argument, with bonus handling for code arguments.
+     *
+     * @param string $token The current token
+     * @param string $rest  The remaining unparsed input, including the current token
+     *
+     * @throws \RuntimeException When too many arguments are given
+     */
+    private function parseShellArgument(string $token, string $rest)
+    {
+        $c = \count($this-&gt;arguments);
+
+        // if input is expecting another argument, add it
+        if ($this-&gt;definition-&gt;hasArgument($c)) {
+            $arg = $this-&gt;definition-&gt;getArgument($c);
+
+            if ($arg instanceof CodeArgument) {
+                // When we find a code argument, we&#039;re done parsing. Add the
+                // remaining input to the current argument and call it a day.
+                $this-&gt;parsed = [];
+                $this-&gt;arguments[$arg-&gt;getName()] = $rest;
+            } else {
+                $this-&gt;arguments[$arg-&gt;getName()] = $arg-&gt;isArray() ? [$token] : $token;
+            }
+
+            return;
+        }
+
+        // (copypasta)
+        //
+        // @codeCoverageIgnoreStart
+
+        // if last argument isArray(), append token to last argument
+        if ($this-&gt;definition-&gt;hasArgument($c - 1) &amp;&amp; $this-&gt;definition-&gt;getArgument($c - 1)-&gt;isArray()) {
+            $arg = $this-&gt;definition-&gt;getArgument($c - 1);
+            $this-&gt;arguments[$arg-&gt;getName()][] = $token;
+
+            return;
+        }
+
+        // unexpected argument
+        $all = $this-&gt;definition-&gt;getArguments();
+        if (\count($all)) {
+            throw new \RuntimeException(\sprintf(&#039;Too many arguments, expected arguments &quot;%s&quot;.&#039;, \implode(&#039;&quot; &quot;&#039;, \array_keys($all))));
+        }
+
+        throw new \RuntimeException(\sprintf(&#039;No arguments expected, got &quot;%s&quot;.&#039;, $token));
+        // @codeCoverageIgnoreEnd
+    }
+
+    // Everything below this is copypasta from ArgvInput private methods
+    // @codeCoverageIgnoreStart
+
+    /**
+     * Parses a short option.
+     *
+     * @param string $token The current token
+     */
+    private function parseShortOption(string $token)
+    {
+        $name = \substr($token, 1);
+
+        if (\strlen($name) &gt; 1) {
+            if ($this-&gt;definition-&gt;hasShortcut($name[0]) &amp;&amp; $this-&gt;definition-&gt;getOptionForShortcut($name[0])-&gt;acceptValue()) {
+                // an option with a value (with no space)
+                $this-&gt;addShortOption($name[0], \substr($name, 1));
+            } else {
+                $this-&gt;parseShortOptionSet($name);
+            }
+        } else {
+            $this-&gt;addShortOption($name, null);
+        }
+    }
+
+    /**
+     * Parses a short option set.
+     *
+     * @param string $name The current token
+     *
+     * @throws \RuntimeException When option given doesn&#039;t exist
+     */
+    private function parseShortOptionSet(string $name)
+    {
+        $len = \strlen($name);
+        for ($i = 0; $i &lt; $len; $i++) {
+            if (!$this-&gt;definition-&gt;hasShortcut($name[$i])) {
+                throw new \RuntimeException(\sprintf(&#039;The &quot;-%s&quot; option does not exist.&#039;, $name[$i]));
+            }
+
+            $option = $this-&gt;definition-&gt;getOptionForShortcut($name[$i]);
+            if ($option-&gt;acceptValue()) {
+                $this-&gt;addLongOption($option-&gt;getName(), $i === $len - 1 ? null : \substr($name, $i + 1));
+
+                break;
+            } else {
+                $this-&gt;addLongOption($option-&gt;getName(), null);
+            }
+        }
+    }
+
+    /**
+     * Parses a long option.
+     *
+     * @param string $token The current token
+     */
+    private function parseLongOption(string $token)
+    {
+        $name = \substr($token, 2);
+
+        if (false !== $pos = \strpos($name, &#039;=&#039;)) {
+            if (($value = \substr($name, $pos + 1)) === &#039;&#039;) {
+                \array_unshift($this-&gt;parsed, [$value, null]);
+            }
+            $this-&gt;addLongOption(\substr($name, 0, $pos), $value);
+        } else {
+            $this-&gt;addLongOption($name, null);
+        }
+    }
+
+    /**
+     * Adds a short option value.
+     *
+     * @param string $shortcut The short option key
+     * @param mixed  $value    The value for the option
+     *
+     * @throws \RuntimeException When option given doesn&#039;t exist
+     */
+    private function addShortOption(string $shortcut, $value)
+    {
+        if (!$this-&gt;definition-&gt;hasShortcut($shortcut)) {
+            throw new \RuntimeException(\sprintf(&#039;The &quot;-%s&quot; option does not exist.&#039;, $shortcut));
+        }
+
+        $this-&gt;addLongOption($this-&gt;definition-&gt;getOptionForShortcut($shortcut)-&gt;getName(), $value);
+    }
+
+    /**
+     * Adds a long option value.
+     *
+     * @param string $name  The long option key
+     * @param mixed  $value The value for the option
+     *
+     * @throws \RuntimeException When option given doesn&#039;t exist
+     */
+    private function addLongOption(string $name, $value)
+    {
+        if (!$this-&gt;definition-&gt;hasOption($name)) {
+            throw new \RuntimeException(\sprintf(&#039;The &quot;--%s&quot; option does not exist.&#039;, $name));
+        }
+
+        $option = $this-&gt;definition-&gt;getOption($name);
+
+        if (null !== $value &amp;&amp; !$option-&gt;acceptValue()) {
+            throw new \RuntimeException(\sprintf(&#039;The &quot;--%s&quot; option does not accept a value.&#039;, $name));
+        }
+
+        if (\in_array($value, [&#039;&#039;, null], true) &amp;&amp; $option-&gt;acceptValue() &amp;&amp; \count($this-&gt;parsed)) {
+            // if option accepts an optional or mandatory argument
+            // let&#039;s see if there is one provided
+            $next = \array_shift($this-&gt;parsed);
+            $nextToken = $next[0];
+            if ((isset($nextToken[0]) &amp;&amp; &#039;-&#039; !== $nextToken[0]) || \in_array($nextToken, [&#039;&#039;, null], true)) {
+                $value = $nextToken;
+            } else {
+                \array_unshift($this-&gt;parsed, $next);
+            }
+        }
+
+        if ($value === null) {
+            if ($option-&gt;isValueRequired()) {
+                throw new \RuntimeException(\sprintf(&#039;The &quot;--%s&quot; option requires a value.&#039;, $name));
+            }
+
+            if (!$option-&gt;isArray() &amp;&amp; !$option-&gt;isValueOptional()) {
+                $value = true;
+            }
+        }
+
+        if ($option-&gt;isArray()) {
+            $this-&gt;options[$name][] = $value;
+        } else {
+            $this-&gt;options[$name] = $value;
+        }
+    }
+
+    // @codeCoverageIgnoreEnd
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/psy/psysh/src/Input/SilentInput.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/psy/psysh/src/Logger -->
+
+</body>
+</html>

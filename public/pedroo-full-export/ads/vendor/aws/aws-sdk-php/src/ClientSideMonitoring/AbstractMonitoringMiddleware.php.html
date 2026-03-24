@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/ClientSideMonitoring/AbstractMonitoringMiddleware.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Aws\ClientSideMonitoring;
+
+use Aws\CommandInterface;
+use Aws\Exception\AwsException;
+use Aws\MonitoringEventsInterface;
+use Aws\ResponseContainerInterface;
+use Aws\ResultInterface;
+use GuzzleHttp\Promise;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+
+/**
+ * @internal
+ */
+abstract class AbstractMonitoringMiddleware
+    implements MonitoringMiddlewareInterface
+{
+    private static $socket;
+
+    private $nextHandler;
+    private $options;
+    protected $credentialProvider;
+    protected $region;
+    protected $service;
+
+    protected static function getAwsExceptionHeader(AwsException $e, $headerName)
+    {
+        $response = $e-&gt;getResponse();
+        if ($response !== null) {
+            $header = $response-&gt;getHeader($headerName);
+            if (!empty($header[0])) {
+                return $header[0];
+            }
+        }
+        return null;
+    }
+
+    protected static function getResultHeader(ResultInterface $result, $headerName)
+    {
+        if (isset($result[&#039;@metadata&#039;][&#039;headers&#039;][$headerName])) {
+            return $result[&#039;@metadata&#039;][&#039;headers&#039;][$headerName];
+        }
+        return null;
+    }
+
+    protected static function getExceptionHeader(\Exception $e, $headerName)
+    {
+        if ($e instanceof ResponseContainerInterface) {
+            $response = $e-&gt;getResponse();
+            if ($response instanceof ResponseInterface) {
+                $header = $response-&gt;getHeader($headerName);
+                if (!empty($header[0])) {
+                    return $header[0];
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Constructor stores the passed in handler and options.
+     *
+     * @param callable $handler
+     * @param callable $credentialProvider
+     * @param $options
+     * @param $region
+     * @param $service
+     */
+    public function __construct(
+        callable $handler,
+        callable $credentialProvider,
+        $options,
+        $region,
+        $service
+    ) {
+        $this-&gt;nextHandler = $handler;
+        $this-&gt;credentialProvider = $credentialProvider;
+        $this-&gt;options = $options;
+        $this-&gt;region = $region;
+        $this-&gt;service = $service;
+    }
+
+    /**
+     * Standard invoke pattern for middleware execution to be implemented by
+     * child classes.
+     *
+     * @param  CommandInterface $cmd
+     * @param  RequestInterface $request
+     * @return Promise\PromiseInterface
+     */
+    public function __invoke(CommandInterface $cmd, RequestInterface $request)
+    {
+        $handler = $this-&gt;nextHandler;
+        $eventData = null;
+        $enabled = $this-&gt;isEnabled();
+
+        if ($enabled) {
+            $cmd[&#039;@http&#039;][&#039;collect_stats&#039;] = true;
+            $eventData = $this-&gt;populateRequestEventData(
+                $cmd,
+                $request,
+                $this-&gt;getNewEvent($cmd, $request)
+            );
+        }
+
+        $g = function ($value) use ($eventData, $enabled) {
+            if ($enabled) {
+                $eventData = $this-&gt;populateResultEventData(
+                    $value,
+                    $eventData
+                );
+                $this-&gt;sendEventData($eventData);
+
+                if ($value instanceof MonitoringEventsInterface) {
+                    $value-&gt;appendMonitoringEvent($eventData);
+                }
+            }
+            if ($value instanceof \Exception || $value instanceof \Throwable) {
+                return Promise\Create::rejectionFor($value);
+            }
+            return $value;
+        };
+
+        return Promise\Create::promiseFor($handler($cmd, $request))-&gt;then($g, $g);
+    }
+
+    private function getClientId()
+    {
+        return $this-&gt;unwrappedOptions()-&gt;getClientId();
+    }
+
+    private function getNewEvent(
+        CommandInterface $cmd,
+        RequestInterface $request
+    ) {
+        $event = [
+            &#039;Api&#039; =&gt; $cmd-&gt;getName(),
+            &#039;ClientId&#039; =&gt; $this-&gt;getClientId(),
+            &#039;Region&#039; =&gt; $this-&gt;getRegion(),
+            &#039;Service&#039; =&gt; $this-&gt;getService(),
+            &#039;Timestamp&#039; =&gt; (int) floor(microtime(true) * 1000),
+            &#039;UserAgent&#039; =&gt; substr(
+                $request-&gt;getHeaderLine(&#039;User-Agent&#039;) . &#039; &#039; . \Aws\default_user_agent(),
+                0,
+                256
+            ),
+            &#039;Version&#039; =&gt; 1
+        ];
+        return $event;
+    }
+
+    private function getHost()
+    {
+        return $this-&gt;unwrappedOptions()-&gt;getHost();
+    }
+
+    private function getPort()
+    {
+        return $this-&gt;unwrappedOptions()-&gt;getPort();
+    }
+
+    private function getRegion()
+    {
+        return $this-&gt;region;
+    }
+
+    private function getService()
+    {
+        return $this-&gt;service;
+    }
+
+    /**
+     * Returns enabled flag from options, unwrapping options if necessary.
+     *
+     * @return bool
+     */
+    private function isEnabled()
+    {
+        return $this-&gt;unwrappedOptions()-&gt;isEnabled();
+    }
+
+    /**
+     * Returns $eventData array with information from the request and command.
+     *
+     * @param CommandInterface $cmd
+     * @param RequestInterface $request
+     * @param array $event
+     * @return array
+     */
+    protected function populateRequestEventData(
+        CommandInterface $cmd,
+        RequestInterface $request,
+        array $event
+    ) {
+        $dataFormat = static::getRequestData($request);
+        foreach ($dataFormat as $eventKey =&gt; $value) {
+            if ($value !== null) {
+                $event[$eventKey] = $value;
+            }
+        }
+        return $event;
+    }
+
+    /**
+     * Returns $eventData array with information from the response, including
+     * the calculation for attempt latency.
+     *
+     * @param ResultInterface|\Exception $result
+     * @param array $event
+     * @return array
+     */
+    protected function populateResultEventData(
+        $result,
+        array $event
+    ) {
+        $dataFormat = static::getResponseData($result);
+        foreach ($dataFormat as $eventKey =&gt; $value) {
+            if ($value !== null) {
+                $event[$eventKey] = $value;
+            }
+        }
+        return $event;
+    }
+
+
+    /**
+     * Checks if the socket is created. If PHP version is greater or equals to 8 then,
+     * it will check if the var is instance of \Socket otherwise it will check if is
+     * a resource.
+     *
+     * @return bool Returns true if the socket is created, false otherwise.
+     */
+    private function isSocketCreated(): bool
+    {
+        // Before version 8, sockets are resources
+        // After version 8, sockets are instances of Socket
+        if (PHP_MAJOR_VERSION &gt;= 8) {
+            $socketClass = &#039;\Socket&#039;;
+            return self::$socket instanceof $socketClass;
+        } else {
+            return is_resource(self::$socket);
+        }
+    }
+
+    /**
+     * Creates a UDP socket resource and stores it with the class, or retrieves
+     * it if already instantiated and connected. Handles error-checking and
+     * re-connecting if necessary. If $forceNewConnection is set to true, a new
+     * socket will be created.
+     *
+     * @param bool $forceNewConnection
+     * @return Resource
+     */
+    private function prepareSocket($forceNewConnection = false)
+    {
+        if (!$this-&gt;isSocketCreated()
+            || $forceNewConnection
+            || socket_last_error(self::$socket)
+        ) {
+            self::$socket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+            socket_clear_error(self::$socket);
+            socket_connect(self::$socket, $this-&gt;getHost(), $this-&gt;getPort());
+        }
+
+        return self::$socket;
+    }
+
+    /**
+     * Sends formatted monitoring event data via the UDP socket connection to
+     * the CSM agent endpoint.
+     *
+     * @param array $eventData
+     * @return int
+     */
+    private function sendEventData(array $eventData)
+    {
+        $socket = $this-&gt;prepareSocket();
+        $datagram = json_encode($eventData);
+        $result = socket_write($socket, $datagram, strlen($datagram));
+        if ($result === false) {
+            $this-&gt;prepareSocket(true);
+        }
+        return $result;
+    }
+
+    /**
+     * Unwraps options, if needed, and returns them.
+     *
+     * @return ConfigurationInterface
+     */
+    private function unwrappedOptions()
+    {
+        if (!($this-&gt;options instanceof ConfigurationInterface)) {
+            try {
+                $this-&gt;options = ConfigurationProvider::unwrap($this-&gt;options);
+            } catch (\Exception $e) {
+                // Errors unwrapping CSM config defaults to disabling it
+                $this-&gt;options = new Configuration(
+                    false,
+                    ConfigurationProvider::DEFAULT_HOST,
+                    ConfigurationProvider::DEFAULT_PORT
+                );
+            }
+        }
+        return $this-&gt;options;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/ClientSideMonitoring/ApiCallAttemptMonitoringMiddleware.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/ClientSideMonitoring/Exception -->
+
+</body>
+</html>

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/nette/utils/src/Utils/ObjectHelpers.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * This file is part of the Nette Framework (https://nette.org)
+ * Copyright (c) 2004 David Grudl (https://davidgrudl.com)
+ */
+
+declare(strict_types=1);
+
+namespace Nette\Utils;
+
+use Nette;
+use Nette\MemberAccessException;
+use function array_filter, array_merge, array_pop, array_unique, get_class_methods, get_parent_class, implode, is_a, levenshtein, method_exists, preg_match_all, preg_replace, strlen, ucfirst;
+use const PREG_SET_ORDER, SORT_REGULAR;
+
+
+/**
+ * Nette\SmartObject helpers.
+ * @internal
+ */
+final class ObjectHelpers
+{
+	use Nette\StaticClass;
+
+	/**
+	 * @return never
+	 * @throws MemberAccessException
+	 */
+	public static function strictGet(string $class, string $name): void
+	{
+		$rc = new \ReflectionClass($class);
+		$hint = self::getSuggestion(array_merge(
+			array_filter($rc-&gt;getProperties(\ReflectionProperty::IS_PUBLIC), fn($p) =&gt; !$p-&gt;isStatic()),
+			self::parseFullDoc($rc, &#039;~^[ \t*]*@property(?:-read)?[ \t]+(?:\S+[ \t]+)??\$(\w+)~m&#039;),
+		), $name);
+		throw new MemberAccessException(&quot;Cannot read an undeclared property $class::\$$name&quot; . ($hint ? &quot;, did you mean \$$hint?&quot; : &#039;.&#039;));
+	}
+
+
+	/**
+	 * @return never
+	 * @throws MemberAccessException
+	 */
+	public static function strictSet(string $class, string $name): void
+	{
+		$rc = new \ReflectionClass($class);
+		$hint = self::getSuggestion(array_merge(
+			array_filter($rc-&gt;getProperties(\ReflectionProperty::IS_PUBLIC), fn($p) =&gt; !$p-&gt;isStatic()),
+			self::parseFullDoc($rc, &#039;~^[ \t*]*@property(?:-write)?[ \t]+(?:\S+[ \t]+)??\$(\w+)~m&#039;),
+		), $name);
+		throw new MemberAccessException(&quot;Cannot write to an undeclared property $class::\$$name&quot; . ($hint ? &quot;, did you mean \$$hint?&quot; : &#039;.&#039;));
+	}
+
+
+	/**
+	 * @return never
+	 * @throws MemberAccessException
+	 */
+	public static function strictCall(string $class, string $method, array $additionalMethods = []): void
+	{
+		$trace = debug_backtrace(0, 3); // suppose this method is called from __call()
+		$context = ($trace[1][&#039;function&#039;] ?? null) === &#039;__call&#039;
+			? ($trace[2][&#039;class&#039;] ?? null)
+			: null;
+
+		if ($context &amp;&amp; is_a($class, $context, true) &amp;&amp; method_exists($context, $method)) { // called parent::$method()
+			$class = get_parent_class($context);
+		}
+
+		if (method_exists($class, $method)) { // insufficient visibility
+			$rm = new \ReflectionMethod($class, $method);
+			$visibility = $rm-&gt;isPrivate()
+				? &#039;private &#039;
+				: ($rm-&gt;isProtected() ? &#039;protected &#039; : &#039;&#039;);
+			throw new MemberAccessException(&quot;Call to {$visibility}method $class::$method() from &quot; . ($context ? &quot;scope $context.&quot; : &#039;global scope.&#039;));
+
+		} else {
+			$hint = self::getSuggestion(array_merge(
+				get_class_methods($class),
+				self::parseFullDoc(new \ReflectionClass($class), &#039;~^[ \t*]*@method[ \t]+(?:static[ \t]+)?(?:\S+[ \t]+)??(\w+)\(~m&#039;),
+				$additionalMethods,
+			), $method);
+			throw new MemberAccessException(&quot;Call to undefined method $class::$method()&quot; . ($hint ? &quot;, did you mean $hint()?&quot; : &#039;.&#039;));
+		}
+	}
+
+
+	/**
+	 * @return never
+	 * @throws MemberAccessException
+	 */
+	public static function strictStaticCall(string $class, string $method): void
+	{
+		$trace = debug_backtrace(0, 3); // suppose this method is called from __callStatic()
+		$context = ($trace[1][&#039;function&#039;] ?? null) === &#039;__callStatic&#039;
+			? ($trace[2][&#039;class&#039;] ?? null)
+			: null;
+
+		if ($context &amp;&amp; is_a($class, $context, true) &amp;&amp; method_exists($context, $method)) { // called parent::$method()
+			$class = get_parent_class($context);
+		}
+
+		if (method_exists($class, $method)) { // insufficient visibility
+			$rm = new \ReflectionMethod($class, $method);
+			$visibility = $rm-&gt;isPrivate()
+				? &#039;private &#039;
+				: ($rm-&gt;isProtected() ? &#039;protected &#039; : &#039;&#039;);
+			throw new MemberAccessException(&quot;Call to {$visibility}method $class::$method() from &quot; . ($context ? &quot;scope $context.&quot; : &#039;global scope.&#039;));
+
+		} else {
+			$hint = self::getSuggestion(
+				array_filter((new \ReflectionClass($class))-&gt;getMethods(\ReflectionMethod::IS_PUBLIC), fn($m) =&gt; $m-&gt;isStatic()),
+				$method,
+			);
+			throw new MemberAccessException(&quot;Call to undefined static method $class::$method()&quot; . ($hint ? &quot;, did you mean $hint()?&quot; : &#039;.&#039;));
+		}
+	}
+
+
+	/**
+	 * Returns array of magic properties defined by annotation @property.
+	 * @return array of [name =&gt; bit mask]
+	 * @internal
+	 */
+	public static function getMagicProperties(string $class): array
+	{
+		static $cache;
+		$props = &amp;$cache[$class];
+		if ($props !== null) {
+			return $props;
+		}
+
+		$rc = new \ReflectionClass($class);
+		preg_match_all(
+			&#039;~^  [ \t*]*  @property(|-read|-write|-deprecated)  [ \t]+  [^\s$]+  [ \t]+  \$  (\w+)  ()~mx&#039;,
+			(string) $rc-&gt;getDocComment(),
+			$matches,
+			PREG_SET_ORDER,
+		);
+
+		$props = [];
+		foreach ($matches as [, $type, $name]) {
+			$uname = ucfirst($name);
+			$write = $type !== &#039;-read&#039;
+				&amp;&amp; $rc-&gt;hasMethod($nm = &#039;set&#039; . $uname)
+				&amp;&amp; ($rm = $rc-&gt;getMethod($nm))-&gt;name === $nm &amp;&amp; !$rm-&gt;isPrivate() &amp;&amp; !$rm-&gt;isStatic();
+			$read = $type !== &#039;-write&#039;
+				&amp;&amp; ($rc-&gt;hasMethod($nm = &#039;get&#039; . $uname) || $rc-&gt;hasMethod($nm = &#039;is&#039; . $uname))
+				&amp;&amp; ($rm = $rc-&gt;getMethod($nm))-&gt;name === $nm &amp;&amp; !$rm-&gt;isPrivate() &amp;&amp; !$rm-&gt;isStatic();
+
+			if ($read || $write) {
+				$props[$name] = $read &lt;&lt; 0 | ($nm[0] === &#039;g&#039;) &lt;&lt; 1 | $rm-&gt;returnsReference() &lt;&lt; 2 | $write &lt;&lt; 3 | ($type === &#039;-deprecated&#039;) &lt;&lt; 4;
+			}
+		}
+
+		foreach ($rc-&gt;getTraits() as $trait) {
+			$props += self::getMagicProperties($trait-&gt;name);
+		}
+
+		if ($parent = get_parent_class($class)) {
+			$props += self::getMagicProperties($parent);
+		}
+
+		return $props;
+	}
+
+
+	/**
+	 * Finds the best suggestion (for 8-bit encoding).
+	 * @param  (\ReflectionFunctionAbstract|\ReflectionParameter|\ReflectionClass|\ReflectionProperty|string)[]  $possibilities
+	 * @internal
+	 */
+	public static function getSuggestion(array $possibilities, string $value): ?string
+	{
+		$norm = preg_replace($re = &#039;#^(get|set|has|is|add)(?=[A-Z])#&#039;, &#039;+&#039;, $value);
+		$best = null;
+		$min = (strlen($value) / 4 + 1) * 10 + .1;
+		foreach (array_unique($possibilities, SORT_REGULAR) as $item) {
+			$item = $item instanceof \Reflector ? $item-&gt;name : $item;
+			if ($item !== $value &amp;&amp; (
+				($len = levenshtein($item, $value, 10, 11, 10)) &lt; $min
+				|| ($len = levenshtein(preg_replace($re, &#039;*&#039;, $item), $norm, 10, 11, 10)) &lt; $min
+			)) {
+				$min = $len;
+				$best = $item;
+			}
+		}
+
+		return $best;
+	}
+
+
+	private static function parseFullDoc(\ReflectionClass $rc, string $pattern): array
+	{
+		do {
+			$doc[] = $rc-&gt;getDocComment();
+			$traits = $rc-&gt;getTraits();
+			while ($trait = array_pop($traits)) {
+				$doc[] = $trait-&gt;getDocComment();
+				$traits += $trait-&gt;getTraits();
+			}
+		} while ($rc = $rc-&gt;getParentClass());
+
+		return preg_match_all($pattern, implode(&#039;&#039;, $doc), $m) ? $m[1] : [];
+	}
+
+
+	/**
+	 * Checks if the public non-static property exists.
+	 * Returns &#039;event&#039; if the property exists and has event like name
+	 * @internal
+	 */
+	public static function hasProperty(string $class, string $name): bool|string
+	{
+		static $cache;
+		$prop = &amp;$cache[$class][$name];
+		if ($prop === null) {
+			$prop = false;
+			try {
+				$rp = new \ReflectionProperty($class, $name);
+				if ($rp-&gt;isPublic() &amp;&amp; !$rp-&gt;isStatic()) {
+					$prop = $name &gt;= &#039;onA&#039; &amp;&amp; $name &lt; &#039;on_&#039; ? &#039;event&#039; : true;
+				}
+			} catch (\ReflectionException $e) {
+			}
+		}
+
+		return $prop;
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/nette/utils/src/Utils/Paginator.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/nikic -->
+
+</body>
+</html>

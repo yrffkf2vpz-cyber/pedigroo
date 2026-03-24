@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/mime/Crypto/DkimSigner.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Mime\Crypto;
+
+use Symfony\Component\Mime\Exception\InvalidArgumentException;
+use Symfony\Component\Mime\Exception\RuntimeException;
+use Symfony\Component\Mime\Header\UnstructuredHeader;
+use Symfony\Component\Mime\Message;
+use Symfony\Component\Mime\Part\AbstractPart;
+
+/**
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * RFC 6376 and 8301
+ */
+final class DkimSigner
+{
+    public const CANON_SIMPLE = &#039;simple&#039;;
+    public const CANON_RELAXED = &#039;relaxed&#039;;
+
+    public const ALGO_SHA256 = &#039;rsa-sha256&#039;;
+    public const ALGO_ED25519 = &#039;ed25519-sha256&#039;; // RFC 8463
+
+    private \OpenSSLAsymmetricKey $key;
+
+    /**
+     * @param string $pk         The private key as a string or the path to the file containing the private key, should be prefixed with file:// (in PEM format)
+     * @param string $passphrase A passphrase of the private key (if any)
+     */
+    public function __construct(
+        string $pk,
+        private string $domainName,
+        private string $selector,
+        private array $defaultOptions = [],
+        string $passphrase = &#039;&#039;,
+    ) {
+        if (!\extension_loaded(&#039;openssl&#039;)) {
+            throw new \LogicException(&#039;PHP extension &quot;openssl&quot; is required to use DKIM.&#039;);
+        }
+        $this-&gt;key = openssl_pkey_get_private($pk, $passphrase) ?: throw new InvalidArgumentException(&#039;Unable to load DKIM private key: &#039;.openssl_error_string());
+        $this-&gt;defaultOptions += [
+            &#039;algorithm&#039; =&gt; self::ALGO_SHA256,
+            &#039;signature_expiration_delay&#039; =&gt; 0,
+            &#039;body_max_length&#039; =&gt; \PHP_INT_MAX,
+            &#039;body_show_length&#039; =&gt; false,
+            &#039;header_canon&#039; =&gt; self::CANON_RELAXED,
+            &#039;body_canon&#039; =&gt; self::CANON_RELAXED,
+            &#039;headers_to_ignore&#039; =&gt; [],
+        ];
+    }
+
+    public function sign(Message $message, array $options = []): Message
+    {
+        $options += $this-&gt;defaultOptions;
+        if (!\in_array($options[&#039;algorithm&#039;], [self::ALGO_SHA256, self::ALGO_ED25519], true)) {
+            throw new InvalidArgumentException(\sprintf(&#039;Invalid DKIM signing algorithm &quot;%s&quot;.&#039;, $options[&#039;algorithm&#039;]));
+        }
+        $headersToIgnore[&#039;return-path&#039;] = true;
+        $headersToIgnore[&#039;x-transport&#039;] = true;
+        foreach ($options[&#039;headers_to_ignore&#039;] as $name) {
+            $headersToIgnore[strtolower($name)] = true;
+        }
+        unset($headersToIgnore[&#039;from&#039;]);
+        $signedHeaderNames = [];
+        $headerCanonData = &#039;&#039;;
+        $headers = $message-&gt;getPreparedHeaders();
+        foreach ($headers-&gt;getNames() as $name) {
+            foreach ($headers-&gt;all($name) as $header) {
+                if (isset($headersToIgnore[strtolower($header-&gt;getName())])) {
+                    continue;
+                }
+
+                if (&#039;&#039; !== $header-&gt;getBodyAsString()) {
+                    $headerCanonData .= $this-&gt;canonicalizeHeader($header-&gt;toString(), $options[&#039;header_canon&#039;]);
+                    $signedHeaderNames[] = $header-&gt;getName();
+                }
+            }
+        }
+
+        [$bodyHash, $bodyLength] = $this-&gt;hashBody($message-&gt;getBody(), $options[&#039;body_canon&#039;], $options[&#039;body_max_length&#039;]);
+
+        $params = [
+            &#039;v&#039; =&gt; &#039;1&#039;,
+            &#039;q&#039; =&gt; &#039;dns/txt&#039;,
+            &#039;a&#039; =&gt; $options[&#039;algorithm&#039;],
+            &#039;bh&#039; =&gt; base64_encode($bodyHash),
+            &#039;d&#039; =&gt; $this-&gt;domainName,
+            &#039;h&#039; =&gt; implode(&#039;: &#039;, $signedHeaderNames),
+            &#039;i&#039; =&gt; &#039;@&#039;.$this-&gt;domainName,
+            &#039;s&#039; =&gt; $this-&gt;selector,
+            &#039;t&#039; =&gt; time(),
+            &#039;c&#039; =&gt; $options[&#039;header_canon&#039;].&#039;/&#039;.$options[&#039;body_canon&#039;],
+        ];
+
+        if ($options[&#039;body_show_length&#039;]) {
+            $params[&#039;l&#039;] = $bodyLength;
+        }
+        if ($options[&#039;signature_expiration_delay&#039;]) {
+            $params[&#039;x&#039;] = $params[&#039;t&#039;] + $options[&#039;signature_expiration_delay&#039;];
+        }
+        $value = &#039;&#039;;
+        foreach ($params as $k =&gt; $v) {
+            $value .= $k.&#039;=&#039;.$v.&#039;; &#039;;
+        }
+        $value = trim($value);
+        $header = new UnstructuredHeader(&#039;DKIM-Signature&#039;, $value);
+        $headerCanonData .= rtrim($this-&gt;canonicalizeHeader($header-&gt;toString().&quot;\r\n b=&quot;, $options[&#039;header_canon&#039;]));
+        if (self::ALGO_SHA256 === $options[&#039;algorithm&#039;]) {
+            if (!openssl_sign($headerCanonData, $signature, $this-&gt;key, \OPENSSL_ALGO_SHA256)) {
+                throw new RuntimeException(&#039;Unable to sign DKIM hash: &#039;.openssl_error_string());
+            }
+        } else {
+            throw new \RuntimeException(\sprintf(&#039;The &quot;%s&quot; DKIM signing algorithm is not supported yet.&#039;, self::ALGO_ED25519));
+        }
+        $header-&gt;setValue($value.&#039; b=&#039;.trim(chunk_split(base64_encode($signature), 73, &#039; &#039;)));
+        $headers-&gt;add($header);
+
+        return new Message($headers, $message-&gt;getBody());
+    }
+
+    private function canonicalizeHeader(string $header, string $headerCanon): string
+    {
+        if (self::CANON_RELAXED !== $headerCanon) {
+            return $header.&quot;\r\n&quot;;
+        }
+
+        $exploded = explode(&#039;:&#039;, $header, 2);
+        $name = strtolower(trim($exploded[0]));
+        $value = str_replace(&quot;\r\n&quot;, &#039;&#039;, $exploded[1]);
+        $value = trim(preg_replace(&quot;/[ \t][ \t]+/&quot;, &#039; &#039;, $value));
+
+        return $name.&#039;:&#039;.$value.&quot;\r\n&quot;;
+    }
+
+    private function hashBody(AbstractPart $body, string $bodyCanon, int $maxLength): array
+    {
+        $hash = hash_init(&#039;sha256&#039;);
+        $relaxed = self::CANON_RELAXED === $bodyCanon;
+        $currentLine = &#039;&#039;;
+        $emptyCounter = 0;
+        $isSpaceSequence = false;
+        $length = 0;
+        foreach ($body-&gt;bodyToIterable() as $chunk) {
+            $canon = &#039;&#039;;
+            for ($i = 0, $len = \strlen($chunk); $i &lt; $len; ++$i) {
+                switch ($chunk[$i]) {
+                    case &quot;\r&quot;:
+                        break;
+                    case &quot;\n&quot;:
+                        // previous char is always \r
+                        if ($relaxed) {
+                            $isSpaceSequence = false;
+                        }
+                        if (&#039;&#039; === $currentLine) {
+                            ++$emptyCounter;
+                        } else {
+                            $currentLine = &#039;&#039;;
+                            $canon .= &quot;\r\n&quot;;
+                        }
+                        break;
+                    case &#039; &#039;:
+                    case &quot;\t&quot;:
+                        if ($relaxed) {
+                            $isSpaceSequence = true;
+                            break;
+                        }
+                        // no break
+                    default:
+                        if ($emptyCounter &gt; 0) {
+                            $canon .= str_repeat(&quot;\r\n&quot;, $emptyCounter);
+                            $emptyCounter = 0;
+                        }
+                        if ($isSpaceSequence) {
+                            $currentLine .= &#039; &#039;;
+                            $canon .= &#039; &#039;;
+                            $isSpaceSequence = false;
+                        }
+                        $currentLine .= $chunk[$i];
+                        $canon .= $chunk[$i];
+                }
+            }
+
+            if ($length + \strlen($canon) &gt;= $maxLength) {
+                $canon = substr($canon, 0, $maxLength - $length);
+                $length += \strlen($canon);
+                hash_update($hash, $canon);
+
+                break;
+            }
+
+            $length += \strlen($canon);
+            hash_update($hash, $canon);
+        }
+
+        // Add trailing Line return if last line is non empty
+        if (&#039;&#039; !== $currentLine) {
+            hash_update($hash, &quot;\r\n&quot;);
+            $length += \strlen(&quot;\r\n&quot;);
+        }
+
+        if (!$relaxed &amp;&amp; 0 === $length) {
+            hash_update($hash, &quot;\r\n&quot;);
+            $length = 2;
+        }
+
+        return [hash_final($hash, true), $length];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/mime/Crypto/SMime.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/mime/DependencyInjection -->
+
+</body>
+</html>

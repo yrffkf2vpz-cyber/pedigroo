@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Bus/DatabaseBatchRepository.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Bus;
+
+use Carbon\CarbonImmutable;
+use Closure;
+use DateTimeInterface;
+use Illuminate\Database\Connection;
+use Illuminate\Database\PostgresConnection;
+use Illuminate\Database\Query\Expression;
+use Illuminate\Support\Str;
+use Throwable;
+
+class DatabaseBatchRepository implements PrunableBatchRepository
+{
+    /**
+     * The batch factory instance.
+     *
+     * @var \Illuminate\Bus\BatchFactory
+     */
+    protected $factory;
+
+    /**
+     * The database connection instance.
+     *
+     * @var \Illuminate\Database\Connection
+     */
+    protected $connection;
+
+    /**
+     * The database table to use to store batch information.
+     *
+     * @var string
+     */
+    protected $table;
+
+    /**
+     * Create a new batch repository instance.
+     *
+     * @param  \Illuminate\Bus\BatchFactory  $factory
+     * @param  \Illuminate\Database\Connection  $connection
+     * @param  string  $table
+     */
+    public function __construct(BatchFactory $factory, Connection $connection, string $table)
+    {
+        $this-&gt;factory = $factory;
+        $this-&gt;connection = $connection;
+        $this-&gt;table = $table;
+    }
+
+    /**
+     * Retrieve a list of batches.
+     *
+     * @param  int  $limit
+     * @param  mixed  $before
+     * @return \Illuminate\Bus\Batch[]
+     */
+    public function get($limit = 50, $before = null)
+    {
+        return $this-&gt;connection-&gt;table($this-&gt;table)
+            -&gt;orderByDesc(&#039;id&#039;)
+            -&gt;limit($limit)
+            -&gt;when($before, fn ($q) =&gt; $q-&gt;where(&#039;id&#039;, &#039;&lt;&#039;, $before))
+            -&gt;get()
+            -&gt;map(function ($batch) {
+                return $this-&gt;toBatch($batch);
+            })
+            -&gt;all();
+    }
+
+    /**
+     * Retrieve information about an existing batch.
+     *
+     * @param  string  $batchId
+     * @return \Illuminate\Bus\Batch|null
+     */
+    public function find(string $batchId)
+    {
+        $batch = $this-&gt;connection-&gt;table($this-&gt;table)
+            -&gt;useWritePdo()
+            -&gt;where(&#039;id&#039;, $batchId)
+            -&gt;first();
+
+        if ($batch) {
+            return $this-&gt;toBatch($batch);
+        }
+    }
+
+    /**
+     * Store a new pending batch.
+     *
+     * @param  \Illuminate\Bus\PendingBatch  $batch
+     * @return \Illuminate\Bus\Batch
+     */
+    public function store(PendingBatch $batch)
+    {
+        $id = (string) Str::orderedUuid();
+
+        $this-&gt;connection-&gt;table($this-&gt;table)-&gt;insert([
+            &#039;id&#039; =&gt; $id,
+            &#039;name&#039; =&gt; $batch-&gt;name,
+            &#039;total_jobs&#039; =&gt; 0,
+            &#039;pending_jobs&#039; =&gt; 0,
+            &#039;failed_jobs&#039; =&gt; 0,
+            &#039;failed_job_ids&#039; =&gt; &#039;[]&#039;,
+            &#039;options&#039; =&gt; $this-&gt;serialize($batch-&gt;options),
+            &#039;created_at&#039; =&gt; time(),
+            &#039;cancelled_at&#039; =&gt; null,
+            &#039;finished_at&#039; =&gt; null,
+        ]);
+
+        return $this-&gt;find($id);
+    }
+
+    /**
+     * Increment the total number of jobs within the batch.
+     *
+     * @param  string  $batchId
+     * @param  int  $amount
+     * @return void
+     */
+    public function incrementTotalJobs(string $batchId, int $amount)
+    {
+        $this-&gt;connection-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $batchId)-&gt;update([
+            &#039;total_jobs&#039; =&gt; new Expression(&#039;total_jobs + &#039;.$amount),
+            &#039;pending_jobs&#039; =&gt; new Expression(&#039;pending_jobs + &#039;.$amount),
+            &#039;finished_at&#039; =&gt; null,
+        ]);
+    }
+
+    /**
+     * Decrement the total number of pending jobs for the batch.
+     *
+     * @param  string  $batchId
+     * @param  string  $jobId
+     * @return \Illuminate\Bus\UpdatedBatchJobCounts
+     */
+    public function decrementPendingJobs(string $batchId, string $jobId)
+    {
+        $values = $this-&gt;updateAtomicValues($batchId, function ($batch) use ($jobId) {
+            return [
+                &#039;pending_jobs&#039; =&gt; $batch-&gt;pending_jobs - 1,
+                &#039;failed_jobs&#039; =&gt; $batch-&gt;failed_jobs,
+                &#039;failed_job_ids&#039; =&gt; json_encode(array_values(array_diff((array) json_decode($batch-&gt;failed_job_ids, true), [$jobId]))),
+            ];
+        });
+
+        return new UpdatedBatchJobCounts(
+            $values[&#039;pending_jobs&#039;],
+            $values[&#039;failed_jobs&#039;]
+        );
+    }
+
+    /**
+     * Increment the total number of failed jobs for the batch.
+     *
+     * @param  string  $batchId
+     * @param  string  $jobId
+     * @return \Illuminate\Bus\UpdatedBatchJobCounts
+     */
+    public function incrementFailedJobs(string $batchId, string $jobId)
+    {
+        $values = $this-&gt;updateAtomicValues($batchId, function ($batch) use ($jobId) {
+            return [
+                &#039;pending_jobs&#039; =&gt; $batch-&gt;pending_jobs,
+                &#039;failed_jobs&#039; =&gt; $batch-&gt;failed_jobs + 1,
+                &#039;failed_job_ids&#039; =&gt; json_encode(array_values(array_unique(array_merge((array) json_decode($batch-&gt;failed_job_ids, true), [$jobId])))),
+            ];
+        });
+
+        return new UpdatedBatchJobCounts(
+            $values[&#039;pending_jobs&#039;],
+            $values[&#039;failed_jobs&#039;]
+        );
+    }
+
+    /**
+     * Update an atomic value within the batch.
+     *
+     * @param  string  $batchId
+     * @param  \Closure  $callback
+     * @return int|null
+     */
+    protected function updateAtomicValues(string $batchId, Closure $callback)
+    {
+        return $this-&gt;connection-&gt;transaction(function () use ($batchId, $callback) {
+            $batch = $this-&gt;connection-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $batchId)
+                -&gt;lockForUpdate()
+                -&gt;first();
+
+            return is_null($batch) ? [] : tap($callback($batch), function ($values) use ($batchId) {
+                $this-&gt;connection-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $batchId)-&gt;update($values);
+            });
+        });
+    }
+
+    /**
+     * Mark the batch that has the given ID as finished.
+     *
+     * @param  string  $batchId
+     * @return void
+     */
+    public function markAsFinished(string $batchId)
+    {
+        $this-&gt;connection-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $batchId)-&gt;update([
+            &#039;finished_at&#039; =&gt; time(),
+        ]);
+    }
+
+    /**
+     * Cancel the batch that has the given ID.
+     *
+     * @param  string  $batchId
+     * @return void
+     */
+    public function cancel(string $batchId)
+    {
+        $this-&gt;connection-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $batchId)-&gt;update([
+            &#039;cancelled_at&#039; =&gt; time(),
+            &#039;finished_at&#039; =&gt; time(),
+        ]);
+    }
+
+    /**
+     * Delete the batch that has the given ID.
+     *
+     * @param  string  $batchId
+     * @return void
+     */
+    public function delete(string $batchId)
+    {
+        $this-&gt;connection-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $batchId)-&gt;delete();
+    }
+
+    /**
+     * Prune all of the entries older than the given date.
+     *
+     * @param  \DateTimeInterface  $before
+     * @return int
+     */
+    public function prune(DateTimeInterface $before)
+    {
+        $query = $this-&gt;connection-&gt;table($this-&gt;table)
+            -&gt;whereNotNull(&#039;finished_at&#039;)
+            -&gt;where(&#039;finished_at&#039;, &#039;&lt;&#039;, $before-&gt;getTimestamp());
+
+        $totalDeleted = 0;
+
+        do {
+            $deleted = $query-&gt;limit(1000)-&gt;delete();
+
+            $totalDeleted += $deleted;
+        } while ($deleted !== 0);
+
+        return $totalDeleted;
+    }
+
+    /**
+     * Prune all of the unfinished entries older than the given date.
+     *
+     * @param  \DateTimeInterface  $before
+     * @return int
+     */
+    public function pruneUnfinished(DateTimeInterface $before)
+    {
+        $query = $this-&gt;connection-&gt;table($this-&gt;table)
+            -&gt;whereNull(&#039;finished_at&#039;)
+            -&gt;where(&#039;created_at&#039;, &#039;&lt;&#039;, $before-&gt;getTimestamp());
+
+        $totalDeleted = 0;
+
+        do {
+            $deleted = $query-&gt;limit(1000)-&gt;delete();
+
+            $totalDeleted += $deleted;
+        } while ($deleted !== 0);
+
+        return $totalDeleted;
+    }
+
+    /**
+     * Prune all of the cancelled entries older than the given date.
+     *
+     * @param  \DateTimeInterface  $before
+     * @return int
+     */
+    public function pruneCancelled(DateTimeInterface $before)
+    {
+        $query = $this-&gt;connection-&gt;table($this-&gt;table)
+            -&gt;whereNotNull(&#039;cancelled_at&#039;)
+            -&gt;where(&#039;created_at&#039;, &#039;&lt;&#039;, $before-&gt;getTimestamp());
+
+        $totalDeleted = 0;
+
+        do {
+            $deleted = $query-&gt;limit(1000)-&gt;delete();
+
+            $totalDeleted += $deleted;
+        } while ($deleted !== 0);
+
+        return $totalDeleted;
+    }
+
+    /**
+     * Execute the given Closure within a storage specific transaction.
+     *
+     * @param  \Closure  $callback
+     * @return mixed
+     */
+    public function transaction(Closure $callback)
+    {
+        return $this-&gt;connection-&gt;transaction(fn () =&gt; $callback());
+    }
+
+    /**
+     * Rollback the last database transaction for the connection.
+     *
+     * @return void
+     */
+    public function rollBack()
+    {
+        $this-&gt;connection-&gt;rollBack(toLevel: 0);
+    }
+
+    /**
+     * Serialize the given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    protected function serialize($value)
+    {
+        $serialized = serialize($value);
+
+        return $this-&gt;connection instanceof PostgresConnection
+            ? base64_encode($serialized)
+            : $serialized;
+    }
+
+    /**
+     * Unserialize the given value.
+     *
+     * @param  string  $serialized
+     * @return mixed
+     */
+    protected function unserialize($serialized)
+    {
+        if ($this-&gt;connection instanceof PostgresConnection &amp;&amp;
+            ! Str::contains($serialized, [&#039;:&#039;, &#039;;&#039;])) {
+            $serialized = base64_decode($serialized);
+        }
+
+        try {
+            return unserialize($serialized);
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    /**
+     * Convert the given raw batch to a Batch object.
+     *
+     * @param  object  $batch
+     * @return \Illuminate\Bus\Batch
+     */
+    protected function toBatch($batch)
+    {
+        return $this-&gt;factory-&gt;make(
+            $this,
+            $batch-&gt;id,
+            $batch-&gt;name,
+            (int) $batch-&gt;total_jobs,
+            (int) $batch-&gt;pending_jobs,
+            (int) $batch-&gt;failed_jobs,
+            (array) json_decode($batch-&gt;failed_job_ids, true),
+            $this-&gt;unserialize($batch-&gt;options),
+            CarbonImmutable::createFromTimestamp($batch-&gt;created_at, date_default_timezone_get()),
+            $batch-&gt;cancelled_at ? CarbonImmutable::createFromTimestamp($batch-&gt;cancelled_at, date_default_timezone_get()) : $batch-&gt;cancelled_at,
+            $batch-&gt;finished_at ? CarbonImmutable::createFromTimestamp($batch-&gt;finished_at, date_default_timezone_get()) : $batch-&gt;finished_at
+        );
+    }
+
+    /**
+     * Get the underlying database connection.
+     *
+     * @return \Illuminate\Database\Connection
+     */
+    public function getConnection()
+    {
+        return $this-&gt;connection;
+    }
+
+    /**
+     * Set the underlying database connection.
+     *
+     * @param  \Illuminate\Database\Connection  $connection
+     * @return void
+     */
+    public function setConnection(Connection $connection)
+    {
+        $this-&gt;connection = $connection;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Bus/Dispatcher.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Bus/Events -->
+
+</body>
+</html>

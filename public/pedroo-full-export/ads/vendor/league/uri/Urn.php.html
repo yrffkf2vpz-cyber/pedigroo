@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/uri/Urn.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * League.Uri (https://uri.thephpleague.com)
+ *
+ * (c) Ignace Nyamagana Butera &lt;nyamsprod@gmail.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+declare(strict_types=1);
+
+namespace League\Uri;
+
+use BackedEnum;
+use Closure;
+use JsonSerializable;
+use League\Uri\Contracts\Conditionable;
+use League\Uri\Contracts\Transformable;
+use League\Uri\Contracts\UriComponentInterface;
+use League\Uri\Contracts\UriInterface;
+use League\Uri\Exceptions\SyntaxError;
+use League\Uri\UriTemplate\Template;
+use Stringable;
+use Uri\Rfc3986\Uri as Rfc3986Uri;
+use Uri\WhatWg\Url as WhatWgUrl;
+
+use function is_bool;
+use function preg_match;
+use function str_replace;
+use function strtolower;
+
+/**
+ * @phpstan-type UrnSerialize array{0: array{urn: non-empty-string}, 1: array{}}
+ * @phpstan-import-type InputComponentMap from UriString
+ * @phpstan-type UrnMap array{
+ *      scheme: &#039;urn&#039;,
+ *      nid: string,
+ *      nss: string,
+ *      r_component: ?string,
+ *      q_component: ?string,
+ *      f_component: ?string,
+ *  }
+ */
+final class Urn implements Conditionable, Stringable, JsonSerializable, Transformable
+{
+    /**
+     * RFC8141 regular expression URN splitter.
+     *
+     * The regexp does not perform any look-ahead.
+     * Not all invalid URN are caught. Some
+     * post-regexp-validation checks
+     * are mandatory.
+     *
+     * @link https://datatracker.ietf.org/doc/html/rfc8141#section-2
+     *
+     * @var string
+     */
+    private const REGEXP_URN_PARTS = &#039;/^
+        urn:
+        (?&lt;nid&gt;[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?): # NID
+        (?&lt;nss&gt;.*?)                                   # NSS
+        (?&lt;frc&gt;\?\+(?&lt;rcomponent&gt;.*?))?               # r-component
+        (?&lt;fqc&gt;\?\=(?&lt;qcomponent&gt;.*?))?               # q-component
+        (?:\#(?&lt;fcomponent&gt;.*))?                      # f-component
+    $/xi&#039;;
+
+    /**
+     * RFC8141 namespace identifier regular expression.
+     *
+     * @link https://datatracker.ietf.org/doc/html/rfc8141#section-2
+     *
+     * @var string
+     */
+    private const REGEX_NID_SEQUENCE = &#039;/^[a-z0-9]([a-z0-9-]{0,30})[a-z0-9]$/xi&#039;;
+
+    /** @var non-empty-string */
+    private readonly string $uriString;
+    /** @var non-empty-string */
+    private readonly string $nid;
+    /** @var non-empty-string */
+    private readonly string $nss;
+    /** @var non-empty-string|null */
+    private readonly ?string $rComponent;
+    /** @var non-empty-string|null */
+    private readonly ?string $qComponent;
+    /** @var non-empty-string|null */
+    private readonly ?string $fComponent;
+
+    /**
+     * @param Rfc3986Uri|WhatWgUrl|BackedEnum|Stringable|string $urn the percent-encoded URN
+     */
+    public static function parse(Rfc3986Uri|WhatWgUrl|BackedEnum|Stringable|string $urn): ?Urn
+    {
+        try {
+            return self::fromString($urn);
+        } catch (SyntaxError) {
+            return null;
+        }
+    }
+
+    /**
+     * @param Rfc3986Uri|WhatWgUrl|Stringable|string $urn the percent-encoded URN
+     * @see self::fromString()
+     *
+     * @throws SyntaxError if the URN is invalid
+     */
+    public static function new(Rfc3986Uri|WhatWgUrl|Stringable|string $urn): self
+    {
+        return self::fromString($urn);
+    }
+
+    /**
+     * @param Rfc3986Uri|WhatWgUrl|BackedEnum|Stringable|string $urn the percent-encoded URN
+     *
+     * @throws SyntaxError if the URN is invalid
+     */
+    public static function fromString(Rfc3986Uri|WhatWgUrl|BackedEnum|Stringable|string $urn): self
+    {
+        $urn = match (true) {
+            $urn instanceof Rfc3986Uri =&gt; $urn-&gt;toRawString(),
+            $urn instanceof WhatWgUrl =&gt; $urn-&gt;toAsciiString(),
+            $urn instanceof BackedEnum =&gt; (string) $urn-&gt;value,
+            default =&gt; (string) $urn,
+        };
+
+        UriString::containsRfc3986Chars($urn) || throw new SyntaxError(&#039;The URN is malformed, it contains invalid characters.&#039;);
+        1 === preg_match(self::REGEXP_URN_PARTS, $urn, $matches) || throw new SyntaxError(&#039;The URN string is invalid.&#039;);
+
+        return new self(
+            nid: $matches[&#039;nid&#039;],
+            nss: $matches[&#039;nss&#039;],
+            rComponent: (isset($matches[&#039;frc&#039;]) &amp;&amp; &#039;&#039; !== $matches[&#039;frc&#039;]) ? $matches[&#039;rcomponent&#039;] : null,
+            qComponent: (isset($matches[&#039;fqc&#039;]) &amp;&amp; &#039;&#039; !== $matches[&#039;fqc&#039;]) ? $matches[&#039;qcomponent&#039;] : null,
+            fComponent: $matches[&#039;fcomponent&#039;] ?? null,
+        );
+    }
+
+    /**
+     * Create a new instance from a hash representation of the URI similar
+     * to PHP parse_url function result.
+     *
+     * @param InputComponentMap $components a hash representation of the URI similar to PHP parse_url function result
+     */
+    public static function fromComponents(array $components = []): self
+    {
+        $components += [
+            &#039;scheme&#039; =&gt; null, &#039;user&#039; =&gt; null, &#039;pass&#039; =&gt; null, &#039;host&#039; =&gt; null,
+            &#039;port&#039; =&gt; null, &#039;path&#039; =&gt; &#039;&#039;, &#039;query&#039; =&gt; null, &#039;fragment&#039; =&gt; null,
+        ];
+
+        return self::fromString(UriString::build($components));
+    }
+
+    /**
+     * @param Stringable|string $nss the percent-encoded NSS
+     *
+     * @throws SyntaxError if the URN is invalid
+     */
+    public static function fromRfc2141(BackedEnum|Stringable|string $nid, BackedEnum|Stringable|string $nss): self
+    {
+        if ($nid instanceof BackedEnum) {
+            $nid = $nid-&gt;value;
+        }
+
+        if ($nss instanceof BackedEnum) {
+            $nss = $nss-&gt;value;
+        }
+
+        return new self((string) $nid, (string) $nss);
+    }
+
+    /**
+     * @param string $nss the percent-encoded NSS
+     * @param ?string $rComponent the percent-encoded r-component
+     * @param ?string $qComponent the percent-encoded q-component
+     * @param ?string $fComponent the percent-encoded f-component
+     *
+     * @throws SyntaxError if one of the URN part is invalid
+     */
+    private function __construct(
+        string $nid,
+        string $nss,
+        ?string $rComponent = null,
+        ?string $qComponent = null,
+        ?string $fComponent = null,
+    ) {
+        (&#039;&#039; !== $nid &amp;&amp; 1 === preg_match(self::REGEX_NID_SEQUENCE, $nid)) || throw new SyntaxError(&#039;The URN is malformed, the NID is invalid.&#039;);
+        (&#039;&#039; !== $nss &amp;&amp; Encoder::isPathEncoded($nss)) || throw new SyntaxError(&#039;The URN is malformed, the NSS is invalid.&#039;);
+
+        /** @param Closure(string): ?non-empty-string $closure */
+        $validateComponent = static fn (?string $value, Closure $closure, string $name): ?string =&gt; match (true) {
+            null === $value,
+            (&#039;&#039; !== $value &amp;&amp; 1 !== preg_match(&#039;/[#?]/&#039;, $value) &amp;&amp; $closure($value)) =&gt; $value,
+            default =&gt; throw new SyntaxError(&#039;The URN is malformed, the `&#039;.$name.&#039;` component is invalid.&#039;),
+        };
+
+        $this-&gt;nid = $nid;
+        $this-&gt;nss = $nss;
+        $this-&gt;rComponent = $validateComponent($rComponent, Encoder::isPathEncoded(...), &#039;r-component&#039;);
+        $this-&gt;qComponent = $validateComponent($qComponent, Encoder::isQueryEncoded(...), &#039;q-component&#039;);
+        $this-&gt;fComponent = $validateComponent($fComponent, Encoder::isFragmentEncoded(...), &#039;f-component&#039;);
+        $this-&gt;uriString = $this-&gt;setUriString();
+    }
+
+    /**
+     * @return non-empty-string
+     */
+    private function setUriString(): string
+    {
+        $str = $this-&gt;toRfc2141();
+        if (null !== $this-&gt;rComponent) {
+            $str .= &#039;?+&#039;.$this-&gt;rComponent;
+        }
+
+        if (null !== $this-&gt;qComponent) {
+            $str .= &#039;?=&#039;.$this-&gt;qComponent;
+        }
+
+        if (null !== $this-&gt;fComponent) {
+            $str .= &#039;#&#039;.$this-&gt;fComponent;
+        }
+
+        return $str;
+    }
+
+    /**
+     * Returns the NID.
+     *
+     * @return non-empty-string
+     */
+    public function getNid(): string
+    {
+        return $this-&gt;nid;
+    }
+
+    /**
+     * Returns the percent-encoded NSS.
+     *
+     * @return non-empty-string
+     */
+    public function getNss(): string
+    {
+        return $this-&gt;nss;
+    }
+
+    /**
+     * Returns the percent-encoded r-component string or null if it is not set.
+     *
+     * @return ?non-empty-string
+     */
+    public function getRComponent(): ?string
+    {
+        return $this-&gt;rComponent;
+    }
+
+    /**
+     * Returns the percent-encoded q-component string or null if it is not set.
+     *
+     * @return ?non-empty-string
+     */
+    public function getQComponent(): ?string
+    {
+        return $this-&gt;qComponent;
+    }
+
+    /**
+     * Returns the percent-encoded f-component string or null if it is not set.
+     *
+     * @return ?non-empty-string
+     */
+    public function getFComponent(): ?string
+    {
+        return $this-&gt;fComponent;
+    }
+
+    /**
+     * Returns the RFC8141 URN string representation.
+     *
+     * @return non-empty-string
+     */
+    public function toString(): string
+    {
+        return $this-&gt;uriString;
+    }
+
+    /**
+     * Returns the RFC2141 URN string representation.
+     *
+     * @return non-empty-string
+     */
+    public function toRfc2141(): string
+    {
+        return &#039;urn:&#039;.$this-&gt;nid.&#039;:&#039;.$this-&gt;nss;
+    }
+
+    /**
+     * Returns the human-readable string representation of the URN as an IRI.
+     *
+     * @see https://datatracker.ietf.org/doc/html/rfc3987
+     */
+    public function toDisplayString(): string
+    {
+        return UriString::toIriString($this-&gt;uriString);
+    }
+
+    /**
+     * Returns the RFC8141 URN string representation.
+     *
+     * @see self::toString()
+     *
+     * @return non-empty-string
+     */
+    public function __toString(): string
+    {
+        return $this-&gt;toString();
+    }
+
+    /**
+     * Returns the RFC8141 URN string representation.
+     * @see self::toString()
+     *
+     * @return non-empty-string
+     */
+    public function jsonSerialize(): string
+    {
+        return $this-&gt;toString();
+    }
+
+    /**
+     * Returns the RFC3986 representation of the current URN.
+     *
+     * If a template URI is used the following variables as present
+     * {nid} for the namespace identifier
+     * {nss} for the namespace specific string
+     * {r_component} for the r-component without its delimiter
+     * {q_component} for the q-component without its delimiter
+     * {f_component} for the f-component without its delimiter
+     */
+    public function resolve(UriTemplate|Template|BackedEnum|string|null $template = null): UriInterface
+    {
+        return null !== $template ? Uri::fromTemplate($template, $this-&gt;toComponents()) : Uri::new($this-&gt;uriString);
+    }
+
+    public function hasRComponent(): bool
+    {
+        return null !== $this-&gt;rComponent;
+    }
+
+    public function hasQComponent(): bool
+    {
+        return null !== $this-&gt;qComponent;
+    }
+
+    public function hasFComponent(): bool
+    {
+        return null !== $this-&gt;fComponent;
+    }
+
+    public function hasOptionalComponent(): bool
+    {
+        return null !== $this-&gt;rComponent
+            || null !== $this-&gt;qComponent
+            || null !== $this-&gt;fComponent;
+    }
+
+    /**
+     * Return an instance with the specified NID.
+     *
+     * This method MUST retain the state of the current instance, and return
+     * an instance that contains the specified NID.
+     *
+     * @throws SyntaxError for invalid component or transformations
+     *                     that would result in an object in invalid state.
+     */
+    public function withNid(BackedEnum|Stringable|string $nid): self
+    {
+        if ($nid instanceof BackedEnum) {
+            $nid = $nid-&gt;value;
+        }
+
+        $nid = (string) $nid;
+
+        return $this-&gt;nid === $nid ? $this : new self(
+            nid: $nid,
+            nss: $this-&gt;nss,
+            rComponent: $this-&gt;rComponent,
+            qComponent: $this-&gt;qComponent,
+            fComponent: $this-&gt;fComponent,
+        );
+    }
+
+    /**
+     * Return an instance with the specified NSS.
+     *
+     * This method MUST retain the state of the current instance, and return
+     * an instance that contains the specified NSS.
+     *
+     * @throws SyntaxError for invalid component or transformations
+     *                     that would result in an object in invalid state.
+     */
+    public function withNss(BackedEnum|Stringable|string $nss): self
+    {
+        $nss = Encoder::encodePath($nss);
+
+        return $this-&gt;nss === $nss ? $this : new self(
+            nid: $this-&gt;nid,
+            nss: $nss,
+            rComponent: $this-&gt;rComponent,
+            qComponent: $this-&gt;qComponent,
+            fComponent: $this-&gt;fComponent,
+        );
+    }
+
+    /**
+     * Return an instance with the specified r-component.
+     *
+     * This method MUST retain the state of the current instance, and return
+     * an instance that contains the specified r-component.
+     *
+     * The component is removed if the value is null.
+     *
+     * @throws SyntaxError for invalid component or transformations
+     *                     that would result in an object in invalid state.
+     */
+    public function withRComponent(BackedEnum|Stringable|string|null $component): self
+    {
+        if ($component instanceof BackedEnum) {
+            $component = (string) $component-&gt;value;
+        }
+
+        if ($component instanceof UriComponentInterface) {
+            $component = $component-&gt;value();
+        }
+
+        if (null !== $component) {
+            $component = self::formatComponent(Encoder::encodePath($component));
+        }
+
+        return $this-&gt;rComponent === $component ? $this : new self(
+            nid: $this-&gt;nid,
+            nss: $this-&gt;nss,
+            rComponent: $component,
+            qComponent: $this-&gt;qComponent,
+            fComponent: $this-&gt;fComponent,
+        );
+    }
+
+    private static function formatComponent(?string $component): ?string
+    {
+        return null === $component ? null : str_replace([&#039;?&#039;, &#039;#&#039;], [&#039;%3F&#039;, &#039;%23&#039;], $component);
+    }
+
+    /**
+     * Return an instance with the specified q-component.
+     *
+     * This method MUST retain the state of the current instance, and return
+     * an instance that contains the specified q-component.
+     *
+     * The component is removed if the value is null.
+     *
+     * @throws SyntaxError for invalid component or transformations
+     *                     that would result in an object in invalid state.
+     */
+    public function withQComponent(BackedEnum|Stringable|string|null $component): self
+    {
+        if ($component instanceof UriComponentInterface) {
+            $component = $component-&gt;value();
+        }
+
+        $component = self::formatComponent(Encoder::encodeQueryOrFragment($component));
+
+        return $this-&gt;qComponent === $component ? $this : new self(
+            nid: $this-&gt;nid,
+            nss: $this-&gt;nss,
+            rComponent: $this-&gt;rComponent,
+            qComponent: $component,
+            fComponent: $this-&gt;fComponent,
+        );
+    }
+
+    /**
+     * Return an instance with the specified f-component.
+     *
+     * This method MUST retain the state of the current instance, and return
+     * an instance that contains the specified f-component.
+     *
+     * The component is removed if the value is null.
+     *
+     * @throws SyntaxError for invalid component or transformations
+     *                     that would result in an object in invalid state.
+     */
+    public function withFComponent(BackedEnum|Stringable|string|null $component): self
+    {
+        if ($component instanceof UriComponentInterface) {
+            $component = $component-&gt;value();
+        }
+
+        $component = self::formatComponent(Encoder::encodeQueryOrFragment($component));
+
+        return $this-&gt;fComponent === $component ? $this : new self(
+            nid: $this-&gt;nid,
+            nss: $this-&gt;nss,
+            rComponent: $this-&gt;rComponent,
+            qComponent: $this-&gt;qComponent,
+            fComponent: $component,
+        );
+    }
+
+    public function normalize(): self
+    {
+        $copy = new self(
+            nid: strtolower($this-&gt;nid),
+            nss: (string) Encoder::normalizePath($this-&gt;nss),
+            rComponent: null === $this-&gt;rComponent ? $this-&gt;rComponent : Encoder::normalizePath($this-&gt;rComponent),
+            qComponent: Encoder::normalizeQuery($this-&gt;qComponent),
+            fComponent: Encoder::normalizeFragment($this-&gt;fComponent),
+        );
+
+        return $copy-&gt;uriString === $this-&gt;uriString ? $this : $copy;
+    }
+
+    public function equals(Urn|Rfc3986Uri|WhatWgUrl|BackedEnum|Stringable|string $other, UrnComparisonMode $urnComparisonMode = UrnComparisonMode::ExcludeComponents): bool
+    {
+        if (!$other instanceof Urn) {
+            $other = self::parse($other);
+        }
+
+        return (null !== $other) &amp;&amp; match ($urnComparisonMode) {
+            UrnComparisonMode::ExcludeComponents =&gt; $other-&gt;normalize()-&gt;toRfc2141() === $this-&gt;normalize()-&gt;toRfc2141(),
+            UrnComparisonMode::IncludeComponents =&gt; $other-&gt;normalize()-&gt;toString() === $this-&gt;normalize()-&gt;toString(),
+        };
+    }
+
+    public function when(callable|bool $condition, callable $onSuccess, ?callable $onFail = null): static
+    {
+        if (!is_bool($condition)) {
+            $condition = $condition($this);
+        }
+
+        return match (true) {
+            $condition =&gt; $onSuccess($this),
+            null !== $onFail =&gt; $onFail($this),
+            default =&gt; $this,
+        } ?? $this;
+    }
+
+    public function transform(callable $callback): static
+    {
+        return $callback($this);
+    }
+
+    /**
+     * @return UrnSerialize
+     */
+    public function __serialize(): array
+    {
+        return [[&#039;urn&#039; =&gt; $this-&gt;toString()], []];
+    }
+
+    /**
+     * @param UrnSerialize $data
+     *
+     * @throws SyntaxError
+     */
+    public function __unserialize(array $data): void
+    {
+        [$properties] = $data;
+        $uri = self::fromString($properties[&#039;urn&#039;] ?? throw new SyntaxError(&#039;The `urn` property is missing from the serialized object.&#039;));
+
+        $this-&gt;nid = $uri-&gt;nid;
+        $this-&gt;nss = $uri-&gt;nss;
+        $this-&gt;rComponent = $uri-&gt;rComponent;
+        $this-&gt;qComponent = $uri-&gt;qComponent;
+        $this-&gt;fComponent = $uri-&gt;fComponent;
+        $this-&gt;uriString = $uri-&gt;uriString;
+    }
+
+    /**
+     * @return UrnMap
+     */
+    public function toComponents(): array
+    {
+        return [
+            &#039;scheme&#039; =&gt; &#039;urn&#039;,
+            &#039;nid&#039; =&gt; $this-&gt;nid,
+            &#039;nss&#039; =&gt; $this-&gt;nss,
+            &#039;r_component&#039; =&gt; $this-&gt;rComponent,
+            &#039;q_component&#039; =&gt; $this-&gt;qComponent,
+            &#039;f_component&#039; =&gt; $this-&gt;fComponent,
+        ];
+    }
+
+    /**
+     * @return UrnMap
+     */
+    public function __debugInfo(): array
+    {
+        return $this-&gt;toComponents();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/uri/composer.json -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/uri/UriTemplate -->
+
+</body>
+</html>

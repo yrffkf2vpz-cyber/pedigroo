@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Queue/DatabaseQueue.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Queue;
+
+use Illuminate\Contracts\Queue\ClearableQueue;
+use Illuminate\Contracts\Queue\Queue as QueueContract;
+use Illuminate\Database\Connection;
+use Illuminate\Queue\Jobs\DatabaseJob;
+use Illuminate\Queue\Jobs\DatabaseJobRecord;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
+use Illuminate\Support\Stringable;
+use PDO;
+
+class DatabaseQueue extends Queue implements QueueContract, ClearableQueue
+{
+    /**
+     * The database connection instance.
+     *
+     * @var \Illuminate\Database\Connection
+     */
+    protected $database;
+
+    /**
+     * The database table that holds the jobs.
+     *
+     * @var string
+     */
+    protected $table;
+
+    /**
+     * The name of the default queue.
+     *
+     * @var string
+     */
+    protected $default;
+
+    /**
+     * The expiration time of a job.
+     *
+     * @var int|null
+     */
+    protected $retryAfter = 60;
+
+    /**
+     * Create a new database queue instance.
+     *
+     * @param  \Illuminate\Database\Connection  $database
+     * @param  string  $table
+     * @param  string  $default
+     * @param  int  $retryAfter
+     * @param  bool  $dispatchAfterCommit
+     */
+    public function __construct(
+        Connection $database,
+        $table,
+        $default = &#039;default&#039;,
+        $retryAfter = 60,
+        $dispatchAfterCommit = false,
+    ) {
+        $this-&gt;table = $table;
+        $this-&gt;default = $default;
+        $this-&gt;database = $database;
+        $this-&gt;retryAfter = $retryAfter;
+        $this-&gt;dispatchAfterCommit = $dispatchAfterCommit;
+    }
+
+    /**
+     * Get the size of the queue.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function size($queue = null)
+    {
+        return $this-&gt;database-&gt;table($this-&gt;table)
+            -&gt;where(&#039;queue&#039;, $this-&gt;getQueue($queue))
+            -&gt;count();
+    }
+
+    /**
+     * Get the number of pending jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function pendingSize($queue = null)
+    {
+        return $this-&gt;database-&gt;table($this-&gt;table)
+            -&gt;where(&#039;queue&#039;, $this-&gt;getQueue($queue))
+            -&gt;whereNull(&#039;reserved_at&#039;)
+            -&gt;where(&#039;available_at&#039;, &#039;&lt;=&#039;, $this-&gt;currentTime())
+            -&gt;count();
+    }
+
+    /**
+     * Get the number of delayed jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function delayedSize($queue = null)
+    {
+        return $this-&gt;database-&gt;table($this-&gt;table)
+            -&gt;where(&#039;queue&#039;, $this-&gt;getQueue($queue))
+            -&gt;whereNull(&#039;reserved_at&#039;)
+            -&gt;where(&#039;available_at&#039;, &#039;&gt;&#039;, $this-&gt;currentTime())
+            -&gt;count();
+    }
+
+    /**
+     * Get the number of reserved jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function reservedSize($queue = null)
+    {
+        return $this-&gt;database-&gt;table($this-&gt;table)
+            -&gt;where(&#039;queue&#039;, $this-&gt;getQueue($queue))
+            -&gt;whereNotNull(&#039;reserved_at&#039;)
+            -&gt;count();
+    }
+
+    /**
+     * Get the creation timestamp of the oldest pending job, excluding delayed jobs.
+     *
+     * @param  string|null  $queue
+     * @return int|null
+     */
+    public function creationTimeOfOldestPendingJob($queue = null)
+    {
+        return $this-&gt;database-&gt;table($this-&gt;table)
+            -&gt;where(&#039;queue&#039;, $this-&gt;getQueue($queue))
+            -&gt;whereNull(&#039;reserved_at&#039;)
+            -&gt;where(&#039;available_at&#039;, &#039;&lt;=&#039;, $this-&gt;currentTime())
+            -&gt;oldest(&#039;available_at&#039;)
+            -&gt;value(&#039;available_at&#039;);
+    }
+
+    /**
+     * Push a new job onto the queue.
+     *
+     * @param  string  $job
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    public function push($job, $data = &#039;&#039;, $queue = null)
+    {
+        return $this-&gt;enqueueUsing(
+            $job,
+            $this-&gt;createPayload($job, $this-&gt;getQueue($queue), $data),
+            $queue,
+            null,
+            function ($payload, $queue) {
+                return $this-&gt;pushToDatabase($queue, $payload);
+            }
+        );
+    }
+
+    /**
+     * Push a raw payload onto the queue.
+     *
+     * @param  string  $payload
+     * @param  string|null  $queue
+     * @param  array  $options
+     * @return mixed
+     */
+    public function pushRaw($payload, $queue = null, array $options = [])
+    {
+        return $this-&gt;pushToDatabase($queue, $payload);
+    }
+
+    /**
+     * Push a new job onto the queue after (n) seconds.
+     *
+     * @param  \DateTimeInterface|\DateInterval|int  $delay
+     * @param  string  $job
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    public function later($delay, $job, $data = &#039;&#039;, $queue = null)
+    {
+        return $this-&gt;enqueueUsing(
+            $job,
+            $this-&gt;createPayload($job, $this-&gt;getQueue($queue), $data, $delay),
+            $queue,
+            $delay,
+            function ($payload, $queue, $delay) {
+                return $this-&gt;pushToDatabase($queue, $payload, $delay);
+            }
+        );
+    }
+
+    /**
+     * Push an array of jobs onto the queue.
+     *
+     * @param  array  $jobs
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    public function bulk($jobs, $data = &#039;&#039;, $queue = null)
+    {
+        $queue = $this-&gt;getQueue($queue);
+
+        $now = $this-&gt;availableAt();
+
+        return $this-&gt;database-&gt;table($this-&gt;table)-&gt;insert((new Collection((array) $jobs))-&gt;map(
+            function ($job) use ($queue, $data, $now) {
+                return $this-&gt;buildDatabaseRecord(
+                    $queue,
+                    $this-&gt;createPayload($job, $this-&gt;getQueue($queue), $data),
+                    isset($job-&gt;delay) ? $this-&gt;availableAt($job-&gt;delay) : $now,
+                );
+            }
+        )-&gt;all());
+    }
+
+    /**
+     * Release a reserved job back onto the queue after (n) seconds.
+     *
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\Jobs\DatabaseJobRecord  $job
+     * @param  int  $delay
+     * @return mixed
+     */
+    public function release($queue, $job, $delay)
+    {
+        return $this-&gt;pushToDatabase($queue, $job-&gt;payload, $delay, $job-&gt;attempts);
+    }
+
+    /**
+     * Push a raw payload to the database with a given delay of (n) seconds.
+     *
+     * @param  string|null  $queue
+     * @param  string  $payload
+     * @param  \DateTimeInterface|\DateInterval|int  $delay
+     * @param  int  $attempts
+     * @return mixed
+     */
+    protected function pushToDatabase($queue, $payload, $delay = 0, $attempts = 0)
+    {
+        return $this-&gt;database-&gt;table($this-&gt;table)-&gt;insertGetId($this-&gt;buildDatabaseRecord(
+            $this-&gt;getQueue($queue), $payload, $this-&gt;availableAt($delay), $attempts
+        ));
+    }
+
+    /**
+     * Create an array to insert for the given job.
+     *
+     * @param  string|null  $queue
+     * @param  string  $payload
+     * @param  int  $availableAt
+     * @param  int  $attempts
+     * @return array
+     */
+    protected function buildDatabaseRecord($queue, $payload, $availableAt, $attempts = 0)
+    {
+        return [
+            &#039;queue&#039; =&gt; $queue,
+            &#039;attempts&#039; =&gt; $attempts,
+            &#039;reserved_at&#039; =&gt; null,
+            &#039;available_at&#039; =&gt; $availableAt,
+            &#039;created_at&#039; =&gt; $this-&gt;currentTime(),
+            &#039;payload&#039; =&gt; $payload,
+        ];
+    }
+
+    /**
+     * Pop the next job off of the queue.
+     *
+     * @param  string|null  $queue
+     * @return \Illuminate\Contracts\Queue\Job|null
+     *
+     * @throws \Throwable
+     */
+    public function pop($queue = null)
+    {
+        $queue = $this-&gt;getQueue($queue);
+
+        return $this-&gt;database-&gt;transaction(function () use ($queue) {
+            if ($job = $this-&gt;getNextAvailableJob($queue)) {
+                return $this-&gt;marshalJob($queue, $job);
+            }
+        });
+    }
+
+    /**
+     * Get the next available job for the queue.
+     *
+     * @param  string|null  $queue
+     * @return \Illuminate\Queue\Jobs\DatabaseJobRecord|null
+     */
+    protected function getNextAvailableJob($queue)
+    {
+        $job = $this-&gt;database-&gt;table($this-&gt;table)
+            -&gt;lock($this-&gt;getLockForPopping())
+            -&gt;where(&#039;queue&#039;, $this-&gt;getQueue($queue))
+            -&gt;where(function ($query) {
+                $this-&gt;isAvailable($query);
+                $this-&gt;isReservedButExpired($query);
+            })
+            -&gt;orderBy(&#039;id&#039;, &#039;asc&#039;)
+            -&gt;first();
+
+        return $job ? new DatabaseJobRecord((object) $job) : null;
+    }
+
+    /**
+     * Get the lock required for popping the next job.
+     *
+     * @return string|bool
+     */
+    protected function getLockForPopping()
+    {
+        $databaseEngine = $this-&gt;database-&gt;getPdo()-&gt;getAttribute(PDO::ATTR_DRIVER_NAME);
+        $databaseVersion = $this-&gt;database-&gt;getConfig(&#039;version&#039;) ?? $this-&gt;database-&gt;getPdo()-&gt;getAttribute(PDO::ATTR_SERVER_VERSION);
+
+        if ((new Stringable($databaseVersion))-&gt;contains(&#039;MariaDB&#039;)) {
+            $databaseEngine = &#039;mariadb&#039;;
+            $databaseVersion = Str::before(Str::after($databaseVersion, &#039;5.5.5-&#039;), &#039;-&#039;);
+        } elseif ((new Stringable($databaseVersion))-&gt;contains([&#039;vitess&#039;, &#039;PlanetScale&#039;])) {
+            $databaseEngine = &#039;vitess&#039;;
+            $databaseVersion = Str::before($databaseVersion, &#039;-&#039;);
+        }
+
+        if (($databaseEngine === &#039;mysql&#039; &amp;&amp; version_compare($databaseVersion, &#039;8.0.1&#039;, &#039;&gt;=&#039;)) ||
+            ($databaseEngine === &#039;mariadb&#039; &amp;&amp; version_compare($databaseVersion, &#039;10.6.0&#039;, &#039;&gt;=&#039;)) ||
+            ($databaseEngine === &#039;pgsql&#039; &amp;&amp; version_compare($databaseVersion, &#039;9.5&#039;, &#039;&gt;=&#039;)) ||
+            ($databaseEngine === &#039;vitess&#039; &amp;&amp; version_compare($databaseVersion, &#039;19.0&#039;, &#039;&gt;=&#039;))) {
+            return &#039;FOR UPDATE SKIP LOCKED&#039;;
+        }
+
+        if ($databaseEngine === &#039;sqlsrv&#039;) {
+            return &#039;with(rowlock,updlock,readpast)&#039;;
+        }
+
+        return true;
+    }
+
+    /**
+     * Modify the query to check for available jobs.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return void
+     */
+    protected function isAvailable($query)
+    {
+        $query-&gt;where(function ($query) {
+            $query-&gt;whereNull(&#039;reserved_at&#039;)
+                -&gt;where(&#039;available_at&#039;, &#039;&lt;=&#039;, $this-&gt;currentTime());
+        });
+    }
+
+    /**
+     * Modify the query to check for jobs that are reserved but have expired.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return void
+     */
+    protected function isReservedButExpired($query)
+    {
+        $expiration = Carbon::now()-&gt;subSeconds($this-&gt;retryAfter)-&gt;getTimestamp();
+
+        $query-&gt;orWhere(function ($query) use ($expiration) {
+            $query-&gt;where(&#039;reserved_at&#039;, &#039;&lt;=&#039;, $expiration);
+        });
+    }
+
+    /**
+     * Marshal the reserved job into a DatabaseJob instance.
+     *
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\Jobs\DatabaseJobRecord  $job
+     * @return \Illuminate\Queue\Jobs\DatabaseJob
+     */
+    protected function marshalJob($queue, $job)
+    {
+        return new DatabaseJob(
+            $this-&gt;container,
+            $this,
+            $this-&gt;markJobAsReserved($job),
+            $this-&gt;connectionName,
+            $queue,
+        );
+    }
+
+    /**
+     * Mark the given job ID as reserved.
+     *
+     * @param  \Illuminate\Queue\Jobs\DatabaseJobRecord  $job
+     * @return \Illuminate\Queue\Jobs\DatabaseJobRecord
+     */
+    protected function markJobAsReserved($job)
+    {
+        $this-&gt;database-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $job-&gt;id)-&gt;update([
+            &#039;reserved_at&#039; =&gt; $job-&gt;touch(),
+            &#039;attempts&#039; =&gt; $job-&gt;increment(),
+        ]);
+
+        return $job;
+    }
+
+    /**
+     * Delete a reserved job from the queue.
+     *
+     * @param  string  $queue
+     * @param  string  $id
+     * @return void
+     *
+     * @throws \Throwable
+     */
+    public function deleteReserved($queue, $id)
+    {
+        $this-&gt;database-&gt;transaction(function () use ($id) {
+            if ($this-&gt;database-&gt;table($this-&gt;table)-&gt;lockForUpdate()-&gt;find($id)) {
+                $this-&gt;database-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $id)-&gt;delete();
+            }
+        });
+    }
+
+    /**
+     * Delete a reserved job from the reserved queue and release it.
+     *
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\Jobs\DatabaseJob  $job
+     * @param  int  $delay
+     * @return void
+     */
+    public function deleteAndRelease($queue, $job, $delay)
+    {
+        $this-&gt;database-&gt;transaction(function () use ($queue, $job, $delay) {
+            if ($this-&gt;database-&gt;table($this-&gt;table)-&gt;lockForUpdate()-&gt;find($job-&gt;getJobId())) {
+                $this-&gt;database-&gt;table($this-&gt;table)-&gt;where(&#039;id&#039;, $job-&gt;getJobId())-&gt;delete();
+            }
+
+            $this-&gt;release($queue, $job-&gt;getJobRecord(), $delay);
+        });
+    }
+
+    /**
+     * Delete all of the jobs from the queue.
+     *
+     * @param  string  $queue
+     * @return int
+     */
+    public function clear($queue)
+    {
+        return $this-&gt;database-&gt;table($this-&gt;table)
+            -&gt;where(&#039;queue&#039;, $this-&gt;getQueue($queue))
+            -&gt;delete();
+    }
+
+    /**
+     * Get the queue or return the default.
+     *
+     * @param  string|null  $queue
+     * @return string
+     */
+    public function getQueue($queue)
+    {
+        return $queue ?: $this-&gt;default;
+    }
+
+    /**
+     * Get the underlying database instance.
+     *
+     * @return \Illuminate\Database\Connection
+     */
+    public function getDatabase()
+    {
+        return $this-&gt;database;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Queue/DeferredQueue.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Queue/Attributes -->
+
+</body>
+</html>

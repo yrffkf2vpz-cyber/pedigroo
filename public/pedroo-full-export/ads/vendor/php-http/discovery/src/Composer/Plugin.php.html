@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-http/discovery/src/Composer/Plugin.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Http\Discovery\Composer;
+
+use Composer\Composer;
+use Composer\DependencyResolver\Pool;
+use Composer\EventDispatcher\EventSubscriberInterface;
+use Composer\Factory;
+use Composer\Installer;
+use Composer\IO\IOInterface;
+use Composer\Json\JsonFile;
+use Composer\Json\JsonManipulator;
+use Composer\Package\Locker;
+use Composer\Package\Version\VersionParser;
+use Composer\Package\Version\VersionSelector;
+use Composer\Plugin\PluginInterface;
+use Composer\Repository\InstalledRepositoryInterface;
+use Composer\Repository\RepositorySet;
+use Composer\Script\Event;
+use Composer\Script\ScriptEvents;
+use Composer\Util\Filesystem;
+use Http\Discovery\ClassDiscovery;
+
+/**
+ * Auto-installs missing implementations.
+ *
+ * When a dependency requires both this package and one of the supported `*-implementation`
+ * virtual packages, this plugin will auto-install a well-known implementation if none is
+ * found. The plugin will first look at already installed packages and figure out the
+ * preferred implementation to install based on the below stickyness rules (or on the first
+ * listed implementation if no rules match.)
+ *
+ * Don&#039;t miss updating src/Strategy/Common*Strategy.php when adding a new supported package.
+ *
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+class Plugin implements PluginInterface, EventSubscriberInterface
+{
+    /**
+     * Describes, for every supported virtual implementation, which packages
+     * provide said implementation and which extra dependencies each package
+     * requires to provide the implementation.
+     */
+    private const PROVIDE_RULES = [
+        &#039;php-http/async-client-implementation&#039; =&gt; [
+            &#039;symfony/http-client:&gt;=6.3&#039; =&gt; [&#039;guzzlehttp/promises&#039;, &#039;psr/http-factory-implementation&#039;, &#039;php-http/httplug&#039;],
+            &#039;symfony/http-client&#039; =&gt; [&#039;guzzlehttp/promises&#039;, &#039;php-http/message-factory&#039;, &#039;psr/http-factory-implementation&#039;, &#039;php-http/httplug&#039;],
+            &#039;php-http/guzzle7-adapter&#039; =&gt; [],
+            &#039;php-http/guzzle6-adapter&#039; =&gt; [],
+            &#039;php-http/curl-client&#039; =&gt; [],
+            &#039;php-http/react-adapter&#039; =&gt; [],
+        ],
+        &#039;php-http/client-implementation&#039; =&gt; [
+            &#039;symfony/http-client:&gt;=6.3&#039; =&gt; [&#039;psr/http-factory-implementation&#039;, &#039;php-http/httplug&#039;],
+            &#039;symfony/http-client&#039; =&gt; [&#039;php-http/message-factory&#039;, &#039;psr/http-factory-implementation&#039;, &#039;php-http/httplug&#039;],
+            &#039;php-http/guzzle7-adapter&#039; =&gt; [],
+            &#039;php-http/guzzle6-adapter&#039; =&gt; [],
+            &#039;php-http/cakephp-adapter&#039; =&gt; [],
+            &#039;php-http/curl-client&#039; =&gt; [],
+            &#039;php-http/react-adapter&#039; =&gt; [],
+            &#039;php-http/buzz-adapter&#039; =&gt; [],
+            &#039;php-http/artax-adapter&#039; =&gt; [],
+            &#039;kriswallsmith/buzz:^1&#039; =&gt; [],
+        ],
+        &#039;psr/http-client-implementation&#039; =&gt; [
+            &#039;symfony/http-client&#039; =&gt; [&#039;psr/http-factory-implementation&#039;, &#039;psr/http-client&#039;],
+            &#039;guzzlehttp/guzzle&#039; =&gt; [],
+            &#039;kriswallsmith/buzz:^1&#039; =&gt; [],
+        ],
+        &#039;psr/http-message-implementation&#039; =&gt; [
+            &#039;php-http/discovery&#039; =&gt; [&#039;psr/http-factory-implementation&#039;],
+        ],
+        &#039;psr/http-factory-implementation&#039; =&gt; [
+            &#039;nyholm/psr7&#039; =&gt; [],
+            &#039;guzzlehttp/psr7:&gt;=2&#039; =&gt; [],
+            &#039;slim/psr7&#039; =&gt; [],
+            &#039;laminas/laminas-diactoros&#039; =&gt; [],
+            &#039;phalcon/cphalcon:^4&#039; =&gt; [],
+            &#039;http-interop/http-factory-guzzle&#039; =&gt; [],
+            &#039;http-interop/http-factory-diactoros&#039; =&gt; [],
+            &#039;http-interop/http-factory-slim&#039; =&gt; [],
+            &#039;httpsoft/http-message&#039; =&gt; [],
+        ],
+    ];
+
+    /**
+     * Describes which package should be preferred on the left side
+     * depending on which one is already installed on the right side.
+     */
+    private const STICKYNESS_RULES = [
+        &#039;symfony/http-client&#039; =&gt; &#039;symfony/framework-bundle&#039;,
+        &#039;php-http/guzzle7-adapter&#039; =&gt; &#039;guzzlehttp/guzzle:^7&#039;,
+        &#039;php-http/guzzle6-adapter&#039; =&gt; &#039;guzzlehttp/guzzle:^6&#039;,
+        &#039;php-http/guzzle5-adapter&#039; =&gt; &#039;guzzlehttp/guzzle:^5&#039;,
+        &#039;php-http/cakephp-adapter&#039; =&gt; &#039;cakephp/cakephp&#039;,
+        &#039;php-http/react-adapter&#039; =&gt; &#039;react/event-loop&#039;,
+        &#039;php-http/buzz-adapter&#039; =&gt; &#039;kriswallsmith/buzz:^0.15.1&#039;,
+        &#039;php-http/artax-adapter&#039; =&gt; &#039;amphp/artax:^3&#039;,
+        &#039;http-interop/http-factory-guzzle&#039; =&gt; &#039;guzzlehttp/psr7:^1&#039;,
+        &#039;http-interop/http-factory-slim&#039; =&gt; &#039;slim/slim:^3&#039;,
+    ];
+
+    private const INTERFACE_MAP = [
+        &#039;php-http/async-client-implementation&#039; =&gt; [
+            &#039;Http\Client\HttpAsyncClient&#039;,
+        ],
+        &#039;php-http/client-implementation&#039; =&gt; [
+            &#039;Http\Client\HttpClient&#039;,
+        ],
+        &#039;psr/http-client-implementation&#039; =&gt; [
+            &#039;Psr\Http\Client\ClientInterface&#039;,
+        ],
+        &#039;psr/http-factory-implementation&#039; =&gt; [
+            &#039;Psr\Http\Message\RequestFactoryInterface&#039;,
+            &#039;Psr\Http\Message\ResponseFactoryInterface&#039;,
+            &#039;Psr\Http\Message\ServerRequestFactoryInterface&#039;,
+            &#039;Psr\Http\Message\StreamFactoryInterface&#039;,
+            &#039;Psr\Http\Message\UploadedFileFactoryInterface&#039;,
+            &#039;Psr\Http\Message\UriFactoryInterface&#039;,
+        ],
+    ];
+
+    public static function getSubscribedEvents(): array
+    {
+        return [
+            ScriptEvents::PRE_AUTOLOAD_DUMP =&gt; &#039;preAutoloadDump&#039;,
+            ScriptEvents::POST_UPDATE_CMD =&gt; &#039;postUpdate&#039;,
+        ];
+    }
+
+    public function activate(Composer $composer, IOInterface $io): void
+    {
+    }
+
+    public function deactivate(Composer $composer, IOInterface $io)
+    {
+    }
+
+    public function uninstall(Composer $composer, IOInterface $io)
+    {
+    }
+
+    public function postUpdate(Event $event)
+    {
+        $composer = $event-&gt;getComposer();
+        $repo = $composer-&gt;getRepositoryManager()-&gt;getLocalRepository();
+        $requires = [
+            $composer-&gt;getPackage()-&gt;getRequires(),
+            $composer-&gt;getPackage()-&gt;getDevRequires(),
+        ];
+        $pinnedAbstractions = [];
+        $pinned = $composer-&gt;getPackage()-&gt;getExtra()[&#039;discovery&#039;] ?? [];
+        foreach (self::INTERFACE_MAP as $abstraction =&gt; $interfaces) {
+            foreach (isset($pinned[$abstraction]) ? [] : $interfaces as $interface) {
+                if (!isset($pinned[$interface])) {
+                    continue 2;
+                }
+            }
+            $pinnedAbstractions[$abstraction] = true;
+        }
+
+        $missingRequires = $this-&gt;getMissingRequires($repo, $requires, &#039;project&#039; === $composer-&gt;getPackage()-&gt;getType(), $pinnedAbstractions);
+        $missingRequires = [
+            &#039;require&#039; =&gt; array_fill_keys(array_merge([], ...array_values($missingRequires[0])), &#039;*&#039;),
+            &#039;require-dev&#039; =&gt; array_fill_keys(array_merge([], ...array_values($missingRequires[1])), &#039;*&#039;),
+            &#039;remove&#039; =&gt; array_fill_keys(array_merge([], ...array_values($missingRequires[2])), &#039;*&#039;),
+        ];
+
+        if (!$missingRequires = array_filter($missingRequires)) {
+            return;
+        }
+
+        $composerJsonContents = file_get_contents(Factory::getComposerFile());
+        $this-&gt;updateComposerJson($missingRequires, $composer-&gt;getConfig()-&gt;get(&#039;sort-packages&#039;));
+
+        $installer = null;
+        // Find the composer installer, hack borrowed from symfony/flex
+        foreach (debug_backtrace(\DEBUG_BACKTRACE_PROVIDE_OBJECT) as $trace) {
+            if (isset($trace[&#039;object&#039;]) &amp;&amp; $trace[&#039;object&#039;] instanceof Installer) {
+                $installer = $trace[&#039;object&#039;];
+                break;
+            }
+        }
+
+        if (!$installer) {
+            return;
+        }
+
+        $event-&gt;stopPropagation();
+
+        $dispatcher = $composer-&gt;getEventDispatcher();
+        $disableScripts = !method_exists($dispatcher, &#039;setRunScripts&#039;) || !((array) $dispatcher)[&quot;\0*\0runScripts&quot;];
+        $composer = Factory::create($event-&gt;getIO(), null, false, $disableScripts);
+
+        /** @var Installer $installer */
+        $installer = clone $installer;
+        if (method_exists($installer, &#039;setAudit&#039;)) {
+            $trace[&#039;object&#039;]-&gt;setAudit(false);
+        }
+        // we need a clone of the installer to preserve its configuration state but with our own service objects
+        $installer-&gt;__construct(
+            $event-&gt;getIO(),
+            $composer-&gt;getConfig(),
+            $composer-&gt;getPackage(),
+            $composer-&gt;getDownloadManager(),
+            $composer-&gt;getRepositoryManager(),
+            $composer-&gt;getLocker(),
+            $composer-&gt;getInstallationManager(),
+            $composer-&gt;getEventDispatcher(),
+            $composer-&gt;getAutoloadGenerator()
+        );
+        if (method_exists($installer, &#039;setPlatformRequirementFilter&#039;)) {
+            $installer-&gt;setPlatformRequirementFilter(((array) $trace[&#039;object&#039;])[&quot;\0*\0platformRequirementFilter&quot;]);
+        }
+
+        if (0 !== $installer-&gt;run()) {
+            file_put_contents(Factory::getComposerFile(), $composerJsonContents);
+
+            return;
+        }
+
+        $versionSelector = new VersionSelector(ClassDiscovery::safeClassExists(RepositorySet::class) ? new RepositorySet() : new Pool());
+        $updateComposerJson = false;
+
+        foreach ($composer-&gt;getRepositoryManager()-&gt;getLocalRepository()-&gt;getPackages() as $package) {
+            foreach ([&#039;require&#039;, &#039;require-dev&#039;] as $key) {
+                if (!isset($missingRequires[$key][$package-&gt;getName()])) {
+                    continue;
+                }
+                $updateComposerJson = true;
+                $missingRequires[$key][$package-&gt;getName()] = $versionSelector-&gt;findRecommendedRequireVersion($package);
+            }
+        }
+
+        if ($updateComposerJson) {
+            $this-&gt;updateComposerJson($missingRequires, $composer-&gt;getConfig()-&gt;get(&#039;sort-packages&#039;));
+            $this-&gt;updateComposerLock($composer, $event-&gt;getIO());
+        }
+    }
+
+    public function getMissingRequires(InstalledRepositoryInterface $repo, array $requires, bool $isProject, array $pinnedAbstractions): array
+    {
+        $allPackages = [];
+        $devPackages = method_exists($repo, &#039;getDevPackageNames&#039;) ? array_fill_keys($repo-&gt;getDevPackageNames(), true) : [];
+
+        // One must require &quot;php-http/discovery&quot;
+        // to opt-in for auto-installation of virtual package implementations
+        if (!isset($requires[0][&#039;php-http/discovery&#039;])) {
+            $requires = [[], []];
+        }
+
+        foreach ($repo-&gt;getPackages() as $package) {
+            $allPackages[$package-&gt;getName()] = true;
+
+            if (1 &lt; \count($names = $package-&gt;getNames(false))) {
+                $allPackages += array_fill_keys($names, false);
+
+                if (isset($devPackages[$package-&gt;getName()])) {
+                    $devPackages += $names;
+                }
+            }
+
+            if (isset($package-&gt;getRequires()[&#039;php-http/discovery&#039;])) {
+                $requires[(int) isset($devPackages[$package-&gt;getName()])] += $package-&gt;getRequires();
+            }
+        }
+
+        $missingRequires = [[], [], []];
+        $versionParser = new VersionParser();
+
+        if (ClassDiscovery::safeClassExists(\Phalcon\Http\Message\RequestFactory::class, false)) {
+            $missingRequires[0][&#039;psr/http-factory-implementation&#039;] = [];
+            $missingRequires[1][&#039;psr/http-factory-implementation&#039;] = [];
+        }
+
+        foreach ($requires as $dev =&gt; $rules) {
+            $abstractions = [];
+            $rules = array_intersect_key(self::PROVIDE_RULES, $rules);
+
+            while ($rules) {
+                $abstraction = key($rules);
+
+                if (isset($pinnedAbstractions[$abstraction])) {
+                    unset($rules[$abstraction]);
+                    continue;
+                }
+
+                $abstractions[] = $abstraction;
+
+                foreach (array_shift($rules) as $candidate =&gt; $deps) {
+                    [$candidate, $version] = explode(&#039;:&#039;, $candidate, 2) + [1 =&gt; null];
+
+                    if (!isset($allPackages[$candidate])) {
+                        continue;
+                    }
+                    if (null !== $version &amp;&amp; !$repo-&gt;findPackage($candidate, $versionParser-&gt;parseConstraints($version))) {
+                        continue;
+                    }
+                    if ($isProject &amp;&amp; !$dev &amp;&amp; isset($devPackages[$candidate])) {
+                        $missingRequires[0][$abstraction] = [$candidate];
+                        $missingRequires[2][$abstraction] = [$candidate];
+                    } else {
+                        $missingRequires[$dev][$abstraction] = [];
+                    }
+
+                    foreach ($deps as $dep) {
+                        if (isset(self::PROVIDE_RULES[$dep])) {
+                            $rules[$dep] = self::PROVIDE_RULES[$dep];
+                        } elseif (!isset($allPackages[$dep])) {
+                            $missingRequires[$dev][$abstraction][] = $dep;
+                        } elseif ($isProject &amp;&amp; !$dev &amp;&amp; isset($devPackages[$dep])) {
+                            $missingRequires[0][$abstraction][] = $dep;
+                            $missingRequires[2][$abstraction][] = $dep;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            while ($abstractions) {
+                $abstraction = array_shift($abstractions);
+
+                if (isset($missingRequires[$dev][$abstraction])) {
+                    continue;
+                }
+                $candidates = self::PROVIDE_RULES[$abstraction];
+
+                foreach ($candidates as $candidate =&gt; $deps) {
+                    [$candidate, $version] = explode(&#039;:&#039;, $candidate, 2) + [1 =&gt; null];
+
+                    if (null !== $version &amp;&amp; !$repo-&gt;findPackage($candidate, $versionParser-&gt;parseConstraints($version))) {
+                        continue;
+                    }
+                    if (isset($allPackages[$candidate]) &amp;&amp; (!$isProject || $dev || !isset($devPackages[$candidate]))) {
+                        continue 2;
+                    }
+                }
+
+                foreach (array_intersect_key(self::STICKYNESS_RULES, $candidates) as $candidate =&gt; $stickyRule) {
+                    [$stickyName, $stickyVersion] = explode(&#039;:&#039;, $stickyRule, 2) + [1 =&gt; null];
+                    if (!isset($allPackages[$stickyName]) || ($isProject &amp;&amp; !$dev &amp;&amp; isset($devPackages[$stickyName]))) {
+                        continue;
+                    }
+                    if (null !== $stickyVersion &amp;&amp; !$repo-&gt;findPackage($stickyName, $versionParser-&gt;parseConstraints($stickyVersion))) {
+                        continue;
+                    }
+
+                    $candidates = [$candidate =&gt; $candidates[$candidate]];
+                    break;
+                }
+
+                $dep = key($candidates);
+                [$dep] = explode(&#039;:&#039;, $dep, 2);
+                $missingRequires[$dev][$abstraction] = [$dep];
+
+                if ($isProject &amp;&amp; !$dev &amp;&amp; isset($devPackages[$dep])) {
+                    $missingRequires[2][$abstraction][] = $dep;
+                }
+            }
+        }
+
+        $missingRequires[1] = array_diff_key($missingRequires[1], $missingRequires[0]);
+
+        return $missingRequires;
+    }
+
+    public function preAutoloadDump(Event $event)
+    {
+        $filesystem = new Filesystem();
+        // Double realpath() on purpose, see https://bugs.php.net/72738
+        $vendorDir = $filesystem-&gt;normalizePath(realpath(realpath($event-&gt;getComposer()-&gt;getConfig()-&gt;get(&#039;vendor-dir&#039;))));
+        $filesystem-&gt;ensureDirectoryExists($vendorDir.&#039;/composer&#039;);
+        $pinned = $event-&gt;getComposer()-&gt;getPackage()-&gt;getExtra()[&#039;discovery&#039;] ?? [];
+        $candidates = [];
+
+        $allInterfaces = array_merge(...array_values(self::INTERFACE_MAP));
+        foreach ($pinned as $abstraction =&gt; $class) {
+            if (isset(self::INTERFACE_MAP[$abstraction])) {
+                $interfaces = self::INTERFACE_MAP[$abstraction];
+            } elseif (false !== $k = array_search($abstraction, $allInterfaces, true)) {
+                $interfaces = [$allInterfaces[$k]];
+            } else {
+                throw new \UnexpectedValueException(sprintf(&#039;Invalid &quot;extra.discovery&quot; pinned in composer.json: &quot;%s&quot; is not one of [&quot;%s&quot;].&#039;, $abstraction, implode(&#039;&quot;, &quot;&#039;, array_keys(self::INTERFACE_MAP))));
+            }
+
+            foreach ($interfaces as $interface) {
+                $candidates[] = sprintf(&quot;case %s: return [[&#039;class&#039; =&gt; %s]];\n&quot;, var_export($interface, true), var_export($class, true));
+            }
+        }
+
+        $file = $vendorDir.&#039;/composer/GeneratedDiscoveryStrategy.php&#039;;
+
+        if (!$candidates) {
+            if (file_exists($file)) {
+                unlink($file);
+            }
+
+            return;
+        }
+
+        $candidates = implode(&#039;            &#039;, $candidates);
+        $code = &lt;&lt;&lt;EOPHP
+&lt;?php
+
+namespace Http\Discovery\Strategy;
+
+class GeneratedDiscoveryStrategy implements DiscoveryStrategy
+{
+    public static function getCandidates(\$type)
+    {
+        switch (\$type) {
+            $candidates
+            default: return [];
+        }
+    }
+}
+
+EOPHP
+        ;
+
+        if (!file_exists($file) || $code !== file_get_contents($file)) {
+            file_put_contents($file, $code);
+        }
+
+        $rootPackage = $event-&gt;getComposer()-&gt;getPackage();
+        $autoload = $rootPackage-&gt;getAutoload();
+        $autoload[&#039;classmap&#039;][] = $vendorDir.&#039;/composer/GeneratedDiscoveryStrategy.php&#039;;
+        $rootPackage-&gt;setAutoload($autoload);
+    }
+
+    private function updateComposerJson(array $missingRequires, bool $sortPackages)
+    {
+        $file = Factory::getComposerFile();
+        $contents = file_get_contents($file);
+
+        $manipulator = new JsonManipulator($contents);
+
+        foreach ($missingRequires as $key =&gt; $packages) {
+            foreach ($packages as $package =&gt; $constraint) {
+                if (&#039;remove&#039; === $key) {
+                    $manipulator-&gt;removeSubNode(&#039;require-dev&#039;, $package);
+                } else {
+                    $manipulator-&gt;addLink($key, $package, $constraint, $sortPackages);
+                }
+            }
+        }
+
+        file_put_contents($file, $manipulator-&gt;getContents());
+    }
+
+    private function updateComposerLock(Composer $composer, IOInterface $io)
+    {
+        if (false === $composer-&gt;getConfig()-&gt;get(&#039;lock&#039;)) {
+            return;
+        }
+
+        $lock = substr(Factory::getComposerFile(), 0, -4).&#039;lock&#039;;
+        $composerJson = file_get_contents(Factory::getComposerFile());
+        $lockFile = new JsonFile($lock, null, $io);
+        $locker = ClassDiscovery::safeClassExists(RepositorySet::class)
+            ? new Locker($io, $lockFile, $composer-&gt;getInstallationManager(), $composerJson)
+            : new Locker($io, $lockFile, $composer-&gt;getRepositoryManager(), $composer-&gt;getInstallationManager(), $composerJson);
+
+        if (!$locker-&gt;isLocked()) {
+            return;
+        }
+
+        $lockData = $locker-&gt;getLockData();
+        $lockData[&#039;content-hash&#039;] = Locker::getContentHash($composerJson);
+        $lockFile-&gt;write($lockData);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-http/discovery/src/Exception.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-http/discovery/src/Exception -->
+
+</body>
+</html>

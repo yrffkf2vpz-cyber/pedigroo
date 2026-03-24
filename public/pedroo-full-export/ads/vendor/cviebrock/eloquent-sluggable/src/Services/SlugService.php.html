@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/cviebrock/eloquent-sluggable/src/Services/SlugService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Cviebrock\EloquentSluggable\Services;
+
+use Cocur\Slugify\Slugify;
+use Cviebrock\EloquentSluggable\Sluggable;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+
+/**
+ * Class SlugService.
+ */
+class SlugService
+{
+    final public function __construct() {}
+
+    /**
+     * @var Model
+     * @var Sluggable
+     */
+    protected $model;
+
+    /**
+     * Slug the current model.
+     */
+    public function slug(Model $model, bool $force = false): bool
+    {
+        $this-&gt;setModel($model);
+
+        $attributes = [];
+
+        foreach ($this-&gt;model-&gt;sluggable() as $attribute =&gt; $config) {
+            if (is_numeric($attribute)) {
+                $attribute = $config;
+                $config = $this-&gt;getConfiguration();
+            } else {
+                $config = $this-&gt;getConfiguration($config);
+            }
+
+            $slug = $this-&gt;buildSlug($attribute, $config, $force);
+
+            if ($slug !== null) {
+                $this-&gt;model-&gt;setAttribute($attribute, $slug);
+                $attributes[] = $attribute;
+            }
+        }
+
+        return $this-&gt;model-&gt;isDirty($attributes);
+    }
+
+    /**
+     * Get the sluggable configuration for the current model,
+     * including default values where not specified.
+     */
+    public function getConfiguration(array $overrides = []): array
+    {
+        $defaultConfig = config(&#039;sluggable&#039;, []);
+
+        return array_merge($defaultConfig, $overrides);
+    }
+
+    /**
+     * Build the slug for the given attribute of the current model.
+     */
+    public function buildSlug(string $attribute, array $config, bool $force = false): ?string
+    {
+        $slug = $this-&gt;model-&gt;getAttribute($attribute);
+
+        if ($force || $this-&gt;needsSlugging($attribute, $config)) {
+            $source = $this-&gt;getSlugSource($config[&#039;source&#039;]);
+
+            if ($source || is_numeric($source)) {
+                $slug = $this-&gt;generateSlug($source, $config, $attribute);
+                $slug = $this-&gt;validateSlug($slug, $config, $attribute);
+                $slug = $this-&gt;makeSlugUnique($slug, $config, $attribute);
+            }
+        }
+
+        return $slug;
+    }
+
+    /**
+     * Determines whether the model needs slugging.
+     */
+    protected function needsSlugging(string $attribute, array $config): bool
+    {
+        $value = $this-&gt;model-&gt;getAttributeValue($attribute);
+
+        if (
+            $config[&#039;onUpdate&#039;] === true
+            || $value === null
+            || trim($value) === &#039;&#039;
+        ) {
+            return true;
+        }
+
+        if ($this-&gt;model-&gt;isDirty($attribute)) {
+            return false;
+        }
+
+        return !$this-&gt;model-&gt;exists;
+    }
+
+    /**
+     * Get the source string for the slug.
+     *
+     * @param mixed $from
+     */
+    protected function getSlugSource($from): string
+    {
+        if (is_null($from)) {
+            return $this-&gt;model-&gt;__toString();
+        }
+
+        $sourceStrings = array_map(function ($key) {
+            $value = data_get($this-&gt;model, $key, $this-&gt;model-&gt;getAttribute($key));
+            if (is_bool($value)) {
+                $value = (int) $value;
+            }
+
+            return $value;
+        }, (array) $from);
+
+        return implode(&#039; &#039;, $sourceStrings);
+    }
+
+    /**
+     * Generate a slug from the given source string.
+     *
+     * @throws \UnexpectedValueException
+     */
+    protected function generateSlug(string $source, array $config, string $attribute): string
+    {
+        $separator = $config[&#039;separator&#039;];
+        $method = $config[&#039;method&#039;];
+        $maxLength = $config[&#039;maxLength&#039;];
+        $maxLengthKeepWords = $config[&#039;maxLengthKeepWords&#039;];
+
+        if ($method === null) {
+            $slugEngine = $this-&gt;getSlugEngine($attribute, $config);
+            $slug = $slugEngine-&gt;slugify($source, $separator);
+        } elseif (is_callable($method)) {
+            $slug = $method($source, $separator);
+        } else {
+            throw new \UnexpectedValueException(&#039;Sluggable &quot;method&quot; for &#039; . get_class($this-&gt;model) . &#039;:&#039; . $attribute . &#039; is not callable nor null.&#039;);
+        }
+
+        $len = mb_strlen($slug);
+        if (is_string($slug) &amp;&amp; $maxLength &amp;&amp; $len &gt; $maxLength) {
+            $reverseOffset = $maxLength - $len;
+            $lastSeparatorPos = mb_strrpos($slug, $separator, $reverseOffset);
+            if ($maxLengthKeepWords &amp;&amp; $lastSeparatorPos !== false) {
+                $slug = mb_substr($slug, 0, $lastSeparatorPos);
+            } else {
+                $slug = trim(mb_substr($slug, 0, $maxLength), $separator);
+            }
+        }
+
+        return $slug;
+    }
+
+    /**
+     * Return a class that has a `slugify()` method, used to convert
+     * strings into slugs.
+     */
+    protected function getSlugEngine(string $attribute, array $config): Slugify
+    {
+        static $slugEngines = [];
+
+        $key = get_class($this-&gt;model) . &#039;.&#039; . $attribute;
+
+        if (!array_key_exists($key, $slugEngines)) {
+            $engine = new Slugify($config[&#039;slugEngineOptions&#039;]);
+            $engine = $this-&gt;model-&gt;customizeSlugEngine($engine, $attribute);
+
+            $slugEngines[$key] = $engine;
+        }
+
+        return $slugEngines[$key];
+    }
+
+    /**
+     * Checks that the given slug is not a reserved word.
+     *
+     * @throws \UnexpectedValueException
+     */
+    protected function validateSlug(string $slug, array $config, string $attribute): string
+    {
+        $separator = $config[&#039;separator&#039;];
+        $reserved = $config[&#039;reserved&#039;];
+
+        if ($reserved === null) {
+            return $slug;
+        }
+
+        // check for reserved names
+        if ($reserved instanceof \Closure) {
+            $reserved = $reserved($this-&gt;model);
+        }
+
+        if (is_array($reserved)) {
+            if (in_array($slug, $reserved)) {
+                $method = $config[&#039;uniqueSuffix&#039;];
+                $firstSuffix = $config[&#039;firstUniqueSuffix&#039;];
+
+                if ($method === null) {
+                    $suffix = $this-&gt;generateSuffix($slug, $separator, collect($reserved), $firstSuffix);
+                } elseif (is_callable($method)) {
+                    $suffix = $method($slug, $separator, collect($reserved), $firstSuffix);
+                } else {
+                    throw new \UnexpectedValueException(&#039;Sluggable &quot;uniqueSuffix&quot; for &#039; . get_class($this-&gt;model) . &#039;:&#039; . $attribute . &#039; is not null, or a closure.&#039;);
+                }
+
+                return $slug . $separator . $suffix;
+            }
+
+            return $slug;
+        }
+
+        throw new \UnexpectedValueException(&#039;Sluggable &quot;reserved&quot; for &#039; . get_class($this-&gt;model) . &#039;:&#039; . $attribute . &#039; is not null, an array, or a closure that returns null/array.&#039;);
+    }
+
+    /**
+     * Checks if the slug should be unique, and makes it so if needed.
+     *
+     * @throws \UnexpectedValueException
+     */
+    protected function makeSlugUnique(string $slug, array $config, string $attribute): string
+    {
+        if (!$config[&#039;unique&#039;]) {
+            return $slug;
+        }
+
+        $separator = $config[&#039;separator&#039;];
+
+        // find all models where the slug is like the current one
+        $list = $this-&gt;getExistingSlugs($slug, $attribute, $config);
+
+        // if ...
+        // 	a) the list is empty, or
+        // 	b) our slug isn&#039;t in the list
+        // ... we are okay
+        if (
+            $list-&gt;count() === 0
+            || $list-&gt;contains($slug) === false
+        ) {
+            return $slug;
+        }
+
+        // if our slug is in the list, but
+        // 	a) it&#039;s for our model, or
+        //  b) it looks like a suffixed version of our slug
+        // ... we are also okay (use the current slug)
+        if ($list-&gt;has($this-&gt;model-&gt;getKey())) {
+            $currentSlug = $list-&gt;get($this-&gt;model-&gt;getKey());
+
+            if (
+                $currentSlug === $slug
+                || !$slug || strpos($currentSlug, $slug) === 0
+            ) {
+                return $currentSlug;
+            }
+        }
+
+        $method = $config[&#039;uniqueSuffix&#039;];
+        $firstSuffix = $config[&#039;firstUniqueSuffix&#039;];
+
+        if ($method === null) {
+            $suffix = $this-&gt;generateSuffix($slug, $separator, $list, $firstSuffix);
+        } elseif (is_callable($method)) {
+            $suffix = $method($slug, $separator, $list, $firstSuffix);
+        } else {
+            throw new \UnexpectedValueException(&#039;Sluggable &quot;uniqueSuffix&quot; for &#039; . get_class($this-&gt;model) . &#039;:&#039; . $attribute . &#039; is not null, or a closure.&#039;);
+        }
+
+        return $slug . $separator . $suffix;
+    }
+
+    /**
+     * Generate a unique suffix for the given slug (and list of existing, &quot;similar&quot; slugs.
+     *
+     * @param mixed $firstSuffix
+     */
+    protected function generateSuffix(string $slug, string $separator, Collection $list, $firstSuffix): string
+    {
+        $len = strlen($slug . $separator);
+
+        // If the slug already exists, but belongs to
+        // our model, return the current suffix.
+        if ($list-&gt;search($slug) === $this-&gt;model-&gt;getKey()) {
+            $suffix = explode($separator, $slug);
+
+            return end($suffix);
+        }
+
+        $list-&gt;transform(function ($value, $key) use ($len) {
+            return (int) substr($value, $len);
+        });
+
+        $max = $list-&gt;max();
+
+        // return one more than the largest value,
+        // or return the first suffix the first time
+        return (string) ($max === 0 ? $firstSuffix : $max + 1);
+    }
+
+    /**
+     * Get all existing slugs that are similar to the given slug.
+     */
+    protected function getExistingSlugs(string $slug, string $attribute, array $config): Collection
+    {
+        $includeTrashed = $config[&#039;includeTrashed&#039;];
+
+        $query = $this-&gt;model-&gt;newQuery()
+            -&gt;findSimilarSlugs($attribute, $config, $slug);
+
+        // use the model scope to find similar slugs
+        $query-&gt;withUniqueSlugConstraints($this-&gt;model, $attribute, $config, $slug);
+
+        // include trashed models if required
+        if ($includeTrashed &amp;&amp; $this-&gt;usesSoftDeleting()) {
+            $query-&gt;withTrashed();
+        }
+
+        // get the list of all matching slugs
+        $results = $query
+            -&gt;withoutEagerLoads()
+            -&gt;select([$attribute, $this-&gt;model-&gt;getQualifiedKeyName()])
+            -&gt;get()
+            -&gt;toBase();
+
+        // key the results and return
+        return $results-&gt;pluck($attribute, $this-&gt;model-&gt;getKeyName());
+    }
+
+    /**
+     * Does this model use softDeleting?
+     */
+    protected function usesSoftDeleting(): bool
+    {
+        return method_exists($this-&gt;model, &#039;bootSoftDeletes&#039;);
+    }
+
+    /**
+     * Generate a unique slug for a given string.
+     *
+     * @throws \InvalidArgumentException
+     * @throws \UnexpectedValueException
+     */
+    public static function createSlug(Model|string $model, string $attribute, string $fromString, ?array $config = null): string
+    {
+        if (is_string($model)) {
+            $model = new $model();
+        }
+
+        $instance = (new static())-&gt;setModel($model);
+
+        if ($config === null) {
+            $config = Arr::get($model-&gt;sluggable(), $attribute);
+            if ($config === null) {
+                $modelClass = get_class($model);
+
+                throw new \InvalidArgumentException(&quot;Argument 2 passed to SlugService::createSlug [&#039;{$attribute}&#039;] is not a valid slug attribute for model {$modelClass}.&quot;);
+            }
+        }
+
+        $config = $instance-&gt;getConfiguration($config);
+
+        $slug = $instance-&gt;generateSlug($fromString, $config, $attribute);
+        $slug = $instance-&gt;validateSlug($slug, $config, $attribute);
+        $slug = $instance-&gt;makeSlugUnique($slug, $config, $attribute);
+
+        return $slug;
+    }
+
+    /**
+     * @return $this
+     */
+    public function setModel(Model $model): self
+    {
+        $this-&gt;model = $model;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/cviebrock/eloquent-sluggable/src/Sluggable.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/cviebrock/eloquent-sluggable/tests -->
+
+</body>
+</html>

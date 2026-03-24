@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/EndpointV2/EndpointV2Middleware.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\EndpointV2;
+
+use Aws\Api\Operation;
+use Aws\Api\Service;
+use Aws\Auth\Exception\UnresolvedAuthSchemeException;
+use Aws\CommandInterface;
+use Aws\MetricsBuilder;
+use Closure;
+use GuzzleHttp\Promise\Promise;
+use Aws\EndpointV2\Ruleset\RulesetEndpoint;
+use function JmesPath\search;
+
+/**
+ * Handles endpoint rule evaluation and endpoint resolution.
+ *
+ * IMPORTANT: this middleware must be added to the &quot;build&quot; step.
+ * Specifically, it must precede the &#039;builder&#039; step.
+ *
+ * @internal
+ */
+class EndpointV2Middleware
+{
+    const ACCOUNT_ID_PARAM = &#039;AccountId&#039;;
+    const ACCOUNT_ID_ENDPOINT_MODE_PARAM = &#039;AccountIdEndpointMode&#039;;
+    private static $validAuthSchemes = [
+        &#039;sigv4&#039; =&gt; &#039;v4&#039;,
+        &#039;sigv4a&#039; =&gt; &#039;v4a&#039;,
+        &#039;none&#039; =&gt; &#039;anonymous&#039;,
+        &#039;bearer&#039; =&gt; &#039;bearer&#039;,
+        &#039;sigv4-s3express&#039; =&gt; &#039;v4-s3express&#039;
+    ];
+
+    /** @var callable */
+    private $nextHandler;
+
+    /** @var EndpointProviderV2 */
+    private $endpointProvider;
+
+    /** @var Service */
+    private $api;
+
+    /** @var array */
+    private $clientArgs;
+
+    /** @var Closure */
+    private $credentialProvider;
+
+    /**
+     * Create a middleware wrapper function
+     *
+     * @param EndpointProviderV2 $endpointProvider
+     * @param Service $api
+     * @param array $args
+     * @param callable $credentialProvider
+     *
+     * @return Closure
+     */
+    public static function wrap(
+        EndpointProviderV2 $endpointProvider,
+        Service $api,
+        array $args,
+        callable $credentialProvider
+    ) : Closure
+    {
+        return function (callable $handler) use ($endpointProvider, $api, $args, $credentialProvider) {
+            return new self($handler, $endpointProvider, $api, $args, $credentialProvider);
+        };
+    }
+
+    /**
+     * @param callable $nextHandler
+     * @param EndpointProviderV2 $endpointProvider
+     * @param Service $api
+     * @param array $args
+     */
+    public function __construct(
+        callable $nextHandler,
+        EndpointProviderV2 $endpointProvider,
+        Service $api,
+        array $args,
+        ?callable $credentialProvider = null
+    )
+    {
+        $this-&gt;nextHandler = $nextHandler;
+        $this-&gt;endpointProvider = $endpointProvider;
+        $this-&gt;api = $api;
+        $this-&gt;clientArgs = $args;
+        $this-&gt;credentialProvider = $credentialProvider;
+    }
+
+    /**
+     * @param CommandInterface $command
+     *
+     * @return Promise
+     */
+    public function __invoke(CommandInterface $command)
+    {
+        $nextHandler = $this-&gt;nextHandler;
+        $operation = $this-&gt;api-&gt;getOperation($command-&gt;getName());
+        $commandArgs = $command-&gt;toArray();
+        $providerArgs = $this-&gt;resolveArgs($commandArgs, $operation);
+
+        $endpoint = $this-&gt;endpointProvider-&gt;resolveEndpoint($providerArgs);
+
+        $this-&gt;appendEndpointMetrics($providerArgs, $endpoint, $command);
+
+        if (!empty($authSchemes = $endpoint-&gt;getProperty(&#039;authSchemes&#039;))) {
+            $this-&gt;applyAuthScheme(
+                $authSchemes,
+                $command
+            );
+        }
+
+        return $nextHandler($command, $endpoint);
+    }
+
+    /**
+     * Resolves client, context params, static context params and endpoint provider
+     * arguments provided at the command level.
+     *
+     * @param array $commandArgs
+     * @param Operation $operation
+     *
+     * @return array
+     */
+    private function resolveArgs(array $commandArgs, Operation $operation): array
+    {
+        $rulesetParams = $this-&gt;endpointProvider-&gt;getRuleset()-&gt;getParameters();
+
+        if (isset($rulesetParams[self::ACCOUNT_ID_PARAM])
+            &amp;&amp; isset($rulesetParams[self::ACCOUNT_ID_ENDPOINT_MODE_PARAM])) {
+            $this-&gt;clientArgs[self::ACCOUNT_ID_PARAM] = $this-&gt;resolveAccountId();
+        }
+
+        $endpointCommandArgs = $this-&gt;filterEndpointCommandArgs(
+            $rulesetParams,
+            $commandArgs
+        );
+        $staticContextParams = $this-&gt;bindStaticContextParams(
+            $operation-&gt;getStaticContextParams()
+        );
+        $contextParams = $this-&gt;bindContextParams(
+            $commandArgs, $operation-&gt;getContextParams()
+        );
+        $operationContextParams = $this-&gt;bindOperationContextParams(
+            $commandArgs,
+            $operation-&gt;getOperationContextParams()
+        );
+
+        return array_merge(
+            $this-&gt;clientArgs,
+            $operationContextParams,
+            $contextParams,
+            $staticContextParams,
+            $endpointCommandArgs
+        );
+    }
+
+    /**
+     * Compares Ruleset parameters against Command arguments
+     * to create a mapping of arguments to pass into the
+     * endpoint provider for endpoint resolution.
+     *
+     * @param array $rulesetParams
+     * @param array $commandArgs
+     * @return array
+     */
+    private function filterEndpointCommandArgs(
+        array $rulesetParams,
+        array $commandArgs
+    ): array
+    {
+        $endpointMiddlewareOpts = [
+            &#039;@use_dual_stack_endpoint&#039; =&gt; &#039;UseDualStack&#039;,
+            &#039;@use_accelerate_endpoint&#039; =&gt; &#039;Accelerate&#039;,
+            &#039;@use_path_style_endpoint&#039; =&gt; &#039;ForcePathStyle&#039;
+        ];
+
+        $filteredArgs = [];
+
+        foreach($rulesetParams as $name =&gt; $value) {
+            if (isset($commandArgs[$name])) {
+                if (!empty($value-&gt;getBuiltIn())) {
+                    continue;
+                }
+                $filteredArgs[$name] = $commandArgs[$name];
+            }
+        }
+
+        if ($this-&gt;api-&gt;getServiceName() === &#039;s3&#039;) {
+            foreach($endpointMiddlewareOpts as $optionName =&gt; $newValue) {
+                if (isset($commandArgs[$optionName])) {
+                    $filteredArgs[$newValue] = $commandArgs[$optionName];
+                }
+            }
+        }
+
+        return $filteredArgs;
+    }
+
+    /**
+     * Binds static context params to their corresponding values.
+     *
+     * @param $staticContextParams
+     *
+     * @return array
+     */
+    private function bindStaticContextParams($staticContextParams): array
+    {
+        $scopedParams = [];
+
+        forEach($staticContextParams as $paramName =&gt; $paramValue) {
+            $scopedParams[$paramName] = $paramValue[&#039;value&#039;];
+        }
+
+        return $scopedParams;
+    }
+
+    /**
+     * Binds context params to their corresponding values found in
+     * command arguments.
+     *
+     * @param array $commandArgs
+     * @param array $contextParams
+     *
+     * @return array
+     */
+    private function bindContextParams(
+        array $commandArgs,
+        array $contextParams
+    ): array
+    {
+        $scopedParams = [];
+
+        foreach($contextParams as $name =&gt; $spec) {
+            if (isset($commandArgs[$spec[&#039;shape&#039;]])) {
+                $scopedParams[$name] = $commandArgs[$spec[&#039;shape&#039;]];
+            }
+        }
+
+        return $scopedParams;
+    }
+
+    /**
+     * Binds context params to their corresponding values found in
+     * command arguments.
+     *
+     * @param array $commandArgs
+     * @param array $contextParams
+     *
+     * @return array
+     */
+    private function bindOperationContextParams(
+        array $commandArgs,
+        array $operationContextParams
+    ): array
+    {
+        $scopedParams = [];
+
+        foreach($operationContextParams as $name =&gt; $spec) {
+            $scopedValue = search($spec[&#039;path&#039;], $commandArgs);
+
+            if ($scopedValue) {
+                $scopedParams[$name] = $scopedValue;
+            }
+        }
+
+        return $scopedParams;
+    }
+
+    /**
+     * Applies resolved auth schemes to the command object.
+     *
+     * @param $authSchemes
+     * @param $command
+     *
+     * @return void
+     */
+    private function applyAuthScheme(
+        array $authSchemes,
+        CommandInterface $command
+    ): void
+    {
+        $authScheme = $this-&gt;resolveAuthScheme($authSchemes);
+
+        $command[&#039;@context&#039;][&#039;signature_version&#039;] = $authScheme[&#039;version&#039;];
+
+        if (isset($authScheme[&#039;name&#039;])) {
+            $command[&#039;@context&#039;][&#039;signing_service&#039;] = $authScheme[&#039;name&#039;];
+        }
+
+        if (isset($authScheme[&#039;region&#039;])) {
+            $command[&#039;@context&#039;][&#039;signing_region&#039;] = $authScheme[&#039;region&#039;];
+        } elseif (isset($authScheme[&#039;signingRegionSet&#039;])) {
+            $command[&#039;@context&#039;][&#039;signing_region_set&#039;] = $authScheme[&#039;signingRegionSet&#039;];
+        }
+    }
+
+    /**
+     * Returns the first compatible auth scheme in an endpoint object&#039;s
+     * auth schemes.
+     *
+     * @param array $authSchemes
+     *
+     * @return array
+     */
+    private function resolveAuthScheme(array $authSchemes): array
+    {
+        $invalidAuthSchemes = [];
+
+        foreach($authSchemes as $authScheme) {
+            if ($this-&gt;isValidAuthScheme($authScheme[&#039;name&#039;])) {
+                return $this-&gt;normalizeAuthScheme($authScheme);
+            }
+            $invalidAuthSchemes[$authScheme[&#039;name&#039;]] = false;
+        }
+
+        $invalidAuthSchemesString = &#039;`&#039; . implode(
+            &#039;`, `&#039;,
+            array_keys($invalidAuthSchemes))
+            . &#039;`&#039;;
+        $validAuthSchemesString = &#039;`&#039;
+            . implode(&#039;`, `&#039;, array_keys(
+                array_diff_key(self::$validAuthSchemes, $invalidAuthSchemes))
+            )
+            . &#039;`&#039;;
+        throw new UnresolvedAuthSchemeException(
+            &quot;This operation requests {$invalidAuthSchemesString}&quot;
+            . &quot; auth schemes, but the client currently supports {$validAuthSchemesString}.&quot;
+        );
+    }
+
+    /**
+     * Normalizes an auth scheme&#039;s name, signing region or signing region set
+     * to the auth keys recognized by the SDK.
+     *
+     * @param array $authScheme
+     * @return array
+     */
+    private function normalizeAuthScheme(array $authScheme): array
+    {
+        /*
+            sigv4a will contain a regionSet property. which is guaranteed to be `*`
+            for now.  The SigV4 class handles this automatically for now. It seems
+            complexity will be added here in the future.
+       */
+        $normalizedAuthScheme = [];
+
+        if (isset($authScheme[&#039;disableDoubleEncoding&#039;])
+            &amp;&amp; $authScheme[&#039;disableDoubleEncoding&#039;] === true
+            &amp;&amp; $authScheme[&#039;name&#039;] !== &#039;sigv4a&#039;
+            &amp;&amp; $authScheme[&#039;name&#039;] !== &#039;sigv4-s3express&#039;
+        ) {
+            $normalizedAuthScheme[&#039;version&#039;] = &#039;s3v4&#039;;
+        } else {
+            $normalizedAuthScheme[&#039;version&#039;] = self::$validAuthSchemes[$authScheme[&#039;name&#039;]];
+        }
+
+        $normalizedAuthScheme[&#039;name&#039;] = $authScheme[&#039;signingName&#039;] ?? null;
+        $normalizedAuthScheme[&#039;region&#039;] = $authScheme[&#039;signingRegion&#039;] ?? null;
+        $normalizedAuthScheme[&#039;signingRegionSet&#039;] = $authScheme[&#039;signingRegionSet&#039;] ?? null;
+
+        return $normalizedAuthScheme;
+    }
+
+    private function isValidAuthScheme($signatureVersion): bool
+    {
+        if (isset(self::$validAuthSchemes[$signatureVersion])) {
+              if ($signatureVersion === &#039;sigv4a&#039;) {
+                  return extension_loaded(&#039;awscrt&#039;);
+              }
+              return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * This method tries to resolve an `AccountId` parameter from a resolved identity.
+     * We will just perform this operation if the parameter `AccountId` is part of the ruleset parameters and
+     * `AccountIdEndpointMode` is not disabled, otherwise, we will ignore it.
+     *
+     * @return null|string
+     */
+    private function resolveAccountId(): ?string
+    {
+        if (isset($this-&gt;clientArgs[self::ACCOUNT_ID_ENDPOINT_MODE_PARAM])
+            &amp;&amp; $this-&gt;clientArgs[self::ACCOUNT_ID_ENDPOINT_MODE_PARAM] === &#039;disabled&#039;) {
+            return null;
+        }
+
+        if (is_null($this-&gt;credentialProvider)) {
+            return null;
+        }
+
+        $identityProviderFn = $this-&gt;credentialProvider;
+        $identity = $identityProviderFn()-&gt;wait();
+
+        return $identity-&gt;getAccountId();
+    }
+
+    private function appendEndpointMetrics(
+        array $providerArgs,
+        RulesetEndpoint $endpoint,
+        CommandInterface $command
+    ): void
+    {
+        // Resolved AccountId Metric
+        if (!empty($providerArgs[self::ACCOUNT_ID_PARAM])) {
+            $command-&gt;getMetricsBuilder()-&gt;append(MetricsBuilder::RESOLVED_ACCOUNT_ID);
+        }
+        // AccountIdMode Metric
+        if(!empty($providerArgs[self::ACCOUNT_ID_ENDPOINT_MODE_PARAM])) {
+            $command-&gt;getMetricsBuilder()-&gt;identifyMetricByValueAndAppend(
+                &#039;account_id_endpoint_mode&#039;,
+                $providerArgs[self::ACCOUNT_ID_ENDPOINT_MODE_PARAM]
+            );
+        }
+
+        // AccountId Endpoint Metric
+        $command-&gt;getMetricsBuilder()-&gt;identifyMetricByValueAndAppend(
+            &#039;account_id_endpoint&#039;,
+            $endpoint-&gt;getUrl()
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/EndpointV2/EndpointV2SerializerTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/EndpointV2/Rule -->
+
+</body>
+</html>

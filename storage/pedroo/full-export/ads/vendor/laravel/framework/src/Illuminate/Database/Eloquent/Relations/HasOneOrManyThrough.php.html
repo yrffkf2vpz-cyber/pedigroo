@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Relations/HasOneOrManyThrough.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+use Closure;
+use Illuminate\Contracts\Support\Arrayable;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Database\Eloquent\Relations\Concerns\InteractsWithDictionary;
+use Illuminate\Database\Query\Grammars\MySqlGrammar;
+use Illuminate\Database\UniqueConstraintViolationException;
+
+/**
+ * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+ * @template TIntermediateModel of \Illuminate\Database\Eloquent\Model
+ * @template TDeclaringModel of \Illuminate\Database\Eloquent\Model
+ * @template TResult
+ *
+ * @extends \Illuminate\Database\Eloquent\Relations\Relation&lt;TRelatedModel, TIntermediateModel, TResult&gt;
+ */
+abstract class HasOneOrManyThrough extends Relation
+{
+    use InteractsWithDictionary;
+
+    /**
+     * The &quot;through&quot; parent model instance.
+     *
+     * @var TIntermediateModel
+     */
+    protected $throughParent;
+
+    /**
+     * The far parent model instance.
+     *
+     * @var TDeclaringModel
+     */
+    protected $farParent;
+
+    /**
+     * The near key on the relationship.
+     *
+     * @var string
+     */
+    protected $firstKey;
+
+    /**
+     * The far key on the relationship.
+     *
+     * @var string
+     */
+    protected $secondKey;
+
+    /**
+     * The local key on the relationship.
+     *
+     * @var string
+     */
+    protected $localKey;
+
+    /**
+     * The local key on the intermediary model.
+     *
+     * @var string
+     */
+    protected $secondLocalKey;
+
+    /**
+     * Create a new has many through relationship instance.
+     *
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;  $query
+     * @param  TDeclaringModel  $farParent
+     * @param  TIntermediateModel  $throughParent
+     * @param  string  $firstKey
+     * @param  string  $secondKey
+     * @param  string  $localKey
+     * @param  string  $secondLocalKey
+     */
+    public function __construct(Builder $query, Model $farParent, Model $throughParent, $firstKey, $secondKey, $localKey, $secondLocalKey)
+    {
+        $this-&gt;localKey = $localKey;
+        $this-&gt;firstKey = $firstKey;
+        $this-&gt;secondKey = $secondKey;
+        $this-&gt;farParent = $farParent;
+        $this-&gt;throughParent = $throughParent;
+        $this-&gt;secondLocalKey = $secondLocalKey;
+
+        parent::__construct($query, $throughParent);
+    }
+
+    /**
+     * Set the base constraints on the relation query.
+     *
+     * @return void
+     */
+    public function addConstraints()
+    {
+        $query = $this-&gt;getRelationQuery();
+
+        $localValue = $this-&gt;farParent[$this-&gt;localKey];
+
+        $this-&gt;performJoin($query);
+
+        if (static::$constraints) {
+            $query-&gt;where($this-&gt;getQualifiedFirstKeyName(), &#039;=&#039;, $localValue);
+        }
+    }
+
+    /**
+     * Set the join clause on the query.
+     *
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;|null  $query
+     * @return void
+     */
+    protected function performJoin(?Builder $query = null)
+    {
+        $query ??= $this-&gt;query;
+
+        $farKey = $this-&gt;getQualifiedFarKeyName();
+
+        $query-&gt;join($this-&gt;throughParent-&gt;getTable(), $this-&gt;getQualifiedParentKeyName(), &#039;=&#039;, $farKey);
+
+        if ($this-&gt;throughParentSoftDeletes()) {
+            $query-&gt;withGlobalScope(&#039;SoftDeletableHasManyThrough&#039;, function ($query) {
+                $query-&gt;whereNull($this-&gt;throughParent-&gt;getQualifiedDeletedAtColumn());
+            });
+        }
+    }
+
+    /**
+     * Get the fully qualified parent key name.
+     *
+     * @return string
+     */
+    public function getQualifiedParentKeyName()
+    {
+        return $this-&gt;parent-&gt;qualifyColumn($this-&gt;secondLocalKey);
+    }
+
+    /**
+     * Determine whether &quot;through&quot; parent of the relation uses Soft Deletes.
+     *
+     * @return bool
+     */
+    public function throughParentSoftDeletes()
+    {
+        return $this-&gt;throughParent::isSoftDeletable();
+    }
+
+    /**
+     * Indicate that trashed &quot;through&quot; parents should be included in the query.
+     *
+     * @return $this
+     */
+    public function withTrashedParents()
+    {
+        $this-&gt;query-&gt;withoutGlobalScope(&#039;SoftDeletableHasManyThrough&#039;);
+
+        return $this;
+    }
+
+    /** @inheritDoc */
+    public function addEagerConstraints(array $models)
+    {
+        $whereIn = $this-&gt;whereInMethod($this-&gt;farParent, $this-&gt;localKey);
+
+        $this-&gt;whereInEager(
+            $whereIn,
+            $this-&gt;getQualifiedFirstKeyName(),
+            $this-&gt;getKeys($models, $this-&gt;localKey),
+            $this-&gt;getRelationQuery(),
+        );
+    }
+
+    /**
+     * Build model dictionary keyed by the relation&#039;s foreign key.
+     *
+     * @param  \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt;  $results
+     * @return array&lt;array&lt;TRelatedModel&gt;&gt;
+     */
+    protected function buildDictionary(EloquentCollection $results)
+    {
+        $dictionary = [];
+
+        // First we will create a dictionary of models keyed by the foreign key of the
+        // relationship as this will allow us to quickly access all of the related
+        // models without having to do nested looping which will be quite slow.
+        foreach ($results as $result) {
+            $dictionary[$result-&gt;laravel_through_key][] = $result;
+        }
+
+        return $dictionary;
+    }
+
+    /**
+     * Get the first related model record matching the attributes or instantiate it.
+     *
+     * @param  array  $attributes
+     * @param  array  $values
+     * @return TRelatedModel
+     */
+    public function firstOrNew(array $attributes = [], array $values = [])
+    {
+        if (! is_null($instance = $this-&gt;where($attributes)-&gt;first())) {
+            return $instance;
+        }
+
+        return $this-&gt;related-&gt;newInstance(array_merge($attributes, $values));
+    }
+
+    /**
+     * Get the first record matching the attributes. If the record is not found, create it.
+     *
+     * @param  array  $attributes
+     * @param  array  $values
+     * @return TRelatedModel
+     */
+    public function firstOrCreate(array $attributes = [], array $values = [])
+    {
+        if (! is_null($instance = (clone $this)-&gt;where($attributes)-&gt;first())) {
+            return $instance;
+        }
+
+        return $this-&gt;createOrFirst(array_merge($attributes, $values));
+    }
+
+    /**
+     * Attempt to create the record. If a unique constraint violation occurs, attempt to find the matching record.
+     *
+     * @param  array  $attributes
+     * @param  array  $values
+     * @return TRelatedModel
+     */
+    public function createOrFirst(array $attributes = [], array $values = [])
+    {
+        try {
+            return $this-&gt;getQuery()-&gt;withSavepointIfNeeded(fn () =&gt; $this-&gt;create(array_merge($attributes, $values)));
+        } catch (UniqueConstraintViolationException $exception) {
+            return $this-&gt;where($attributes)-&gt;first() ?? throw $exception;
+        }
+    }
+
+    /**
+     * Create or update a related record matching the attributes, and fill it with values.
+     *
+     * @param  array  $attributes
+     * @param  array  $values
+     * @return TRelatedModel
+     */
+    public function updateOrCreate(array $attributes, array $values = [])
+    {
+        return tap($this-&gt;firstOrCreate($attributes, $values), function ($instance) use ($values) {
+            if (! $instance-&gt;wasRecentlyCreated) {
+                $instance-&gt;fill($values)-&gt;save();
+            }
+        });
+    }
+
+    /**
+     * Add a basic where clause to the query, and return the first result.
+     *
+     * @param  \Closure|string|array  $column
+     * @param  mixed  $operator
+     * @param  mixed  $value
+     * @param  string  $boolean
+     * @return TRelatedModel|null
+     */
+    public function firstWhere($column, $operator = null, $value = null, $boolean = &#039;and&#039;)
+    {
+        return $this-&gt;where($column, $operator, $value, $boolean)-&gt;first();
+    }
+
+    /**
+     * Execute the query and get the first related model.
+     *
+     * @param  array  $columns
+     * @return TRelatedModel|null
+     */
+    public function first($columns = [&#039;*&#039;])
+    {
+        $results = $this-&gt;limit(1)-&gt;get($columns);
+
+        return count($results) &gt; 0 ? $results-&gt;first() : null;
+    }
+
+    /**
+     * Execute the query and get the first result or throw an exception.
+     *
+     * @param  array  $columns
+     * @return TRelatedModel
+     *
+     * @throws \Illuminate\Database\Eloquent\ModelNotFoundException&lt;TRelatedModel&gt;
+     */
+    public function firstOrFail($columns = [&#039;*&#039;])
+    {
+        if (! is_null($model = $this-&gt;first($columns))) {
+            return $model;
+        }
+
+        throw (new ModelNotFoundException)-&gt;setModel(get_class($this-&gt;related));
+    }
+
+    /**
+     * Execute the query and get the first result or call a callback.
+     *
+     * @template TValue
+     *
+     * @param  (\Closure(): TValue)|list&lt;string&gt;  $columns
+     * @param  (\Closure(): TValue)|null  $callback
+     * @return TRelatedModel|TValue
+     */
+    public function firstOr($columns = [&#039;*&#039;], ?Closure $callback = null)
+    {
+        if ($columns instanceof Closure) {
+            $callback = $columns;
+
+            $columns = [&#039;*&#039;];
+        }
+
+        if (! is_null($model = $this-&gt;first($columns))) {
+            return $model;
+        }
+
+        return $callback();
+    }
+
+    /**
+     * Find a related model by its primary key.
+     *
+     * @param  mixed  $id
+     * @param  array  $columns
+     * @return ($id is (\Illuminate\Contracts\Support\Arrayable&lt;array-key, mixed&gt;|array&lt;mixed&gt;) ? \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt; : TRelatedModel|null)
+     */
+    public function find($id, $columns = [&#039;*&#039;])
+    {
+        if (is_array($id) || $id instanceof Arrayable) {
+            return $this-&gt;findMany($id, $columns);
+        }
+
+        return $this-&gt;where(
+            $this-&gt;getRelated()-&gt;getQualifiedKeyName(), &#039;=&#039;, $id
+        )-&gt;first($columns);
+    }
+
+    /**
+     * Find a sole related model by its primary key.
+     *
+     * @param  mixed  $id
+     * @param  array  $columns
+     * @return TRelatedModel
+     *
+     * @throws \Illuminate\Database\Eloquent\ModelNotFoundException&lt;TRelatedModel&gt;
+     * @throws \Illuminate\Database\MultipleRecordsFoundException
+     */
+    public function findSole($id, $columns = [&#039;*&#039;])
+    {
+        return $this-&gt;where(
+            $this-&gt;getRelated()-&gt;getQualifiedKeyName(), &#039;=&#039;, $id
+        )-&gt;sole($columns);
+    }
+
+    /**
+     * Find multiple related models by their primary keys.
+     *
+     * @param  \Illuminate\Contracts\Support\Arrayable|array  $ids
+     * @param  array  $columns
+     * @return \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt;
+     */
+    public function findMany($ids, $columns = [&#039;*&#039;])
+    {
+        $ids = $ids instanceof Arrayable ? $ids-&gt;toArray() : $ids;
+
+        if (empty($ids)) {
+            return $this-&gt;getRelated()-&gt;newCollection();
+        }
+
+        return $this-&gt;whereIn(
+            $this-&gt;getRelated()-&gt;getQualifiedKeyName(), $ids
+        )-&gt;get($columns);
+    }
+
+    /**
+     * Find a related model by its primary key or throw an exception.
+     *
+     * @param  mixed  $id
+     * @param  array  $columns
+     * @return ($id is (\Illuminate\Contracts\Support\Arrayable&lt;array-key, mixed&gt;|array&lt;mixed&gt;) ? \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt; : TRelatedModel)
+     *
+     * @throws \Illuminate\Database\Eloquent\ModelNotFoundException&lt;TRelatedModel&gt;
+     */
+    public function findOrFail($id, $columns = [&#039;*&#039;])
+    {
+        $result = $this-&gt;find($id, $columns);
+
+        $id = $id instanceof Arrayable ? $id-&gt;toArray() : $id;
+
+        if (is_array($id)) {
+            if (count($result) === count(array_unique($id))) {
+                return $result;
+            }
+        } elseif (! is_null($result)) {
+            return $result;
+        }
+
+        throw (new ModelNotFoundException)-&gt;setModel(get_class($this-&gt;related), $id);
+    }
+
+    /**
+     * Find a related model by its primary key or call a callback.
+     *
+     * @template TValue
+     *
+     * @param  mixed  $id
+     * @param  (\Closure(): TValue)|list&lt;string&gt;|string  $columns
+     * @param  (\Closure(): TValue)|null  $callback
+     * @return (
+     *     $id is (\Illuminate\Contracts\Support\Arrayable&lt;array-key, mixed&gt;|array&lt;mixed&gt;)
+     *     ? \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt;|TValue
+     *     : TRelatedModel|TValue
+     * )
+     */
+    public function findOr($id, $columns = [&#039;*&#039;], ?Closure $callback = null)
+    {
+        if ($columns instanceof Closure) {
+            $callback = $columns;
+
+            $columns = [&#039;*&#039;];
+        }
+
+        $result = $this-&gt;find($id, $columns);
+
+        $id = $id instanceof Arrayable ? $id-&gt;toArray() : $id;
+
+        if (is_array($id)) {
+            if (count($result) === count(array_unique($id))) {
+                return $result;
+            }
+        } elseif (! is_null($result)) {
+            return $result;
+        }
+
+        return $callback();
+    }
+
+    /** @inheritDoc */
+    public function get($columns = [&#039;*&#039;])
+    {
+        $builder = $this-&gt;prepareQueryBuilder($columns);
+
+        $models = $builder-&gt;getModels();
+
+        // If we actually found models we will also eager load any relationships that
+        // have been specified as needing to be eager loaded. This will solve the
+        // n + 1 query problem for the developer and also increase performance.
+        if (count($models) &gt; 0) {
+            $models = $builder-&gt;eagerLoadRelations($models);
+        }
+
+        return $this-&gt;query-&gt;applyAfterQueryCallbacks(
+            $this-&gt;related-&gt;newCollection($models)
+        );
+    }
+
+    /**
+     * Get a paginator for the &quot;select&quot; statement.
+     *
+     * @param  int|null  $perPage
+     * @param  array  $columns
+     * @param  string  $pageName
+     * @param  int|null  $page
+     * @return \Illuminate\Pagination\LengthAwarePaginator
+     */
+    public function paginate($perPage = null, $columns = [&#039;*&#039;], $pageName = &#039;page&#039;, $page = null)
+    {
+        $this-&gt;query-&gt;addSelect($this-&gt;shouldSelect($columns));
+
+        return $this-&gt;query-&gt;paginate($perPage, $columns, $pageName, $page);
+    }
+
+    /**
+     * Paginate the given query into a simple paginator.
+     *
+     * @param  int|null  $perPage
+     * @param  array  $columns
+     * @param  string  $pageName
+     * @param  int|null  $page
+     * @return \Illuminate\Contracts\Pagination\Paginator
+     */
+    public function simplePaginate($perPage = null, $columns = [&#039;*&#039;], $pageName = &#039;page&#039;, $page = null)
+    {
+        $this-&gt;query-&gt;addSelect($this-&gt;shouldSelect($columns));
+
+        return $this-&gt;query-&gt;simplePaginate($perPage, $columns, $pageName, $page);
+    }
+
+    /**
+     * Paginate the given query into a cursor paginator.
+     *
+     * @param  int|null  $perPage
+     * @param  array  $columns
+     * @param  string  $cursorName
+     * @param  string|null  $cursor
+     * @return \Illuminate\Contracts\Pagination\CursorPaginator
+     */
+    public function cursorPaginate($perPage = null, $columns = [&#039;*&#039;], $cursorName = &#039;cursor&#039;, $cursor = null)
+    {
+        $this-&gt;query-&gt;addSelect($this-&gt;shouldSelect($columns));
+
+        return $this-&gt;query-&gt;cursorPaginate($perPage, $columns, $cursorName, $cursor);
+    }
+
+    /**
+     * Set the select clause for the relation query.
+     *
+     * @param  array  $columns
+     * @return array
+     */
+    protected function shouldSelect(array $columns = [&#039;*&#039;])
+    {
+        if ($columns == [&#039;*&#039;]) {
+            $columns = [$this-&gt;related-&gt;qualifyColumn(&#039;*&#039;)];
+        }
+
+        return array_merge($columns, [$this-&gt;getQualifiedFirstKeyName().&#039; as laravel_through_key&#039;]);
+    }
+
+    /**
+     * Chunk the results of the query.
+     *
+     * @param  int  $count
+     * @param  callable  $callback
+     * @return bool
+     */
+    public function chunk($count, callable $callback)
+    {
+        return $this-&gt;prepareQueryBuilder()-&gt;chunk($count, $callback);
+    }
+
+    /**
+     * Chunk the results of a query by comparing numeric IDs.
+     *
+     * @param  int  $count
+     * @param  callable  $callback
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return bool
+     */
+    public function chunkById($count, callable $callback, $column = null, $alias = null)
+    {
+        $column ??= $this-&gt;getRelated()-&gt;getQualifiedKeyName();
+
+        $alias ??= $this-&gt;getRelated()-&gt;getKeyName();
+
+        return $this-&gt;prepareQueryBuilder()-&gt;chunkById($count, $callback, $column, $alias);
+    }
+
+    /**
+     * Chunk the results of a query by comparing IDs in descending order.
+     *
+     * @param  int  $count
+     * @param  callable  $callback
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return bool
+     */
+    public function chunkByIdDesc($count, callable $callback, $column = null, $alias = null)
+    {
+        $column ??= $this-&gt;getRelated()-&gt;getQualifiedKeyName();
+
+        $alias ??= $this-&gt;getRelated()-&gt;getKeyName();
+
+        return $this-&gt;prepareQueryBuilder()-&gt;chunkByIdDesc($count, $callback, $column, $alias);
+    }
+
+    /**
+     * Execute a callback over each item while chunking by ID.
+     *
+     * @param  callable  $callback
+     * @param  int  $count
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return bool
+     */
+    public function eachById(callable $callback, $count = 1000, $column = null, $alias = null)
+    {
+        $column = $column ?? $this-&gt;getRelated()-&gt;getQualifiedKeyName();
+
+        $alias = $alias ?? $this-&gt;getRelated()-&gt;getKeyName();
+
+        return $this-&gt;prepareQueryBuilder()-&gt;eachById($callback, $count, $column, $alias);
+    }
+
+    /**
+     * Get a generator for the given query.
+     *
+     * @return \Illuminate\Support\LazyCollection&lt;int, TRelatedModel&gt;
+     */
+    public function cursor()
+    {
+        return $this-&gt;prepareQueryBuilder()-&gt;cursor();
+    }
+
+    /**
+     * Execute a callback over each item while chunking.
+     *
+     * @param  callable  $callback
+     * @param  int  $count
+     * @return bool
+     */
+    public function each(callable $callback, $count = 1000)
+    {
+        return $this-&gt;chunk($count, function ($results) use ($callback) {
+            foreach ($results as $key =&gt; $value) {
+                if ($callback($value, $key) === false) {
+                    return false;
+                }
+            }
+        });
+    }
+
+    /**
+     * Query lazily, by chunks of the given size.
+     *
+     * @param  int  $chunkSize
+     * @return \Illuminate\Support\LazyCollection&lt;int, TRelatedModel&gt;
+     */
+    public function lazy($chunkSize = 1000)
+    {
+        return $this-&gt;prepareQueryBuilder()-&gt;lazy($chunkSize);
+    }
+
+    /**
+     * Query lazily, by chunking the results of a query by comparing IDs.
+     *
+     * @param  int  $chunkSize
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return \Illuminate\Support\LazyCollection&lt;int, TRelatedModel&gt;
+     */
+    public function lazyById($chunkSize = 1000, $column = null, $alias = null)
+    {
+        $column ??= $this-&gt;getRelated()-&gt;getQualifiedKeyName();
+
+        $alias ??= $this-&gt;getRelated()-&gt;getKeyName();
+
+        return $this-&gt;prepareQueryBuilder()-&gt;lazyById($chunkSize, $column, $alias);
+    }
+
+    /**
+     * Query lazily, by chunking the results of a query by comparing IDs in descending order.
+     *
+     * @param  int  $chunkSize
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return \Illuminate\Support\LazyCollection&lt;int, TRelatedModel&gt;
+     */
+    public function lazyByIdDesc($chunkSize = 1000, $column = null, $alias = null)
+    {
+        $column ??= $this-&gt;getRelated()-&gt;getQualifiedKeyName();
+
+        $alias ??= $this-&gt;getRelated()-&gt;getKeyName();
+
+        return $this-&gt;prepareQueryBuilder()-&gt;lazyByIdDesc($chunkSize, $column, $alias);
+    }
+
+    /**
+     * Prepare the query builder for query execution.
+     *
+     * @param  array  $columns
+     * @return \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;
+     */
+    protected function prepareQueryBuilder($columns = [&#039;*&#039;])
+    {
+        $builder = $this-&gt;query-&gt;applyScopes();
+
+        return $builder-&gt;addSelect(
+            $this-&gt;shouldSelect($builder-&gt;getQuery()-&gt;columns ? [] : $columns)
+        );
+    }
+
+    /** @inheritDoc */
+    public function getRelationExistenceQuery(Builder $query, Builder $parentQuery, $columns = [&#039;*&#039;])
+    {
+        if ($parentQuery-&gt;getQuery()-&gt;from === $query-&gt;getQuery()-&gt;from) {
+            return $this-&gt;getRelationExistenceQueryForSelfRelation($query, $parentQuery, $columns);
+        }
+
+        if ($parentQuery-&gt;getQuery()-&gt;from === $this-&gt;throughParent-&gt;getTable()) {
+            return $this-&gt;getRelationExistenceQueryForThroughSelfRelation($query, $parentQuery, $columns);
+        }
+
+        $this-&gt;performJoin($query);
+
+        return $query-&gt;select($columns)-&gt;whereColumn(
+            $this-&gt;getQualifiedLocalKeyName(), &#039;=&#039;, $this-&gt;getQualifiedFirstKeyName()
+        );
+    }
+
+    /**
+     * Add the constraints for a relationship query on the same table.
+     *
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;  $query
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TDeclaringModel&gt;  $parentQuery
+     * @param  mixed  $columns
+     * @return \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;
+     */
+    public function getRelationExistenceQueryForSelfRelation(Builder $query, Builder $parentQuery, $columns = [&#039;*&#039;])
+    {
+        $query-&gt;from($query-&gt;getModel()-&gt;getTable().&#039; as &#039;.$hash = $this-&gt;getRelationCountHash());
+
+        $query-&gt;join($this-&gt;throughParent-&gt;getTable(), $this-&gt;getQualifiedParentKeyName(), &#039;=&#039;, $hash.&#039;.&#039;.$this-&gt;secondKey);
+
+        if ($this-&gt;throughParentSoftDeletes()) {
+            $query-&gt;whereNull($this-&gt;throughParent-&gt;getQualifiedDeletedAtColumn());
+        }
+
+        $query-&gt;getModel()-&gt;setTable($hash);
+
+        return $query-&gt;select($columns)-&gt;whereColumn(
+            $parentQuery-&gt;getQuery()-&gt;from.&#039;.&#039;.$this-&gt;localKey, &#039;=&#039;, $this-&gt;getQualifiedFirstKeyName()
+        );
+    }
+
+    /**
+     * Add the constraints for a relationship query on the same table as the through parent.
+     *
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;  $query
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TDeclaringModel&gt;  $parentQuery
+     * @param  mixed  $columns
+     * @return \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;
+     */
+    public function getRelationExistenceQueryForThroughSelfRelation(Builder $query, Builder $parentQuery, $columns = [&#039;*&#039;])
+    {
+        $table = $this-&gt;throughParent-&gt;getTable().&#039; as &#039;.$hash = $this-&gt;getRelationCountHash();
+
+        $query-&gt;join($table, $hash.&#039;.&#039;.$this-&gt;secondLocalKey, &#039;=&#039;, $this-&gt;getQualifiedFarKeyName());
+
+        if ($this-&gt;throughParentSoftDeletes()) {
+            $query-&gt;whereNull($hash.&#039;.&#039;.$this-&gt;throughParent-&gt;getDeletedAtColumn());
+        }
+
+        return $query-&gt;select($columns)-&gt;whereColumn(
+            $parentQuery-&gt;getQuery()-&gt;from.&#039;.&#039;.$this-&gt;localKey, &#039;=&#039;, $hash.&#039;.&#039;.$this-&gt;firstKey
+        );
+    }
+
+    /**
+     * Alias to set the &quot;limit&quot; value of the query.
+     *
+     * @param  int  $value
+     * @return $this
+     */
+    public function take($value)
+    {
+        return $this-&gt;limit($value);
+    }
+
+    /**
+     * Set the &quot;limit&quot; value of the query.
+     *
+     * @param  int  $value
+     * @return $this
+     */
+    public function limit($value)
+    {
+        if ($this-&gt;farParent-&gt;exists) {
+            $this-&gt;query-&gt;limit($value);
+        } else {
+            $column = $this-&gt;getQualifiedFirstKeyName();
+
+            $grammar = $this-&gt;query-&gt;getQuery()-&gt;getGrammar();
+
+            if ($grammar instanceof MySqlGrammar &amp;&amp; $grammar-&gt;useLegacyGroupLimit($this-&gt;query-&gt;getQuery())) {
+                $column = &#039;laravel_through_key&#039;;
+            }
+
+            $this-&gt;query-&gt;groupLimit($value, $column);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Get the qualified foreign key on the related model.
+     *
+     * @return string
+     */
+    public function getQualifiedFarKeyName()
+    {
+        return $this-&gt;getQualifiedForeignKeyName();
+    }
+
+    /**
+     * Get the foreign key on the &quot;through&quot; model.
+     *
+     * @return string
+     */
+    public function getFirstKeyName()
+    {
+        return $this-&gt;firstKey;
+    }
+
+    /**
+     * Get the qualified foreign key on the &quot;through&quot; model.
+     *
+     * @return string
+     */
+    public function getQualifiedFirstKeyName()
+    {
+        return $this-&gt;throughParent-&gt;qualifyColumn($this-&gt;firstKey);
+    }
+
+    /**
+     * Get the foreign key on the related model.
+     *
+     * @return string
+     */
+    public function getForeignKeyName()
+    {
+        return $this-&gt;secondKey;
+    }
+
+    /**
+     * Get the qualified foreign key on the related model.
+     *
+     * @return string
+     */
+    public function getQualifiedForeignKeyName()
+    {
+        return $this-&gt;related-&gt;qualifyColumn($this-&gt;secondKey);
+    }
+
+    /**
+     * Get the local key on the far parent model.
+     *
+     * @return string
+     */
+    public function getLocalKeyName()
+    {
+        return $this-&gt;localKey;
+    }
+
+    /**
+     * Get the qualified local key on the far parent model.
+     *
+     * @return string
+     */
+    public function getQualifiedLocalKeyName()
+    {
+        return $this-&gt;farParent-&gt;qualifyColumn($this-&gt;localKey);
+    }
+
+    /**
+     * Get the local key on the intermediary model.
+     *
+     * @return string
+     */
+    public function getSecondLocalKeyName()
+    {
+        return $this-&gt;secondLocalKey;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Relations/HasOneThrough.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Relations/Concerns -->
+
+</body>
+</html>

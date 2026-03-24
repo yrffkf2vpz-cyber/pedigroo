@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-di/php-di/src/Definition/Source/AttributeBasedAutowiring.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace DI\Definition\Source;
+
+use DI\Attribute\Inject;
+use DI\Attribute\Injectable;
+use DI\Definition\Exception\InvalidAttribute;
+use DI\Definition\ObjectDefinition;
+use DI\Definition\ObjectDefinition\MethodInjection;
+use DI\Definition\ObjectDefinition\PropertyInjection;
+use DI\Definition\Reference;
+use InvalidArgumentException;
+use ReflectionClass;
+use ReflectionMethod;
+use ReflectionNamedType;
+use ReflectionParameter;
+use ReflectionProperty;
+use Throwable;
+
+/**
+ * Provides DI definitions by reading PHP 8 attributes such as #[Inject] and #[Injectable].
+ *
+ * This source automatically includes the reflection source.
+ *
+ * @author Matthieu Napoli &lt;matthieu@mnapoli.fr&gt;
+ */
+class AttributeBasedAutowiring implements DefinitionSource, Autowiring
+{
+    /**
+     * @throws InvalidAttribute
+     */
+    public function autowire(string $name, ?ObjectDefinition $definition = null) : ?ObjectDefinition
+    {
+        $className = $definition ? $definition-&gt;getClassName() : $name;
+
+        if (!class_exists($className) &amp;&amp; !interface_exists($className)) {
+            return $definition;
+        }
+
+        $definition = $definition ?: new ObjectDefinition($name);
+
+        $class = new ReflectionClass($className);
+
+        $this-&gt;readInjectableAttribute($class, $definition);
+
+        // Browse the class properties looking for annotated properties
+        $this-&gt;readProperties($class, $definition);
+
+        // Browse the object&#039;s methods looking for annotated methods
+        $this-&gt;readMethods($class, $definition);
+
+        return $definition;
+    }
+
+    /**
+     * @throws InvalidAttribute
+     * @throws InvalidArgumentException The class doesn&#039;t exist
+     */
+    public function getDefinition(string $name) : ?ObjectDefinition
+    {
+        return $this-&gt;autowire($name);
+    }
+
+    /**
+     * Autowiring cannot guess all existing definitions.
+     */
+    public function getDefinitions() : array
+    {
+        return [];
+    }
+
+    /**
+     * Browse the class properties looking for annotated properties.
+     */
+    private function readProperties(ReflectionClass $class, ObjectDefinition $definition) : void
+    {
+        foreach ($class-&gt;getProperties() as $property) {
+            $this-&gt;readProperty($property, $definition);
+        }
+
+        // Read also the *private* properties of the parent classes
+        /** @noinspection PhpAssignmentInConditionInspection */
+        while ($class = $class-&gt;getParentClass()) {
+            foreach ($class-&gt;getProperties(ReflectionProperty::IS_PRIVATE) as $property) {
+                $this-&gt;readProperty($property, $definition, $class-&gt;getName());
+            }
+        }
+    }
+
+    /**
+     * @throws InvalidAttribute
+     */
+    private function readProperty(ReflectionProperty $property, ObjectDefinition $definition, ?string $classname = null) : void
+    {
+        if ($property-&gt;isStatic() || $property-&gt;isPromoted()) {
+            return;
+        }
+
+        // Look for #[Inject] attribute
+        try {
+            $attribute = $property-&gt;getAttributes(Inject::class)[0] ?? null;
+            if (! $attribute) {
+                return;
+            }
+            /** @var Inject $inject */
+            $inject = $attribute-&gt;newInstance();
+        } catch (Throwable $e) {
+            throw new InvalidAttribute(sprintf(
+                &#039;#[Inject] annotation on property %s::%s is malformed. %s&#039;,
+                $property-&gt;getDeclaringClass()-&gt;getName(),
+                $property-&gt;getName(),
+                $e-&gt;getMessage()
+            ), 0, $e);
+        }
+
+        // Try to #[Inject(&quot;name&quot;)] or look for the property type
+        $entryName = $inject-&gt;getName();
+
+        // Try using typed properties
+        $propertyType = $property-&gt;getType();
+        if ($entryName === null &amp;&amp; $propertyType instanceof ReflectionNamedType) {
+            if (! class_exists($propertyType-&gt;getName()) &amp;&amp; ! interface_exists($propertyType-&gt;getName())) {
+                throw new InvalidAttribute(sprintf(
+                    &#039;#[Inject] found on property %s::%s but unable to guess what to inject, the type of the property does not look like a valid class or interface name&#039;,
+                    $property-&gt;getDeclaringClass()-&gt;getName(),
+                    $property-&gt;getName()
+                ));
+            }
+            $entryName = $propertyType-&gt;getName();
+        }
+
+        if ($entryName === null) {
+            throw new InvalidAttribute(sprintf(
+                &#039;#[Inject] found on property %s::%s but unable to guess what to inject, please add a type to the property&#039;,
+                $property-&gt;getDeclaringClass()-&gt;getName(),
+                $property-&gt;getName()
+            ));
+        }
+
+        $definition-&gt;addPropertyInjection(
+            new PropertyInjection($property-&gt;getName(), new Reference($entryName), $classname)
+        );
+    }
+
+    /**
+     * Browse the object&#039;s methods looking for annotated methods.
+     */
+    private function readMethods(ReflectionClass $class, ObjectDefinition $objectDefinition) : void
+    {
+        // This will look in all the methods, including those of the parent classes
+        foreach ($class-&gt;getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+            if ($method-&gt;isStatic()) {
+                continue;
+            }
+
+            $methodInjection = $this-&gt;getMethodInjection($method);
+
+            if (! $methodInjection) {
+                continue;
+            }
+
+            if ($method-&gt;isConstructor()) {
+                $objectDefinition-&gt;completeConstructorInjection($methodInjection);
+            } else {
+                $objectDefinition-&gt;completeFirstMethodInjection($methodInjection);
+            }
+        }
+    }
+
+    private function getMethodInjection(ReflectionMethod $method) : ?MethodInjection
+    {
+        // Look for #[Inject] attribute
+        $attribute = $method-&gt;getAttributes(Inject::class)[0] ?? null;
+
+        if ($attribute) {
+            /** @var Inject $inject */
+            $inject = $attribute-&gt;newInstance();
+            $annotationParameters = $inject-&gt;getParameters();
+        } elseif ($method-&gt;isConstructor()) {
+            // #[Inject] on constructor is implicit, we continue
+            $annotationParameters = [];
+        } else {
+            return null;
+        }
+
+        $parameters = [];
+        foreach ($method-&gt;getParameters() as $index =&gt; $parameter) {
+            $entryName = $this-&gt;getMethodParameter($index, $parameter, $annotationParameters);
+
+            if ($entryName !== null) {
+                $parameters[$index] = new Reference($entryName);
+            }
+        }
+
+        if ($method-&gt;isConstructor()) {
+            return MethodInjection::constructor($parameters);
+        }
+
+        return new MethodInjection($method-&gt;getName(), $parameters);
+    }
+
+    /**
+     * @return string|null Entry name or null if not found.
+     */
+    private function getMethodParameter(int $parameterIndex, ReflectionParameter $parameter, array $annotationParameters) : ?string
+    {
+        // Let&#039;s check if this parameter has an #[Inject] attribute
+        $attribute = $parameter-&gt;getAttributes(Inject::class)[0] ?? null;
+        if ($attribute) {
+            /** @var Inject $inject */
+            $inject = $attribute-&gt;newInstance();
+
+            return $inject-&gt;getName();
+        }
+
+        // #[Inject] has definition for this parameter (by index, or by name)
+        if (isset($annotationParameters[$parameterIndex])) {
+            return $annotationParameters[$parameterIndex];
+        }
+        if (isset($annotationParameters[$parameter-&gt;getName()])) {
+            return $annotationParameters[$parameter-&gt;getName()];
+        }
+
+        // Skip optional parameters if not explicitly defined
+        if ($parameter-&gt;isOptional()) {
+            return null;
+        }
+
+        // Look for the property type
+        $parameterType = $parameter-&gt;getType();
+        if ($parameterType instanceof ReflectionNamedType &amp;&amp; !$parameterType-&gt;isBuiltin()) {
+            return $parameterType-&gt;getName();
+        }
+
+        return null;
+    }
+
+    /**
+     * @throws InvalidAttribute
+     */
+    private function readInjectableAttribute(ReflectionClass $class, ObjectDefinition $definition) : void
+    {
+        try {
+            $attribute = $class-&gt;getAttributes(Injectable::class)[0] ?? null;
+            if (! $attribute) {
+                return;
+            }
+            $attribute = $attribute-&gt;newInstance();
+        } catch (Throwable $e) {
+            throw new InvalidAttribute(sprintf(
+                &#039;Error while reading #[Injectable] on %s: %s&#039;,
+                $class-&gt;getName(),
+                $e-&gt;getMessage()
+            ), 0, $e);
+        }
+
+        if ($attribute-&gt;isLazy() !== null) {
+            $definition-&gt;setLazy($attribute-&gt;isLazy());
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-di/php-di/src/Definition/Source/Autowiring.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-di/php-di/src/Factory -->
+
+</body>
+</html>

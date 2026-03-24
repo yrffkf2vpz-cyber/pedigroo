@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest/src/Logging/TeamCity/TeamCityLogger.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Logging\TeamCity;
+
+use NunoMaduro\Collision\Adapters\Phpunit\Style;
+use Pest\Exceptions\ShouldNotHappen;
+use Pest\Logging\Converter;
+use Pest\Logging\TeamCity\Subscriber\TestConsideredRiskySubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestErroredSubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestExecutionFinishedSubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestFailedSubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestFinishedSubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestPreparedSubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestSkippedSubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestSuiteFinishedSubscriber;
+use Pest\Logging\TeamCity\Subscriber\TestSuiteStartedSubscriber;
+use PHPUnit\Event\Code\Test;
+use PHPUnit\Event\EventFacadeIsSealedException;
+use PHPUnit\Event\Facade;
+use PHPUnit\Event\Telemetry\Duration;
+use PHPUnit\Event\Telemetry\HRTime;
+use PHPUnit\Event\Telemetry\Info;
+use PHPUnit\Event\Telemetry\Snapshot;
+use PHPUnit\Event\Test\ConsideredRisky;
+use PHPUnit\Event\Test\Errored;
+use PHPUnit\Event\Test\Failed;
+use PHPUnit\Event\Test\Finished;
+use PHPUnit\Event\Test\Prepared;
+use PHPUnit\Event\Test\Skipped;
+use PHPUnit\Event\TestRunner\ExecutionFinished;
+use PHPUnit\Event\TestSuite\Finished as TestSuiteFinished;
+use PHPUnit\Event\TestSuite\Started as TestSuiteStarted;
+use PHPUnit\Event\UnknownSubscriberTypeException;
+use PHPUnit\TestRunner\TestResult\Facade as TestResultFacade;
+use ReflectionClass;
+use Symfony\Component\Console\Output\ConsoleOutput;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * @internal
+ */
+final class TeamCityLogger
+{
+    /**
+     * The current time.
+     */
+    private ?HRTime $time = null;
+
+    /**
+     * Indicates if the summary test count has been printed.
+     */
+    private bool $isSummaryTestCountPrinted = false;
+
+    /**
+     * @var array&lt;string, bool&gt;
+     */
+    private array $testEvents = [];
+
+    /**
+     * @throws EventFacadeIsSealedException
+     * @throws UnknownSubscriberTypeException
+     */
+    public function __construct(
+        private readonly OutputInterface $output,
+        private readonly Converter $converter,
+        private readonly ?int $flowId,
+        private readonly bool $withoutDuration,
+    ) {
+        $this-&gt;registerSubscribers();
+        $this-&gt;setFlowId();
+    }
+
+    public function testSuiteStarted(TestSuiteStarted $event): void
+    {
+        $message = ServiceMessage::testSuiteStarted(
+            $this-&gt;converter-&gt;getTestSuiteName($event-&gt;testSuite()),
+            $this-&gt;converter-&gt;getTestSuiteLocation($event-&gt;testSuite())
+        );
+
+        $this-&gt;output($message);
+
+        if (! $this-&gt;isSummaryTestCountPrinted) {
+            $this-&gt;isSummaryTestCountPrinted = true;
+            $message = ServiceMessage::testSuiteCount(
+                $this-&gt;converter-&gt;getTestSuiteSize($event-&gt;testSuite())
+            );
+
+            $this-&gt;output($message);
+        }
+    }
+
+    public function testSuiteFinished(TestSuiteFinished $event): void
+    {
+        $message = ServiceMessage::testSuiteFinished(
+            $this-&gt;converter-&gt;getTestSuiteName($event-&gt;testSuite()),
+        );
+
+        $this-&gt;output($message);
+    }
+
+    public function testPrepared(Prepared $event): void
+    {
+        $message = ServiceMessage::testStarted(
+            $this-&gt;converter-&gt;getTestCaseMethodName($event-&gt;test()),
+            $this-&gt;converter-&gt;getTestCaseLocation($event-&gt;test()),
+        );
+
+        $this-&gt;output($message);
+
+        $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+    }
+
+    public function testMarkedIncomplete(): never
+    {
+        throw ShouldNotHappen::fromMessage(&#039;testMarkedIncomplete not implemented.&#039;);
+    }
+
+    public function testSkipped(Skipped $event): void
+    {
+        $this-&gt;whenFirstEventForTest($event-&gt;test(), function () use ($event): void {
+            $message = ServiceMessage::testIgnored(
+                $this-&gt;converter-&gt;getTestCaseMethodName($event-&gt;test()),
+                &#039;This test was ignored.&#039;
+            );
+
+            $this-&gt;output($message);
+        });
+    }
+
+    /**
+     * This will trigger in the following scenarios
+     * - When an exception is thrown
+     */
+    public function testErrored(Errored $event): void
+    {
+        $this-&gt;whenFirstEventForTest($event-&gt;test(), function () use ($event): void {
+            $testName = $this-&gt;converter-&gt;getTestCaseMethodName($event-&gt;test());
+            $message = $this-&gt;converter-&gt;getExceptionMessage($event-&gt;throwable());
+            $details = $this-&gt;converter-&gt;getExceptionDetails($event-&gt;throwable());
+
+            $message = ServiceMessage::testFailed(
+                $testName,
+                $message,
+                $details,
+            );
+
+            $this-&gt;output($message);
+        });
+    }
+
+    /**
+     * This will trigger in the following scenarios
+     * - When an assertion fails
+     */
+    public function testFailed(Failed $event): void
+    {
+        $this-&gt;whenFirstEventForTest($event-&gt;test(), function () use ($event): void {
+            $testName = $this-&gt;converter-&gt;getTestCaseMethodName($event-&gt;test());
+            $message = $this-&gt;converter-&gt;getExceptionMessage($event-&gt;throwable());
+            $details = $this-&gt;converter-&gt;getExceptionDetails($event-&gt;throwable());
+
+            if ($event-&gt;hasComparisonFailure()) {
+                $comparison = $event-&gt;comparisonFailure();
+                $message = ServiceMessage::comparisonFailure(
+                    $testName,
+                    $message,
+                    $details,
+                    $comparison-&gt;actual(),
+                    $comparison-&gt;expected()
+                );
+            } else {
+                $message = ServiceMessage::testFailed(
+                    $testName,
+                    $message,
+                    $details,
+                );
+            }
+
+            $this-&gt;output($message);
+        });
+    }
+
+    /**
+     * This will trigger in the following scenarios
+     * - When no assertions in a test
+     */
+    public function testConsideredRisky(ConsideredRisky $event): void
+    {
+        $this-&gt;whenFirstEventForTest($event-&gt;test(), function () use ($event): void {
+            $message = ServiceMessage::testIgnored(
+                $this-&gt;converter-&gt;getTestCaseMethodName($event-&gt;test()),
+                $event-&gt;message()
+            );
+
+            $this-&gt;output($message);
+        });
+    }
+
+    public function testFinished(Finished $event): void
+    {
+        if (! $this-&gt;time instanceof \PHPUnit\Event\Telemetry\HRTime) {
+            throw ShouldNotHappen::fromMessage(&#039;Start time has not been set.&#039;);
+        }
+
+        $testName = $this-&gt;converter-&gt;getTestCaseMethodName($event-&gt;test());
+        $duration = $event-&gt;telemetryInfo()-&gt;time()-&gt;duration($this-&gt;time)-&gt;asFloat();
+        if ($this-&gt;withoutDuration) {
+            $duration = 100;
+        }
+
+        $message = ServiceMessage::testFinished(
+            $testName,
+            (int) ($duration * 1000)
+        );
+
+        $this-&gt;output($message);
+    }
+
+    public function testExecutionFinished(ExecutionFinished $event): void
+    {
+        $result = TestResultFacade::result();
+        $state = $this-&gt;converter-&gt;getStateFromResult($result);
+
+        assert($this-&gt;output instanceof ConsoleOutput);
+        $style = new Style($this-&gt;output);
+
+        $telemetry = $event-&gt;telemetryInfo();
+
+        if ($this-&gt;withoutDuration) {
+            $reflector = new ReflectionClass($telemetry);
+
+            $property = $reflector-&gt;getProperty(&#039;current&#039;);
+            $snapshot = $property-&gt;getValue($telemetry);
+            assert($snapshot instanceof Snapshot);
+
+            $telemetry = new Info(
+                $snapshot,
+                Duration::fromSecondsAndNanoseconds(1, 0),
+                $telemetry-&gt;memoryUsageSinceStart(),
+                $telemetry-&gt;durationSincePrevious(),
+                $telemetry-&gt;memoryUsageSincePrevious(),
+            );
+        }
+
+        $style-&gt;writeRecap($state, $telemetry, $result);
+    }
+
+    public function output(ServiceMessage $message): void
+    {
+        $this-&gt;output-&gt;writeln(&quot;{$message-&gt;toString()}&quot;);
+    }
+
+    /**
+     * @throws EventFacadeIsSealedException
+     * @throws UnknownSubscriberTypeException
+     */
+    private function registerSubscribers(): void
+    {
+        $subscribers = [
+            new TestSuiteStartedSubscriber($this),
+            new TestSuiteFinishedSubscriber($this),
+            new TestPreparedSubscriber($this),
+            new TestFinishedSubscriber($this),
+            new TestErroredSubscriber($this),
+            new TestFailedSubscriber($this),
+            new TestSkippedSubscriber($this),
+            new TestConsideredRiskySubscriber($this),
+            new TestExecutionFinishedSubscriber($this),
+        ];
+
+        Facade::instance()-&gt;registerSubscribers(...$subscribers);
+    }
+
+    private function setFlowId(): void
+    {
+        if ($this-&gt;flowId === null) {
+            return;
+        }
+
+        ServiceMessage::setFlowId($this-&gt;flowId);
+    }
+
+    private function whenFirstEventForTest(Test $test, callable $callback): void
+    {
+        $testIdentifier = $this-&gt;converter-&gt;getTestCaseLocation($test);
+
+        if (! isset($this-&gt;testEvents[$testIdentifier])) {
+            $this-&gt;testEvents[$testIdentifier] = true;
+            $callback();
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest/src/Matchers/Any.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest/src/Logging/TeamCity/Subscriber -->
+
+</body>
+</html>

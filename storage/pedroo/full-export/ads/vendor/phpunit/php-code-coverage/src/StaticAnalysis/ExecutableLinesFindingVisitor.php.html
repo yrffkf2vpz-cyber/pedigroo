@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpunit/php-code-coverage/src/StaticAnalysis/ExecutableLinesFindingVisitor.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of phpunit/php-code-coverage.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace SebastianBergmann\CodeCoverage\StaticAnalysis;
+
+use function array_diff_key;
+use function assert;
+use function count;
+use function current;
+use function end;
+use function explode;
+use function max;
+use function preg_match;
+use function preg_quote;
+use function range;
+use function reset;
+use function sprintf;
+use PhpParser\Node;
+use PhpParser\NodeVisitorAbstract;
+
+/**
+ * @internal This class is not covered by the backward compatibility promise for phpunit/php-code-coverage
+ *
+ * @phpstan-import-type LinesType from \SebastianBergmann\CodeCoverage\StaticAnalysis\FileAnalyser
+ */
+final class ExecutableLinesFindingVisitor extends NodeVisitorAbstract
+{
+    private int $nextBranch = 0;
+    private readonly string $source;
+
+    /**
+     * @var LinesType
+     */
+    private array $executableLinesGroupedByBranch = [];
+
+    /**
+     * @var array&lt;int, bool&gt;
+     */
+    private array $unsets = [];
+
+    /**
+     * @var array&lt;int, string&gt;
+     */
+    private array $commentsToCheckForUnset = [];
+
+    public function __construct(string $source)
+    {
+        $this-&gt;source = $source;
+    }
+
+    public function enterNode(Node $node): void
+    {
+        foreach ($node-&gt;getComments() as $comment) {
+            $commentLine = $comment-&gt;getStartLine();
+
+            if (!isset($this-&gt;executableLinesGroupedByBranch[$commentLine])) {
+                continue;
+            }
+
+            foreach (explode(&quot;\n&quot;, $comment-&gt;getText()) as $text) {
+                $this-&gt;commentsToCheckForUnset[$commentLine] = $text;
+                $commentLine++;
+            }
+        }
+
+        if ($node instanceof Node\Scalar\String_ ||
+            $node instanceof Node\Scalar\EncapsedStringPart) {
+            $startLine = $node-&gt;getStartLine() + 1;
+            $endLine   = $node-&gt;getEndLine() - 1;
+
+            if ($startLine &lt;= $endLine) {
+                foreach (range($startLine, $endLine) as $line) {
+                    unset($this-&gt;executableLinesGroupedByBranch[$line]);
+                }
+            }
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\Interface_) {
+            foreach (range($node-&gt;getStartLine(), $node-&gt;getEndLine()) as $line) {
+                $this-&gt;unsets[$line] = true;
+            }
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\Declare_ ||
+            $node instanceof Node\Stmt\DeclareDeclare ||
+            $node instanceof Node\Stmt\Else_ ||
+            $node instanceof Node\Stmt\EnumCase ||
+            $node instanceof Node\Stmt\Finally_ ||
+            $node instanceof Node\Stmt\GroupUse ||
+            $node instanceof Node\Stmt\Label ||
+            $node instanceof Node\Stmt\Namespace_ ||
+            $node instanceof Node\Stmt\Nop ||
+            $node instanceof Node\Stmt\Switch_ ||
+            $node instanceof Node\Stmt\TryCatch ||
+            $node instanceof Node\Stmt\Use_ ||
+            $node instanceof Node\Stmt\UseUse ||
+            $node instanceof Node\Expr\ConstFetch ||
+            $node instanceof Node\Expr\Variable ||
+            $node instanceof Node\Expr\Throw_ ||
+            $node instanceof Node\ComplexType ||
+            $node instanceof Node\Const_ ||
+            $node instanceof Node\Identifier ||
+            $node instanceof Node\Name ||
+            $node instanceof Node\Param ||
+            $node instanceof Node\Scalar) {
+            return;
+        }
+
+        if ($node instanceof Node\Expr\Match_) {
+            foreach ($node-&gt;arms as $arm) {
+                $this-&gt;setLineBranch(
+                    $arm-&gt;body-&gt;getStartLine(),
+                    $arm-&gt;body-&gt;getEndLine(),
+                    ++$this-&gt;nextBranch,
+                );
+            }
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\Expression &amp;&amp; $node-&gt;expr instanceof Node\Expr\Throw_) {
+            $this-&gt;setLineBranch($node-&gt;expr-&gt;expr-&gt;getEndLine(), $node-&gt;expr-&gt;expr-&gt;getEndLine(), ++$this-&gt;nextBranch);
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\Enum_ ||
+            $node instanceof Node\Stmt\Function_ ||
+            $node instanceof Node\Stmt\Class_ ||
+            $node instanceof Node\Stmt\ClassMethod ||
+            $node instanceof Node\Expr\Closure ||
+            $node instanceof Node\Stmt\Trait_) {
+            if ($node instanceof Node\Stmt\Function_ || $node instanceof Node\Stmt\ClassMethod) {
+                $unsets = [];
+
+                foreach ($node-&gt;getParams() as $param) {
+                    foreach (range($param-&gt;getStartLine(), $param-&gt;getEndLine()) as $line) {
+                        $unsets[$line] = true;
+                    }
+                }
+
+                unset($unsets[$node-&gt;getEndLine()]);
+
+                $this-&gt;unsets += $unsets;
+            }
+
+            $isConcreteClassLike = $node instanceof Node\Stmt\Enum_ || $node instanceof Node\Stmt\Class_ || $node instanceof Node\Stmt\Trait_;
+
+            if (null !== $node-&gt;stmts) {
+                foreach ($node-&gt;stmts as $stmt) {
+                    if ($stmt instanceof Node\Stmt\Nop) {
+                        continue;
+                    }
+
+                    foreach (range($stmt-&gt;getStartLine(), $stmt-&gt;getEndLine()) as $line) {
+                        unset($this-&gt;executableLinesGroupedByBranch[$line]);
+
+                        if (
+                            $isConcreteClassLike &amp;&amp;
+                            !$stmt instanceof Node\Stmt\ClassMethod
+                        ) {
+                            $this-&gt;unsets[$line] = true;
+                        }
+                    }
+                }
+            }
+
+            if ($isConcreteClassLike) {
+                return;
+            }
+
+            $hasEmptyBody = [] === $node-&gt;stmts ||
+                null === $node-&gt;stmts ||
+                (
+                    1 === count($node-&gt;stmts) &amp;&amp;
+                    $node-&gt;stmts[0] instanceof Node\Stmt\Nop
+                );
+
+            if ($hasEmptyBody) {
+                if ($node-&gt;getEndLine() === $node-&gt;getStartLine() &amp;&amp; isset($this-&gt;executableLinesGroupedByBranch[$node-&gt;getStartLine()])) {
+                    return;
+                }
+
+                $this-&gt;setLineBranch($node-&gt;getEndLine(), $node-&gt;getEndLine(), ++$this-&gt;nextBranch);
+
+                return;
+            }
+
+            return;
+        }
+
+        if ($node instanceof Node\Expr\ArrowFunction) {
+            $startLine = max(
+                $node-&gt;getStartLine() + 1,
+                $node-&gt;expr-&gt;getStartLine(),
+            );
+
+            $endLine = $node-&gt;expr-&gt;getEndLine();
+
+            if ($endLine &lt; $startLine) {
+                return;
+            }
+
+            $this-&gt;setLineBranch($startLine, $endLine, ++$this-&gt;nextBranch);
+
+            return;
+        }
+
+        if ($node instanceof Node\Expr\Ternary) {
+            if (null !== $node-&gt;if &amp;&amp;
+                $node-&gt;getStartLine() !== $node-&gt;if-&gt;getEndLine()) {
+                $this-&gt;setLineBranch($node-&gt;if-&gt;getStartLine(), $node-&gt;if-&gt;getEndLine(), ++$this-&gt;nextBranch);
+            }
+
+            if ($node-&gt;getStartLine() !== $node-&gt;else-&gt;getEndLine()) {
+                $this-&gt;setLineBranch($node-&gt;else-&gt;getStartLine(), $node-&gt;else-&gt;getEndLine(), ++$this-&gt;nextBranch);
+            }
+
+            return;
+        }
+
+        if ($node instanceof Node\Expr\BinaryOp\Coalesce) {
+            if ($node-&gt;getStartLine() !== $node-&gt;getEndLine()) {
+                $this-&gt;setLineBranch($node-&gt;getEndLine(), $node-&gt;getEndLine(), ++$this-&gt;nextBranch);
+            }
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\If_ ||
+            $node instanceof Node\Stmt\ElseIf_ ||
+            $node instanceof Node\Stmt\Case_) {
+            if (null === $node-&gt;cond) {
+                return;
+            }
+
+            $this-&gt;setLineBranch(
+                $node-&gt;cond-&gt;getStartLine(),
+                $node-&gt;cond-&gt;getStartLine(),
+                ++$this-&gt;nextBranch,
+            );
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\For_) {
+            $startLine = null;
+            $endLine   = null;
+
+            if ([] !== $node-&gt;init) {
+                $startLine = $node-&gt;init[0]-&gt;getStartLine();
+
+                end($node-&gt;init);
+
+                $endLine = current($node-&gt;init)-&gt;getEndLine();
+
+                reset($node-&gt;init);
+            }
+
+            if ([] !== $node-&gt;cond) {
+                if (null === $startLine) {
+                    $startLine = $node-&gt;cond[0]-&gt;getStartLine();
+                }
+
+                end($node-&gt;cond);
+
+                $endLine = current($node-&gt;cond)-&gt;getEndLine();
+
+                reset($node-&gt;cond);
+            }
+
+            if ([] !== $node-&gt;loop) {
+                if (null === $startLine) {
+                    $startLine = $node-&gt;loop[0]-&gt;getStartLine();
+                }
+
+                end($node-&gt;loop);
+
+                $endLine = current($node-&gt;loop)-&gt;getEndLine();
+
+                reset($node-&gt;loop);
+            }
+
+            if (null === $startLine || null === $endLine) {
+                return;
+            }
+
+            $this-&gt;setLineBranch(
+                $startLine,
+                $endLine,
+                ++$this-&gt;nextBranch,
+            );
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\Foreach_) {
+            $this-&gt;setLineBranch(
+                $node-&gt;expr-&gt;getStartLine(),
+                $node-&gt;valueVar-&gt;getEndLine(),
+                ++$this-&gt;nextBranch,
+            );
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\While_ ||
+            $node instanceof Node\Stmt\Do_) {
+            $this-&gt;setLineBranch(
+                $node-&gt;cond-&gt;getStartLine(),
+                $node-&gt;cond-&gt;getEndLine(),
+                ++$this-&gt;nextBranch,
+            );
+
+            return;
+        }
+
+        if ($node instanceof Node\Stmt\Catch_) {
+            assert([] !== $node-&gt;types);
+            $startLine = $node-&gt;types[0]-&gt;getStartLine();
+            end($node-&gt;types);
+            $endLine = current($node-&gt;types)-&gt;getEndLine();
+
+            $this-&gt;setLineBranch(
+                $startLine,
+                $endLine,
+                ++$this-&gt;nextBranch,
+            );
+
+            return;
+        }
+
+        if ($node instanceof Node\Expr\CallLike) {
+            if (isset($this-&gt;executableLinesGroupedByBranch[$node-&gt;getStartLine()])) {
+                $branch = $this-&gt;executableLinesGroupedByBranch[$node-&gt;getStartLine()];
+            } else {
+                $branch = ++$this-&gt;nextBranch;
+            }
+
+            $this-&gt;setLineBranch($node-&gt;getStartLine(), $node-&gt;getEndLine(), $branch);
+
+            return;
+        }
+
+        if (isset($this-&gt;executableLinesGroupedByBranch[$node-&gt;getStartLine()])) {
+            return;
+        }
+
+        $this-&gt;setLineBranch($node-&gt;getStartLine(), $node-&gt;getEndLine(), ++$this-&gt;nextBranch);
+    }
+
+    public function afterTraverse(array $nodes): void
+    {
+        $lines = explode(&quot;\n&quot;, $this-&gt;source);
+
+        foreach ($lines as $lineNumber =&gt; $line) {
+            $lineNumber++;
+
+            if (1 === preg_match(&#039;/^\s*$/&#039;, $line) ||
+                (
+                    isset($this-&gt;commentsToCheckForUnset[$lineNumber]) &amp;&amp;
+                    1 === preg_match(sprintf(&#039;/^\s*%s\s*$/&#039;, preg_quote($this-&gt;commentsToCheckForUnset[$lineNumber], &#039;/&#039;)), $line)
+                )) {
+                unset($this-&gt;executableLinesGroupedByBranch[$lineNumber]);
+            }
+        }
+
+        $this-&gt;executableLinesGroupedByBranch = array_diff_key(
+            $this-&gt;executableLinesGroupedByBranch,
+            $this-&gt;unsets,
+        );
+    }
+
+    /**
+     * @return LinesType
+     */
+    public function executableLinesGroupedByBranch(): array
+    {
+        return $this-&gt;executableLinesGroupedByBranch;
+    }
+
+    private function setLineBranch(int $start, int $end, int $branch): void
+    {
+        foreach (range($start, $end) as $line) {
+            $this-&gt;executableLinesGroupedByBranch[$line] = $branch;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpunit/php-code-coverage/src/StaticAnalysis/FileAnalyser.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpunit/php-code-coverage/src/TestSize -->
+
+</body>
+</html>

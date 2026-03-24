@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Database/Console/Migrations/MigrateCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database\Console\Migrations;
+
+use Illuminate\Console\ConfirmableTrait;
+use Illuminate\Contracts\Console\Isolatable;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Database\Events\SchemaLoaded;
+use Illuminate\Database\Migrations\Migrator;
+use Illuminate\Database\SQLiteDatabaseDoesNotExistException;
+use Illuminate\Database\SqlServerConnection;
+use Illuminate\Support\Str;
+use PDOException;
+use RuntimeException;
+use Symfony\Component\Console\Attribute\AsCommand;
+use Throwable;
+
+use function Laravel\Prompts\confirm;
+
+#[AsCommand(name: &#039;migrate&#039;)]
+class MigrateCommand extends BaseCommand implements Isolatable
+{
+    use ConfirmableTrait;
+
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = &#039;migrate {--database= : The database connection to use}
+                {--force : Force the operation to run when in production}
+                {--path=* : The path(s) to the migrations files to be executed}
+                {--realpath : Indicate any provided migration file paths are pre-resolved absolute paths}
+                {--schema-path= : The path to a schema dump file}
+                {--pretend : Dump the SQL queries that would be run}
+                {--seed : Indicates if the seed task should be re-run}
+                {--seeder= : The class name of the root seeder}
+                {--step : Force the migrations to be run so they can be rolled back individually}
+                {--graceful : Return a successful exit code even if an error occurs}&#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;Run the database migrations&#039;;
+
+    /**
+     * The migrator instance.
+     *
+     * @var \Illuminate\Database\Migrations\Migrator
+     */
+    protected $migrator;
+
+    /**
+     * The event dispatcher instance.
+     *
+     * @var \Illuminate\Contracts\Events\Dispatcher
+     */
+    protected $dispatcher;
+
+    /**
+     * Create a new migration command instance.
+     *
+     * @param  \Illuminate\Database\Migrations\Migrator  $migrator
+     * @param  \Illuminate\Contracts\Events\Dispatcher  $dispatcher
+     */
+    public function __construct(Migrator $migrator, Dispatcher $dispatcher)
+    {
+        parent::__construct();
+
+        $this-&gt;migrator = $migrator;
+        $this-&gt;dispatcher = $dispatcher;
+    }
+
+    /**
+     * Execute the console command.
+     *
+     * @return int
+     */
+    public function handle()
+    {
+        if (! $this-&gt;confirmToProceed()) {
+            return 1;
+        }
+
+        try {
+            $this-&gt;runMigrations();
+        } catch (Throwable $e) {
+            if ($this-&gt;option(&#039;graceful&#039;)) {
+                $this-&gt;components-&gt;warn($e-&gt;getMessage());
+
+                return 0;
+            }
+
+            throw $e;
+        }
+
+        return 0;
+    }
+
+    /**
+     * Run the pending migrations.
+     *
+     * @return void
+     */
+    protected function runMigrations()
+    {
+        $this-&gt;migrator-&gt;usingConnection($this-&gt;option(&#039;database&#039;), function () {
+            $this-&gt;prepareDatabase();
+
+            // Next, we will check to see if a path option has been defined. If it has
+            // we will use the path relative to the root of this installation folder
+            // so that migrations may be run for any path within the applications.
+            $this-&gt;migrator-&gt;setOutput($this-&gt;output)
+                -&gt;run($this-&gt;getMigrationPaths(), [
+                    &#039;pretend&#039; =&gt; $this-&gt;option(&#039;pretend&#039;),
+                    &#039;step&#039; =&gt; $this-&gt;option(&#039;step&#039;),
+                ]);
+
+            // Finally, if the &quot;seed&quot; option has been given, we will re-run the database
+            // seed task to re-populate the database, which is convenient when adding
+            // a migration and a seed at the same time, as it is only this command.
+            if ($this-&gt;option(&#039;seed&#039;) &amp;&amp; ! $this-&gt;option(&#039;pretend&#039;)) {
+                $this-&gt;call(&#039;db:seed&#039;, [
+                    &#039;--class&#039; =&gt; $this-&gt;option(&#039;seeder&#039;) ?: &#039;Database\\Seeders\\DatabaseSeeder&#039;,
+                    &#039;--force&#039; =&gt; true,
+                ]);
+            }
+        });
+    }
+
+    /**
+     * Prepare the migration database for running.
+     *
+     * @return void
+     */
+    protected function prepareDatabase()
+    {
+        if (! $this-&gt;repositoryExists()) {
+            $this-&gt;components-&gt;info(&#039;Preparing database.&#039;);
+
+            $this-&gt;components-&gt;task(&#039;Creating migration table&#039;, function () {
+                return $this-&gt;callSilent(&#039;migrate:install&#039;, array_filter([
+                    &#039;--database&#039; =&gt; $this-&gt;option(&#039;database&#039;),
+                ])) == 0;
+            });
+
+            $this-&gt;newLine();
+        }
+
+        if (! $this-&gt;migrator-&gt;hasRunAnyMigrations() &amp;&amp; ! $this-&gt;option(&#039;pretend&#039;)) {
+            $this-&gt;loadSchemaState();
+        }
+    }
+
+    /**
+     * Determine if the migrator repository exists.
+     *
+     * @return bool
+     */
+    protected function repositoryExists()
+    {
+        return retry(2, fn () =&gt; $this-&gt;migrator-&gt;repositoryExists(), 0, function ($e) {
+            try {
+                return $this-&gt;handleMissingDatabase($e-&gt;getPrevious());
+            } catch (Throwable) {
+                return false;
+            }
+        });
+    }
+
+    /**
+     * Attempt to create the database if it is missing.
+     *
+     * @param  \Throwable  $e
+     * @return bool
+     */
+    protected function handleMissingDatabase(Throwable $e)
+    {
+        if ($e instanceof SQLiteDatabaseDoesNotExistException) {
+            return $this-&gt;createMissingSqliteDatabase($e-&gt;path);
+        }
+
+        $connection = $this-&gt;migrator-&gt;resolveConnection($this-&gt;option(&#039;database&#039;));
+
+        if (! $e instanceof PDOException) {
+            return false;
+        }
+
+        if (($e-&gt;getCode() === 1049 &amp;&amp; in_array($connection-&gt;getDriverName(), [&#039;mysql&#039;, &#039;mariadb&#039;])) ||
+            (($e-&gt;errorInfo[0] ?? null) == &#039;08006&#039; &amp;&amp;
+              $connection-&gt;getDriverName() == &#039;pgsql&#039; &amp;&amp;
+              Str::contains($e-&gt;getMessage(), &#039;&quot;&#039;.$connection-&gt;getDatabaseName().&#039;&quot;&#039;))) {
+            return $this-&gt;createMissingMySqlOrPgsqlDatabase($connection);
+        }
+
+        return false;
+    }
+
+    /**
+     * Create a missing SQLite database.
+     *
+     * @param  string  $path
+     * @return bool
+     *
+     * @throws \RuntimeException
+     */
+    protected function createMissingSqliteDatabase($path)
+    {
+        if ($this-&gt;option(&#039;force&#039;)) {
+            return touch($path);
+        }
+
+        if ($this-&gt;option(&#039;no-interaction&#039;)) {
+            return false;
+        }
+
+        $this-&gt;components-&gt;warn(&#039;The SQLite database configured for this application does not exist: &#039;.$path);
+
+        if (! confirm(&#039;Would you like to create it?&#039;, default: true)) {
+            $this-&gt;components-&gt;info(&#039;Operation cancelled. No database was created.&#039;);
+
+            throw new RuntimeException(&#039;Database was not created. Aborting migration.&#039;);
+        }
+
+        return touch($path);
+    }
+
+    /**
+     * Create a missing MySQL or Postgres database.
+     *
+     * @param  \Illuminate\Database\Connection  $connection
+     * @return bool
+     *
+     * @throws \RuntimeException
+     */
+    protected function createMissingMySqlOrPgsqlDatabase($connection)
+    {
+        if ($this-&gt;laravel[&#039;config&#039;]-&gt;get(&quot;database.connections.{$connection-&gt;getName()}.database&quot;) !== $connection-&gt;getDatabaseName()) {
+            return false;
+        }
+
+        if (! $this-&gt;option(&#039;force&#039;) &amp;&amp; $this-&gt;option(&#039;no-interaction&#039;)) {
+            return false;
+        }
+
+        if (! $this-&gt;option(&#039;force&#039;) &amp;&amp; ! $this-&gt;option(&#039;no-interaction&#039;)) {
+            $this-&gt;components-&gt;warn(&quot;The database &#039;{$connection-&gt;getDatabaseName()}&#039; does not exist on the &#039;{$connection-&gt;getName()}&#039; connection.&quot;);
+
+            if (! confirm(&#039;Would you like to create it?&#039;, default: true)) {
+                $this-&gt;components-&gt;info(&#039;Operation cancelled. No database was created.&#039;);
+
+                throw new RuntimeException(&#039;Database was not created. Aborting migration.&#039;);
+            }
+        }
+        try {
+            $this-&gt;laravel[&#039;config&#039;]-&gt;set(
+                &quot;database.connections.{$connection-&gt;getName()}.database&quot;,
+                match ($connection-&gt;getDriverName()) {
+                    &#039;mysql&#039;, &#039;mariadb&#039; =&gt; null,
+                    &#039;pgsql&#039; =&gt; &#039;postgres&#039;,
+                },
+            );
+
+            $this-&gt;laravel[&#039;db&#039;]-&gt;purge();
+
+            $freshConnection = $this-&gt;migrator-&gt;resolveConnection($this-&gt;option(&#039;database&#039;));
+
+            return tap($freshConnection-&gt;unprepared(
+                match ($connection-&gt;getDriverName()) {
+                    &#039;mysql&#039;, &#039;mariadb&#039; =&gt; &quot;CREATE DATABASE IF NOT EXISTS `{$connection-&gt;getDatabaseName()}`&quot;,
+                    &#039;pgsql&#039; =&gt; &#039;CREATE DATABASE &quot;&#039;.$connection-&gt;getDatabaseName().&#039;&quot;&#039;,
+                }
+            ), function () {
+                $this-&gt;laravel[&#039;db&#039;]-&gt;purge();
+            });
+        } finally {
+            $this-&gt;laravel[&#039;config&#039;]-&gt;set(&quot;database.connections.{$connection-&gt;getName()}.database&quot;, $connection-&gt;getDatabaseName());
+        }
+    }
+
+    /**
+     * Load the schema state to seed the initial database schema structure.
+     *
+     * @return void
+     */
+    protected function loadSchemaState()
+    {
+        $connection = $this-&gt;migrator-&gt;resolveConnection($this-&gt;option(&#039;database&#039;));
+
+        // First, we will make sure that the connection supports schema loading and that
+        // the schema file exists before we proceed any further. If not, we will just
+        // continue with the standard migration operation as normal without errors.
+        if ($connection instanceof SqlServerConnection ||
+            ! is_file($path = $this-&gt;schemaPath($connection))) {
+            return;
+        }
+
+        $this-&gt;components-&gt;info(&#039;Loading stored database schemas.&#039;);
+
+        $this-&gt;components-&gt;task($path, function () use ($connection, $path) {
+            // Since the schema file will create the &quot;migrations&quot; table and reload it to its
+            // proper state, we need to delete it here so we don&#039;t get an error that this
+            // table already exists when the stored database schema file gets executed.
+            $this-&gt;migrator-&gt;deleteRepository();
+
+            $connection-&gt;getSchemaState()-&gt;handleOutputUsing(function ($type, $buffer) {
+                $this-&gt;output-&gt;write($buffer);
+            })-&gt;load($path);
+        });
+
+        $this-&gt;newLine();
+
+        // Finally, we will fire an event that this schema has been loaded so developers
+        // can perform any post schema load tasks that are necessary in listeners for
+        // this event, which may seed the database tables with some necessary data.
+        $this-&gt;dispatcher-&gt;dispatch(
+            new SchemaLoaded($connection, $path)
+        );
+    }
+
+    /**
+     * Get the path to the stored schema for the given connection.
+     *
+     * @param  \Illuminate\Database\Connection  $connection
+     * @return string
+     */
+    protected function schemaPath($connection)
+    {
+        if ($this-&gt;option(&#039;schema-path&#039;)) {
+            return $this-&gt;option(&#039;schema-path&#039;);
+        }
+
+        if (file_exists($path = database_path(&#039;schema/&#039;.$connection-&gt;getName().&#039;-schema.dump&#039;))) {
+            return $path;
+        }
+
+        return database_path(&#039;schema/&#039;.$connection-&gt;getName().&#039;-schema.sql&#039;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Database/Console/Migrations/MigrateMakeCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Database/Console/Seeds -->
+
+</body>
+</html>

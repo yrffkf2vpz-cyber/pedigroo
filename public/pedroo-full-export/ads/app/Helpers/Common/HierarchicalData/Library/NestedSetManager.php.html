@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Helpers/Common/HierarchicalData/Library/NestedSetManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Helpers\Common\HierarchicalData\Library;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
+use RuntimeException;
+
+class NestedSetManager
+{
+	protected string $parentColumn = &#039;parent_id&#039;;
+	protected string $leftColumn = &#039;lft&#039;;
+	protected string $rightColumn = &#039;rgt&#039;;
+	protected string $depthColumn = &#039;depth&#039;;
+	
+	/**
+	 * Insert a new node as a child of the given parent ID (or as root).
+	 *
+	 * Wrap the entire process in a transaction to ensure consistency
+	 * if something fails halfway.
+	 */
+	public function insertNode(string $modelClass, array $attributes, ?int $parentId = null): Model
+	{
+		/** @var Model $modelClass */
+		return DB::transaction(function () use ($modelClass, $attributes, $parentId) {
+			if (is_null($parentId)) {
+				return $this-&gt;insertRoot($modelClass, $attributes);
+			}
+			
+			$parent = $modelClass::findOrFail($parentId);
+			$parentLeft = $parent-&gt;{$this-&gt;leftColumn};
+			$parentRight = $parent-&gt;{$this-&gt;rightColumn};
+			$parentDepth = $parent-&gt;{$this-&gt;depthColumn};
+			
+			// Shift boundaries
+			$modelClass::where($this-&gt;rightColumn, &#039;&gt;=&#039;, $parentRight)-&gt;increment($this-&gt;rightColumn, 2);
+			$modelClass::where($this-&gt;leftColumn, &#039;&gt;&#039;, $parentRight)-&gt;increment($this-&gt;leftColumn, 2);
+			
+			// Create the new node
+			$newNode = new $modelClass($attributes);
+			$newNode-&gt;{$this-&gt;parentColumn} = $parentId;
+			$newNode-&gt;{$this-&gt;leftColumn} = $parentRight;
+			$newNode-&gt;{$this-&gt;rightColumn} = $parentRight + 1;
+			$newNode-&gt;{$this-&gt;depthColumn} = $parentDepth + 1;
+			$newNode-&gt;save();
+			
+			return $newNode;
+		});
+	}
+	
+	/**
+	 * Insert a new node as a root (no parent).
+	 */
+	protected function insertRoot(string $modelClass, array $attributes): Model
+	{
+		/** @var Model $modelClass */
+		// This could also be wrapped in a transaction, but it&#039;s already inside
+		// insertNode&#039;s transaction if that&#039;s how it&#039;s being called.
+		$maxRight = $modelClass::max($this-&gt;rightColumn) ?? 0;
+		
+		$newNode = new $modelClass($attributes);
+		$newNode-&gt;{$this-&gt;parentColumn} = null;
+		$newNode-&gt;{$this-&gt;leftColumn} = $maxRight + 1;
+		$newNode-&gt;{$this-&gt;rightColumn} = $maxRight + 2;
+		$newNode-&gt;{$this-&gt;depthColumn} = 0;
+		$newNode-&gt;save();
+		
+		return $newNode;
+	}
+	
+	/**
+	 * Delete a node (and all of its descendants).
+	 *
+	 * Use a transaction to ensure consistency.
+	 */
+	public function deleteNode(string $modelClass, int $nodeId): void
+	{
+		/** @var Model $modelClass */
+		DB::transaction(function () use ($modelClass, $nodeId) {
+			$node = $modelClass::findOrFail($nodeId);
+			$left = $node-&gt;{$this-&gt;leftColumn};
+			$right = $node-&gt;{$this-&gt;rightColumn};
+			$width = $right - $left + 1;
+			
+			// 1) Delete all descendants (and the node itself)
+			$modelClass::where($this-&gt;leftColumn, &#039;&gt;=&#039;, $left)-&gt;where($this-&gt;rightColumn, &#039;&lt;=&#039;, $right)-&gt;delete();
+			
+			// 2) Shift everything on the right back
+			$modelClass::where($this-&gt;rightColumn, &#039;&gt;&#039;, $right)-&gt;decrement($this-&gt;rightColumn, $width);
+			$modelClass::where($this-&gt;leftColumn, &#039;&gt;&#039;, $right)-&gt;decrement($this-&gt;leftColumn, $width);
+		});
+	}
+	
+	/**
+	 * Move an existing node (and its entire subtree) under a new parent.
+	 *
+	 * Use a transaction to keep partial updates from corrupting the tree.
+	 */
+	public function moveNode(string $modelClass, int $nodeId, int $newParentId): void
+	{
+		/** @var Model $modelClass */
+		DB::transaction(function () use ($modelClass, $nodeId, $newParentId) {
+			$node = $modelClass::findOrFail($nodeId);
+			$newParent = $modelClass::findOrFail($newParentId);
+			
+			// Basic check: ensure we don&#039;t move a node into its own subtree
+			if (
+				$newParent-&gt;{$this-&gt;leftColumn} &gt;= $node-&gt;{$this-&gt;leftColumn}
+				&amp;&amp; $newParent-&gt;{$this-&gt;rightColumn} &lt;= $node-&gt;{$this-&gt;rightColumn}
+			) {
+				throw new RuntimeException(&#039;Cannot move a node inside its own subtree.&#039;);
+			}
+			
+			$nodeLeft = $node-&gt;{$this-&gt;leftColumn};
+			$nodeRight = $node-&gt;{$this-&gt;rightColumn};
+			$width = $nodeRight - $nodeLeft + 1;
+			
+			// 1) Temporarily remove the subtree (map it to [1..$width])
+			$modelClass::where($this-&gt;leftColumn, &#039;&gt;=&#039;, $nodeLeft)
+				-&gt;where($this-&gt;rightColumn, &#039;&lt;=&#039;, $nodeRight)
+				-&gt;update([
+					$this-&gt;leftColumn  =&gt; DB::raw($this-&gt;leftColumn . &#039; - &#039; . ($nodeLeft - 1)),
+					$this-&gt;rightColumn =&gt; DB::raw($this-&gt;rightColumn . &#039; - &#039; . ($nodeLeft - 1)),
+				]);
+			
+			// 2) Close the gap in the original tree
+			$modelClass::where($this-&gt;rightColumn, &#039;&gt;&#039;, $nodeRight)-&gt;decrement($this-&gt;rightColumn, $width);
+			$modelClass::where($this-&gt;leftColumn, &#039;&gt;&#039;, $nodeRight)-&gt;decrement($this-&gt;leftColumn, $width);
+			
+			// 3) Make room at the new parent&#039;s position
+			$newParent-&gt;refresh();
+			$parentRight = $newParent-&gt;{$this-&gt;rightColumn};
+			
+			$modelClass::where($this-&gt;rightColumn, &#039;&gt;=&#039;, $parentRight)-&gt;increment($this-&gt;rightColumn, $width);
+			$modelClass::where($this-&gt;leftColumn, &#039;&gt;&#039;, $parentRight)-&gt;increment($this-&gt;leftColumn, $width);
+			
+			// 4) Shift the subtree from [1..$width] to the new location
+			$offset = $parentRight - 1;
+			
+			$modelClass::where($this-&gt;leftColumn, &#039;&lt;=&#039;, $width)
+				-&gt;where($this-&gt;rightColumn, &#039;&lt;=&#039;, $width)
+				-&gt;update([
+					$this-&gt;leftColumn  =&gt; DB::raw($this-&gt;leftColumn . &#039; + &#039; . $offset),
+					$this-&gt;rightColumn =&gt; DB::raw($this-&gt;rightColumn . &#039; + &#039; . $offset),
+				]);
+			
+			// 5) Update the root node of the moved subtree
+			$node-&gt;refresh();
+			$node-&gt;{$this-&gt;parentColumn} = $newParentId;
+			$node-&gt;{$this-&gt;depthColumn} = $newParent-&gt;{$this-&gt;depthColumn} + 1;
+			$node-&gt;save();
+			
+			// 6) Update depth on all children in that subtree
+			$this-&gt;updateSubtreeDepths($modelClass, $node);
+		});
+	}
+	
+	/**
+	 * Recalculate `depth` for the entire subtree under the given node.
+	 * (No transaction needed here because it&#039;s already called within the move transaction.)
+	 */
+	protected function updateSubtreeDepths(string $modelClass, Model $rootNode): void
+	{
+		/** @var Model $modelClass */
+		$queue = [$rootNode];
+		while ($queue) {
+			/** @var Model $current */
+			$current = array_shift($queue);
+			
+			// Get immediate children
+			$children = $modelClass::where($this-&gt;parentColumn, $current-&gt;getKey())-&gt;get();
+			foreach ($children as $child) {
+				$child-&gt;{$this-&gt;depthColumn} = $current-&gt;{$this-&gt;depthColumn} + 1;
+				$child-&gt;save();
+				$queue[] = $child;
+			}
+		}
+	}
+	
+	/**
+	 * Build a PARTIAL tree (nested array) for the subtree under a given node.
+	 */
+	public function buildSubtree(string $modelClass, int $nodeId, bool $normalizeDepth = false): array
+	{
+		/** @var Model $modelClass */
+		$node = $modelClass::findOrFail($nodeId);
+		
+		$subtreeNodes = $modelClass::query()
+			-&gt;where($this-&gt;leftColumn, &#039;&gt;=&#039;, $node-&gt;{$this-&gt;leftColumn})
+			-&gt;where($this-&gt;rightColumn, &#039;&lt;=&#039;, $node-&gt;{$this-&gt;rightColumn})
+			-&gt;orderBy($this-&gt;leftColumn)
+			-&gt;get();
+		
+		$depthOffset = $normalizeDepth ? $node-&gt;{$this-&gt;depthColumn} : 0;
+		
+		return $this-&gt;buildNestedArray($subtreeNodes, $depthOffset);
+	}
+	
+	/**
+	 * Build a tree (nested array) of ALL nodes, sorted by `lft`.
+	 */
+	public function buildTree(string $modelClass): array
+	{
+		/** @var Model $modelClass */
+		$allNodes = $modelClass::orderBy($this-&gt;leftColumn)-&gt;get();
+		
+		return $this-&gt;buildNestedArray($allNodes);
+	}
+	
+	/**
+	 * Converts a collection of nodes (already ordered by lft) into a nested array.
+	 */
+	protected function buildNestedArray($nodes, int $depthOffset = 0): array
+	{
+		$tree = [];
+		$stack = [];
+		
+		foreach ($nodes as $node) {
+			// Adjust depth if we&#039;re offsetting
+			$depth = $node-&gt;{$this-&gt;depthColumn} - $depthOffset;
+			
+			$item = [
+				&#039;id&#039;       =&gt; $node-&gt;getKey(),
+				&#039;name&#039;     =&gt; $node-&gt;name ?? &#039;&#039;,
+				&#039;depth&#039;    =&gt; $depth,
+				&#039;children&#039; =&gt; [],
+			];
+			
+			if (empty($stack)) {
+				$tree[] = $item;
+				$stack[] = &amp;$tree[array_key_last($tree)];
+			} else {
+				// While the top of the stack has a depth &gt;= current node’s depth, pop it
+				while (!empty($stack) &amp;&amp; end($stack)[&#039;depth&#039;] &gt;= $depth) {
+					array_pop($stack);
+				}
+				
+				// If we still have items in the stack, the top is our parent
+				if (!empty($stack)) {
+					// Reference the top item in the stack (the parent)
+					$parentIndex = count($stack) - 1;
+					$stack[$parentIndex][&#039;children&#039;][] = $item;
+					
+					// Now push a reference to the newly added child
+					$childIndex = count($stack[$parentIndex][&#039;children&#039;]) - 1;
+					$stack[] = &amp;$stack[$parentIndex][&#039;children&#039;][$childIndex];
+				} else {
+					// No parent in the stack =&gt; it&#039;s a new root in this subset
+					$tree[] = $item;
+					
+					// Push a reference to this new root onto the stack
+					$rootIndex = count($tree) - 1;
+					$stack[] = &amp;$tree[$rootIndex];
+				}
+			}
+		}
+		
+		return $tree;
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Helpers/Common/HierarchicalData/Model/HasAdjacentList.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Helpers/Common/HierarchicalData/Model -->
+
+</body>
+</html>

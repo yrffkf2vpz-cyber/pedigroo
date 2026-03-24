@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/psy/psysh/src/Command/HistoryCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\Command;
+
+use Psy\ConfigPaths;
+use Psy\Input\FilterOptions;
+use Psy\Output\ShellOutput;
+use Psy\Readline\Readline;
+use Psy\Readline\ReadlineAware;
+use Symfony\Component\Console\Formatter\OutputFormatter;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * Psy Shell history command.
+ *
+ * Shows, searches and replays readline history. Not too shabby.
+ */
+class HistoryCommand extends Command implements ReadlineAware
+{
+    private FilterOptions $filter;
+    private Readline $readline;
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __construct($name = null)
+    {
+        $this-&gt;filter = new FilterOptions();
+
+        parent::__construct($name);
+    }
+
+    /**
+     * Set the Shell&#039;s Readline service.
+     *
+     * @param Readline $readline
+     */
+    public function setReadline(Readline $readline)
+    {
+        $this-&gt;readline = $readline;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function configure(): void
+    {
+        list($grep, $insensitive, $invert) = FilterOptions::getOptions();
+
+        $this
+            -&gt;setName(&#039;history&#039;)
+            -&gt;setAliases([&#039;hist&#039;])
+            -&gt;setDefinition([
+                new InputOption(&#039;show&#039;, &#039;s&#039;, InputOption::VALUE_REQUIRED, &#039;Show the given range of lines.&#039;),
+                new InputOption(&#039;head&#039;, &#039;H&#039;, InputOption::VALUE_REQUIRED, &#039;Display the first N items.&#039;),
+                new InputOption(&#039;tail&#039;, &#039;T&#039;, InputOption::VALUE_REQUIRED, &#039;Display the last N items.&#039;),
+
+                $grep,
+                $insensitive,
+                $invert,
+
+                new InputOption(&#039;no-numbers&#039;, &#039;N&#039;, InputOption::VALUE_NONE, &#039;Omit line numbers.&#039;),
+
+                new InputOption(&#039;save&#039;, &#039;&#039;, InputOption::VALUE_REQUIRED, &#039;Save history to a file.&#039;),
+                new InputOption(&#039;replay&#039;, &#039;&#039;, InputOption::VALUE_NONE, &#039;Replay.&#039;),
+                new InputOption(&#039;clear&#039;, &#039;&#039;, InputOption::VALUE_NONE, &#039;Clear the history.&#039;),
+            ])
+            -&gt;setDescription(&#039;Show the Psy Shell history.&#039;)
+            -&gt;setHelp(
+                &lt;&lt;&lt;&#039;HELP&#039;
+Show, search, save or replay the Psy Shell history.
+
+e.g.
+&lt;return&gt;&gt;&gt;&gt; history --grep /[bB]acon/&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; history --show 0..10 --replay&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; history --clear&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; history --tail 1000 --save somefile.txt&lt;/return&gt;
+HELP
+            );
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @return int 0 if everything went fine, or an exit code
+     */
+    protected function execute(InputInterface $input, OutputInterface $output): int
+    {
+        $this-&gt;validateOnlyOne($input, [&#039;show&#039;, &#039;head&#039;, &#039;tail&#039;]);
+        $this-&gt;validateOnlyOne($input, [&#039;save&#039;, &#039;replay&#039;, &#039;clear&#039;]);
+
+        // For --show, slice first (uses original line numbers), then filter
+        $show = $input-&gt;getOption(&#039;show&#039;);
+
+        // For --head/--tail, filter first, then slice (uses result count)
+        $head = $input-&gt;getOption(&#039;head&#039;);
+        $tail = $input-&gt;getOption(&#039;tail&#039;);
+
+        $history = $this-&gt;getHistorySlice($show);
+        $highlighted = false;
+
+        $this-&gt;filter-&gt;bind($input);
+        if ($this-&gt;filter-&gt;hasFilter()) {
+            $matches = [];
+            $highlighted = [];
+            foreach ($history as $i =&gt; $line) {
+                if ($this-&gt;filter-&gt;match($line, $matches)) {
+                    if (isset($matches[0])) {
+                        $chunks = \explode($matches[0], $history[$i]);
+                        $chunks = \array_map([__CLASS__, &#039;escape&#039;], $chunks);
+                        $glue = \sprintf(&#039;&lt;urgent&gt;%s&lt;/urgent&gt;&#039;, self::escape($matches[0]));
+
+                        $highlighted[$i] = \implode($glue, $chunks);
+                    }
+                } else {
+                    unset($history[$i]);
+                    unset($highlighted[$i]);
+                }
+            }
+        }
+
+        $history = $this-&gt;applyHeadOrTail($history, $head, $tail);
+        if ($highlighted) {
+            $highlighted = $this-&gt;applyHeadOrTail($highlighted, $head, $tail);
+        }
+
+        if ($save = $input-&gt;getOption(&#039;save&#039;)) {
+            $output-&gt;writeln(\sprintf(&#039;Saving history in %s...&#039;, ConfigPaths::prettyPath($save)));
+            \file_put_contents($save, \implode(\PHP_EOL, $history).\PHP_EOL);
+            $output-&gt;writeln(&#039;&lt;info&gt;History saved.&lt;/info&gt;&#039;);
+        } elseif ($input-&gt;getOption(&#039;replay&#039;)) {
+            if (!($input-&gt;getOption(&#039;show&#039;) || $input-&gt;getOption(&#039;head&#039;) || $input-&gt;getOption(&#039;tail&#039;))) {
+                throw new \InvalidArgumentException(&#039;You must limit history via --head, --tail or --show before replaying&#039;);
+            }
+
+            $count = \count($history);
+            $output-&gt;writeln(\sprintf(&#039;Replaying %d line%s of history&#039;, $count, ($count !== 1) ? &#039;s&#039; : &#039;&#039;));
+
+            $this-&gt;getShell()-&gt;addInput($history);
+        } elseif ($input-&gt;getOption(&#039;clear&#039;)) {
+            $this-&gt;clearHistory();
+            $output-&gt;writeln(&#039;&lt;info&gt;History cleared.&lt;/info&gt;&#039;);
+        } else {
+            $type = $input-&gt;getOption(&#039;no-numbers&#039;) ? 0 : ShellOutput::NUMBER_LINES;
+            if (!$highlighted) {
+                $type = $type | OutputInterface::OUTPUT_RAW;
+            }
+
+            $output-&gt;page($highlighted ?: $history, $type);
+        }
+
+        return 0;
+    }
+
+    /**
+     * Extract a range from a string.
+     *
+     * @param string $range
+     *
+     * @return int[] [ start, end ]
+     */
+    private function extractRange(string $range): array
+    {
+        if (\preg_match(&#039;/^\d+$/&#039;, $range)) {
+            return [(int) $range, (int) $range + 1];
+        }
+
+        $matches = [];
+        if ($range !== &#039;..&#039; &amp;&amp; \preg_match(&#039;/^(\d*)\.\.(\d*)$/&#039;, $range, $matches)) {
+            $start = $matches[1] ? (int) $matches[1] : 0;
+            $end = $matches[2] ? (int) $matches[2] + 1 : \PHP_INT_MAX;
+
+            return [$start, $end];
+        }
+
+        throw new \InvalidArgumentException(&#039;Unexpected range: &#039;.$range);
+    }
+
+    /**
+     * Retrieve a slice of the readline history by range.
+     *
+     * @param string|null $show Range specification (e.g., &quot;5..10&quot;)
+     *
+     * @return array A slice of history
+     */
+    private function getHistorySlice(?string $show): array
+    {
+        $history = $this-&gt;readline-&gt;listHistory();
+        // don&#039;t show the current `history` invocation
+        \array_pop($history);
+
+        if ($show === null) {
+            return $history;
+        }
+
+        list($start, $end) = $this-&gt;extractRange($show);
+        $length = $end - $start;
+
+        return \array_slice($history, $start, $length, true);
+    }
+
+    /**
+     * Apply --head or --tail to a history array.
+     */
+    private function applyHeadOrTail(array $history, ?string $head, ?string $tail): array
+    {
+        if ($head) {
+            if (!\preg_match(&#039;/^\d+$/&#039;, $head)) {
+                throw new \InvalidArgumentException(&#039;Please specify an integer argument for --head&#039;);
+            }
+
+            return \array_slice($history, 0, (int) $head, true);
+        } elseif ($tail) {
+            if (!\preg_match(&#039;/^\d+$/&#039;, $tail)) {
+                throw new \InvalidArgumentException(&#039;Please specify an integer argument for --tail&#039;);
+            }
+
+            $start = \count($history) - (int) $tail;
+            $length = (int) $tail + 1;
+
+            return \array_slice($history, $start, $length, true);
+        }
+
+        return $history;
+    }
+
+    /**
+     * Validate that only one of the given $options is set.
+     *
+     * @param InputInterface $input
+     * @param array          $options
+     */
+    private function validateOnlyOne(InputInterface $input, array $options)
+    {
+        $count = 0;
+        foreach ($options as $opt) {
+            if ($input-&gt;getOption($opt)) {
+                $count++;
+            }
+        }
+
+        if ($count &gt; 1) {
+            throw new \InvalidArgumentException(&#039;Please specify only one of --&#039;.\implode(&#039;, --&#039;, $options));
+        }
+    }
+
+    /**
+     * Clear the readline history.
+     */
+    private function clearHistory()
+    {
+        $this-&gt;readline-&gt;clearHistory();
+    }
+
+    public static function escape(string $string): string
+    {
+        return OutputFormatter::escape($string);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/psy/psysh/src/Command/ListCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/psy/psysh/src/Command/ListCommand -->
+
+</body>
+</html>

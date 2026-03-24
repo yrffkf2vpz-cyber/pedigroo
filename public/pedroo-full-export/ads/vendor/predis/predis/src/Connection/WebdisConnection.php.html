@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Connection/WebdisConnection.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Connection;
+
+use Closure;
+use InvalidArgumentException;
+use Predis\Command\CommandInterface;
+use Predis\NotSupportedException;
+use Predis\Protocol\ProtocolException;
+use Predis\Response\Error as ErrorResponse;
+use Predis\Response\Status as StatusResponse;
+
+/**
+ * This class implements a Predis connection that actually talks with Webdis
+ * instead of connecting directly to Redis. It relies on the cURL extension to
+ * communicate with the web server and the phpiredis extension to parse the
+ * protocol for responses returned in the http response bodies.
+ *
+ * Some features are not yet available or they simply cannot be implemented:
+ *   - Pipelining commands.
+ *   - Publish / Subscribe.
+ *   - MULTI / EXEC transactions (not yet supported by Webdis).
+ *
+ * The connection parameters supported by this class are:
+ *
+ *  - scheme: must be &#039;http&#039;.
+ *  - host: hostname or IP address of the server.
+ *  - port: TCP port of the server.
+ *  - timeout: timeout to perform the connection (default is 5 seconds).
+ *  - user: username for authentication.
+ *  - pass: password for authentication.
+ *
+ * @see http://webd.is
+ * @see http://github.com/nicolasff/webdis
+ * @see http://github.com/seppo0010/phpiredis
+ * @deprecated 2.1.2
+ */
+class WebdisConnection implements NodeConnectionInterface
+{
+    private $parameters;
+    private $resource;
+    private $reader;
+
+    /**
+     * @param ParametersInterface $parameters Initialization parameters for the connection.
+     *
+     * @throws InvalidArgumentException
+     */
+    public function __construct(ParametersInterface $parameters)
+    {
+        $this-&gt;assertExtensions();
+
+        if ($parameters-&gt;scheme !== &#039;http&#039;) {
+            throw new InvalidArgumentException(&quot;Invalid scheme: &#039;{$parameters-&gt;scheme}&#039;.&quot;);
+        }
+
+        $this-&gt;parameters = $parameters;
+
+        $this-&gt;resource = $this-&gt;createCurl();
+        $this-&gt;reader = $this-&gt;createReader();
+    }
+
+    /**
+     * Frees the underlying cURL and protocol reader resources when the garbage
+     * collector kicks in.
+     */
+    public function __destruct()
+    {
+        curl_close($this-&gt;resource);
+        phpiredis_reader_destroy($this-&gt;reader);
+    }
+
+    /**
+     * Helper method used to throw on unsupported methods.
+     *
+     * @param string $method Name of the unsupported method.
+     *
+     * @throws NotSupportedException
+     */
+    private function throwNotSupportedException($method)
+    {
+        $class = __CLASS__;
+        throw new NotSupportedException(&quot;The method $class::$method() is not supported.&quot;);
+    }
+
+    /**
+     * Checks if the cURL and phpiredis extensions are loaded in PHP.
+     */
+    private function assertExtensions()
+    {
+        if (!extension_loaded(&#039;curl&#039;)) {
+            throw new NotSupportedException(
+                &#039;The &quot;curl&quot; extension is required by this connection backend.&#039;
+            );
+        }
+
+        if (!extension_loaded(&#039;phpiredis&#039;)) {
+            throw new NotSupportedException(
+                &#039;The &quot;phpiredis&quot; extension is required by this connection backend.&#039;
+            );
+        }
+    }
+
+    /**
+     * Initializes cURL.
+     *
+     * @return resource
+     */
+    private function createCurl()
+    {
+        $parameters = $this-&gt;getParameters();
+        $timeout = (isset($parameters-&gt;timeout) ? (float) $parameters-&gt;timeout : 5.0) * 1000;
+
+        if (filter_var($host = $parameters-&gt;host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            $host = &quot;[$host]&quot;;
+        }
+
+        $options = [
+            CURLOPT_FAILONERROR =&gt; true,
+            CURLOPT_CONNECTTIMEOUT_MS =&gt; $timeout,
+            CURLOPT_URL =&gt; &quot;$parameters-&gt;scheme://$host:$parameters-&gt;port&quot;,
+            CURLOPT_HTTP_VERSION =&gt; CURL_HTTP_VERSION_1_1,
+            CURLOPT_POST =&gt; true,
+            CURLOPT_WRITEFUNCTION =&gt; [$this, &#039;feedReader&#039;],
+        ];
+
+        if (isset($parameters-&gt;user, $parameters-&gt;pass)) {
+            $options[CURLOPT_USERPWD] = &quot;{$parameters-&gt;user}:{$parameters-&gt;pass}&quot;;
+        }
+
+        curl_setopt_array($resource = curl_init(), $options);
+
+        return $resource;
+    }
+
+    /**
+     * Initializes the phpiredis protocol reader.
+     *
+     * @return resource
+     */
+    private function createReader()
+    {
+        $reader = phpiredis_reader_create();
+
+        phpiredis_reader_set_status_handler($reader, $this-&gt;getStatusHandler());
+        phpiredis_reader_set_error_handler($reader, $this-&gt;getErrorHandler());
+
+        return $reader;
+    }
+
+    /**
+     * Returns the handler used by the protocol reader for inline responses.
+     *
+     * @return Closure
+     */
+    protected function getStatusHandler()
+    {
+        static $statusHandler;
+
+        if (!$statusHandler) {
+            $statusHandler = function ($payload) {
+                return StatusResponse::get($payload);
+            };
+        }
+
+        return $statusHandler;
+    }
+
+    /**
+     * Returns the handler used by the protocol reader for error responses.
+     *
+     * @return Closure
+     */
+    protected function getErrorHandler()
+    {
+        static $errorHandler;
+
+        if (!$errorHandler) {
+            $errorHandler = function ($errorMessage) {
+                return new ErrorResponse($errorMessage);
+            };
+        }
+
+        return $errorHandler;
+    }
+
+    /**
+     * Feeds the phpredis reader resource with the data read from the network.
+     *
+     * @param resource $resource Reader resource.
+     * @param string   $buffer   Buffer of data read from a connection.
+     *
+     * @return int
+     */
+    protected function feedReader($resource, $buffer)
+    {
+        phpiredis_reader_feed($this-&gt;reader, $buffer);
+
+        return strlen($buffer);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function connect()
+    {
+        // NOOP
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function disconnect()
+    {
+        // NOOP
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function isConnected()
+    {
+        return true;
+    }
+
+    /**
+     * Checks if the specified command is supported by this connection class.
+     *
+     * @param CommandInterface $command Command instance.
+     *
+     * @return string
+     * @throws NotSupportedException
+     */
+    protected function getCommandId(CommandInterface $command)
+    {
+        switch ($commandID = $command-&gt;getId()) {
+            case &#039;AUTH&#039;:
+            case &#039;SELECT&#039;:
+            case &#039;MULTI&#039;:
+            case &#039;EXEC&#039;:
+            case &#039;WATCH&#039;:
+            case &#039;UNWATCH&#039;:
+            case &#039;DISCARD&#039;:
+            case &#039;MONITOR&#039;:
+                throw new NotSupportedException(&quot;Command &#039;$commandID&#039; is not allowed by Webdis.&quot;);
+            default:
+                return $commandID;
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function writeRequest(CommandInterface $command)
+    {
+        $this-&gt;throwNotSupportedException(__FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function readResponse(CommandInterface $command)
+    {
+        $this-&gt;throwNotSupportedException(__FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function executeCommand(CommandInterface $command)
+    {
+        $resource = $this-&gt;resource;
+        $commandId = $this-&gt;getCommandId($command);
+
+        if ($arguments = $command-&gt;getArguments()) {
+            $arguments = implode(&#039;/&#039;, array_map(&#039;urlencode&#039;, $arguments));
+            $serializedCommand = &quot;$commandId/$arguments.raw&quot;;
+        } else {
+            $serializedCommand = &quot;$commandId.raw&quot;;
+        }
+
+        curl_setopt($resource, CURLOPT_POSTFIELDS, $serializedCommand);
+
+        if (curl_exec($resource) === false) {
+            $error = trim(curl_error($resource));
+            $errno = curl_errno($resource);
+
+            throw new ConnectionException($this, &quot;$error{$this-&gt;getParameters()}]&quot;, $errno);
+        }
+
+        if (phpiredis_reader_get_state($this-&gt;reader) !== PHPIREDIS_READER_STATE_COMPLETE) {
+            throw new ProtocolException($this, phpiredis_reader_get_error($this-&gt;reader));
+        }
+
+        return phpiredis_reader_get_reply($this-&gt;reader);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getResource()
+    {
+        return $this-&gt;resource;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getParameters()
+    {
+        return $this-&gt;parameters;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function addConnectCommand(CommandInterface $command)
+    {
+        $this-&gt;throwNotSupportedException(__FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function read()
+    {
+        $this-&gt;throwNotSupportedException(__FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __toString()
+    {
+        return &quot;{$this-&gt;parameters-&gt;host}:{$this-&gt;parameters-&gt;port}&quot;;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __sleep()
+    {
+        return [&#039;parameters&#039;];
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __wakeup()
+    {
+        $this-&gt;assertExtensions();
+
+        $this-&gt;resource = $this-&gt;createCurl();
+        $this-&gt;reader = $this-&gt;createReader();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Monitor/Consumer.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Connection/Cluster -->
+
+</body>
+</html>

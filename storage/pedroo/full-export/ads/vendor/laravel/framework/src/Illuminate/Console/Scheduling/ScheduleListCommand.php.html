@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Console/Scheduling/ScheduleListCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Console\Scheduling;
+
+use Closure;
+use Cron\CronExpression;
+use DateTimeZone;
+use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use ReflectionClass;
+use ReflectionFunction;
+use Symfony\Component\Console\Attribute\AsCommand;
+use Symfony\Component\Console\Terminal;
+
+#[AsCommand(name: &#039;schedule:list&#039;)]
+class ScheduleListCommand extends Command
+{
+    /**
+     * The console command name.
+     *
+     * @var string
+     */
+    protected $signature = &#039;schedule:list
+        {--timezone= : The timezone that times should be displayed in}
+        {--next : Sort the listed tasks by their next due date}
+        {--json : Output the scheduled tasks as JSON}
+    &#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;List all scheduled tasks&#039;;
+
+    /**
+     * The terminal width resolver callback.
+     *
+     * @var \Closure|null
+     */
+    protected static $terminalWidthResolver;
+
+    /**
+     * Execute the console command.
+     *
+     * @param  \Illuminate\Console\Scheduling\Schedule  $schedule
+     * @return void
+     *
+     * @throws \Exception
+     */
+    public function handle(Schedule $schedule)
+    {
+        $events = new Collection($schedule-&gt;events());
+
+        if ($events-&gt;isEmpty()) {
+            if ($this-&gt;option(&#039;json&#039;)) {
+                $this-&gt;output-&gt;writeln(&#039;[]&#039;);
+            } else {
+                $this-&gt;components-&gt;info(&#039;No scheduled tasks have been defined.&#039;);
+            }
+
+            return;
+        }
+
+        $timezone = new DateTimeZone($this-&gt;option(&#039;timezone&#039;) ?? config(&#039;app.timezone&#039;));
+
+        $events = $this-&gt;sortEvents($events, $timezone);
+
+        $this-&gt;display($events, $timezone);
+    }
+
+    /**
+     * Render the scheduled tasks information as JSON.
+     *
+     * @param  \Illuminate\Support\Collection  $events
+     * @param  \DateTimeZone  $timezone
+     * @return void
+     */
+    protected function displayJson(Collection $events, DateTimeZone $timezone)
+    {
+        $this-&gt;output-&gt;writeln($events-&gt;map(function ($event) use ($timezone) {
+            $nextDueDate = $this-&gt;getNextDueDateForEvent($event, $timezone);
+
+            $command = $event-&gt;command ?? &#039;&#039;;
+
+            if (! $this-&gt;output-&gt;isVerbose()) {
+                $command = $event-&gt;normalizeCommand($command);
+            }
+
+            if ($event instanceof CallbackEvent) {
+                $command = $event-&gt;getSummaryForDisplay();
+
+                if (in_array($command, [&#039;Closure&#039;, &#039;Callback&#039;])) {
+                    $command = &#039;Closure at: &#039;.$this-&gt;getClosureLocation($event);
+                }
+            }
+
+            return [
+                &#039;expression&#039; =&gt; $event-&gt;expression,
+                &#039;command&#039; =&gt; $command,
+                &#039;description&#039; =&gt; $event-&gt;description ?? null,
+                &#039;next_due_date&#039; =&gt; $nextDueDate-&gt;format(&#039;Y-m-d H:i:s P&#039;),
+                &#039;next_due_date_human&#039; =&gt; $nextDueDate-&gt;diffForHumans(),
+                &#039;timezone&#039; =&gt; $timezone-&gt;getName(),
+                &#039;has_mutex&#039; =&gt; $event-&gt;mutex-&gt;exists($event),
+                &#039;repeat_seconds&#039; =&gt; $event-&gt;isRepeatable() ? $event-&gt;repeatSeconds : null,
+                &#039;environments&#039; =&gt; $event-&gt;environments,
+            ];
+        })-&gt;values()-&gt;toJson());
+    }
+
+    /**
+     * Render the scheduled tasks information formatted for the CLI.
+     *
+     * @param  \Illuminate\Support\Collection  $events
+     * @param  \DateTimeZone  $timezone
+     * @return void
+     */
+    protected function displayForCli(Collection $events, DateTimeZone $timezone)
+    {
+        $terminalWidth = self::getTerminalWidth();
+
+        $expressionSpacing = $this-&gt;getCronExpressionSpacing($events);
+
+        $repeatExpressionSpacing = $this-&gt;getRepeatExpressionSpacing($events);
+
+        $events = $events-&gt;map(function ($event) use ($terminalWidth, $expressionSpacing, $repeatExpressionSpacing, $timezone) {
+            return $this-&gt;listEvent($event, $terminalWidth, $expressionSpacing, $repeatExpressionSpacing, $timezone);
+        });
+
+        $this-&gt;line(
+            $events-&gt;flatten()-&gt;filter()-&gt;prepend(&#039;&#039;)-&gt;push(&#039;&#039;)-&gt;toArray()
+        );
+    }
+
+    /**
+     * Get the spacing to be used on each event row.
+     *
+     * @param  \Illuminate\Support\Collection  $events
+     * @return array&lt;int, int&gt;
+     */
+    private function getCronExpressionSpacing($events)
+    {
+        $rows = $events-&gt;map(fn ($event) =&gt; array_map(mb_strlen(...), preg_split(&quot;/\s+/&quot;, $event-&gt;expression)));
+
+        return (new Collection($rows[0] ?? []))-&gt;keys()-&gt;map(fn ($key) =&gt; $rows-&gt;max($key))-&gt;all();
+    }
+
+    /**
+     * Get the spacing to be used on each event row.
+     *
+     * @param  \Illuminate\Support\Collection  $events
+     * @return int
+     */
+    private function getRepeatExpressionSpacing($events)
+    {
+        return $events-&gt;map(fn ($event) =&gt; mb_strlen($this-&gt;getRepeatExpression($event)))-&gt;max();
+    }
+
+    /**
+     * List the given even in the console.
+     *
+     * @param  \Illuminate\Console\Scheduling\Event  $event
+     * @param  int  $terminalWidth
+     * @param  array  $expressionSpacing
+     * @param  int  $repeatExpressionSpacing
+     * @param  \DateTimeZone  $timezone
+     * @return array
+     */
+    private function listEvent($event, $terminalWidth, $expressionSpacing, $repeatExpressionSpacing, $timezone)
+    {
+        $expression = $this-&gt;formatCronExpression($event-&gt;expression, $expressionSpacing);
+
+        $repeatExpression = str_pad($this-&gt;getRepeatExpression($event), $repeatExpressionSpacing);
+
+        $command = $event-&gt;command ?? &#039;&#039;;
+
+        $description = $event-&gt;description ?? &#039;&#039;;
+
+        if (! $this-&gt;output-&gt;isVerbose()) {
+            $command = $event-&gt;normalizeCommand($command);
+        }
+
+        if ($event instanceof CallbackEvent) {
+            $command = $event-&gt;getSummaryForDisplay();
+
+            if (in_array($command, [&#039;Closure&#039;, &#039;Callback&#039;])) {
+                $command = &#039;Closure at: &#039;.$this-&gt;getClosureLocation($event);
+            }
+        }
+
+        $command = mb_strlen($command) &gt; 1 ? &quot;{$command} &quot; : &#039;&#039;;
+
+        $nextDueDateLabel = &#039;Next Due:&#039;;
+
+        $nextDueDate = $this-&gt;getNextDueDateForEvent($event, $timezone);
+
+        $nextDueDate = $this-&gt;output-&gt;isVerbose()
+            ? $nextDueDate-&gt;format(&#039;Y-m-d H:i:s P&#039;)
+            : $nextDueDate-&gt;diffForHumans();
+
+        $hasMutex = $event-&gt;mutex-&gt;exists($event) ? &#039;Has Mutex › &#039; : &#039;&#039;;
+
+        $dots = str_repeat(&#039;.&#039;, max(
+            $terminalWidth - mb_strwidth($expression.$repeatExpression.$command.$nextDueDateLabel.$nextDueDate.$hasMutex) - 8, 0
+        ));
+
+        // Highlight the parameters...
+        $command = preg_replace(&quot;#(php artisan [\w\-:]+) (.+)#&quot;, &#039;$1 &lt;fg=yellow;options=bold&gt;$2&lt;/&gt;&#039;, $command);
+
+        return [sprintf(
+            &#039;  &lt;fg=yellow&gt;%s&lt;/&gt; &lt;fg=#6C7280&gt;%s&lt;/&gt; %s&lt;fg=#6C7280&gt;%s %s%s %s&lt;/&gt;&#039;,
+            $expression,
+            $repeatExpression,
+            $command,
+            $dots,
+            $hasMutex,
+            $nextDueDateLabel,
+            $nextDueDate
+        ), $this-&gt;output-&gt;isVerbose() &amp;&amp; mb_strlen($description) &gt; 1 ? sprintf(
+            &#039;  &lt;fg=#6C7280&gt;%s%s %s&lt;/&gt;&#039;,
+            str_repeat(&#039; &#039;, mb_strlen($expression) + 2),
+            &#039;⇁&#039;,
+            $description
+        ) : &#039;&#039;];
+    }
+
+    /**
+     * Get the repeat expression for an event.
+     *
+     * @param  \Illuminate\Console\Scheduling\Event  $event
+     * @return string
+     */
+    private function getRepeatExpression($event)
+    {
+        return $event-&gt;isRepeatable() ? &quot;{$event-&gt;repeatSeconds}s &quot; : &#039;&#039;;
+    }
+
+    /**
+     * Sort the events by due date if option set.
+     *
+     * @param  \Illuminate\Support\Collection  $events
+     * @param  \DateTimeZone  $timezone
+     * @return \Illuminate\Support\Collection
+     */
+    private function sortEvents(\Illuminate\Support\Collection $events, DateTimeZone $timezone)
+    {
+        return $this-&gt;option(&#039;next&#039;)
+            ? $events-&gt;sortBy(fn ($event) =&gt; $this-&gt;getNextDueDateForEvent($event, $timezone))
+            : $events;
+    }
+
+    /**
+     * Render the scheduled tasks information.
+     *
+     * @param  \Illuminate\Support\Collection  $events
+     * @param  \DateTimeZone  $timezone
+     * @return void
+     */
+    protected function display(Collection $events, DateTimeZone $timezone)
+    {
+        $this-&gt;option(&#039;json&#039;) ? $this-&gt;displayJson($events, $timezone) : $this-&gt;displayForCli($events, $timezone);
+    }
+
+    /**
+     * Get the next due date for an event.
+     *
+     * @param  \Illuminate\Console\Scheduling\Event  $event
+     * @param  \DateTimeZone  $timezone
+     * @return \Illuminate\Support\Carbon
+     */
+    private function getNextDueDateForEvent($event, DateTimeZone $timezone)
+    {
+        $nextDueDate = Carbon::instance(
+            (new CronExpression($event-&gt;expression))
+                -&gt;getNextRunDate(Carbon::now()-&gt;setTimezone($event-&gt;timezone))
+                -&gt;setTimezone($timezone)
+        );
+
+        if (! $event-&gt;isRepeatable()) {
+            return $nextDueDate;
+        }
+
+        $previousDueDate = Carbon::instance(
+            (new CronExpression($event-&gt;expression))
+                -&gt;getPreviousRunDate(Carbon::now()-&gt;setTimezone($event-&gt;timezone), allowCurrentDate: true)
+                -&gt;setTimezone($timezone)
+        );
+
+        $now = Carbon::now()-&gt;setTimezone($event-&gt;timezone);
+
+        if (! $now-&gt;copy()-&gt;startOfMinute()-&gt;eq($previousDueDate)) {
+            return $nextDueDate;
+        }
+
+        return $now
+            -&gt;endOfSecond()
+            -&gt;ceilSeconds($event-&gt;repeatSeconds);
+    }
+
+    /**
+     * Format the cron expression based on the spacing provided.
+     *
+     * @param  string  $expression
+     * @param  array&lt;int, int&gt;  $spacing
+     * @return string
+     */
+    private function formatCronExpression($expression, $spacing)
+    {
+        $expressions = preg_split(&quot;/\s+/&quot;, $expression);
+
+        return (new Collection($spacing))
+            -&gt;map(fn ($length, $index) =&gt; str_pad($expressions[$index], $length))
+            -&gt;implode(&#039; &#039;);
+    }
+
+    /**
+     * Get the file and line number for the event closure.
+     *
+     * @param  \Illuminate\Console\Scheduling\CallbackEvent  $event
+     * @return string
+     */
+    private function getClosureLocation(CallbackEvent $event)
+    {
+        $callback = (new ReflectionClass($event))-&gt;getProperty(&#039;callback&#039;)-&gt;getValue($event);
+
+        if ($callback instanceof Closure) {
+            $function = new ReflectionFunction($callback);
+
+            return sprintf(
+                &#039;%s:%s&#039;,
+                str_replace($this-&gt;laravel-&gt;basePath().DIRECTORY_SEPARATOR, &#039;&#039;, $function-&gt;getFileName() ?: &#039;&#039;),
+                $function-&gt;getStartLine()
+            );
+        }
+
+        if (is_string($callback)) {
+            return $callback;
+        }
+
+        if (is_array($callback)) {
+            $className = is_string($callback[0]) ? $callback[0] : $callback[0]::class;
+
+            return sprintf(&#039;%s::%s&#039;, $className, $callback[1]);
+        }
+
+        return sprintf(&#039;%s::__invoke&#039;, $callback::class);
+    }
+
+    /**
+     * Get the terminal width.
+     *
+     * @return int
+     */
+    public static function getTerminalWidth()
+    {
+        return is_null(static::$terminalWidthResolver)
+            ? (new Terminal)-&gt;getWidth()
+            : call_user_func(static::$terminalWidthResolver);
+    }
+
+    /**
+     * Set a callback that should be used when resolving the terminal width.
+     *
+     * @param  \Closure|null  $resolver
+     * @return void
+     */
+    public static function resolveTerminalWidthUsing($resolver)
+    {
+        static::$terminalWidthResolver = $resolver;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Console/Scheduling/ScheduleRunCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Console/View -->
+
+</body>
+</html>

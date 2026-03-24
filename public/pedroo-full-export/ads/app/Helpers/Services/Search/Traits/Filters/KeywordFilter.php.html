@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Helpers/Services/Search/Traits/Filters/KeywordFilter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Helpers\Services\Search\Traits\Filters;
+
+use App\Helpers\Common\DBUtils;
+use App\Helpers\Common\Num;
+use App\Models\Category;
+use Illuminate\Support\Facades\DB;
+
+trait KeywordFilter
+{
+	protected array $searchableColumns = [
+		// Post
+		&#039;title&#039;                    =&gt; 10,
+		&#039;{postsTable}.description&#039; =&gt; 10,
+		&#039;tags&#039;                     =&gt; 8,
+		// Category
+		&#039;tCategory.name&#039;           =&gt; 5,
+		&#039;tParentCat.name&#039;          =&gt; 2,
+	];
+	
+	protected bool $forceAverage = true; // Force relevance&#039;s average
+	protected int $average = 1;         // Set relevance&#039;s average
+	public static int $queryLength = 1; // Minimum query characters
+	
+	// Ban this words in query search
+	// protected $bannedWords = [&#039;sell&#039;, &#039;buy&#039;, &#039;the&#039;, &#039;of&#039;, &#039;any&#039;, &#039;some&#039;, &#039;for&#039;, &#039;it&#039;, &#039;latest&#039;];
+	protected array $bannedWords = [];
+	
+	protected function applyKeywordFilter(): void
+	{
+		if (!(isset($this-&gt;posts) &amp;&amp; isset($this-&gt;postsTable) &amp;&amp; isset($this-&gt;having) &amp;&amp; isset($this-&gt;groupBy) &amp;&amp; isset($this-&gt;orderBy))) {
+			return;
+		}
+		
+		$keywords = data_get($this-&gt;input, &#039;keyword&#039;);
+		$keywords = data_get($this-&gt;input, &#039;q&#039;, $keywords);
+		$keywords = is_string($keywords) ? $keywords : null;
+		
+		if (trim($keywords) == &#039;&#039;) {
+			return;
+		}
+		
+		// Get valid columns name
+		$searchableColumns = collect($this-&gt;searchableColumns)
+			-&gt;reject(function ($value, $key) {
+				return (
+					empty($keywords)
+					&amp;&amp; (
+						str_contains($key, &#039;tCategory.&#039;)
+						|| str_contains($key, &#039;tParentCat.&#039;)
+					)
+				);
+			})
+			-&gt;mapWithKeys(function ($value, $key) {
+				$key = str_replace(&#039;{postsTable}&#039;, $this-&gt;postsTable, $key);
+				
+				if (str_contains($key, &#039;.&#039;)) {
+					$key = DB::getTablePrefix() . $key;
+				}
+				
+				return [$key =&gt; $value];
+			})-&gt;toArray();
+		
+		// Ban the Country&#039;s name from keywords
+		$this-&gt;bannedWords[] = strtolower(config(&#039;country.name&#039;));
+		
+		// Query search SELECT array
+		$select = [];
+		$bindings = [];
+		
+		// Get all keywords in array
+		$wordsArray = preg_split(&#039;/[\s,+]+/&#039;, $keywords);
+		
+		//-- If third parameter is set as true, it will check if the column starts with the search
+		//-- if then it adds relevance * 30
+		//-- this ensures that relevant results will be at top
+		$select[] = &quot;(CASE WHEN title LIKE ? THEN 300 ELSE 0 END) &quot;;
+		$bindings[] = $keywords . &#039;%&#039;;
+		
+		foreach ($searchableColumns as $column =&gt; $relevance) {
+			$tmp = [];
+			
+			foreach ($wordsArray as $word) {
+				// Skip short keywords
+				if (strlen($word) &lt;= self::$queryLength) {
+					continue;
+				}
+				
+				// @todo: Find another way
+				if (in_array(mb_strtolower($word), $this-&gt;bannedWords)) {
+					continue;
+				}
+				
+				$wordFilter = $column . &quot; LIKE ?&quot;;
+				$wordBinding = &#039;%&#039; . $word . &#039;%&#039;;
+				
+				$masterLocaleWordFilter = &#039;&#039;;
+				$masterLocaleWordBinding = &#039;&#039;;
+				
+				if (str_contains($column, &#039;tCategory.&#039;) || str_contains($column, &#039;tParentCat.&#039;)) {
+					$modelColumn = last(explode(&#039;.&#039;, $column));
+					if ((new Category)-&gt;isTranslatableAttribute($modelColumn)) {
+						$locale = app()-&gt;getLocale();
+						$masterLocale = config(&#039;translatable.fallback_locale&#039;) ?? config(&#039;app.fallback_locale&#039;);
+						
+						// JSON columns manipulation is only available in:
+						// MySQL 5.7 or above &amp; MariaDB 10.2.3 or above
+						$jsonMethodsAreAvailable = (
+							(!DBUtils::isMariaDB() &amp;&amp; DBUtils::isMySqlMinVersion(&#039;5.7&#039;))
+							|| (DBUtils::isMariaDB() &amp;&amp; DBUtils::isMySqlMinVersion(&#039;10.2.3&#039;))
+						);
+						if ($jsonMethodsAreAvailable) {
+							
+							// Convert non-JSON value column to the right JSON format
+							$jsonObjColumn = &#039;JSON_OBJECT(\&#039;&#039; . $locale . &#039;\&#039;, &#039; . $column . &#039;)&#039;;
+							$isValidJson = &#039;JSON_VALID(&#039; . $column . &#039;)&#039;;
+							$column = &#039;IF(&#039; . $isValidJson . &#039;, &#039; . $column . &#039;, &#039; . $jsonObjColumn . &#039;)&#039;;
+							
+							// Apply WHERE clause using MySQL JSON methods
+							$jsonColumn = &#039;JSON_UNQUOTE(JSON_EXTRACT(&#039; . $column . &#039;, \&#039;$.&#039; . $locale . &#039;\&#039;))&#039;;
+							$jsonColumn = &#039;LOWER(&#039; . $jsonColumn . &#039;)&#039;;
+							$jsonColumn = &#039;BINARY &#039; . $jsonColumn;
+							
+							$wordFilter = $jsonColumn . &#039; LIKE BINARY LOWER(?)&#039;;
+							$wordBinding = &#039;%&#039; . $word . &#039;%&#039;;
+							
+							if (!empty($masterLocale) &amp;&amp; $locale != $masterLocale) {
+								$jsonColumn = &#039;JSON_UNQUOTE(JSON_EXTRACT(&#039; . $column . &#039;, \&#039;$.&#039; . $masterLocale . &#039;\&#039;))&#039;;
+								$jsonColumn = &#039;LOWER(&#039; . $jsonColumn . &#039;)&#039;;
+								$jsonColumn = &#039;BINARY &#039; . $jsonColumn;
+								
+								$masterLocaleWordFilter = $jsonColumn . &#039; LIKE BINARY LOWER(?)&#039;;
+								$masterLocaleWordBinding = &#039;%&#039; . $word . &#039;%&#039;;
+							}
+							
+						} else {
+							
+							// $word = trim(json_encode($word), &#039;&quot;&#039;);
+							// Escaping Quote
+							$word = str_replace([&#039;\&#039;&#039;], [&#039;\\\&#039;&#039;], $word);
+							
+							$wordFilter = $column . &#039; LIKE ?&#039;;
+							$wordBinding = &#039;%&#039; . $word . &#039;%&#039;;
+							
+						}
+					}
+				}
+				
+				$tmp[] = $wordFilter;
+				$bindings[] = $wordBinding;
+				
+				if (!empty($masterLocaleWordFilter) &amp;&amp; !empty($masterLocaleWordBinding)) {
+					$tmp[] = $masterLocaleWordFilter;
+					$bindings[] = $masterLocaleWordBinding;
+				}
+			}
+			
+			if (is_array($tmp) &amp;&amp; count($tmp) &gt; 0) {
+				$select[] = &quot;(CASE WHEN &quot; . implode(&#039; || &#039;, $tmp) . &quot; THEN &quot; . $relevance . &quot; ELSE 0 END) &quot;;
+			}
+		}
+		
+		if (!is_array($select) || !is_array($bindings)) {
+			return;
+		}
+		if (count($select) &lt;= 0) {
+			return;
+		}
+		
+		// Make possible the orderBy &#039;relevance&#039;
+		$this-&gt;orderByParametersFields[&#039;relevance&#039;] = [&#039;name&#039; =&gt; &#039;relevance&#039;, &#039;order&#039; =&gt; &#039;DESC&#039;];
+		
+		//-- Select
+		$this-&gt;posts-&gt;addSelect(DB::raw(&quot;(&quot; . implode(&quot;+\n&quot;, $select) . &quot;) AS relevance&quot;));
+		if (!empty($bindings)) {
+			foreach ($bindings as $binding) {
+				$this-&gt;posts-&gt;addBinding($binding, &#039;select&#039;);
+			}
+		}
+		
+		//-- Having
+		//-- Selects only the rows that have more than
+		//-- the sum of all attributes relevance and divided by count of attributes
+		//-- e.i. (20 + 5 + 2) / 4 = 6.75
+		$average = array_sum($searchableColumns) / count($searchableColumns);
+		$average = Num::toFloat($average);
+		if ($this-&gt;forceAverage) {
+			$average = $this-&gt;average;
+		}
+		$this-&gt;having[] = &#039;relevance &gt;= &#039; . $average;
+		
+		//-- Group By (relevance)
+		$this-&gt;groupBy[] = &quot;relevance&quot;;
+		
+		//-- Orders By (relevance)
+		$this-&gt;orderBy[] = &#039;relevance DESC&#039;;
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Helpers/Services/Search/Traits/Filters/LocationFilter.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Helpers/Services/Search/Traits/Relations -->
+
+</body>
+</html>

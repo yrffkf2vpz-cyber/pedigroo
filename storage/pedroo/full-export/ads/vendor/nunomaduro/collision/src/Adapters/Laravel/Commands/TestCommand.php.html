@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/nunomaduro/collision/src/Adapters/Laravel/Commands/TestCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace NunoMaduro\Collision\Adapters\Laravel\Commands;
+
+use Dotenv\Exception\InvalidPathException;
+use Dotenv\Parser\Parser;
+use Dotenv\Store\StoreBuilder;
+use Illuminate\Console\Command;
+use Illuminate\Support\Env;
+use Illuminate\Support\Str;
+use NunoMaduro\Collision\Adapters\Laravel\Exceptions\RequirementsException;
+use NunoMaduro\Collision\Coverage;
+use ParaTest\Options;
+use RuntimeException;
+use SebastianBergmann\Environment\Console;
+use Symfony\Component\Console\Input\ArgvInput;
+use Symfony\Component\Console\Input\InputDefinition;
+use Symfony\Component\Process\Exception\ProcessSignaledException;
+use Symfony\Component\Process\Process;
+
+/**
+ * @internal
+ *
+ * @final
+ */
+class TestCommand extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = &#039;test
+        {--without-tty : Disable output to TTY}
+        {--compact : Indicates whether the compact printer should be used}
+        {--coverage : Indicates whether code coverage information should be collected}
+        {--min= : Indicates the minimum threshold enforcement for code coverage}
+        {--p|parallel : Indicates if the tests should run in parallel}
+        {--profile : Lists top 10 slowest tests}
+        {--recreate-databases : Indicates if the test databases should be re-created}
+        {--drop-databases : Indicates if the test databases should be dropped}
+        {--without-databases : Indicates if database configuration should be performed}
+    &#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;Run the application tests&#039;;
+
+    /**
+     * Create a new command instance.
+     *
+     * @return void
+     */
+    public function __construct()
+    {
+        parent::__construct();
+
+        $this-&gt;ignoreValidationErrors();
+    }
+
+    /**
+     * Execute the console command.
+     *
+     * @return mixed
+     */
+    public function handle()
+    {
+        if ($this-&gt;option(&#039;coverage&#039;) &amp;&amp; ! Coverage::isAvailable()) {
+            $this-&gt;output-&gt;writeln(sprintf(
+                &quot;\n  &lt;fg=white;bg=red;options=bold&gt; ERROR &lt;/&gt; Code coverage driver not available.%s&lt;/&gt;&quot;,
+                Coverage::usingXdebug()
+                    ? &quot; Did you set &lt;href=https://xdebug.org/docs/code_coverage#mode&gt;Xdebug&#039;s coverage mode&lt;/&gt;?&quot;
+                    : &#039; Did you install &lt;href=https://xdebug.org/&gt;Xdebug&lt;/&gt; or &lt;href=https://github.com/krakjoe/pcov&gt;PCOV&lt;/&gt;?&#039;
+            ));
+
+            $this-&gt;newLine();
+
+            return 1;
+        }
+
+        /** @var bool $usesParallel */
+        $usesParallel = $this-&gt;option(&#039;parallel&#039;);
+
+        if ($usesParallel &amp;&amp; ! $this-&gt;isParallelDependenciesInstalled()) {
+            throw new RequirementsException(&#039;Running Collision 8.x artisan test command in parallel requires at least ParaTest (brianium/paratest) 7.x.&#039;);
+        }
+
+        $options = array_slice($_SERVER[&#039;argv&#039;], $this-&gt;option(&#039;without-tty&#039;) ? 3 : 2);
+
+        $this-&gt;clearEnv();
+
+        $parallel = $this-&gt;option(&#039;parallel&#039;);
+
+        $process = (new Process(array_merge(
+            // Binary ...
+            $this-&gt;binary(),
+            // Arguments ...
+            $parallel ? $this-&gt;paratestArguments($options) : $this-&gt;phpunitArguments($options)
+        ),
+            null,
+            // Envs ...
+            $parallel ? $this-&gt;paratestEnvironmentVariables() : $this-&gt;phpunitEnvironmentVariables(),
+        ))-&gt;setTimeout(null);
+
+        try {
+            $process-&gt;setTty(! $this-&gt;option(&#039;without-tty&#039;));
+        } catch (RuntimeException $e) {
+            // $this-&gt;output-&gt;writeln(&#039;Warning: &#039;.$e-&gt;getMessage());
+        }
+
+        $exitCode = 1;
+
+        try {
+            $exitCode = $process-&gt;run(function ($type, $line) {
+                $this-&gt;output-&gt;write($line);
+            });
+        } catch (ProcessSignaledException $e) {
+            if (extension_loaded(&#039;pcntl&#039;) &amp;&amp; $e-&gt;getSignal() !== SIGINT) {
+                throw $e;
+            }
+        }
+
+        if ($exitCode === 0 &amp;&amp; $this-&gt;option(&#039;coverage&#039;)) {
+            if (! $this-&gt;usingPest() &amp;&amp; $this-&gt;option(&#039;parallel&#039;)) {
+                $this-&gt;newLine();
+            }
+
+            $hideFullCoverage = (bool) $this-&gt;option(&#039;compact&#039;);
+            $coverage = Coverage::report($this-&gt;output, $hideFullCoverage);
+
+            $exitCode = (int) ($coverage &lt; $this-&gt;option(&#039;min&#039;));
+
+            if ($exitCode === 1) {
+                $this-&gt;output-&gt;writeln(sprintf(
+                    &quot;\n  &lt;fg=white;bg=red;options=bold&gt; FAIL &lt;/&gt; Code coverage below expected:&lt;fg=red;options=bold&gt; %s %%&lt;/&gt;. Minimum:&lt;fg=white;options=bold&gt; %s %%&lt;/&gt;.&quot;,
+                    number_format($coverage, 1),
+                    number_format((float) $this-&gt;option(&#039;min&#039;), 1)
+                ));
+            }
+        }
+
+        return $exitCode;
+    }
+
+    /**
+     * Get the PHP binary to execute.
+     *
+     * @return array
+     */
+    protected function binary()
+    {
+        if ($this-&gt;usingPest()) {
+            $command = $this-&gt;option(&#039;parallel&#039;) ? [&#039;vendor/pestphp/pest/bin/pest&#039;, &#039;--parallel&#039;] : [&#039;vendor/pestphp/pest/bin/pest&#039;];
+        } else {
+            $command = $this-&gt;option(&#039;parallel&#039;) ? [&#039;vendor/brianium/paratest/bin/paratest&#039;] : [&#039;vendor/phpunit/phpunit/phpunit&#039;];
+        }
+
+        if (&#039;phpdbg&#039; === PHP_SAPI) {
+            return array_merge([PHP_BINARY, &#039;-qrr&#039;], $command);
+        }
+
+        return array_merge([PHP_BINARY], $command);
+    }
+
+    /**
+     * Gets the common arguments of PHPUnit and Pest.
+     *
+     * @return array
+     */
+    protected function commonArguments()
+    {
+        $arguments = [];
+
+        if ($this-&gt;option(&#039;coverage&#039;)) {
+            $arguments[] = &#039;--coverage-php&#039;;
+            $arguments[] = Coverage::getPath();
+        }
+
+        if ($this-&gt;option(&#039;ansi&#039;)) {
+            $arguments[] = &#039;--colors=always&#039;;
+        } elseif ($this-&gt;option(&#039;no-ansi&#039;)) {
+            $arguments[] = &#039;--colors=never&#039;;
+        } elseif ((new Console)-&gt;hasColorSupport()) {
+            $arguments[] = &#039;--colors=always&#039;;
+        }
+
+        return $arguments;
+    }
+
+    /**
+     * Determines if Pest is being used.
+     *
+     * @return bool
+     */
+    protected function usingPest()
+    {
+        return function_exists(&#039;\Pest\\version&#039;);
+    }
+
+    /**
+     * Get the array of arguments for running PHPUnit.
+     *
+     * @param  array  $options
+     * @return array
+     */
+    protected function phpunitArguments($options)
+    {
+        $options = array_merge([&#039;--no-output&#039;], $options);
+
+        $options = array_values(array_filter($options, function ($option) {
+            return ! Str::startsWith($option, &#039;--env=&#039;)
+                &amp;&amp; $option != &#039;-q&#039;
+                &amp;&amp; $option != &#039;--quiet&#039;
+                &amp;&amp; $option != &#039;--coverage&#039;
+                &amp;&amp; $option != &#039;--compact&#039;
+                &amp;&amp; $option != &#039;--profile&#039;
+                &amp;&amp; $option != &#039;--ansi&#039;
+                &amp;&amp; $option != &#039;--no-ansi&#039;
+                &amp;&amp; ! Str::startsWith($option, &#039;--min&#039;);
+        }));
+
+        return array_merge($this-&gt;commonArguments(), [&#039;--configuration=&#039;.$this-&gt;getConfigurationFile()], $options);
+    }
+
+    /**
+     * Get the configuration file.
+     *
+     * @return string
+     */
+    protected function getConfigurationFile()
+    {
+        if (! file_exists($file = base_path(&#039;phpunit.xml&#039;))) {
+            $file = base_path(&#039;phpunit.xml.dist&#039;);
+        }
+
+        return $file;
+    }
+
+    /**
+     * Get the array of arguments for running Paratest.
+     *
+     * @param  array  $options
+     * @return array
+     */
+    protected function paratestArguments($options)
+    {
+        $options = array_values(array_filter($options, function ($option) {
+            return ! Str::startsWith($option, &#039;--env=&#039;)
+                &amp;&amp; $option != &#039;--coverage&#039;
+                &amp;&amp; $option != &#039;-q&#039;
+                &amp;&amp; $option != &#039;--quiet&#039;
+                &amp;&amp; $option != &#039;--ansi&#039;
+                &amp;&amp; $option != &#039;--no-ansi&#039;
+                &amp;&amp; ! Str::startsWith($option, &#039;--min&#039;)
+                &amp;&amp; ! Str::startsWith($option, &#039;-p&#039;)
+                &amp;&amp; ! Str::startsWith($option, &#039;--compact&#039;)
+                &amp;&amp; ! Str::startsWith($option, &#039;--parallel&#039;)
+                &amp;&amp; ! Str::startsWith($option, &#039;--recreate-databases&#039;)
+                &amp;&amp; ! Str::startsWith($option, &#039;--drop-databases&#039;)
+                &amp;&amp; ! Str::startsWith($option, &#039;--without-databases&#039;);
+        }));
+
+        $options = array_merge($this-&gt;commonArguments(), [
+            &#039;--configuration=&#039;.$this-&gt;getConfigurationFile(),
+            &quot;--runner=\Illuminate\Testing\ParallelRunner&quot;,
+        ], $options);
+
+        $inputDefinition = new InputDefinition;
+        Options::setInputDefinition($inputDefinition);
+        $input = new ArgvInput($options, $inputDefinition);
+
+        /** @var non-empty-string $basePath */
+        $basePath = base_path();
+
+        $paraTestOptions = Options::fromConsoleInput(
+            $input,
+            $basePath,
+        );
+
+        if (! $paraTestOptions-&gt;configuration-&gt;hasCoverageCacheDirectory()) {
+            $cacheDirectory = sys_get_temp_dir().DIRECTORY_SEPARATOR.&#039;__laravel_test_cache_directory&#039;;
+            $options[] = &#039;--cache-directory&#039;;
+            $options[] = $cacheDirectory;
+        }
+
+        return $options;
+    }
+
+    /**
+     * Get the array of environment variables for running PHPUnit.
+     *
+     * @return array
+     */
+    protected function phpunitEnvironmentVariables()
+    {
+        $variables = [
+            &#039;COLLISION_PRINTER&#039; =&gt; &#039;DefaultPrinter&#039;,
+        ];
+
+        if ($this-&gt;option(&#039;compact&#039;)) {
+            $variables[&#039;COLLISION_PRINTER_COMPACT&#039;] = &#039;true&#039;;
+        }
+
+        if ($this-&gt;option(&#039;profile&#039;)) {
+            $variables[&#039;COLLISION_PRINTER_PROFILE&#039;] = &#039;true&#039;;
+        }
+
+        return $variables;
+    }
+
+    /**
+     * Get the array of environment variables for running Paratest.
+     *
+     * @return array
+     */
+    protected function paratestEnvironmentVariables()
+    {
+        return [
+            &#039;LARAVEL_PARALLEL_TESTING&#039; =&gt; 1,
+            &#039;LARAVEL_PARALLEL_TESTING_RECREATE_DATABASES&#039; =&gt; $this-&gt;option(&#039;recreate-databases&#039;),
+            &#039;LARAVEL_PARALLEL_TESTING_DROP_DATABASES&#039; =&gt; $this-&gt;option(&#039;drop-databases&#039;),
+            &#039;LARAVEL_PARALLEL_TESTING_WITHOUT_DATABASES&#039; =&gt; $this-&gt;option(&#039;without-databases&#039;),
+        ];
+    }
+
+    /**
+     * Clears any set Environment variables set by Laravel if the --env option is empty.
+     *
+     * @return void
+     */
+    protected function clearEnv()
+    {
+        if (! $this-&gt;option(&#039;env&#039;)) {
+            $vars = self::getEnvironmentVariables(
+                $this-&gt;laravel-&gt;environmentPath(),
+                $this-&gt;laravel-&gt;environmentFile()
+            );
+
+            $repository = Env::getRepository();
+
+            foreach ($vars as $name) {
+                $repository-&gt;clear($name);
+            }
+        }
+    }
+
+    /**
+     * @param  string  $path
+     * @param  string  $file
+     * @return array
+     */
+    protected static function getEnvironmentVariables($path, $file)
+    {
+        try {
+            $content = StoreBuilder::createWithNoNames()
+                -&gt;addPath($path)
+                -&gt;addName($file)
+                -&gt;make()
+                -&gt;read();
+        } catch (InvalidPathException $e) {
+            return [];
+        }
+
+        $vars = [];
+
+        foreach ((new Parser)-&gt;parse($content) as $entry) {
+            $vars[] = $entry-&gt;getName();
+        }
+
+        return $vars;
+    }
+
+    /**
+     * Check if the parallel dependencies are installed.
+     *
+     * @return bool
+     */
+    protected function isParallelDependenciesInstalled()
+    {
+        return class_exists(\ParaTest\ParaTestCommand::class);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/nunomaduro/collision/src/Adapters/Laravel/ExceptionHandler.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/nunomaduro/collision/src/Adapters/Laravel/Exceptions -->
+
+</body>
+</html>

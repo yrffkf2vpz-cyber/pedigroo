@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/spatie/laravel-backup/src/Tasks/Backup/DbDumperFactory.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Spatie\Backup\Tasks\Backup;
+
+use Exception;
+use Illuminate\Database\ConfigurationUrlParser;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Spatie\Backup\Exceptions\CannotCreateDbDumper;
+use Spatie\DbDumper\Databases\MariaDb;
+use Spatie\DbDumper\Databases\MongoDb;
+use Spatie\DbDumper\Databases\MySql;
+use Spatie\DbDumper\Databases\PostgreSql;
+use Spatie\DbDumper\Databases\Sqlite;
+use Spatie\DbDumper\DbDumper;
+
+class DbDumperFactory
+{
+    /** @var array&lt;DbDumper&gt; */
+    protected static array $custom = [];
+
+    public static function createFromConnection(string $dbConnectionName): DbDumper
+    {
+        $parser = new ConfigurationUrlParser;
+
+        if (config(&quot;database.connections.{$dbConnectionName}&quot;) === null) {
+            throw CannotCreateDbDumper::unsupportedDriver($dbConnectionName);
+        }
+
+        try {
+            $dbConfig = $parser-&gt;parseConfiguration(config(&quot;database.connections.{$dbConnectionName}&quot;));
+        } catch (Exception) {
+            throw CannotCreateDbDumper::unsupportedDriver($dbConnectionName);
+        }
+
+        if (isset($dbConfig[&#039;read&#039;])) {
+            $dbConfig = Arr::except(
+                array_merge($dbConfig, $dbConfig[&#039;read&#039;]),
+                [&#039;read&#039;, &#039;write&#039;]
+            );
+        }
+
+        $dbDumper = static::forDriver($dbConfig[&#039;driver&#039;] ?? &#039;&#039;)
+            -&gt;setHost(Arr::first(Arr::wrap($dbConfig[&#039;host&#039;] ?? &#039;&#039;)))
+            -&gt;setDbName($dbConfig[&#039;connect_via_database&#039;] ?? $dbConfig[&#039;database&#039;])
+            -&gt;setUserName($dbConfig[&#039;username&#039;] ?? &#039;&#039;)
+            -&gt;setPassword($dbConfig[&#039;password&#039;] ?? &#039;&#039;);
+
+        if ($dbDumper instanceof MySql) {
+            $dbDumper
+                -&gt;setSkipSsl($dbConfig[&#039;dump&#039;][&#039;skip_ssl&#039;] ?? false)
+                -&gt;setDefaultCharacterSet($dbConfig[&#039;charset&#039;] ?? &#039;&#039;)
+                -&gt;setGtidPurged($dbConfig[&#039;dump&#039;][&#039;mysql_gtid_purged&#039;] ?? &#039;AUTO&#039;);
+        }
+
+        if ($dbDumper instanceof MongoDb) {
+            $dbDumper-&gt;setAuthenticationDatabase($dbConfig[&#039;dump&#039;][&#039;mongodb_user_auth&#039;] ?? &#039;&#039;);
+        }
+
+        if (isset($dbConfig[&#039;port&#039;])) {
+            if (filter_var($dbConfig[&#039;port&#039;], FILTER_VALIDATE_INT, [
+                &#039;options&#039; =&gt; [
+                    &#039;min_range&#039; =&gt; 1,
+                    &#039;max_range&#039; =&gt; 65535,
+                ],
+            ]) !== false) {
+                $dbDumper = $dbDumper-&gt;setPort((int) $dbConfig[&#039;port&#039;]);
+            }
+        }
+
+        if (isset($dbConfig[&#039;dump&#039;])) {
+            $dbDumper = static::processExtraDumpParameters($dbConfig[&#039;dump&#039;], $dbDumper);
+        }
+
+        if (isset($dbConfig[&#039;unix_socket&#039;])) {
+            $dbDumper = $dbDumper-&gt;setSocket($dbConfig[&#039;unix_socket&#039;]);
+        }
+
+        return $dbDumper;
+    }
+
+    public static function extend(string $driver, callable $callback): void
+    {
+        static::$custom[$driver] = $callback;
+    }
+
+    protected static function forDriver(string $dbDriver): DbDumper
+    {
+        $driver = strtolower($dbDriver);
+
+        if (isset(static::$custom[$driver])) {
+            return (static::$custom[$driver])();
+        }
+
+        return match ($driver) {
+            &#039;mysql&#039; =&gt; new MySql,
+            &#039;mariadb&#039; =&gt; new MariaDb,
+            &#039;pgsql&#039; =&gt; new PostgreSql,
+            &#039;sqlite&#039; =&gt; new Sqlite,
+            &#039;mongodb&#039; =&gt; new MongoDb,
+            default =&gt; throw CannotCreateDbDumper::unsupportedDriver($driver),
+        };
+    }
+
+    /** @param array&lt;string, string|array&lt;string&gt;&gt; $dumpConfiguration */
+    protected static function processExtraDumpParameters(array $dumpConfiguration, DbDumper $dbDumper): DbDumper
+    {
+        collect($dumpConfiguration)-&gt;each(function ($configValue, $configName) use ($dbDumper) {
+            $methodName = lcfirst(Str::studly(is_numeric($configName) ? $configValue : $configName));
+            $methodValue = is_numeric($configName) ? null : $configValue;
+
+            $methodName = static::determineValidMethodName($dbDumper, $methodName);
+
+            if (method_exists($dbDumper, $methodName)) {
+                static::callMethodOnDumper($dbDumper, $methodName, $methodValue);
+            }
+        });
+
+        return $dbDumper;
+    }
+
+    protected static function callMethodOnDumper(DbDumper $dbDumper, string $methodName, mixed $methodValue): DbDumper
+    {
+        if (! $methodValue) {
+            $dbDumper-&gt;$methodName();
+
+            return $dbDumper;
+        }
+
+        $dbDumper-&gt;$methodName($methodValue);
+
+        return $dbDumper;
+    }
+
+    protected static function determineValidMethodName(DbDumper $dbDumper, string $methodName): string
+    {
+        return collect([$methodName, &#039;set&#039;.ucfirst($methodName)])
+            -&gt;first(fn (string $methodName) =&gt; method_exists($dbDumper, $methodName), &#039;&#039;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/spatie/laravel-backup/src/Tasks/Backup/FileSelection.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/spatie/laravel-backup/src/Tasks/Cleanup -->
+
+</body>
+</html>

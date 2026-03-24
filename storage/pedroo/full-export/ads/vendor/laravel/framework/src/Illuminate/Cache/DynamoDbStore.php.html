@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Cache/DynamoDbStore.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Cache;
+
+use Aws\DynamoDb\DynamoDbClient;
+use Aws\DynamoDb\Exception\DynamoDbException;
+use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Contracts\Cache\Store;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\InteractsWithTime;
+use Illuminate\Support\Str;
+use RuntimeException;
+
+class DynamoDbStore implements LockProvider, Store
+{
+    use InteractsWithTime;
+
+    /**
+     * A string that should be prepended to keys.
+     *
+     * @var string
+     */
+    protected $prefix;
+
+    /**
+     * Create a new store instance.
+     *
+     * @param  \Aws\DynamoDb\DynamoDbClient  $dynamo  The DynamoDB client instance.
+     * @param  string  $table  The table name.
+     * @param  string  $keyAttribute  The name of the attribute that should hold the key.
+     * @param  string  $valueAttribute  The name of the attribute that should hold the value.
+     * @param  string  $expirationAttribute  The name of the attribute that should hold the expiration timestamp.
+     * @param  string  $prefix
+     */
+    public function __construct(
+        protected DynamoDbClient $dynamo,
+        protected $table,
+        protected $keyAttribute = &#039;key&#039;,
+        protected $valueAttribute = &#039;value&#039;,
+        protected $expirationAttribute = &#039;expires_at&#039;,
+        $prefix = &#039;&#039;,
+    ) {
+        $this-&gt;setPrefix($prefix);
+    }
+
+    /**
+     * Retrieve an item from the cache by key.
+     *
+     * @param  string  $key
+     * @return mixed
+     */
+    public function get($key)
+    {
+        $response = $this-&gt;dynamo-&gt;getItem([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;ConsistentRead&#039; =&gt; false,
+            &#039;Key&#039; =&gt; [
+                $this-&gt;keyAttribute =&gt; [
+                    &#039;S&#039; =&gt; $this-&gt;prefix.$key,
+                ],
+            ],
+        ]);
+
+        if (! isset($response[&#039;Item&#039;])) {
+            return;
+        }
+
+        if ($this-&gt;isExpired($response[&#039;Item&#039;])) {
+            return;
+        }
+
+        if (isset($response[&#039;Item&#039;][$this-&gt;valueAttribute])) {
+            return $this-&gt;unserialize(
+                $response[&#039;Item&#039;][$this-&gt;valueAttribute][&#039;S&#039;] ??
+                $response[&#039;Item&#039;][$this-&gt;valueAttribute][&#039;N&#039;] ??
+                null
+            );
+        }
+    }
+
+    /**
+     * Retrieve multiple items from the cache by key.
+     *
+     * Items not found in the cache will have a null value.
+     *
+     * @param  array  $keys
+     * @return array
+     */
+    public function many(array $keys)
+    {
+        if (count($keys) === 0) {
+            return [];
+        }
+
+        $prefixedKeys = array_map(function ($key) {
+            return $this-&gt;prefix.$key;
+        }, $keys);
+
+        $response = $this-&gt;dynamo-&gt;batchGetItem([
+            &#039;RequestItems&#039; =&gt; [
+                $this-&gt;table =&gt; [
+                    &#039;ConsistentRead&#039; =&gt; false,
+                    &#039;Keys&#039; =&gt; (new Collection($prefixedKeys))-&gt;map(fn ($key) =&gt; [
+                        $this-&gt;keyAttribute =&gt; [
+                            &#039;S&#039; =&gt; $key,
+                        ],
+                    ])-&gt;all(),
+                ],
+            ],
+        ]);
+
+        $now = Carbon::now();
+
+        return array_merge(
+            Arr::mapWithKeys($keys, fn ($key) =&gt; [$key =&gt; null]),
+            (new Collection($response[&#039;Responses&#039;][$this-&gt;table]))-&gt;mapWithKeys(function ($response) use ($now) {
+                if ($this-&gt;isExpired($response, $now)) {
+                    $value = null;
+                } else {
+                    $value = $this-&gt;unserialize(
+                        $response[$this-&gt;valueAttribute][&#039;S&#039;] ??
+                        $response[$this-&gt;valueAttribute][&#039;N&#039;] ??
+                        null
+                    );
+                }
+
+                return [Str::replaceFirst($this-&gt;prefix, &#039;&#039;, $response[$this-&gt;keyAttribute][&#039;S&#039;]) =&gt; $value];
+            })-&gt;all());
+    }
+
+    /**
+     * Determine if the given item is expired.
+     *
+     * @param  array  $item
+     * @param  \DateTimeInterface|null  $expiration
+     * @return bool
+     */
+    protected function isExpired(array $item, $expiration = null)
+    {
+        $expiration = $expiration ?: Carbon::now();
+
+        return isset($item[$this-&gt;expirationAttribute]) &amp;&amp;
+               $expiration-&gt;getTimestamp() &gt;= $item[$this-&gt;expirationAttribute][&#039;N&#039;];
+    }
+
+    /**
+     * Store an item in the cache for a given number of seconds.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  int  $seconds
+     * @return bool
+     */
+    public function put($key, $value, $seconds)
+    {
+        $this-&gt;dynamo-&gt;putItem([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Item&#039; =&gt; [
+                $this-&gt;keyAttribute =&gt; [
+                    &#039;S&#039; =&gt; $this-&gt;prefix.$key,
+                ],
+                $this-&gt;valueAttribute =&gt; [
+                    $this-&gt;type($value) =&gt; $this-&gt;serialize($value),
+                ],
+                $this-&gt;expirationAttribute =&gt; [
+                    &#039;N&#039; =&gt; (string) $this-&gt;toTimestamp($seconds),
+                ],
+            ],
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Store multiple items in the cache for a given number of seconds.
+     *
+     * @param  array  $values
+     * @param  int  $seconds
+     * @return bool
+     */
+    public function putMany(array $values, $seconds)
+    {
+        if (count($values) === 0) {
+            return true;
+        }
+
+        $expiration = $this-&gt;toTimestamp($seconds);
+
+        $this-&gt;dynamo-&gt;batchWriteItem([
+            &#039;RequestItems&#039; =&gt; [
+                $this-&gt;table =&gt; (new Collection($values))-&gt;map(function ($value, $key) use ($expiration) {
+                    return [
+                        &#039;PutRequest&#039; =&gt; [
+                            &#039;Item&#039; =&gt; [
+                                $this-&gt;keyAttribute =&gt; [
+                                    &#039;S&#039; =&gt; $this-&gt;prefix.$key,
+                                ],
+                                $this-&gt;valueAttribute =&gt; [
+                                    $this-&gt;type($value) =&gt; $this-&gt;serialize($value),
+                                ],
+                                $this-&gt;expirationAttribute =&gt; [
+                                    &#039;N&#039; =&gt; (string) $expiration,
+                                ],
+                            ],
+                        ],
+                    ];
+                })-&gt;values()-&gt;all(),
+            ],
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Store an item in the cache if the key doesn&#039;t exist.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  int  $seconds
+     * @return bool
+     */
+    public function add($key, $value, $seconds)
+    {
+        try {
+            $this-&gt;dynamo-&gt;putItem([
+                &#039;TableName&#039; =&gt; $this-&gt;table,
+                &#039;Item&#039; =&gt; [
+                    $this-&gt;keyAttribute =&gt; [
+                        &#039;S&#039; =&gt; $this-&gt;prefix.$key,
+                    ],
+                    $this-&gt;valueAttribute =&gt; [
+                        $this-&gt;type($value) =&gt; $this-&gt;serialize($value),
+                    ],
+                    $this-&gt;expirationAttribute =&gt; [
+                        &#039;N&#039; =&gt; (string) $this-&gt;toTimestamp($seconds),
+                    ],
+                ],
+                &#039;ConditionExpression&#039; =&gt; &#039;attribute_not_exists(#key) OR #expires_at &lt; :now&#039;,
+                &#039;ExpressionAttributeNames&#039; =&gt; [
+                    &#039;#key&#039; =&gt; $this-&gt;keyAttribute,
+                    &#039;#expires_at&#039; =&gt; $this-&gt;expirationAttribute,
+                ],
+                &#039;ExpressionAttributeValues&#039; =&gt; [
+                    &#039;:now&#039; =&gt; [
+                        &#039;N&#039; =&gt; (string) $this-&gt;currentTime(),
+                    ],
+                ],
+            ]);
+
+            return true;
+        } catch (DynamoDbException $e) {
+            if (str_contains($e-&gt;getMessage(), &#039;ConditionalCheckFailed&#039;)) {
+                return false;
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Increment the value of an item in the cache.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return int|false
+     *
+     * @throws \Aws\DynamoDb\Exception\DynamoDbException
+     */
+    public function increment($key, $value = 1)
+    {
+        try {
+            $response = $this-&gt;dynamo-&gt;updateItem([
+                &#039;TableName&#039; =&gt; $this-&gt;table,
+                &#039;Key&#039; =&gt; [
+                    $this-&gt;keyAttribute =&gt; [
+                        &#039;S&#039; =&gt; $this-&gt;prefix.$key,
+                    ],
+                ],
+                &#039;ConditionExpression&#039; =&gt; &#039;attribute_exists(#key) AND #expires_at &gt; :now&#039;,
+                &#039;UpdateExpression&#039; =&gt; &#039;SET #value = #value + :amount&#039;,
+                &#039;ExpressionAttributeNames&#039; =&gt; [
+                    &#039;#key&#039; =&gt; $this-&gt;keyAttribute,
+                    &#039;#value&#039; =&gt; $this-&gt;valueAttribute,
+                    &#039;#expires_at&#039; =&gt; $this-&gt;expirationAttribute,
+                ],
+                &#039;ExpressionAttributeValues&#039; =&gt; [
+                    &#039;:now&#039; =&gt; [
+                        &#039;N&#039; =&gt; (string) $this-&gt;currentTime(),
+                    ],
+                    &#039;:amount&#039; =&gt; [
+                        &#039;N&#039; =&gt; (string) $value,
+                    ],
+                ],
+                &#039;ReturnValues&#039; =&gt; &#039;UPDATED_NEW&#039;,
+            ]);
+
+            return (int) $response[&#039;Attributes&#039;][$this-&gt;valueAttribute][&#039;N&#039;];
+        } catch (DynamoDbException $e) {
+            if (str_contains($e-&gt;getMessage(), &#039;ConditionalCheckFailed&#039;)) {
+                return false;
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Decrement the value of an item in the cache.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return int|false
+     *
+     * @throws \Aws\DynamoDb\Exception\DynamoDbException
+     */
+    public function decrement($key, $value = 1)
+    {
+        try {
+            $response = $this-&gt;dynamo-&gt;updateItem([
+                &#039;TableName&#039; =&gt; $this-&gt;table,
+                &#039;Key&#039; =&gt; [
+                    $this-&gt;keyAttribute =&gt; [
+                        &#039;S&#039; =&gt; $this-&gt;prefix.$key,
+                    ],
+                ],
+                &#039;ConditionExpression&#039; =&gt; &#039;attribute_exists(#key) AND #expires_at &gt; :now&#039;,
+                &#039;UpdateExpression&#039; =&gt; &#039;SET #value = #value - :amount&#039;,
+                &#039;ExpressionAttributeNames&#039; =&gt; [
+                    &#039;#key&#039; =&gt; $this-&gt;keyAttribute,
+                    &#039;#value&#039; =&gt; $this-&gt;valueAttribute,
+                    &#039;#expires_at&#039; =&gt; $this-&gt;expirationAttribute,
+                ],
+                &#039;ExpressionAttributeValues&#039; =&gt; [
+                    &#039;:now&#039; =&gt; [
+                        &#039;N&#039; =&gt; (string) $this-&gt;currentTime(),
+                    ],
+                    &#039;:amount&#039; =&gt; [
+                        &#039;N&#039; =&gt; (string) $value,
+                    ],
+                ],
+                &#039;ReturnValues&#039; =&gt; &#039;UPDATED_NEW&#039;,
+            ]);
+
+            return (int) $response[&#039;Attributes&#039;][$this-&gt;valueAttribute][&#039;N&#039;];
+        } catch (DynamoDbException $e) {
+            if (str_contains($e-&gt;getMessage(), &#039;ConditionalCheckFailed&#039;)) {
+                return false;
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Store an item in the cache indefinitely.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return bool
+     */
+    public function forever($key, $value)
+    {
+        return $this-&gt;put($key, $value, Carbon::now()-&gt;addYears(5)-&gt;getTimestamp());
+    }
+
+    /**
+     * Get a lock instance.
+     *
+     * @param  string  $name
+     * @param  int  $seconds
+     * @param  string|null  $owner
+     * @return \Illuminate\Contracts\Cache\Lock
+     */
+    public function lock($name, $seconds = 0, $owner = null)
+    {
+        return new DynamoDbLock($this, $name, $seconds, $owner);
+    }
+
+    /**
+     * Restore a lock instance using the owner identifier.
+     *
+     * @param  string  $name
+     * @param  string  $owner
+     * @return \Illuminate\Contracts\Cache\Lock
+     */
+    public function restoreLock($name, $owner)
+    {
+        return $this-&gt;lock($name, 0, $owner);
+    }
+
+    /**
+     * Remove an item from the cache.
+     *
+     * @param  string  $key
+     * @return bool
+     */
+    public function forget($key)
+    {
+        $this-&gt;dynamo-&gt;deleteItem([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                $this-&gt;keyAttribute =&gt; [
+                    &#039;S&#039; =&gt; $this-&gt;prefix.$key,
+                ],
+            ],
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Remove all items from the cache.
+     *
+     * @return never
+     *
+     * @throws \RuntimeException
+     */
+    public function flush()
+    {
+        throw new RuntimeException(&#039;DynamoDb does not support flushing an entire table. Please create a new table.&#039;);
+    }
+
+    /**
+     * Get the UNIX timestamp for the given number of seconds.
+     *
+     * @param  int  $seconds
+     * @return int
+     */
+    protected function toTimestamp($seconds)
+    {
+        return $seconds &gt; 0
+            ? $this-&gt;availableAt($seconds)
+            : $this-&gt;currentTime();
+    }
+
+    /**
+     * Serialize the value.
+     *
+     * @param  mixed  $value
+     * @return mixed
+     */
+    protected function serialize($value)
+    {
+        return is_numeric($value) ? (string) $value : serialize($value);
+    }
+
+    /**
+     * Unserialize the value.
+     *
+     * @param  mixed  $value
+     * @return mixed
+     */
+    protected function unserialize($value)
+    {
+        if (filter_var($value, FILTER_VALIDATE_INT) !== false) {
+            return (int) $value;
+        }
+
+        if (is_numeric($value)) {
+            return (float) $value;
+        }
+
+        return unserialize($value);
+    }
+
+    /**
+     * Get the DynamoDB type for the given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    protected function type($value)
+    {
+        return is_numeric($value) ? &#039;N&#039; : &#039;S&#039;;
+    }
+
+    /**
+     * Get the cache key prefix.
+     *
+     * @return string
+     */
+    public function getPrefix()
+    {
+        return $this-&gt;prefix;
+    }
+
+    /**
+     * Set the cache key prefix.
+     *
+     * @param  string  $prefix
+     * @return void
+     */
+    public function setPrefix($prefix)
+    {
+        $this-&gt;prefix = $prefix;
+    }
+
+    /**
+     * Get the DynamoDb Client instance.
+     *
+     * @return \Aws\DynamoDb\DynamoDbClient
+     */
+    public function getClient()
+    {
+        return $this-&gt;dynamo;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Cache/Events/CacheEvent.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Cache/Console -->
+
+</body>
+</html>

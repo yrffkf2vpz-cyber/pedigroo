@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Transaction/MultiExec.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Transaction;
+
+use Exception;
+use InvalidArgumentException;
+use Predis\ClientContextInterface;
+use Predis\ClientException;
+use Predis\ClientInterface;
+use Predis\Command\CommandInterface;
+use Predis\CommunicationException;
+use Predis\Connection\Cluster\ClusterInterface;
+use Predis\Connection\RelayConnection;
+use Predis\NotSupportedException;
+use Predis\Protocol\ProtocolException;
+use Predis\Response\Error;
+use Predis\Response\ErrorInterface as ErrorResponseInterface;
+use Predis\Response\ServerException;
+use Predis\Response\Status as StatusResponse;
+use Relay\Exception as RelayException;
+use Relay\Relay;
+use SplQueue;
+
+/**
+ * Client-side abstraction of a Redis transaction based on MULTI / EXEC.
+ *
+ * {@inheritdoc}
+ */
+class MultiExec implements ClientContextInterface
+{
+    private $state;
+
+    protected $client;
+    protected $commands;
+    protected $exceptions = true;
+    protected $attempts = 0;
+    protected $watchKeys = [];
+    protected $modeCAS = false;
+
+    /**
+     * @param ClientInterface $client  Client instance used by the transaction.
+     * @param array|null      $options Initialization options.
+     */
+    public function __construct(ClientInterface $client, ?array $options = null)
+    {
+        $this-&gt;assertClient($client);
+
+        $this-&gt;client = $client;
+        $this-&gt;state = new MultiExecState();
+
+        $this-&gt;configure($client, $options ?: []);
+        $this-&gt;reset();
+    }
+
+    /**
+     * Checks if the passed client instance satisfies the required conditions
+     * needed to initialize the transaction object.
+     *
+     * @param ClientInterface $client Client instance used by the transaction object.
+     *
+     * @throws NotSupportedException
+     */
+    private function assertClient(ClientInterface $client)
+    {
+        if ($client-&gt;getConnection() instanceof ClusterInterface) {
+            throw new NotSupportedException(
+                &#039;Cannot initialize a MULTI/EXEC transaction over cluster connections.&#039;
+            );
+        }
+
+        if (!$client-&gt;getCommandFactory()-&gt;supports(&#039;MULTI&#039;, &#039;EXEC&#039;, &#039;DISCARD&#039;)) {
+            throw new NotSupportedException(
+                &#039;MULTI, EXEC and DISCARD are not supported by the current command factory.&#039;
+            );
+        }
+    }
+
+    /**
+     * Configures the transaction using the provided options.
+     *
+     * @param ClientInterface $client  Underlying client instance.
+     * @param array           $options Array of options for the transaction.
+     **/
+    protected function configure(ClientInterface $client, array $options)
+    {
+        if (isset($options[&#039;exceptions&#039;])) {
+            $this-&gt;exceptions = (bool) $options[&#039;exceptions&#039;];
+        } else {
+            $this-&gt;exceptions = $client-&gt;getOptions()-&gt;exceptions;
+        }
+
+        if (isset($options[&#039;cas&#039;])) {
+            $this-&gt;modeCAS = (bool) $options[&#039;cas&#039;];
+        }
+
+        if (isset($options[&#039;watch&#039;]) &amp;&amp; $keys = $options[&#039;watch&#039;]) {
+            $this-&gt;watchKeys = $keys;
+        }
+
+        if (isset($options[&#039;retry&#039;])) {
+            $this-&gt;attempts = (int) $options[&#039;retry&#039;];
+        }
+    }
+
+    /**
+     * Resets the state of the transaction.
+     */
+    protected function reset()
+    {
+        $this-&gt;state-&gt;reset();
+        $this-&gt;commands = new SplQueue();
+    }
+
+    /**
+     * Initializes the transaction context.
+     */
+    protected function initialize()
+    {
+        if ($this-&gt;state-&gt;isInitialized()) {
+            return;
+        }
+
+        if ($this-&gt;modeCAS) {
+            $this-&gt;state-&gt;flag(MultiExecState::CAS);
+        }
+
+        if ($this-&gt;watchKeys) {
+            $this-&gt;watch($this-&gt;watchKeys);
+        }
+
+        $cas = $this-&gt;state-&gt;isCAS();
+        $discarded = $this-&gt;state-&gt;isDiscarded();
+
+        if (!$cas || ($cas &amp;&amp; $discarded)) {
+            $this-&gt;call(&#039;MULTI&#039;);
+
+            if ($discarded) {
+                $this-&gt;state-&gt;unflag(MultiExecState::CAS);
+            }
+        }
+
+        $this-&gt;state-&gt;unflag(MultiExecState::DISCARDED);
+        $this-&gt;state-&gt;flag(MultiExecState::INITIALIZED);
+    }
+
+    /**
+     * Dynamically invokes a Redis command with the specified arguments.
+     *
+     * @param string $method    Command ID.
+     * @param array  $arguments Arguments for the command.
+     *
+     * @return mixed
+     */
+    public function __call($method, $arguments)
+    {
+        return $this-&gt;executeCommand(
+            $this-&gt;client-&gt;createCommand($method, $arguments)
+        );
+    }
+
+    /**
+     * Executes a Redis command bypassing the transaction logic.
+     *
+     * @param string $commandID Command ID.
+     * @param array  $arguments Arguments for the command.
+     *
+     * @return mixed
+     * @throws ServerException
+     */
+    protected function call($commandID, array $arguments = [])
+    {
+        try {
+            $response = $this-&gt;client-&gt;executeCommand(
+                $this-&gt;client-&gt;createCommand($commandID, $arguments)
+            );
+        } catch (ServerException $exception) {
+            if (!$this-&gt;client-&gt;getConnection() instanceof RelayConnection) {
+                throw $exception;
+            }
+
+            if (strcasecmp($commandID, &#039;EXEC&#039;) != 0) {
+                throw $exception;
+            }
+
+            if (!strpos($exception-&gt;getMessage(), &#039;RELAY_ERR_REDIS&#039;)) {
+                throw $exception;
+            }
+
+            return null;
+        }
+
+        if ($response instanceof ErrorResponseInterface) {
+            throw new ServerException($response-&gt;getMessage());
+        }
+
+        return $response;
+    }
+
+    /**
+     * Executes the specified Redis command.
+     *
+     * @param CommandInterface $command Command instance.
+     *
+     * @return $this|mixed
+     * @throws AbortedMultiExecException
+     * @throws CommunicationException
+     */
+    public function executeCommand(CommandInterface $command)
+    {
+        $this-&gt;initialize();
+
+        if ($this-&gt;state-&gt;isCAS()) {
+            return $this-&gt;client-&gt;executeCommand($command);
+        }
+
+        $response = $this-&gt;client-&gt;getConnection()-&gt;executeCommand($command);
+
+        if ($response instanceof StatusResponse &amp;&amp; $response == &#039;QUEUED&#039;) {
+            $this-&gt;commands-&gt;enqueue($command);
+        } elseif ($response instanceof Relay) {
+            $this-&gt;commands-&gt;enqueue($command);
+        } elseif ($response instanceof ErrorResponseInterface) {
+            throw new AbortedMultiExecException($this, $response-&gt;getMessage());
+        } else {
+            $this-&gt;onProtocolError(&#039;The server did not return a +QUEUED status response.&#039;);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Executes WATCH against one or more keys.
+     *
+     * @param string|array $keys One or more keys.
+     *
+     * @return mixed
+     * @throws NotSupportedException
+     * @throws ClientException
+     */
+    public function watch($keys)
+    {
+        if (!$this-&gt;client-&gt;getCommandFactory()-&gt;supports(&#039;WATCH&#039;)) {
+            throw new NotSupportedException(&#039;WATCH is not supported by the current command factory.&#039;);
+        }
+
+        if ($this-&gt;state-&gt;isWatchAllowed()) {
+            throw new ClientException(&#039;Sending WATCH after MULTI is not allowed.&#039;);
+        }
+
+        $response = $this-&gt;call(&#039;WATCH&#039;, is_array($keys) ? $keys : [$keys]);
+        $this-&gt;state-&gt;flag(MultiExecState::WATCH);
+
+        return $response;
+    }
+
+    /**
+     * Finalizes the transaction by executing MULTI on the server.
+     *
+     * @return MultiExec
+     */
+    public function multi()
+    {
+        if ($this-&gt;state-&gt;check(MultiExecState::INITIALIZED | MultiExecState::CAS)) {
+            $this-&gt;state-&gt;unflag(MultiExecState::CAS);
+            $this-&gt;call(&#039;MULTI&#039;);
+        } else {
+            $this-&gt;initialize();
+        }
+
+        return $this;
+    }
+
+    /**
+     * Executes UNWATCH.
+     *
+     * @return MultiExec
+     * @throws NotSupportedException
+     */
+    public function unwatch()
+    {
+        if (!$this-&gt;client-&gt;getCommandFactory()-&gt;supports(&#039;UNWATCH&#039;)) {
+            throw new NotSupportedException(
+                &#039;UNWATCH is not supported by the current command factory.&#039;
+            );
+        }
+
+        $this-&gt;state-&gt;unflag(MultiExecState::WATCH);
+        $this-&gt;__call(&#039;UNWATCH&#039;, []);
+
+        return $this;
+    }
+
+    /**
+     * Resets the transaction by UNWATCH-ing the keys that are being WATCHed and
+     * DISCARD-ing pending commands that have been already sent to the server.
+     *
+     * @return MultiExec
+     */
+    public function discard()
+    {
+        if ($this-&gt;state-&gt;isInitialized()) {
+            $this-&gt;call($this-&gt;state-&gt;isCAS() ? &#039;UNWATCH&#039; : &#039;DISCARD&#039;);
+
+            $this-&gt;reset();
+            $this-&gt;state-&gt;flag(MultiExecState::DISCARDED);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Executes the whole transaction.
+     *
+     * @return mixed
+     */
+    public function exec()
+    {
+        return $this-&gt;execute();
+    }
+
+    /**
+     * Checks the state of the transaction before execution.
+     *
+     * @param mixed $callable Callback for execution.
+     *
+     * @throws InvalidArgumentException
+     * @throws ClientException
+     */
+    private function checkBeforeExecution($callable)
+    {
+        if ($this-&gt;state-&gt;isExecuting()) {
+            throw new ClientException(
+                &#039;Cannot invoke &quot;execute&quot; or &quot;exec&quot; inside an active transaction context.&#039;
+            );
+        }
+
+        if ($callable) {
+            if (!is_callable($callable)) {
+                throw new InvalidArgumentException(&#039;The argument must be a callable object.&#039;);
+            }
+
+            if (!$this-&gt;commands-&gt;isEmpty()) {
+                $this-&gt;discard();
+
+                throw new ClientException(
+                    &#039;Cannot execute a transaction block after using fluent interface.&#039;
+                );
+            }
+        } elseif ($this-&gt;attempts) {
+            $this-&gt;discard();
+
+            throw new ClientException(
+                &#039;Automatic retries are supported only when a callable block is provided.&#039;
+            );
+        }
+    }
+
+    /**
+     * Handles the actual execution of the whole transaction.
+     *
+     * @param mixed $callable Optional callback for execution.
+     *
+     * @return array
+     * @throws CommunicationException
+     * @throws AbortedMultiExecException
+     * @throws ServerException
+     */
+    public function execute($callable = null)
+    {
+        $this-&gt;checkBeforeExecution($callable);
+
+        $execResponse = null;
+        $attempts = $this-&gt;attempts;
+
+        do {
+            if ($callable) {
+                $this-&gt;executeTransactionBlock($callable);
+            }
+
+            if ($this-&gt;commands-&gt;isEmpty()) {
+                if ($this-&gt;state-&gt;isWatching()) {
+                    $this-&gt;discard();
+                }
+
+                return;
+            }
+
+            $execResponse = $this-&gt;call(&#039;EXEC&#039;);
+
+            // The additional `false` check is needed for Relay,
+            // let&#039;s hope it won&#039;t break anything
+            if ($execResponse === null || $execResponse === false) {
+                if ($attempts === 0) {
+                    throw new AbortedMultiExecException(
+                        $this, &#039;The current transaction has been aborted by the server.&#039;
+                    );
+                }
+
+                $this-&gt;reset();
+
+                continue;
+            }
+
+            break;
+        } while ($attempts-- &gt; 0);
+
+        $response = [];
+        $commands = $this-&gt;commands;
+        $size = count($execResponse);
+
+        if ($size !== count($commands)) {
+            $this-&gt;onProtocolError(&#039;EXEC returned an unexpected number of response items.&#039;);
+        }
+
+        for ($i = 0; $i &lt; $size; ++$i) {
+            $cmdResponse = $execResponse[$i];
+
+            if ($this-&gt;exceptions &amp;&amp; $cmdResponse instanceof ErrorResponseInterface) {
+                throw new ServerException($cmdResponse-&gt;getMessage());
+            }
+
+            if ($cmdResponse instanceof RelayException) {
+                if ($this-&gt;exceptions) {
+                    throw new ServerException($cmdResponse-&gt;getMessage(), $cmdResponse-&gt;getCode(), $cmdResponse);
+                }
+
+                $commands-&gt;dequeue();
+                $response[$i] = new Error($cmdResponse-&gt;getMessage());
+                continue;
+            }
+
+            $response[$i] = $commands-&gt;dequeue()-&gt;parseResponse($cmdResponse);
+        }
+
+        return $response;
+    }
+
+    /**
+     * Passes the current transaction object to a callable block for execution.
+     *
+     * @param mixed $callable Callback.
+     *
+     * @throws CommunicationException
+     * @throws ServerException
+     */
+    protected function executeTransactionBlock($callable)
+    {
+        $exception = null;
+        $this-&gt;state-&gt;flag(MultiExecState::INSIDEBLOCK);
+
+        try {
+            call_user_func($callable, $this);
+        } catch (CommunicationException $exception) {
+            // NOOP
+        } catch (ServerException $exception) {
+            // NOOP
+        } catch (Exception $exception) {
+            $this-&gt;discard();
+        }
+
+        $this-&gt;state-&gt;unflag(MultiExecState::INSIDEBLOCK);
+
+        if ($exception) {
+            throw $exception;
+        }
+    }
+
+    /**
+     * Helper method for protocol errors encountered inside the transaction.
+     *
+     * @param string $message Error message.
+     */
+    private function onProtocolError($message)
+    {
+        // Since a MULTI/EXEC block cannot be initialized when using aggregate
+        // connections we can safely assume that Predis\Client::getConnection()
+        // will return a Predis\Connection\NodeConnectionInterface instance.
+        CommunicationException::handle(new ProtocolException(
+            $this-&gt;client-&gt;getConnection(), $message
+        ));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Transaction/MultiExecState.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/psr -->
+
+</body>
+</html>

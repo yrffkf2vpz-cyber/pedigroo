@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-kernel/Log/Logger.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpKernel\Log;
+
+use Psr\Log\AbstractLogger;
+use Psr\Log\InvalidArgumentException;
+use Psr\Log\LogLevel;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
+
+/**
+ * Minimalist PSR-3 logger designed to write in stderr or any other stream.
+ *
+ * @author Kévin Dunglas &lt;dunglas@gmail.com&gt;
+ */
+class Logger extends AbstractLogger implements DebugLoggerInterface
+{
+    private const LEVELS = [
+        LogLevel::DEBUG =&gt; 0,
+        LogLevel::INFO =&gt; 1,
+        LogLevel::NOTICE =&gt; 2,
+        LogLevel::WARNING =&gt; 3,
+        LogLevel::ERROR =&gt; 4,
+        LogLevel::CRITICAL =&gt; 5,
+        LogLevel::ALERT =&gt; 6,
+        LogLevel::EMERGENCY =&gt; 7,
+    ];
+    private const PRIORITIES = [
+        LogLevel::DEBUG =&gt; 100,
+        LogLevel::INFO =&gt; 200,
+        LogLevel::NOTICE =&gt; 250,
+        LogLevel::WARNING =&gt; 300,
+        LogLevel::ERROR =&gt; 400,
+        LogLevel::CRITICAL =&gt; 500,
+        LogLevel::ALERT =&gt; 550,
+        LogLevel::EMERGENCY =&gt; 600,
+    ];
+
+    private int $minLevelIndex;
+    private \Closure $formatter;
+    private bool $debug = false;
+    private array $logs = [];
+    private array $errorCount = [];
+
+    /** @var resource|null */
+    private $handle;
+
+    /**
+     * @param string|resource|null $output
+     */
+    public function __construct(?string $minLevel = null, $output = null, ?callable $formatter = null, private readonly ?RequestStack $requestStack = null, bool $debug = false)
+    {
+        $minLevel ??= match ((int) ($_ENV[&#039;SHELL_VERBOSITY&#039;] ?? $_SERVER[&#039;SHELL_VERBOSITY&#039;] ?? 0)) {
+            -1 =&gt; LogLevel::ERROR,
+            1 =&gt; LogLevel::NOTICE,
+            2 =&gt; LogLevel::INFO,
+            3 =&gt; LogLevel::DEBUG,
+            default =&gt; null === $output || &#039;php://stdout&#039; === $output || &#039;php://stderr&#039; === $output ? LogLevel::ERROR : LogLevel::WARNING,
+        };
+
+        if (!isset(self::LEVELS[$minLevel])) {
+            throw new InvalidArgumentException(\sprintf(&#039;The log level &quot;%s&quot; does not exist.&#039;, $minLevel));
+        }
+
+        $this-&gt;minLevelIndex = self::LEVELS[$minLevel];
+        $this-&gt;formatter = null !== $formatter ? $formatter(...) : $this-&gt;format(...);
+        if ($output &amp;&amp; false === $this-&gt;handle = \is_string($output) ? @fopen($output, &#039;a&#039;) : $output) {
+            throw new InvalidArgumentException(\sprintf(&#039;Unable to open &quot;%s&quot;.&#039;, $output));
+        }
+        $this-&gt;debug = $debug;
+    }
+
+    public function enableDebug(): void
+    {
+        $this-&gt;debug = true;
+    }
+
+    public function log($level, $message, array $context = []): void
+    {
+        if (!isset(self::LEVELS[$level])) {
+            throw new InvalidArgumentException(\sprintf(&#039;The log level &quot;%s&quot; does not exist.&#039;, $level));
+        }
+
+        if (self::LEVELS[$level] &lt; $this-&gt;minLevelIndex) {
+            return;
+        }
+
+        $formatter = $this-&gt;formatter;
+        if ($this-&gt;handle) {
+            @fwrite($this-&gt;handle, $formatter($level, $message, $context).\PHP_EOL);
+        } else {
+            error_log($formatter($level, $message, $context, false));
+        }
+
+        if ($this-&gt;debug &amp;&amp; $this-&gt;requestStack) {
+            $this-&gt;record($level, $message, $context);
+        }
+    }
+
+    public function getLogs(?Request $request = null): array
+    {
+        if ($request) {
+            return $this-&gt;logs[spl_object_id($request)] ?? [];
+        }
+
+        return array_merge(...array_values($this-&gt;logs));
+    }
+
+    public function countErrors(?Request $request = null): int
+    {
+        if ($request) {
+            return $this-&gt;errorCount[spl_object_id($request)] ?? 0;
+        }
+
+        return array_sum($this-&gt;errorCount);
+    }
+
+    public function clear(): void
+    {
+        $this-&gt;logs = [];
+        $this-&gt;errorCount = [];
+    }
+
+    private function format(string $level, string $message, array $context, bool $prefixDate = true): string
+    {
+        if (str_contains($message, &#039;{&#039;)) {
+            $replacements = [];
+            foreach ($context as $key =&gt; $val) {
+                if (null === $val || \is_scalar($val) || $val instanceof \Stringable) {
+                    $replacements[&quot;{{$key}}&quot;] = $val;
+                } elseif ($val instanceof \DateTimeInterface) {
+                    $replacements[&quot;{{$key}}&quot;] = $val-&gt;format(\DateTimeInterface::RFC3339);
+                } elseif (\is_object($val)) {
+                    $replacements[&quot;{{$key}}&quot;] = &#039;[object &#039;.$val::class.&#039;]&#039;;
+                } else {
+                    $replacements[&quot;{{$key}}&quot;] = &#039;[&#039;.\gettype($val).&#039;]&#039;;
+                }
+            }
+
+            $message = strtr($message, $replacements);
+        }
+
+        $log = \sprintf(&#039;[%s] %s&#039;, $level, $message);
+        if ($prefixDate) {
+            $log = date(\DateTimeInterface::RFC3339).&#039; &#039;.$log;
+        }
+
+        return $log;
+    }
+
+    private function record($level, $message, array $context): void
+    {
+        $request = $this-&gt;requestStack-&gt;getCurrentRequest();
+        $key = $request ? spl_object_id($request) : &#039;&#039;;
+
+        $this-&gt;logs[$key][] = [
+            &#039;channel&#039; =&gt; null,
+            &#039;context&#039; =&gt; $context,
+            &#039;message&#039; =&gt; $message,
+            &#039;priority&#039; =&gt; self::PRIORITIES[$level],
+            &#039;priorityName&#039; =&gt; $level,
+            &#039;timestamp&#039; =&gt; time(),
+            &#039;timestamp_rfc3339&#039; =&gt; date(\DATE_RFC3339_EXTENDED),
+        ];
+
+        $this-&gt;errorCount[$key] ??= 0;
+        switch ($level) {
+            case LogLevel::ERROR:
+            case LogLevel::CRITICAL:
+            case LogLevel::ALERT:
+            case LogLevel::EMERGENCY:
+                ++$this-&gt;errorCount[$key];
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-kernel/Profiler/FileProfilerStorage.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-kernel/Profiler -->
+
+</body>
+</html>

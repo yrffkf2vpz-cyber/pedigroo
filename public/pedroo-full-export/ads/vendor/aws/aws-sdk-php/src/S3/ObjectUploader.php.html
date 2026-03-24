@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/ObjectUploader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\S3;
+
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Promise\PromisorInterface;
+use GuzzleHttp\Psr7;
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Uploads an object to S3, using a PutObject command or a multipart upload as
+ * appropriate.
+ */
+class ObjectUploader implements PromisorInterface
+{
+    const DEFAULT_MULTIPART_THRESHOLD = 16777216;
+
+    private $client;
+    private $bucket;
+    private $key;
+    private $body;
+    private $acl;
+    private $options;
+    private static $defaults = [
+        &#039;before_upload&#039; =&gt; null,
+        &#039;concurrency&#039;   =&gt; 3,
+        &#039;mup_threshold&#039; =&gt; self::DEFAULT_MULTIPART_THRESHOLD,
+        &#039;params&#039;        =&gt; [],
+        &#039;part_size&#039;     =&gt; null,
+    ];
+    private $addContentMD5;
+
+    /**
+     * @param S3ClientInterface $client         The S3 Client used to execute
+     *                                          the upload command(s).
+     * @param string            $bucket         Bucket to upload the object, or
+     *                                          an S3 access point ARN.
+     * @param string            $key            Key of the object.
+     * @param mixed             $body           Object data to upload. Can be a
+     *                                          StreamInterface, PHP stream
+     *                                          resource, or a string of data to
+     *                                          upload.
+     * @param string            $acl            ACL to apply to the copy
+     *                                          (default: private).
+     * @param array             $options        Options used to configure the
+     *                                          copy process. Options passed in
+     *                                          through &#039;params&#039; are added to
+     *                                          the sub command(s).
+     */
+    public function __construct(
+        S3ClientInterface $client,
+        $bucket,
+        $key,
+        $body,
+        $acl = &#039;private&#039;,
+        array $options = []
+    ) {
+        $this-&gt;client = $client;
+        $this-&gt;bucket = $bucket;
+        $this-&gt;key = $key;
+        $this-&gt;body = Psr7\Utils::streamFor($body);
+        $this-&gt;acl = $acl;
+        $this-&gt;options = $options + self::$defaults;
+        // Handle &quot;add_content_md5&quot; option.
+        $this-&gt;addContentMD5 = isset($options[&#039;add_content_md5&#039;])
+            &amp;&amp; $options[&#039;add_content_md5&#039;] === true;
+    }
+
+    /**
+     * @return PromiseInterface
+     */
+    public function promise(): PromiseInterface
+    {
+        /** @var int $mup_threshold */
+        $mup_threshold = $this-&gt;options[&#039;mup_threshold&#039;];
+        if ($this-&gt;requiresMultipart($this-&gt;body, $mup_threshold)) {
+            // Perform a multipart upload.
+            return (new MultipartUploader($this-&gt;client, $this-&gt;body, [
+                    &#039;bucket&#039; =&gt; $this-&gt;bucket,
+                    &#039;key&#039;    =&gt; $this-&gt;key,
+                    &#039;acl&#039;    =&gt; $this-&gt;acl
+                ] + $this-&gt;options))-&gt;promise();
+        }
+
+        // Perform a regular PutObject operation.
+        $command = $this-&gt;client-&gt;getCommand(&#039;PutObject&#039;, [
+                &#039;Bucket&#039; =&gt; $this-&gt;bucket,
+                &#039;Key&#039;    =&gt; $this-&gt;key,
+                &#039;Body&#039;   =&gt; $this-&gt;body,
+                &#039;ACL&#039;    =&gt; $this-&gt;acl,
+                &#039;AddContentMD5&#039; =&gt; $this-&gt;addContentMD5
+            ] + $this-&gt;options[&#039;params&#039;]);
+        if (is_callable($this-&gt;options[&#039;before_upload&#039;])) {
+            $this-&gt;options[&#039;before_upload&#039;]($command);
+        }
+        return $this-&gt;client-&gt;executeAsync($command);
+    }
+
+    public function upload()
+    {
+        return $this-&gt;promise()-&gt;wait();
+    }
+
+    /**
+     * Determines if the body should be uploaded using PutObject or the
+     * Multipart Upload System. It also modifies the passed-in $body as needed
+     * to support the upload.
+     *
+     * @param StreamInterface $body      Stream representing the body.
+     * @param integer             $threshold Minimum bytes before using Multipart.
+     *
+     * @return bool
+     */
+    private function requiresMultipart(StreamInterface &amp;$body, $threshold)
+    {
+        // If body size known, compare to threshold to determine if Multipart.
+        if ($body-&gt;getSize() !== null) {
+            return $body-&gt;getSize() &gt;= $threshold;
+        }
+
+        /**
+         * Handle the situation where the body size is unknown.
+         * Read up to 5MB into a buffer to determine how to upload the body.
+         * @var StreamInterface $buffer
+         */
+        $buffer = Psr7\Utils::streamFor();
+        Psr7\Utils::copyToStream($body, $buffer, MultipartUploader::PART_MIN_SIZE);
+
+        // If body &lt; 5MB, use PutObject with the buffer.
+        if ($buffer-&gt;getSize() &lt; MultipartUploader::PART_MIN_SIZE) {
+            $buffer-&gt;seek(0);
+            $body = $buffer;
+            return false;
+        }
+
+        // If body &gt;= 5 MB, then use multipart. [YES]
+        if ($body-&gt;isSeekable() &amp;&amp; $body-&gt;getMetadata(&#039;uri&#039;) !== &#039;php://input&#039;) {
+            // If the body is seekable, just rewind the body.
+            $body-&gt;seek(0);
+        } else {
+            // If the body is non-seekable, stitch the rewind the buffer and
+            // the partially read body together into one stream. This avoids
+            // unnecessary disc usage and does not require seeking on the
+            // original stream.
+            $buffer-&gt;seek(0);
+            $body = new Psr7\AppendStream([$buffer, $body]);
+        }
+
+        return true;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/Parser/GetBucketLocationResultMutator.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/Crypto -->
+
+</body>
+</html>

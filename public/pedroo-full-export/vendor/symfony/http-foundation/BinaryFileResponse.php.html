@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-foundation/BinaryFileResponse.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpFoundation;
+
+use Symfony\Component\HttpFoundation\File\Exception\FileException;
+use Symfony\Component\HttpFoundation\File\File;
+
+/**
+ * BinaryFileResponse represents an HTTP response delivering a file.
+ *
+ * @author Niklas Fiekas &lt;niklas.fiekas@tu-clausthal.de&gt;
+ * @author stealth35 &lt;stealth35-php@live.fr&gt;
+ * @author Igor Wiedler &lt;igor@wiedler.ch&gt;
+ * @author Jordan Alliot &lt;jordan.alliot@gmail.com&gt;
+ * @author Sergey Linnik &lt;linniksa@gmail.com&gt;
+ */
+class BinaryFileResponse extends Response
+{
+    protected static bool $trustXSendfileTypeHeader = false;
+
+    protected File $file;
+    protected ?\SplTempFileObject $tempFileObject = null;
+    protected int $offset = 0;
+    protected int $maxlen = -1;
+    protected bool $deleteFileAfterSend = false;
+    protected int $chunkSize = 16 * 1024;
+
+    /**
+     * @param \SplFileInfo|string $file               The file to stream
+     * @param int                 $status             The response status code (200 &quot;OK&quot; by default)
+     * @param array               $headers            An array of response headers
+     * @param bool                $public             Files are public by default
+     * @param string|null         $contentDisposition The type of Content-Disposition to set automatically with the filename
+     * @param bool                $autoEtag           Whether the ETag header should be automatically set
+     * @param bool                $autoLastModified   Whether the Last-Modified header should be automatically set
+     */
+    public function __construct(\SplFileInfo|string $file, int $status = 200, array $headers = [], bool $public = true, ?string $contentDisposition = null, bool $autoEtag = false, bool $autoLastModified = true)
+    {
+        parent::__construct(null, $status, $headers);
+
+        $this-&gt;setFile($file, $contentDisposition, $autoEtag, $autoLastModified);
+
+        if ($public) {
+            $this-&gt;setPublic();
+        }
+    }
+
+    /**
+     * Sets the file to stream.
+     *
+     * @return $this
+     *
+     * @throws FileException
+     */
+    public function setFile(\SplFileInfo|string $file, ?string $contentDisposition = null, bool $autoEtag = false, bool $autoLastModified = true): static
+    {
+        $isTemporaryFile = $file instanceof \SplTempFileObject;
+        $this-&gt;tempFileObject = $isTemporaryFile ? $file : null;
+
+        if (!$file instanceof File) {
+            if ($file instanceof \SplFileInfo) {
+                $file = new File($file-&gt;getPathname(), !$isTemporaryFile);
+            } else {
+                $file = new File($file);
+            }
+        }
+
+        if (!$file-&gt;isReadable() &amp;&amp; !$isTemporaryFile) {
+            throw new FileException(&#039;File must be readable.&#039;);
+        }
+
+        $this-&gt;file = $file;
+
+        if ($autoEtag) {
+            $this-&gt;setAutoEtag();
+        }
+
+        if ($autoLastModified &amp;&amp; !$isTemporaryFile) {
+            $this-&gt;setAutoLastModified();
+        }
+
+        if ($contentDisposition) {
+            $this-&gt;setContentDisposition($contentDisposition);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Gets the file.
+     */
+    public function getFile(): File
+    {
+        return $this-&gt;file;
+    }
+
+    /**
+     * Sets the response stream chunk size.
+     *
+     * @return $this
+     */
+    public function setChunkSize(int $chunkSize): static
+    {
+        if ($chunkSize &lt; 1) {
+            throw new \InvalidArgumentException(&#039;The chunk size of a BinaryFileResponse cannot be less than 1.&#039;);
+        }
+
+        $this-&gt;chunkSize = $chunkSize;
+
+        return $this;
+    }
+
+    /**
+     * Automatically sets the Last-Modified header according the file modification date.
+     *
+     * @return $this
+     */
+    public function setAutoLastModified(): static
+    {
+        $this-&gt;setLastModified(\DateTimeImmutable::createFromFormat(&#039;U&#039;, $this-&gt;tempFileObject ? time() : $this-&gt;file-&gt;getMTime()));
+
+        return $this;
+    }
+
+    /**
+     * Automatically sets the ETag header according to the checksum of the file.
+     *
+     * @return $this
+     */
+    public function setAutoEtag(): static
+    {
+        $this-&gt;setEtag(base64_encode(hash_file(&#039;xxh128&#039;, $this-&gt;file-&gt;getPathname(), true)));
+
+        return $this;
+    }
+
+    /**
+     * Sets the Content-Disposition header with the given filename.
+     *
+     * @param string $disposition      ResponseHeaderBag::DISPOSITION_INLINE or ResponseHeaderBag::DISPOSITION_ATTACHMENT
+     * @param string $filename         Optionally use this UTF-8 encoded filename instead of the real name of the file
+     * @param string $filenameFallback A fallback filename, containing only ASCII characters. Defaults to an automatically encoded filename
+     *
+     * @return $this
+     */
+    public function setContentDisposition(string $disposition, string $filename = &#039;&#039;, string $filenameFallback = &#039;&#039;): static
+    {
+        if (&#039;&#039; === $filename) {
+            $filename = $this-&gt;file-&gt;getFilename();
+        }
+
+        if (&#039;&#039; === $filenameFallback &amp;&amp; (!preg_match(&#039;/^[\x20-\x7e]*$/&#039;, $filename) || str_contains($filename, &#039;%&#039;))) {
+            $encoding = mb_detect_encoding($filename, null, true) ?: &#039;8bit&#039;;
+
+            for ($i = 0, $filenameLength = mb_strlen($filename, $encoding); $i &lt; $filenameLength; ++$i) {
+                $char = mb_substr($filename, $i, 1, $encoding);
+
+                if (&#039;%&#039; === $char || \ord($char[0]) &lt; 32 || \ord($char[0]) &gt; 126) {
+                    $filenameFallback .= &#039;_&#039;;
+                } else {
+                    $filenameFallback .= $char;
+                }
+            }
+        }
+
+        $dispositionHeader = $this-&gt;headers-&gt;makeDisposition($disposition, $filename, $filenameFallback);
+        $this-&gt;headers-&gt;set(&#039;Content-Disposition&#039;, $dispositionHeader);
+
+        return $this;
+    }
+
+    public function prepare(Request $request): static
+    {
+        if ($this-&gt;isInformational() || $this-&gt;isEmpty()) {
+            parent::prepare($request);
+
+            $this-&gt;maxlen = 0;
+
+            return $this;
+        }
+
+        if (!$this-&gt;headers-&gt;has(&#039;Content-Type&#039;)) {
+            $mimeType = null;
+            if (!$this-&gt;tempFileObject) {
+                $mimeType = $this-&gt;file-&gt;getMimeType();
+            }
+
+            $this-&gt;headers-&gt;set(&#039;Content-Type&#039;, $mimeType ?: &#039;application/octet-stream&#039;);
+        }
+
+        parent::prepare($request);
+
+        $this-&gt;offset = 0;
+        $this-&gt;maxlen = -1;
+
+        if ($this-&gt;tempFileObject) {
+            $fileSize = $this-&gt;tempFileObject-&gt;fstat()[&#039;size&#039;];
+        } elseif (false === $fileSize = $this-&gt;file-&gt;getSize()) {
+            return $this;
+        }
+        $this-&gt;headers-&gt;remove(&#039;Transfer-Encoding&#039;);
+        $this-&gt;headers-&gt;set(&#039;Content-Length&#039;, $fileSize);
+
+        if (!$this-&gt;headers-&gt;has(&#039;Accept-Ranges&#039;)) {
+            // Only accept ranges on safe HTTP methods
+            $this-&gt;headers-&gt;set(&#039;Accept-Ranges&#039;, $request-&gt;isMethodSafe() ? &#039;bytes&#039; : &#039;none&#039;);
+        }
+
+        if (self::$trustXSendfileTypeHeader &amp;&amp; $request-&gt;headers-&gt;has(&#039;X-Sendfile-Type&#039;)) {
+            // Use X-Sendfile, do not send any content.
+            $type = $request-&gt;headers-&gt;get(&#039;X-Sendfile-Type&#039;);
+            $path = $this-&gt;file-&gt;getRealPath();
+            // Fall back to scheme://path for stream wrapped locations.
+            if (false === $path) {
+                $path = $this-&gt;file-&gt;getPathname();
+            }
+            if (&#039;x-accel-redirect&#039; === strtolower($type)) {
+                // Do X-Accel-Mapping substitutions.
+                // @link https://github.com/rack/rack/blob/main/lib/rack/sendfile.rb
+                // @link https://mattbrictson.com/blog/accelerated-rails-downloads
+                if (!$request-&gt;headers-&gt;has(&#039;X-Accel-Mapping&#039;)) {
+                    throw new \LogicException(&#039;The &quot;X-Accel-Mapping&quot; header must be set when &quot;X-Sendfile-Type&quot; is set to &quot;X-Accel-Redirect&quot;.&#039;);
+                }
+                $parts = HeaderUtils::split($request-&gt;headers-&gt;get(&#039;X-Accel-Mapping&#039;), &#039;,=&#039;);
+                foreach ($parts as $part) {
+                    [$pathPrefix, $location] = $part;
+                    if (str_starts_with($path, $pathPrefix)) {
+                        $path = $location.substr($path, \strlen($pathPrefix));
+                        // Only set X-Accel-Redirect header if a valid URI can be produced
+                        // as nginx does not serve arbitrary file paths.
+                        $this-&gt;headers-&gt;set($type, rawurlencode($path));
+                        $this-&gt;maxlen = 0;
+                        break;
+                    }
+                }
+            } else {
+                $this-&gt;headers-&gt;set($type, $path);
+                $this-&gt;maxlen = 0;
+            }
+        } elseif ($request-&gt;headers-&gt;has(&#039;Range&#039;) &amp;&amp; $request-&gt;isMethod(&#039;GET&#039;)) {
+            // Process the range headers.
+            if (!$request-&gt;headers-&gt;has(&#039;If-Range&#039;) || $this-&gt;hasValidIfRangeHeader($request-&gt;headers-&gt;get(&#039;If-Range&#039;))) {
+                $range = $request-&gt;headers-&gt;get(&#039;Range&#039;);
+
+                if (str_starts_with($range, &#039;bytes=&#039;)) {
+                    [$start, $end] = explode(&#039;-&#039;, substr($range, 6), 2) + [1 =&gt; 0];
+
+                    $end = (&#039;&#039; === $end) ? $fileSize - 1 : (int) $end;
+
+                    if (&#039;&#039; === $start) {
+                        $start = $fileSize - $end;
+                        $end = $fileSize - 1;
+                    } else {
+                        $start = (int) $start;
+                    }
+
+                    if ($start &lt;= $end) {
+                        $end = min($end, $fileSize - 1);
+                        if ($start &lt; 0 || $start &gt; $end) {
+                            $this-&gt;setStatusCode(416);
+                            $this-&gt;headers-&gt;set(&#039;Content-Range&#039;, \sprintf(&#039;bytes */%s&#039;, $fileSize));
+                        } else {
+                            $this-&gt;maxlen = $end &lt; $fileSize ? $end - $start + 1 : -1;
+                            $this-&gt;offset = $start;
+
+                            $this-&gt;setStatusCode(206);
+                            $this-&gt;headers-&gt;set(&#039;Content-Range&#039;, \sprintf(&#039;bytes %s-%s/%s&#039;, $start, $end, $fileSize));
+                            $this-&gt;headers-&gt;set(&#039;Content-Length&#039;, $end - $start + 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($request-&gt;isMethod(&#039;HEAD&#039;)) {
+            $this-&gt;maxlen = 0;
+        }
+
+        return $this;
+    }
+
+    private function hasValidIfRangeHeader(?string $header): bool
+    {
+        if ($this-&gt;getEtag() === $header) {
+            return true;
+        }
+
+        if (null === $lastModified = $this-&gt;getLastModified()) {
+            return false;
+        }
+
+        return $lastModified-&gt;format(&#039;D, d M Y H:i:s&#039;).&#039; GMT&#039; === $header;
+    }
+
+    public function sendContent(): static
+    {
+        try {
+            if (!$this-&gt;isSuccessful()) {
+                return $this;
+            }
+
+            if (0 === $this-&gt;maxlen) {
+                return $this;
+            }
+
+            $out = fopen(&#039;php://output&#039;, &#039;w&#039;);
+
+            if ($this-&gt;tempFileObject) {
+                $file = $this-&gt;tempFileObject;
+                $file-&gt;rewind();
+            } else {
+                $file = new \SplFileObject($this-&gt;file-&gt;getPathname(), &#039;r&#039;);
+            }
+
+            ignore_user_abort(true);
+
+            if (0 !== $this-&gt;offset) {
+                $file-&gt;fseek($this-&gt;offset);
+            }
+
+            $length = $this-&gt;maxlen;
+            while ($length &amp;&amp; !$file-&gt;eof()) {
+                $read = $length &gt; $this-&gt;chunkSize || 0 &gt; $length ? $this-&gt;chunkSize : $length;
+
+                if (false === $data = $file-&gt;fread($read)) {
+                    break;
+                }
+                while (&#039;&#039; !== $data) {
+                    $read = fwrite($out, $data);
+                    if (false === $read || connection_aborted()) {
+                        break 2;
+                    }
+                    if (0 &lt; $length) {
+                        $length -= $read;
+                    }
+                    $data = substr($data, $read);
+                }
+            }
+
+            fclose($out);
+        } finally {
+            if (null === $this-&gt;tempFileObject &amp;&amp; $this-&gt;deleteFileAfterSend &amp;&amp; is_file($this-&gt;file-&gt;getPathname())) {
+                unlink($this-&gt;file-&gt;getPathname());
+            }
+        }
+
+        return $this;
+    }
+
+    /**
+     * @throws \LogicException when the content is not null
+     */
+    public function setContent(?string $content): static
+    {
+        if (null !== $content) {
+            throw new \LogicException(&#039;The content cannot be set on a BinaryFileResponse instance.&#039;);
+        }
+
+        return $this;
+    }
+
+    public function getContent(): string|false
+    {
+        return false;
+    }
+
+    /**
+     * Trust X-Sendfile-Type header.
+     */
+    public static function trustXSendfileTypeHeader(): void
+    {
+        self::$trustXSendfileTypeHeader = true;
+    }
+
+    /**
+     * If this is set to true, the file will be unlinked after the request is sent
+     * Note: If the X-Sendfile header is used, the deleteFileAfterSend setting will not be used.
+     *
+     * @return $this
+     */
+    public function deleteFileAfterSend(bool $shouldDelete = true): static
+    {
+        $this-&gt;deleteFileAfterSend = $shouldDelete;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-foundation/CHANGELOG.md -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-foundation/Exception -->
+
+</body>
+</html>

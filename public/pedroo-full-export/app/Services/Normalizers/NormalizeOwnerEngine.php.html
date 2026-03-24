@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/app/Services/Normalizers/NormalizeOwnerEngine.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Services\Normalize;
+
+use App\Models\PdOwner;
+use App\Models\PdDogOwner;
+use App\Models\Kennel;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+
+class NormalizeOwnerEngine
+{
+    /**
+     * A nyers kutyaadatokb�l elo�ll�tja a tulajdonosi strukt�r�t.
+     *
+     * @param array $rawDogData  A WebImporter / NormalizePipeline �ltal �sszerakott nyers adat.
+     * @return array [
+     *   &#039;owners&#039; =&gt; [ PdDogOwner::create()-hez haszn�lhat� t�mb�k ... ],
+     * ]
+     */
+    public function normalize(array $rawDogData): array
+    {
+        $country = $rawDogData[&#039;country&#039;] ?? null;
+
+        // 1) kennel owner / breeder felold�sa
+        $kennelOwner = $this-&gt;resolveKennelOwner($rawDogData, $country);
+
+        // 2) explicit owner (ha van)
+        $explicitOwner = $this-&gt;resolveExplicitOwner($rawDogData, $country);
+
+        // 3) co-owners (ha vannak)
+        $coOwners = $this-&gt;resolveCoOwners($rawDogData, $country);
+
+        // 4) holder (aki tartja, de nem tulajdonos)
+        $holder = $this-&gt;resolveHolder($rawDogData, $country);
+
+        $ownersPivot = [];
+
+        // --- PRIMARY OWNER LOGIKA ---
+
+        if ($explicitOwner) {
+            // ha van explicit owner ? o a primary
+            $ownersPivot[] = [
+                &#039;owner_id&#039;       =&gt; $explicitOwner-&gt;id,
+                &#039;ownership_type&#039; =&gt; &#039;primary&#039;,
+                &#039;can_edit&#039;       =&gt; true,
+                &#039;acquired_at&#039;    =&gt; $rawDogData[&#039;sold_at&#039;] ?? null,
+                &#039;released_at&#039;    =&gt; null,
+            ];
+
+            // a kennel owner ilyenkor m�r nem primary, de opcion�lisan
+            // megjelenhet co-ownerk�nt, ha ezt k�sobb szeretn�d
+        } else {
+            // ha nincs explicit owner ? kennel owner = primary
+            if ($kennelOwner) {
+                $ownersPivot[] = [
+                    &#039;owner_id&#039;       =&gt; $kennelOwner-&gt;id,
+                    &#039;ownership_type&#039; =&gt; &#039;primary&#039;,
+                    &#039;can_edit&#039;       =&gt; true,
+                    &#039;acquired_at&#039;    =&gt; $rawDogData[&#039;birth_date_normalized&#039;] ?? null,
+                    &#039;released_at&#039;    =&gt; null,
+                ];
+            }
+        }
+
+        // --- CO-OWNERS ---
+
+        foreach ($coOwners as $coOwner) {
+            $ownersPivot[] = [
+                &#039;owner_id&#039;       =&gt; $coOwner-&gt;id,
+                &#039;ownership_type&#039; =&gt; &#039;co-owner&#039;,
+                // itt j�n be az elved: k�rhetik, hogy b�rmelyik tulaj szerkeszthessen
+                &#039;can_edit&#039;       =&gt; $rawDogData[&#039;co_owner_can_edit&#039;] ?? false,
+                &#039;acquired_at&#039;    =&gt; $rawDogData[&#039;co_owner_since&#039;] ?? null,
+                &#039;released_at&#039;    =&gt; null,
+            ];
+        }
+
+        // --- HOLDER ---
+
+        if ($holder) {
+            $ownersPivot[] = [
+                &#039;owner_id&#039;       =&gt; $holder-&gt;id,
+                &#039;ownership_type&#039; =&gt; &#039;holder&#039;,
+                &#039;can_edit&#039;       =&gt; false, // holder soha nem szerkeszthet
+                &#039;acquired_at&#039;    =&gt; $rawDogData[&#039;holder_since&#039;] ?? null,
+                &#039;released_at&#039;    =&gt; null,
+            ];
+        }
+
+        return [
+            &#039;owners&#039; =&gt; $ownersPivot,
+        ];
+    }
+
+    /**
+     * Kennel owner / breeder felold�sa.
+     */
+    protected function resolveKennelOwner(array $rawDogData, ?string $country): ?PdOwner
+    {
+        // ha van kennel_id, megpr�b�ljuk onnan
+        if (!empty($rawDogData[&#039;kennel_id&#039;])) {
+            $kennel = Kennel::find($rawDogData[&#039;kennel_id&#039;]);
+            if ($kennel &amp;&amp; !empty($kennel-&gt;owner_name)) {
+                return $this-&gt;findOrCreateOwner($kennel-&gt;owner_name, $country);
+            }
+        }
+
+        // ha van explicit kennel_owner_name a raw adatban
+        if (!empty($rawDogData[&#039;kennel_owner_name&#039;])) {
+            return $this-&gt;findOrCreateOwner($rawDogData[&#039;kennel_owner_name&#039;], $country);
+        }
+
+        // fallback: ha van kennel_name, azt haszn�ljuk owner n�vnek
+        if (!empty($rawDogData[&#039;kennel_name_normalized&#039;])) {
+            return $this-&gt;findOrCreateOwner($rawDogData[&#039;kennel_name_normalized&#039;], $country);
+        }
+
+        return null;
+    }
+
+    /**
+     * Explicit owner felold�sa (ha a forr�soldal megadja).
+     */
+    protected function resolveExplicitOwner(array $rawDogData, ?string $country): ?PdOwner
+    {
+        $name = $rawDogData[&#039;owner_name&#039;] ?? null;
+
+        if (empty($name)) {
+            return null;
+        }
+
+        return $this-&gt;findOrCreateOwner($name, $country);
+    }
+
+    /**
+     * Co-owners felold�sa (pl. vesszovel elv�lasztott lista).
+     */
+    protected function resolveCoOwners(array $rawDogData, ?string $country): array
+    {
+        $result = [];
+
+        $raw = $rawDogData[&#039;co_owner_names&#039;] ?? null;
+        if (empty($raw)) {
+            return $result;
+        }
+
+        $names = array_filter(array_map(&#039;trim&#039;, explode(&#039;,&#039;, $raw)));
+
+        foreach ($names as $name) {
+            if ($name === &#039;&#039;) {
+                continue;
+            }
+            $result[] = $this-&gt;findOrCreateOwner($name, $country);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Holder felold�sa (aki tartja, de nem tulajdonos).
+     */
+    protected function resolveHolder(array $rawDogData, ?string $country): ?PdOwner
+    {
+        $name = $rawDogData[&#039;holder_name&#039;] ?? null;
+
+        if (empty($name)) {
+            return null;
+        }
+
+        return $this-&gt;findOrCreateOwner($name, $country);
+    }
+
+    /**
+     * Owner keres�se / l�trehoz�sa a pd_owners t�bl�ban.
+     */
+    protected function findOrCreateOwner(string $name, ?string $country): PdOwner
+    {
+        $name = trim($name);
+
+        return PdOwner::firstOrCreate(
+            [
+                &#039;name&#039; =&gt; $name,
+                &#039;country&#039; =&gt; $country,
+            ],
+            [
+                &#039;name&#039; =&gt; $name,
+                &#039;country&#039; =&gt; $country,
+            ]
+        );
+    }
+}
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /app/Services/Normalizers/NormalizeOwnerService.php -->
+<!-- PEDROO_NEXT_DIR: /app/Services/Normalizers/Color -->
+
+</body>
+</html>

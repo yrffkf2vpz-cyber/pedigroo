@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpunit/php-code-coverage/src/StaticAnalysis/CodeUnitFindingVisitor.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of phpunit/php-code-coverage.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace SebastianBergmann\CodeCoverage\StaticAnalysis;
+
+use function assert;
+use function implode;
+use function rtrim;
+use function trim;
+use PhpParser\Node;
+use PhpParser\Node\ComplexType;
+use PhpParser\Node\Identifier;
+use PhpParser\Node\IntersectionType;
+use PhpParser\Node\Name;
+use PhpParser\Node\NullableType;
+use PhpParser\Node\Stmt\Class_;
+use PhpParser\Node\Stmt\ClassMethod;
+use PhpParser\Node\Stmt\Enum_;
+use PhpParser\Node\Stmt\Function_;
+use PhpParser\Node\Stmt\Interface_;
+use PhpParser\Node\Stmt\Trait_;
+use PhpParser\Node\UnionType;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use SebastianBergmann\Complexity\CyclomaticComplexityCalculatingVisitor;
+
+/**
+ * @internal This class is not covered by the backward compatibility promise for phpunit/php-code-coverage
+ *
+ * @phpstan-type CodeUnitFunctionType = array{
+ *     name: string,
+ *     namespacedName: string,
+ *     namespace: string,
+ *     signature: string,
+ *     startLine: int,
+ *     endLine: int,
+ *     ccn: int
+ * }
+ * @phpstan-type CodeUnitMethodType = array{
+ *     methodName: string,
+ *     signature: string,
+ *     visibility: string,
+ *     startLine: int,
+ *     endLine: int,
+ *     ccn: int
+ * }
+ * @phpstan-type CodeUnitClassType = array{
+ *     name: string,
+ *     namespacedName: string,
+ *     namespace: string,
+ *     startLine: int,
+ *     endLine: int,
+ *     methods: array&lt;string, CodeUnitMethodType&gt;
+ * }
+ * @phpstan-type CodeUnitTraitType = array{
+ *     name: string,
+ *     namespacedName: string,
+ *     namespace: string,
+ *     startLine: int,
+ *     endLine: int,
+ *     methods: array&lt;string, CodeUnitMethodType&gt;
+ * }
+ */
+final class CodeUnitFindingVisitor extends NodeVisitorAbstract
+{
+    /**
+     * @var array&lt;string, CodeUnitClassType&gt;
+     */
+    private array $classes = [];
+
+    /**
+     * @var array&lt;string, CodeUnitTraitType&gt;
+     */
+    private array $traits = [];
+
+    /**
+     * @var array&lt;string, CodeUnitFunctionType&gt;
+     */
+    private array $functions = [];
+
+    public function enterNode(Node $node): void
+    {
+        if ($node instanceof Class_) {
+            if ($node-&gt;isAnonymous()) {
+                return;
+            }
+
+            $this-&gt;processClass($node);
+        }
+
+        if ($node instanceof Trait_) {
+            $this-&gt;processTrait($node);
+        }
+
+        if (!$node instanceof ClassMethod &amp;&amp; !$node instanceof Function_) {
+            return;
+        }
+
+        if ($node instanceof ClassMethod) {
+            $parentNode = $node-&gt;getAttribute(&#039;parent&#039;);
+
+            if ($parentNode instanceof Class_ &amp;&amp; $parentNode-&gt;isAnonymous()) {
+                return;
+            }
+
+            $this-&gt;processMethod($node);
+
+            return;
+        }
+
+        $this-&gt;processFunction($node);
+    }
+
+    /**
+     * @return array&lt;string, CodeUnitClassType&gt;
+     */
+    public function classes(): array
+    {
+        return $this-&gt;classes;
+    }
+
+    /**
+     * @return array&lt;string, CodeUnitTraitType&gt;
+     */
+    public function traits(): array
+    {
+        return $this-&gt;traits;
+    }
+
+    /**
+     * @return array&lt;string, CodeUnitFunctionType&gt;
+     */
+    public function functions(): array
+    {
+        return $this-&gt;functions;
+    }
+
+    private function cyclomaticComplexity(ClassMethod|Function_ $node): int
+    {
+        $nodes = $node-&gt;getStmts();
+
+        if ($nodes === null) {
+            return 0;
+        }
+
+        $traverser = new NodeTraverser;
+
+        $cyclomaticComplexityCalculatingVisitor = new CyclomaticComplexityCalculatingVisitor;
+
+        $traverser-&gt;addVisitor($cyclomaticComplexityCalculatingVisitor);
+
+        /* @noinspection UnusedFunctionResultInspection */
+        $traverser-&gt;traverse($nodes);
+
+        return $cyclomaticComplexityCalculatingVisitor-&gt;cyclomaticComplexity();
+    }
+
+    private function signature(ClassMethod|Function_ $node): string
+    {
+        $signature  = ($node-&gt;returnsByRef() ? &#039;&amp;&#039; : &#039;&#039;) . $node-&gt;name-&gt;toString() . &#039;(&#039;;
+        $parameters = [];
+
+        foreach ($node-&gt;getParams() as $parameter) {
+            assert(isset($parameter-&gt;var-&gt;name));
+
+            $parameterAsString = &#039;&#039;;
+
+            if ($parameter-&gt;type !== null) {
+                $parameterAsString = $this-&gt;type($parameter-&gt;type) . &#039; &#039;;
+            }
+
+            $parameterAsString .= &#039;$&#039; . $parameter-&gt;var-&gt;name;
+
+            /* @todo Handle default values */
+
+            $parameters[] = $parameterAsString;
+        }
+
+        $signature .= implode(&#039;, &#039;, $parameters) . &#039;)&#039;;
+
+        $returnType = $node-&gt;getReturnType();
+
+        if ($returnType !== null) {
+            $signature .= &#039;: &#039; . $this-&gt;type($returnType);
+        }
+
+        return $signature;
+    }
+
+    private function type(ComplexType|Identifier|Name $type): string
+    {
+        if ($type instanceof NullableType) {
+            return &#039;?&#039; . $type-&gt;type;
+        }
+
+        if ($type instanceof UnionType) {
+            return $this-&gt;unionTypeAsString($type);
+        }
+
+        if ($type instanceof IntersectionType) {
+            return $this-&gt;intersectionTypeAsString($type);
+        }
+
+        return $type-&gt;toString();
+    }
+
+    private function visibility(ClassMethod $node): string
+    {
+        if ($node-&gt;isPrivate()) {
+            return &#039;private&#039;;
+        }
+
+        if ($node-&gt;isProtected()) {
+            return &#039;protected&#039;;
+        }
+
+        return &#039;public&#039;;
+    }
+
+    private function processClass(Class_ $node): void
+    {
+        $name           = $node-&gt;name-&gt;toString();
+        $namespacedName = $node-&gt;namespacedName-&gt;toString();
+
+        $this-&gt;classes[$namespacedName] = [
+            &#039;name&#039;           =&gt; $name,
+            &#039;namespacedName&#039; =&gt; $namespacedName,
+            &#039;namespace&#039;      =&gt; $this-&gt;namespace($namespacedName, $name),
+            &#039;startLine&#039;      =&gt; $node-&gt;getStartLine(),
+            &#039;endLine&#039;        =&gt; $node-&gt;getEndLine(),
+            &#039;methods&#039;        =&gt; [],
+        ];
+    }
+
+    private function processTrait(Trait_ $node): void
+    {
+        $name           = $node-&gt;name-&gt;toString();
+        $namespacedName = $node-&gt;namespacedName-&gt;toString();
+
+        $this-&gt;traits[$namespacedName] = [
+            &#039;name&#039;           =&gt; $name,
+            &#039;namespacedName&#039; =&gt; $namespacedName,
+            &#039;namespace&#039;      =&gt; $this-&gt;namespace($namespacedName, $name),
+            &#039;startLine&#039;      =&gt; $node-&gt;getStartLine(),
+            &#039;endLine&#039;        =&gt; $node-&gt;getEndLine(),
+            &#039;methods&#039;        =&gt; [],
+        ];
+    }
+
+    private function processMethod(ClassMethod $node): void
+    {
+        $parentNode = $node-&gt;getAttribute(&#039;parent&#039;);
+
+        if ($parentNode instanceof Interface_) {
+            return;
+        }
+
+        assert($parentNode instanceof Class_ || $parentNode instanceof Trait_ || $parentNode instanceof Enum_);
+        assert(isset($parentNode-&gt;name));
+        assert(isset($parentNode-&gt;namespacedName));
+        assert($parentNode-&gt;namespacedName instanceof Name);
+
+        $parentName           = $parentNode-&gt;name-&gt;toString();
+        $parentNamespacedName = $parentNode-&gt;namespacedName-&gt;toString();
+
+        if ($parentNode instanceof Class_) {
+            $storage = &amp;$this-&gt;classes;
+        } else {
+            $storage = &amp;$this-&gt;traits;
+        }
+
+        if (!isset($storage[$parentNamespacedName])) {
+            $storage[$parentNamespacedName] = [
+                &#039;name&#039;           =&gt; $parentName,
+                &#039;namespacedName&#039; =&gt; $parentNamespacedName,
+                &#039;namespace&#039;      =&gt; $this-&gt;namespace($parentNamespacedName, $parentName),
+                &#039;startLine&#039;      =&gt; $parentNode-&gt;getStartLine(),
+                &#039;endLine&#039;        =&gt; $parentNode-&gt;getEndLine(),
+                &#039;methods&#039;        =&gt; [],
+            ];
+        }
+
+        $storage[$parentNamespacedName][&#039;methods&#039;][$node-&gt;name-&gt;toString()] = [
+            &#039;methodName&#039; =&gt; $node-&gt;name-&gt;toString(),
+            &#039;signature&#039;  =&gt; $this-&gt;signature($node),
+            &#039;visibility&#039; =&gt; $this-&gt;visibility($node),
+            &#039;startLine&#039;  =&gt; $node-&gt;getStartLine(),
+            &#039;endLine&#039;    =&gt; $node-&gt;getEndLine(),
+            &#039;ccn&#039;        =&gt; $this-&gt;cyclomaticComplexity($node),
+        ];
+    }
+
+    private function processFunction(Function_ $node): void
+    {
+        assert(isset($node-&gt;name));
+        assert(isset($node-&gt;namespacedName));
+        assert($node-&gt;namespacedName instanceof Name);
+
+        $name           = $node-&gt;name-&gt;toString();
+        $namespacedName = $node-&gt;namespacedName-&gt;toString();
+
+        $this-&gt;functions[$namespacedName] = [
+            &#039;name&#039;           =&gt; $name,
+            &#039;namespacedName&#039; =&gt; $namespacedName,
+            &#039;namespace&#039;      =&gt; $this-&gt;namespace($namespacedName, $name),
+            &#039;signature&#039;      =&gt; $this-&gt;signature($node),
+            &#039;startLine&#039;      =&gt; $node-&gt;getStartLine(),
+            &#039;endLine&#039;        =&gt; $node-&gt;getEndLine(),
+            &#039;ccn&#039;            =&gt; $this-&gt;cyclomaticComplexity($node),
+        ];
+    }
+
+    private function namespace(string $namespacedName, string $name): string
+    {
+        return trim(rtrim($namespacedName, $name), &#039;\\&#039;);
+    }
+
+    private function unionTypeAsString(UnionType $node): string
+    {
+        $types = [];
+
+        foreach ($node-&gt;types as $type) {
+            if ($type instanceof IntersectionType) {
+                $types[] = &#039;(&#039; . $this-&gt;intersectionTypeAsString($type) . &#039;)&#039;;
+
+                continue;
+            }
+
+            $types[] = $this-&gt;typeAsString($type);
+        }
+
+        return implode(&#039;|&#039;, $types);
+    }
+
+    private function intersectionTypeAsString(IntersectionType $node): string
+    {
+        $types = [];
+
+        foreach ($node-&gt;types as $type) {
+            $types[] = $this-&gt;typeAsString($type);
+        }
+
+        return implode(&#039;&amp;&#039;, $types);
+    }
+
+    private function typeAsString(Identifier|Name $node): string
+    {
+        if ($node instanceof Name) {
+            return $node-&gt;toCodeString();
+        }
+
+        return $node-&gt;toString();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpunit/php-code-coverage/src/StaticAnalysis/ExecutableLinesFindingVisitor.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpunit/php-code-coverage/src/TestSize -->
+
+</body>
+</html>

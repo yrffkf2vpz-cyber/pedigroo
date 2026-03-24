@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Cache/RateLimiter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Cache;
+
+use Closure;
+use Illuminate\Contracts\Cache\Repository as Cache;
+use Illuminate\Redis\Connections\PhpRedisConnection;
+use Illuminate\Support\Collection;
+use Illuminate\Support\InteractsWithTime;
+
+use function Illuminate\Support\enum_value;
+
+class RateLimiter
+{
+    use InteractsWithTime;
+
+    /**
+     * The cache store implementation.
+     *
+     * @var \Illuminate\Contracts\Cache\Repository
+     */
+    protected $cache;
+
+    /**
+     * The configured limit object resolvers.
+     *
+     * @var array
+     */
+    protected $limiters = [];
+
+    /**
+     * Create a new rate limiter instance.
+     *
+     * @param  \Illuminate\Contracts\Cache\Repository  $cache
+     */
+    public function __construct(Cache $cache)
+    {
+        $this-&gt;cache = $cache;
+    }
+
+    /**
+     * Register a named limiter configuration.
+     *
+     * @param  \UnitEnum|string  $name
+     * @param  \Closure  $callback
+     * @return $this
+     */
+    public function for($name, Closure $callback)
+    {
+        $resolvedName = $this-&gt;resolveLimiterName($name);
+
+        $this-&gt;limiters[$resolvedName] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Get the given named rate limiter.
+     *
+     * @param  \UnitEnum|string  $name
+     * @return \Closure|null
+     */
+    public function limiter($name)
+    {
+        $resolvedName = $this-&gt;resolveLimiterName($name);
+
+        $limiter = $this-&gt;limiters[$resolvedName] ?? null;
+
+        if (! is_callable($limiter)) {
+            return;
+        }
+
+        return function (...$args) use ($limiter) {
+            $result = $limiter(...$args);
+
+            if (! is_array($result)) {
+                return $result;
+            }
+
+            $duplicates = (new Collection($result))-&gt;duplicates(&#039;key&#039;);
+
+            if ($duplicates-&gt;isEmpty()) {
+                return $result;
+            }
+
+            foreach ($result as $limit) {
+                if ($duplicates-&gt;contains($limit-&gt;key)) {
+                    $limit-&gt;key = $limit-&gt;fallbackKey();
+                }
+            }
+
+            return $result;
+        };
+    }
+
+    /**
+     * Attempts to execute a callback if it&#039;s not limited.
+     *
+     * @param  string  $key
+     * @param  int  $maxAttempts
+     * @param  \Closure  $callback
+     * @param  \DateTimeInterface|\DateInterval|int  $decaySeconds
+     * @return mixed
+     */
+    public function attempt($key, $maxAttempts, Closure $callback, $decaySeconds = 60)
+    {
+        if ($this-&gt;tooManyAttempts($key, $maxAttempts)) {
+            return false;
+        }
+
+        if (is_null($result = $callback())) {
+            $result = true;
+        }
+
+        return tap($result, function () use ($key, $decaySeconds) {
+            $this-&gt;hit($key, $decaySeconds);
+        });
+    }
+
+    /**
+     * Determine if the given key has been &quot;accessed&quot; too many times.
+     *
+     * @param  string  $key
+     * @param  int  $maxAttempts
+     * @return bool
+     */
+    public function tooManyAttempts($key, $maxAttempts)
+    {
+        if ($this-&gt;attempts($key) &gt;= $maxAttempts) {
+            if ($this-&gt;cache-&gt;has($this-&gt;cleanRateLimiterKey($key).&#039;:timer&#039;)) {
+                return true;
+            }
+
+            $this-&gt;resetAttempts($key);
+        }
+
+        return false;
+    }
+
+    /**
+     * Increment (by 1) the counter for a given key for a given decay time.
+     *
+     * @param  string  $key
+     * @param  \DateTimeInterface|\DateInterval|int  $decaySeconds
+     * @return int
+     */
+    public function hit($key, $decaySeconds = 60)
+    {
+        return $this-&gt;increment($key, $decaySeconds);
+    }
+
+    /**
+     * Increment the counter for a given key for a given decay time by a given amount.
+     *
+     * @param  string  $key
+     * @param  \DateTimeInterface|\DateInterval|int  $decaySeconds
+     * @param  int  $amount
+     * @return int
+     */
+    public function increment($key, $decaySeconds = 60, $amount = 1)
+    {
+        $key = $this-&gt;cleanRateLimiterKey($key);
+
+        $this-&gt;cache-&gt;add(
+            $key.&#039;:timer&#039;, $this-&gt;availableAt($decaySeconds), $decaySeconds
+        );
+
+        $added = $this-&gt;withoutSerializationOrCompression(
+            fn () =&gt; $this-&gt;cache-&gt;add($key, 0, $decaySeconds)
+        );
+
+        $hits = (int) $this-&gt;cache-&gt;increment($key, $amount);
+
+        if (! $added &amp;&amp; $hits == 1) {
+            $this-&gt;withoutSerializationOrCompression(
+                fn () =&gt; $this-&gt;cache-&gt;put($key, 1, $decaySeconds)
+            );
+        }
+
+        return $hits;
+    }
+
+    /**
+     * Decrement the counter for a given key for a given decay time by a given amount.
+     *
+     * @param  string  $key
+     * @param  \DateTimeInterface|\DateInterval|int  $decaySeconds
+     * @param  int  $amount
+     * @return int
+     */
+    public function decrement($key, $decaySeconds = 60, $amount = 1)
+    {
+        return $this-&gt;increment($key, $decaySeconds, $amount * -1);
+    }
+
+    /**
+     * Get the number of attempts for the given key.
+     *
+     * @param  string  $key
+     * @return mixed
+     */
+    public function attempts($key)
+    {
+        $key = $this-&gt;cleanRateLimiterKey($key);
+
+        return $this-&gt;withoutSerializationOrCompression(fn () =&gt; $this-&gt;cache-&gt;get($key, 0));
+    }
+
+    /**
+     * Reset the number of attempts for the given key.
+     *
+     * @param  string  $key
+     * @return bool
+     */
+    public function resetAttempts($key)
+    {
+        $key = $this-&gt;cleanRateLimiterKey($key);
+
+        return $this-&gt;cache-&gt;forget($key);
+    }
+
+    /**
+     * Get the number of retries left for the given key.
+     *
+     * @param  string  $key
+     * @param  int  $maxAttempts
+     * @return int
+     */
+    public function remaining($key, $maxAttempts)
+    {
+        $key = $this-&gt;cleanRateLimiterKey($key);
+
+        $attempts = $this-&gt;attempts($key);
+
+        return max(0, $maxAttempts - $attempts);
+    }
+
+    /**
+     * Get the number of retries left for the given key.
+     *
+     * @param  string  $key
+     * @param  int  $maxAttempts
+     * @return int
+     */
+    public function retriesLeft($key, $maxAttempts)
+    {
+        return $this-&gt;remaining($key, $maxAttempts);
+    }
+
+    /**
+     * Clear the hits and lockout timer for the given key.
+     *
+     * @param  string  $key
+     * @return void
+     */
+    public function clear($key)
+    {
+        $key = $this-&gt;cleanRateLimiterKey($key);
+
+        $this-&gt;resetAttempts($key);
+
+        $this-&gt;cache-&gt;forget($key.&#039;:timer&#039;);
+    }
+
+    /**
+     * Get the number of seconds until the &quot;key&quot; is accessible again.
+     *
+     * @param  string  $key
+     * @return int
+     */
+    public function availableIn($key)
+    {
+        $key = $this-&gt;cleanRateLimiterKey($key);
+
+        return max(0, $this-&gt;cache-&gt;get($key.&#039;:timer&#039;) - $this-&gt;currentTime());
+    }
+
+    /**
+     * Clean the rate limiter key from unicode characters.
+     *
+     * @param  string  $key
+     * @return string
+     */
+    public function cleanRateLimiterKey($key)
+    {
+        return preg_replace(&#039;/&amp;([a-z])[a-z]+;/i&#039;, &#039;$1&#039;, htmlentities($key));
+    }
+
+    /**
+     * Execute the given callback without serialization or compression when applicable.
+     *
+     * @param  callable  $callback
+     * @return mixed
+     */
+    protected function withoutSerializationOrCompression(callable $callback)
+    {
+        $store = $this-&gt;cache-&gt;getStore();
+
+        if (! $store instanceof RedisStore) {
+            return $callback();
+        }
+
+        $connection = $store-&gt;connection();
+
+        if (! $connection instanceof PhpRedisConnection) {
+            return $callback();
+        }
+
+        return $connection-&gt;withoutSerializationOrCompression($callback);
+    }
+
+    /**
+     * Resolve the rate limiter name.
+     *
+     * @param  \UnitEnum|string  $name
+     * @return string
+     */
+    private function resolveLimiterName($name): string
+    {
+        return (string) enum_value($name);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Cache/RateLimiting/GlobalLimit.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Cache/Console -->
+
+</body>
+</html>

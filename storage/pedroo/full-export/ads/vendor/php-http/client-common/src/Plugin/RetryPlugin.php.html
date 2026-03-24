@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-http/client-common/src/Plugin/RetryPlugin.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Http\Client\Common\Plugin;
+
+use Http\Client\Common\Plugin;
+use Http\Client\Exception\HttpException;
+use Http\Promise\Promise;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Symfony\Component\OptionsResolver\OptionsResolver;
+
+/**
+ * Retry the request if an exception is thrown.
+ *
+ * By default will retry only one time.
+ *
+ * @author Joel Wurtz &lt;joel.wurtz@gmail.com&gt;
+ */
+final class RetryPlugin implements Plugin
+{
+    /**
+     * Number of retry before sending an exception.
+     *
+     * @var int
+     */
+    private $retry;
+
+    /**
+     * @var callable
+     */
+    private $errorResponseDelay;
+
+    /**
+     * @var callable
+     */
+    private $errorResponseDecider;
+
+    /**
+     * @var callable
+     */
+    private $exceptionDecider;
+
+    /**
+     * @var callable
+     */
+    private $exceptionDelay;
+
+    /**
+     * Store the retry counter for each request.
+     *
+     * @var array
+     */
+    private $retryStorage = [];
+
+    /**
+     * @param array{&#039;retries&#039;?: int, &#039;error_response_decider&#039;?: callable, &#039;exception_decider&#039;?: callable, &#039;error_response_delay&#039;?: callable, &#039;exception_delay&#039;?: callable} $config
+     *
+     * Configuration options:
+     *   - retries: Number of retries to attempt if an exception occurs before letting the exception bubble up
+     *   - error_response_decider: A callback that gets a request and response to decide whether the request should be retried
+     *   - exception_decider: A callback that gets a request and an exception to decide after a failure whether the request should be retried
+     *   - error_response_delay: A callback that gets a request and response and the current number of retries and returns how many microseconds we should wait before trying again
+     *   - exception_delay: A callback that gets a request, an exception and the current number of retries and returns how many microseconds we should wait before trying again
+     */
+    public function __construct(array $config = [])
+    {
+        $resolver = new OptionsResolver();
+        $resolver-&gt;setDefaults([
+            &#039;retries&#039; =&gt; 1,
+            &#039;error_response_decider&#039; =&gt; function (RequestInterface $request, ResponseInterface $response) {
+                // do not retry client errors
+                return $response-&gt;getStatusCode() &gt;= 500 &amp;&amp; $response-&gt;getStatusCode() &lt; 600;
+            },
+            &#039;exception_decider&#039; =&gt; function (RequestInterface $request, ClientExceptionInterface $e) {
+                // do not retry client errors
+                return !$e instanceof HttpException || $e-&gt;getCode() &gt;= 500 &amp;&amp; $e-&gt;getCode() &lt; 600;
+            },
+            &#039;error_response_delay&#039; =&gt; __CLASS__.&#039;::defaultErrorResponseDelay&#039;,
+            &#039;exception_delay&#039; =&gt; __CLASS__.&#039;::defaultExceptionDelay&#039;,
+        ]);
+
+        $resolver-&gt;setAllowedTypes(&#039;retries&#039;, &#039;int&#039;);
+        $resolver-&gt;setAllowedTypes(&#039;error_response_decider&#039;, &#039;callable&#039;);
+        $resolver-&gt;setAllowedTypes(&#039;exception_decider&#039;, &#039;callable&#039;);
+        $resolver-&gt;setAllowedTypes(&#039;error_response_delay&#039;, &#039;callable&#039;);
+        $resolver-&gt;setAllowedTypes(&#039;exception_delay&#039;, &#039;callable&#039;);
+        $options = $resolver-&gt;resolve($config);
+
+        $this-&gt;retry = $options[&#039;retries&#039;];
+        $this-&gt;errorResponseDecider = $options[&#039;error_response_decider&#039;];
+        $this-&gt;errorResponseDelay = $options[&#039;error_response_delay&#039;];
+        $this-&gt;exceptionDecider = $options[&#039;exception_decider&#039;];
+        $this-&gt;exceptionDelay = $options[&#039;exception_delay&#039;];
+    }
+
+    public function handleRequest(RequestInterface $request, callable $next, callable $first): Promise
+    {
+        $chainIdentifier = spl_object_hash((object) $first);
+
+        return $next($request)-&gt;then(function (ResponseInterface $response) use ($request, $next, $first, $chainIdentifier) {
+            if (!array_key_exists($chainIdentifier, $this-&gt;retryStorage)) {
+                $this-&gt;retryStorage[$chainIdentifier] = 0;
+            }
+
+            if ($this-&gt;retryStorage[$chainIdentifier] &gt;= $this-&gt;retry) {
+                unset($this-&gt;retryStorage[$chainIdentifier]);
+
+                return $response;
+            }
+
+            if (call_user_func($this-&gt;errorResponseDecider, $request, $response)) {
+                /** @var int $time */
+                $time = call_user_func($this-&gt;errorResponseDelay, $request, $response, $this-&gt;retryStorage[$chainIdentifier]);
+                $response = $this-&gt;retry($request, $next, $first, $chainIdentifier, $time);
+            }
+
+            if (array_key_exists($chainIdentifier, $this-&gt;retryStorage)) {
+                unset($this-&gt;retryStorage[$chainIdentifier]);
+            }
+
+            return $response;
+        }, function (ClientExceptionInterface $exception) use ($request, $next, $first, $chainIdentifier) {
+            if (!array_key_exists($chainIdentifier, $this-&gt;retryStorage)) {
+                $this-&gt;retryStorage[$chainIdentifier] = 0;
+            }
+
+            if ($this-&gt;retryStorage[$chainIdentifier] &gt;= $this-&gt;retry) {
+                unset($this-&gt;retryStorage[$chainIdentifier]);
+
+                throw $exception;
+            }
+
+            if (!call_user_func($this-&gt;exceptionDecider, $request, $exception)) {
+                throw $exception;
+            }
+
+            /** @var int $time */
+            $time = call_user_func($this-&gt;exceptionDelay, $request, $exception, $this-&gt;retryStorage[$chainIdentifier]);
+
+            return $this-&gt;retry($request, $next, $first, $chainIdentifier, $time);
+        });
+    }
+
+    /**
+     * @param int $retries The number of retries we made before. First time this get called it will be 0.
+     */
+    public static function defaultErrorResponseDelay(RequestInterface $request, ResponseInterface $response, int $retries): int
+    {
+        return pow(2, $retries) * 500000;
+    }
+
+    /**
+     * @param int $retries The number of retries we made before. First time this get called it will be 0.
+     */
+    public static function defaultExceptionDelay(RequestInterface $request, ClientExceptionInterface $e, int $retries): int
+    {
+        return pow(2, $retries) * 500000;
+    }
+
+    /**
+     * @throws \Exception if retrying returns a failed promise
+     */
+    private function retry(RequestInterface $request, callable $next, callable $first, string $chainIdentifier, int $delay): ResponseInterface
+    {
+        usleep($delay);
+
+        // Retry synchronously
+        ++$this-&gt;retryStorage[$chainIdentifier];
+        $promise = $this-&gt;handleRequest($request, $next, $first);
+
+        return $promise-&gt;wait();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-http/client-common/src/Plugin/SeekableBodyPlugin.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-http/discovery -->
+
+</body>
+</html>

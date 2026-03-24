@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/vonage/client-core/src/Client.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Vonage;
+
+use Composer\InstalledVersions;
+use Http\Client\HttpClient;
+use InvalidArgumentException;
+use Laminas\Diactoros\Request;
+use Laminas\Diactoros\Uri;
+use Lcobucci\JWT\Token;
+use Psr\Container\ContainerInterface;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Client\ClientInterface;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
+use RuntimeException;
+use Vonage\Account\ClientFactory;
+use Vonage\Application\ClientFactory as ApplicationClientFactory;
+use Vonage\Client\APIResource;
+use Vonage\Client\Credentials\Basic;
+use Vonage\Client\Credentials\Container;
+use Vonage\Client\Credentials\CredentialsInterface;
+use Vonage\Client\Credentials\Gnp;
+use Vonage\Client\Credentials\Handler\BasicHandler;
+use Vonage\Client\Credentials\Handler\SignatureBodyFormHandler;
+use Vonage\Client\Credentials\Handler\SignatureBodyHandler;
+use Vonage\Client\Credentials\Handler\SignatureQueryHandler;
+use Vonage\Client\Credentials\Handler\TokenBodyFormHandler;
+use Vonage\Client\Credentials\Handler\TokenBodyHandler;
+use Vonage\Client\Credentials\Handler\TokenQueryHandler;
+use Vonage\Client\Credentials\Keypair;
+use Vonage\Client\Credentials\SignatureSecret;
+use Vonage\Client\Exception\Exception as ClientException;
+use Vonage\Client\Factory\FactoryInterface;
+use Vonage\Client\Factory\MapFactory;
+use Vonage\Conversion\ClientFactory as ConversionClientFactory;
+use Vonage\Entity\EntityInterface;
+use Vonage\Insights\ClientFactory as InsightsClientFactory;
+use Vonage\Meetings\ClientFactory as MeetingsClientFactory;
+use Vonage\Numbers\ClientFactory as NumbersClientFactory;
+use Vonage\NumberVerification\ClientFactory as NumberVerificationClientFactory;
+use Vonage\Redact\ClientFactory as RedactClientFactory;
+use Vonage\Secrets\ClientFactory as SecretsClientFactory;
+use Vonage\SimSwap\ClientFactory as SimSwapClientFactory;
+use Vonage\SMS\ClientFactory as SMSClientFactory;
+use Vonage\Subaccount\ClientFactory as SubaccountClientFactory;
+use Vonage\Messages\ClientFactory as MessagesClientFactory;
+use Vonage\Users\ClientFactory as UsersClientFactory;
+use Vonage\Verify\ClientFactory as VerifyClientFactory;
+use Vonage\Verify2\ClientFactory as Verify2ClientFactory;
+use Vonage\Conversation\ClientFactory as ConversationClientFactory;
+use Vonage\Verify\Verification;
+use Vonage\Voice\ClientFactory as VoiceClientFactory;
+use Vonage\Logger\{LoggerAwareInterface, LoggerTrait};
+
+use function array_key_exists;
+use function array_merge;
+use function call_user_func_array;
+use function http_build_query;
+use function implode;
+use function is_null;
+use function json_encode;
+use function method_exists;
+use function set_error_handler;
+use function str_replace;
+use function strpos;
+
+/**
+ * Vonage API Client, allows access to the API from PHP.
+ *
+ * @method Account\Client account()
+ * @method Meetings\Client meetings()
+ * @method Messages\Client messages()
+ * @method Application\Client applications()
+ * @method Conversion\Client conversion()
+ * @method Conversation\Client conversation()
+ * @method Insights\Client insights()
+ * @method Numbers\Client numbers()
+ * @method NumberVerification\Client numberVerification()
+ * @method Redact\Client redact()
+ * @method Secrets\Client secrets()
+ * @method SimSwap\Client simswap()
+ * @method SMS\Client sms()
+ * @method Subaccount\Client subaccount()
+ * @method Users\Client users()
+ * @method Verify\Client  verify()
+ * @method Verify2\Client  verify2()
+ * @method Voice\Client voice()
+ * @method Vonage\Video\Client video()
+ *
+ * @property string restUrl
+ * @property string apiUrl
+ */
+class Client implements LoggerAwareInterface
+{
+    use LoggerTrait;
+
+    public const BASE_API = &#039;https://api.nexmo.com&#039;;
+    public const BASE_REST = &#039;https://rest.nexmo.com&#039;;
+
+    protected CredentialsInterface $credentials;
+
+    protected ClientInterface $client;
+
+    protected mixed $debug = false;
+
+    protected ContainerInterface $factory;
+
+    /**
+     * @var LoggerInterface
+     */
+    protected $logger;
+
+    protected array $options = [&#039;show_deprecations&#039; =&gt; false, &#039;debug&#039; =&gt; false];
+
+    public string $apiUrl;
+
+    public string $restUrl;
+
+    /**
+     * Create a new API client using the provided credentials.
+     */
+    public function __construct(
+        CredentialsInterface $credentials,
+        $options = [],
+        ?ClientInterface $client = null
+    ) {
+        if (is_null($client)) {
+            // Since the user did not pass a client, try and make a client
+            // using the Guzzle 6 adapter or Guzzle 7 (depending on availability)
+            [$guzzleVersion] = explode(&#039;@&#039;, (string) InstalledVersions::getVersion(&#039;guzzlehttp/guzzle&#039;), 1);
+            $guzzleVersion = (float) $guzzleVersion;
+
+            if ($guzzleVersion &gt;= 6.0 &amp;&amp; $guzzleVersion &lt; 7) {
+                /** @noinspection CallableParameterUseCaseInTypeContextInspection */
+                /** @noinspection PhpUndefinedNamespaceInspection */
+                /** @noinspection PhpUndefinedClassInspection */
+                $client = new \Http\Adapter\Guzzle6\Client();
+            }
+
+            if ($guzzleVersion &gt;= 7.0 &amp;&amp; $guzzleVersion &lt; 8.0) {
+                $client = new \GuzzleHttp\Client();
+            }
+        }
+
+        $this-&gt;setHttpClient($client);
+
+        if (
+            !($credentials instanceof Container) &amp;&amp;
+            !($credentials instanceof Basic) &amp;&amp;
+            !($credentials instanceof SignatureSecret) &amp;&amp;
+            !($credentials instanceof Keypair) &amp;&amp;
+            !($credentials instanceof Gnp)
+        ) {
+            throw new RuntimeException(&#039;unknown credentials type: &#039; . $credentials::class);
+        }
+
+        $this-&gt;credentials = $credentials;
+
+        $this-&gt;options = array_merge($this-&gt;options, $options);
+
+        // If they&#039;ve provided an app name, validate it
+        if (isset($options[&#039;app&#039;])) {
+            $this-&gt;validateAppOptions($options[&#039;app&#039;]);
+        }
+
+        // Set the default URLs. Keep the constants for
+        // backwards compatibility
+        $this-&gt;apiUrl = static::BASE_API;
+        $this-&gt;restUrl = static::BASE_REST;
+
+        // If they&#039;ve provided alternative URLs, use that instead
+        // of the defaults
+        if (isset($options[&#039;base_rest_url&#039;])) {
+            $this-&gt;restUrl = $options[&#039;base_rest_url&#039;];
+        }
+
+        if (isset($options[&#039;base_api_url&#039;])) {
+            $this-&gt;apiUrl = $options[&#039;base_api_url&#039;];
+        }
+
+        if (isset($options[&#039;debug&#039;])) {
+            $this-&gt;debug = $options[&#039;debug&#039;];
+        }
+
+        $services = [
+            // Registered Services by name
+            &#039;account&#039; =&gt; ClientFactory::class,
+            &#039;applications&#039; =&gt; ApplicationClientFactory::class,
+            &#039;conversion&#039; =&gt; ConversionClientFactory::class,
+            &#039;conversation&#039; =&gt; ConversationClientFactory::class,
+            &#039;insights&#039; =&gt; InsightsClientFactory::class,
+            &#039;numbers&#039; =&gt; NumbersClientFactory::class,
+            &#039;numberVerification&#039; =&gt; NumberVerificationClientFactory::class,
+            &#039;meetings&#039; =&gt; MeetingsClientFactory::class,
+            &#039;messages&#039; =&gt; MessagesClientFactory::class,
+            &#039;redact&#039; =&gt; RedactClientFactory::class,
+            &#039;secrets&#039; =&gt; SecretsClientFactory::class,
+            &#039;simswap&#039; =&gt; SimSwapClientFactory::class,
+            &#039;sms&#039; =&gt; SMSClientFactory::class,
+            &#039;subaccount&#039; =&gt; SubaccountClientFactory::class,
+            &#039;users&#039; =&gt; UsersClientFactory::class,
+            &#039;verify&#039; =&gt; VerifyClientFactory::class,
+            &#039;verify2&#039; =&gt; Verify2ClientFactory::class,
+            &#039;voice&#039; =&gt; VoiceClientFactory::class,
+
+            // Additional utility classes
+            APIResource::class =&gt; APIResource::class,
+            Client::class =&gt; fn () =&gt; $this
+        ];
+
+        if (class_exists(&#039;Vonage\Video\ClientFactory&#039;)) {
+            $services[&#039;video&#039;] = &#039;Vonage\Video\ClientFactory&#039;;
+        } else {
+            $services[&#039;video&#039;] = function (): never {
+                throw new \RuntimeException(&#039;Please install @vonage/video to use the Video API&#039;);
+            };
+        }
+
+        $this-&gt;setFactory(
+            new MapFactory(
+                $services,
+                $this
+            )
+        );
+
+        // Disable throwing E_USER_DEPRECATED notices by default, the user can turn it on during development
+        if (array_key_exists(&#039;show_deprecations&#039;, $this-&gt;options) &amp;&amp; ($this-&gt;options[&#039;show_deprecations&#039;] == true)) {
+            set_error_handler(
+                static fn (
+                    int $errno,
+                    string $errstr,
+                    ?string $errfile = null,
+                    ?int $errline = null,
+                    ?array $errorcontext = null
+                ) =&gt; true,
+                E_USER_DEPRECATED
+            );
+        }
+    }
+
+    public function getRestUrl(): string
+    {
+        return $this-&gt;restUrl;
+    }
+
+    public function getApiUrl(): string
+    {
+        return $this-&gt;apiUrl;
+    }
+
+    /**
+     * Set the Http Client to used to make API requests.
+     *
+     * This allows the default http client to be swapped out for a HTTPlug compatible
+     * replacement.
+     */
+    public function setHttpClient(ClientInterface $client): self
+    {
+        $this-&gt;client = $client;
+
+        return $this;
+    }
+
+    /**
+     * Get the Http Client used to make API requests.
+     */
+    public function getHttpClient(): ClientInterface
+    {
+        return $this-&gt;client;
+    }
+
+    /**
+     * Set the factory used to create API specific clients.
+     */
+    public function setFactory(FactoryInterface $factory): self
+    {
+        $this-&gt;factory = $factory;
+
+        return $this;
+    }
+
+    public function getFactory(): ContainerInterface
+    {
+        return $this-&gt;factory;
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    public static function signRequest(RequestInterface $request, SignatureSecret $credentials): RequestInterface
+    {
+        $handler = match ($request-&gt;getHeaderLine(&#039;content-type&#039;)) {
+            &#039;application/json&#039; =&gt; new SignatureBodyHandler(),
+            &#039;application/x-www-form-urlencoded&#039; =&gt; new SignatureBodyFormHandler(),
+            default =&gt; new SignatureQueryHandler(),
+        };
+
+        return $handler($request, $credentials);
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    public static function authRequest(RequestInterface $request, Basic $credentials): RequestInterface
+    {
+        switch ($request-&gt;getHeaderLine(&#039;content-type&#039;)) {
+            case &#039;application/json&#039;:
+                if (static::requiresBasicAuth($request)) {
+                    $handler = new BasicHandler();
+                } elseif (static::requiresAuthInUrlNotBody($request)) {
+                    $handler = new TokenQueryHandler();
+                } else {
+                    $handler = new TokenBodyHandler();
+                }
+                break;
+            case &#039;application/x-www-form-urlencoded&#039;:
+                $handler = new TokenBodyFormHandler();
+                break;
+            default:
+                if (static::requiresBasicAuth($request)) {
+                    $handler = new BasicHandler();
+                } else {
+                    $handler = new TokenQueryHandler();
+                }
+                break;
+        }
+
+        return $handler($request, $credentials);
+    }
+
+    /**
+     * @throws ClientException
+     */
+    public function generateJwt($claims = []): Token
+    {
+        if (method_exists($this-&gt;credentials, &quot;generateJwt&quot;)) {
+            return $this-&gt;credentials-&gt;generateJwt($claims);
+        }
+
+        throw new ClientException($this-&gt;credentials::class . &#039; does not support JWT generation&#039;);
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    public function get(string $url, array $params = []): ResponseInterface
+    {
+        $queryString = &#039;?&#039; . http_build_query($params);
+        $url .= $queryString;
+
+        $request = new Request($url, &#039;GET&#039;);
+
+        return $this-&gt;send($request);
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    public function post(string $url, array $params): ResponseInterface
+    {
+        $request = new Request(
+            $url,
+            &#039;POST&#039;,
+            &#039;php://temp&#039;,
+            [&#039;content-type&#039; =&gt; &#039;application/json&#039;]
+        );
+
+        $request-&gt;getBody()-&gt;write(json_encode($params));
+
+        return $this-&gt;send($request);
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    public function postUrlEncoded(string $url, array $params): ResponseInterface
+    {
+        $request = new Request(
+            $url,
+            &#039;POST&#039;,
+            &#039;php://temp&#039;,
+            [&#039;content-type&#039; =&gt; &#039;application/x-www-form-urlencoded&#039;]
+        );
+
+        $request-&gt;getBody()-&gt;write(http_build_query($params));
+
+        return $this-&gt;send($request);
+    }
+
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    public function put(string $url, array $params): ResponseInterface
+    {
+        $request = new Request(
+            $url,
+            &#039;PUT&#039;,
+            &#039;php://temp&#039;,
+            [&#039;content-type&#039; =&gt; &#039;application/json&#039;]
+        );
+
+        $request-&gt;getBody()-&gt;write(json_encode($params));
+
+        return $this-&gt;send($request);
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    public function delete(string $url): ResponseInterface
+    {
+        $request = new Request(
+            $url,
+            &#039;DELETE&#039;
+        );
+
+        return $this-&gt;send($request);
+    }
+
+    /**
+     * Wraps the HTTP Client, creates a new PSR-7 request adding authentication, signatures, etc.
+     *
+     * @throws ClientExceptionInterface
+     */
+    public function send(RequestInterface $request): ResponseInterface
+    {
+        // Allow any part of the URI to be replaced with a simple search
+        if (isset($this-&gt;options[&#039;url&#039;])) {
+            foreach ($this-&gt;options[&#039;url&#039;] as $search =&gt; $replace) {
+                $uri = (string)$request-&gt;getUri();
+                $new = str_replace($search, $replace, $uri);
+
+                if ($uri !== $new) {
+                    $request = $request-&gt;withUri(new Uri($new));
+                }
+            }
+        }
+
+        // The user agent must be in the following format:
+        // LIBRARY-NAME/LIBRARY-VERSION LANGUAGE-NAME/LANGUAGE-VERSION [APP-NAME/APP-VERSION]
+        // See https://github.com/Vonage/client-library-specification/blob/master/SPECIFICATION.md#reporting
+        $userAgent = [];
+
+        // Library name
+        $userAgent[] = &#039;vonage-php/&#039; . $this-&gt;getVersion();
+
+        // Language name
+        $userAgent[] = &#039;php/&#039; . PHP_MAJOR_VERSION . &#039;.&#039; . PHP_MINOR_VERSION;
+
+        // If we have an app set, add that to the UA
+        if (isset($this-&gt;options[&#039;app&#039;])) {
+            $app = $this-&gt;options[&#039;app&#039;];
+            $userAgent[] = $app[&#039;name&#039;] . &#039;/&#039; . $app[&#039;version&#039;];
+        }
+
+        // Set the header. Build by joining all the parts we have with a space
+        $request = $request-&gt;withHeader(&#039;User-Agent&#039;, implode(&#039; &#039;, $userAgent));
+        /** @noinspection PhpUnnecessaryLocalVariableInspection */
+        $response = $this-&gt;client-&gt;sendRequest($request);
+
+        if ($this-&gt;debug) {
+            $id = uniqid(&#039;&#039;, true);
+            $request-&gt;getBody()-&gt;rewind();
+            $response-&gt;getBody()-&gt;rewind();
+            $this-&gt;log(
+                LogLevel::DEBUG,
+                &#039;Request &#039; . $id,
+                [
+                    &#039;url&#039; =&gt; $request-&gt;getUri()-&gt;__toString(),
+                    &#039;headers&#039; =&gt; $request-&gt;getHeaders(),
+                    &#039;body&#039; =&gt; explode(&quot;\n&quot;, $request-&gt;getBody()-&gt;__toString())
+                ]
+            );
+            $this-&gt;log(
+                LogLevel::DEBUG,
+                &#039;Response &#039; . $id,
+                [
+                    &#039;headers &#039; =&gt; $response-&gt;getHeaders(),
+                    &#039;body&#039; =&gt; explode(&quot;\n&quot;, $response-&gt;getBody()-&gt;__toString())
+                ]
+            );
+
+            $request-&gt;getBody()-&gt;rewind();
+            $response-&gt;getBody()-&gt;rewind();
+        }
+
+        return $response;
+    }
+
+    protected function validateAppOptions($app): void
+    {
+        $disallowedCharacters = [&#039;/&#039;, &#039; &#039;, &quot;\t&quot;, &quot;\n&quot;];
+
+        foreach ([&#039;name&#039;, &#039;version&#039;] as $key) {
+            if (!isset($app[$key])) {
+                throw new InvalidArgumentException(&#039;app.&#039; . $key . &#039; has not been set&#039;);
+            }
+
+            foreach ($disallowedCharacters as $char) {
+                if (str_contains((string) $app[$key], $char)) {
+                    throw new InvalidArgumentException(&#039;app.&#039; . $key . &#039; cannot contain the &#039; . $char . &#039; character&#039;);
+                }
+            }
+        }
+    }
+
+    public function __call($name, $args)
+    {
+        if (!$this-&gt;factory-&gt;has($name)) {
+            throw new RuntimeException(&#039;no api namespace found: &#039; . $name);
+        }
+
+        $collection = $this-&gt;factory-&gt;get($name);
+
+        if (empty($args)) {
+            return $collection;
+        }
+
+        return call_user_func_array($collection, $args);
+    }
+
+    /**
+     * @noinspection MagicMethodsValidityInspection
+     */
+    public function __get($name)
+    {
+        if (!$this-&gt;factory-&gt;has($name)) {
+            throw new RuntimeException(&#039;no api namespace found: &#039; . $name);
+        }
+
+        return $this-&gt;factory-&gt;get($name);
+    }
+
+    public function getDebug(): mixed
+    {
+        return $this-&gt;debug;
+    }
+
+    public function setDebug(mixed $debug): Client
+    {
+        $this-&gt;debug = $debug;
+        return $this;
+    }
+
+    /**
+     * @deprecated Use the Verify Client, this shouldn&#039;t be here and will be removed.
+     */
+    public function serialize(EntityInterface $entity): string
+    {
+        if ($entity instanceof Verification) {
+            return $this-&gt;verify()-&gt;serialize($entity);
+        }
+
+        throw new RuntimeException(&#039;unknown class `&#039; . $entity::class . &#039;``&#039;);
+    }
+
+    protected function getVersion(): string
+    {
+        return InstalledVersions::getVersion(&#039;vonage/client-core&#039;);
+    }
+
+    public function getLogger(): ?LoggerInterface
+    {
+        if (!$this-&gt;logger &amp;&amp; $this-&gt;getFactory()-&gt;has(LoggerInterface::class)) {
+            $this-&gt;setLogger($this-&gt;getFactory()-&gt;get(LoggerInterface::class));
+        }
+
+        return $this-&gt;logger;
+    }
+
+    public function getCredentials(): CredentialsInterface
+    {
+        return $this-&gt;credentials;
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    protected static function requiresBasicAuth(RequestInterface $request): bool
+    {
+        $path = $request-&gt;getUri()-&gt;getPath();
+        $isSecretManagementEndpoint = str_starts_with($path, &#039;/accounts&#039;) &amp;&amp; str_contains($path, &#039;/secrets&#039;);
+        $isApplicationV2 = str_starts_with($path, &#039;/v2/applications&#039;);
+
+        return $isSecretManagementEndpoint || $isApplicationV2;
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    protected static function requiresAuthInUrlNotBody(RequestInterface $request): bool
+    {
+        $path = $request-&gt;getUri()-&gt;getPath();
+
+        $isRedact =  str_starts_with($path, &#039;/v1/redact&#039;);
+        $isMessages =  str_starts_with($path, &#039;/v1/messages&#039;);
+
+        return $isRedact || $isMessages;
+    }
+
+    /**
+     * @deprecated Use a configured APIResource with a HandlerInterface
+     * Request business logic is being removed from the User Client Layer.
+     */
+    protected function needsKeypairAuthentication(RequestInterface $request): bool
+    {
+        $path = $request-&gt;getUri()-&gt;getPath();
+        $isCallEndpoint = str_starts_with($path, &#039;/v1/calls&#039;);
+        $isRecordingUrl = str_starts_with($path, &#039;/v1/files&#039;);
+        $isStitchEndpoint = str_starts_with($path, &#039;/beta/conversation&#039;);
+        $isUserEndpoint = str_starts_with($path, &#039;/beta/users&#039;);
+
+        return $isCallEndpoint || $isRecordingUrl || $isStitchEndpoint || $isUserEndpoint;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/vonage/client-core/src/Client/APIClient.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/vonage/client-core/src/Account -->
+
+</body>
+</html>

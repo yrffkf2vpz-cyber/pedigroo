@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/app/Pedroo/Intelligence/Breed/PairEligibilityEngine.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Pedroo\Intelligence\Breed;
+
+use App\Models\Dog;
+use App\Pedroo\Intelligence\Color\ColorEngine;
+use App\Pedroo\Intelligence\Health\HealthEngine;
+use App\Pedroo\Intelligence\COI\COIEngine;
+
+class PairEligibilityEngine
+{
+    public function __construct(
+        protected BreedEngine $breedEngine,
+        protected ColorEngine $colorEngine,
+        protected HealthEngine $healthEngine,
+        protected COIEngine $coiEngine,
+    ) {}
+
+    /**
+     * Teljes párosítás-ellenőrzés
+     */
+    public function checkPair(Dog $sire, Dog $dam): array
+    {
+        $breedId = $sire-&gt;breed_id;
+        $rules   = $this-&gt;breedEngine-&gt;loadRules($breedId);
+
+        // 1) Egyedi tenyészthetőség
+        $sireRules = $this-&gt;breedEngine-&gt;checkDogEligibility($sire);
+        $damRules  = $this-&gt;breedEngine-&gt;checkDogEligibility($dam);
+
+        // 2) Genetikai kockázatok (szín + genetika)
+        $geneticRisks = $this-&gt;checkGeneticRisks($sire, $dam, $rules);
+
+        // 3) Egészségügyi kockázatok
+        $healthRisks = $this-&gt;healthEngine-&gt;checkPairHealth($sire, $dam);
+
+        // 4) COI számítása
+        $coi = $this-&gt;coiEngine-&gt;calculatePairCoi($sire, $dam);
+
+        // 5) COI limit
+        $coiLimit  = $rules[&#039;inbreeding_limit&#039;] ?? null;
+        $coiStatus = $coiLimit !== null &amp;&amp; $coi &gt; $coiLimit ? &#039;exceeds_limit&#039; : &#039;ok&#039;;
+
+        // 6) Végső döntés
+        $pairAllowed = $this-&gt;isPairAllowed(
+            $sireRules,
+            $damRules,
+            $geneticRisks,
+            $healthRisks,
+            $coi,
+            $coiLimit
+        );
+
+        // 7) Egységes eredménystruktúra
+        return [
+            &#039;pair_allowed&#039; =&gt; $pairAllowed,
+
+            &#039;coi&#039; =&gt; [
+                &#039;value&#039;  =&gt; $coi,
+                &#039;limit&#039;  =&gt; $coiLimit,
+                &#039;status&#039; =&gt; $coiStatus,
+            ],
+
+            &#039;sire&#039; =&gt; [
+                &#039;id&#039;          =&gt; $sire-&gt;id,
+                &#039;eligibility&#039; =&gt; $sireRules,
+            ],
+
+            &#039;dam&#039; =&gt; [
+                &#039;id&#039;          =&gt; $dam-&gt;id,
+                &#039;eligibility&#039; =&gt; $damRules,
+            ],
+
+            &#039;genetic_risks&#039; =&gt; $geneticRisks,
+            &#039;health_risks&#039;  =&gt; $healthRisks,
+        ];
+    }
+
+    /**
+     * Genetikai + szín + minta kockázatok
+     */
+    private function checkGeneticRisks(Dog $sire, Dog $dam, array $rules): array
+    {
+        $risks = [];
+
+        // --- Merle × Merle (hard tiltás) ---
+        if (
+            ($sire-&gt;genotypes[&#039;M&#039;] ?? null) === &#039;M/m&#039; &amp;&amp;
+            ($dam-&gt;genotypes[&#039;M&#039;] ?? null) === &#039;M/m&#039;
+        ) {
+            $risks[] = &#039;double_merle_risk&#039;;
+        }
+
+        // --- e/e × e/e (jelzés) ---
+        if (
+            ($sire-&gt;genotypes[&#039;E&#039;] ?? null) === &#039;e/e&#039; &amp;&amp;
+            ($dam-&gt;genotypes[&#039;E&#039;] ?? null) === &#039;e/e&#039;
+        ) {
+            $risks[] = &#039;all_red_litter&#039;;
+        }
+
+        // --- d/d × d/d (jelzés) ---
+        if (
+            ($sire-&gt;genotypes[&#039;D&#039;] ?? null) === &#039;d/d&#039; &amp;&amp;
+            ($dam-&gt;genotypes[&#039;D&#039;] ?? null) === &#039;d/d&#039;
+        ) {
+            $risks[] = &#039;all_dilute_litter&#039;;
+        }
+
+        // --- Tiltott színkombinációk ---
+        if (!empty($rules[&#039;forbidden_color_combinations&#039;])) {
+            $combos = json_decode($rules[&#039;forbidden_color_combinations&#039;], true);
+
+            foreach ($combos as $combo) {
+                if (
+                    $sire-&gt;color === $combo[&#039;sire&#039;] &amp;&amp;
+                    $dam-&gt;color  === $combo[&#039;dam&#039;]
+                ) {
+                    $risks[] = &#039;forbidden_color_combination&#039;;
+                }
+            }
+        }
+
+        // --- Tiltott genetikai kombinációk ---
+        if (!empty($rules[&#039;forbidden_genotype_combinations&#039;])) {
+            $combos = json_decode($rules[&#039;forbidden_genotype_combinations&#039;], true);
+
+            foreach ($combos as $combo) {
+                $gene = $combo[&#039;gene&#039;];
+
+                if (
+                    ($sire-&gt;genotypes[$gene] ?? null) === $combo[&#039;sire&#039;] &amp;&amp;
+                    ($dam-&gt;genotypes[$gene] ?? null) === $combo[&#039;dam&#039;]
+                ) {
+                    $risks[] = &#039;forbidden_genotype_combination&#039;;
+                }
+            }
+        }
+
+        return $risks;
+    }
+
+    /**
+     * Végső döntés
+     */
+    private function isPairAllowed(
+        array $sireRules,
+        array $damRules,
+        array $geneticRisks,
+        array $healthRisks,
+        float $coi,
+        ?float $coiLimit
+    ): bool {
+        // Egyedi tiltások
+        if (in_array(false, $sireRules, true) || in_array(false, $damRules, true)) {
+            return false;
+        }
+
+        // Double merle tiltás
+        if (in_array(&#039;double_merle_risk&#039;, $geneticRisks, true)) {
+            return false;
+        }
+
+        // Tiltott színkombináció
+        if (in_array(&#039;forbidden_color_combination&#039;, $geneticRisks, true)) {
+            return false;
+        }
+
+        // Tiltott genetikai kombináció
+        if (in_array(&#039;forbidden_genotype_combination&#039;, $geneticRisks, true)) {
+            return false;
+        }
+
+        // Egészségügyi tiltás
+        if ($healthRisks[&#039;forbidden&#039;] ?? false) {
+            return false;
+        }
+
+        // COI limit tiltás (hard limit)
+        if ($coiLimit !== null &amp;&amp; $coi &gt; $coiLimit) {
+            return false;
+        }
+
+        return true;
+    }
+}
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /app/Pedroo/Intelligence/COI/AncestryBuilder.php -->
+<!-- PEDROO_NEXT_DIR: /app/Pedroo/Intelligence/Breed/Rules -->
+
+</body>
+</html>

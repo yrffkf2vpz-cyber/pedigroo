@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Mail/MailManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Mail;
+
+use Aws\Ses\SesClient;
+use Aws\SesV2\SesV2Client;
+use Closure;
+use Illuminate\Contracts\Mail\Factory as FactoryContract;
+use Illuminate\Log\LogManager;
+use Illuminate\Mail\Transport\ArrayTransport;
+use Illuminate\Mail\Transport\LogTransport;
+use Illuminate\Mail\Transport\ResendTransport;
+use Illuminate\Mail\Transport\SesTransport;
+use Illuminate\Mail\Transport\SesV2Transport;
+use Illuminate\Support\Arr;
+use Illuminate\Support\ConfigurationUrlParser;
+use Illuminate\Support\Str;
+use InvalidArgumentException;
+use Psr\Log\LoggerInterface;
+use Resend;
+use Symfony\Component\HttpClient\HttpClient;
+use Symfony\Component\Mailer\Bridge\Mailgun\Transport\MailgunTransportFactory;
+use Symfony\Component\Mailer\Bridge\Postmark\Transport\PostmarkTransportFactory;
+use Symfony\Component\Mailer\Transport\Dsn;
+use Symfony\Component\Mailer\Transport\FailoverTransport;
+use Symfony\Component\Mailer\Transport\RoundRobinTransport;
+use Symfony\Component\Mailer\Transport\SendmailTransport;
+use Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport;
+use Symfony\Component\Mailer\Transport\Smtp\EsmtpTransportFactory;
+use Symfony\Component\Mailer\Transport\Smtp\Stream\SocketStream;
+
+/**
+ * @mixin \Illuminate\Mail\Mailer
+ */
+class MailManager implements FactoryContract
+{
+    /**
+     * The application instance.
+     *
+     * @var \Illuminate\Contracts\Foundation\Application
+     */
+    protected $app;
+
+    /**
+     * The array of resolved mailers.
+     *
+     * @var array
+     */
+    protected $mailers = [];
+
+    /**
+     * The registered custom driver creators.
+     *
+     * @var array
+     */
+    protected $customCreators = [];
+
+    /**
+     * Create a new Mail manager instance.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     */
+    public function __construct($app)
+    {
+        $this-&gt;app = $app;
+    }
+
+    /**
+     * Get a mailer instance by name.
+     *
+     * @param  string|null  $name
+     * @return \Illuminate\Contracts\Mail\Mailer
+     */
+    public function mailer($name = null)
+    {
+        $name = $name ?: $this-&gt;getDefaultDriver();
+
+        return $this-&gt;mailers[$name] = $this-&gt;get($name);
+    }
+
+    /**
+     * Get a mailer driver instance.
+     *
+     * @param  string|null  $driver
+     * @return \Illuminate\Mail\Mailer
+     */
+    public function driver($driver = null)
+    {
+        return $this-&gt;mailer($driver);
+    }
+
+    /**
+     * Attempt to get the mailer from the local cache.
+     *
+     * @param  string  $name
+     * @return \Illuminate\Mail\Mailer
+     */
+    protected function get($name)
+    {
+        return $this-&gt;mailers[$name] ?? $this-&gt;resolve($name);
+    }
+
+    /**
+     * Resolve the given mailer.
+     *
+     * @param  string  $name
+     * @return \Illuminate\Mail\Mailer
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function resolve($name)
+    {
+        $config = $this-&gt;getConfig($name);
+
+        if (is_null($config)) {
+            throw new InvalidArgumentException(&quot;Mailer [{$name}] is not defined.&quot;);
+        }
+
+        // Once we have created the mailer instance we will set a container instance
+        // on the mailer. This allows us to resolve mailer classes via containers
+        // for maximum testability on said classes instead of passing Closures.
+        $mailer = $this-&gt;build([&#039;name&#039; =&gt; $name, ...$config]);
+
+        // Next we will set all of the global addresses on this mailer, which allows
+        // for easy unification of all &quot;from&quot; addresses as well as easy debugging
+        // of sent messages since these will be sent to a single email address.
+        foreach ([&#039;from&#039;, &#039;reply_to&#039;, &#039;to&#039;, &#039;return_path&#039;] as $type) {
+            $this-&gt;setGlobalAddress($mailer, $config, $type);
+        }
+
+        return $mailer;
+    }
+
+    /**
+     * Build a new mailer instance.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Mail\Mailer
+     */
+    public function build($config)
+    {
+        $mailer = new Mailer(
+            $config[&#039;name&#039;] ?? &#039;ondemand&#039;,
+            $this-&gt;app[&#039;view&#039;],
+            $this-&gt;createSymfonyTransport($config),
+            $this-&gt;app[&#039;events&#039;]
+        );
+
+        if ($this-&gt;app-&gt;bound(&#039;queue&#039;)) {
+            $mailer-&gt;setQueue($this-&gt;app[&#039;queue&#039;]);
+        }
+
+        return $mailer;
+    }
+
+    /**
+     * Create a new transport instance.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\TransportInterface
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function createSymfonyTransport(array $config)
+    {
+        // Here we will check if the &quot;transport&quot; key exists and if it doesn&#039;t we will
+        // assume an application is still using the legacy mail configuration file
+        // format and use the &quot;mail.driver&quot; configuration option instead for BC.
+        $transport = $config[&#039;transport&#039;] ?? $this-&gt;app[&#039;config&#039;][&#039;mail.driver&#039;];
+
+        if (isset($this-&gt;customCreators[$transport])) {
+            return call_user_func($this-&gt;customCreators[$transport], $config);
+        }
+
+        if (trim($transport ?? &#039;&#039;) === &#039;&#039; ||
+            ! method_exists($this, $method = &#039;create&#039;.ucfirst(Str::camel($transport)).&#039;Transport&#039;)) {
+            throw new InvalidArgumentException(&quot;Unsupported mail transport [{$transport}].&quot;);
+        }
+
+        return $this-&gt;{$method}($config);
+    }
+
+    /**
+     * Create an instance of the Symfony SMTP Transport driver.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport
+     */
+    protected function createSmtpTransport(array $config)
+    {
+        $factory = new EsmtpTransportFactory;
+
+        $scheme = $config[&#039;scheme&#039;] ?? null;
+
+        if (! $scheme) {
+            $scheme = ($config[&#039;port&#039;] == 465) ? &#039;smtps&#039; : &#039;smtp&#039;;
+        }
+
+        $transport = $factory-&gt;create(new Dsn(
+            $scheme,
+            $config[&#039;host&#039;],
+            $config[&#039;username&#039;] ?? null,
+            $config[&#039;password&#039;] ?? null,
+            $config[&#039;port&#039;] ?? null,
+            $config
+        ));
+
+        return $this-&gt;configureSmtpTransport($transport, $config);
+    }
+
+    /**
+     * Configure the additional SMTP driver options.
+     *
+     * @param  \Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport  $transport
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport
+     */
+    protected function configureSmtpTransport(EsmtpTransport $transport, array $config)
+    {
+        $stream = $transport-&gt;getStream();
+
+        if ($stream instanceof SocketStream) {
+            if (isset($config[&#039;source_ip&#039;])) {
+                $stream-&gt;setSourceIp($config[&#039;source_ip&#039;]);
+            }
+
+            if (isset($config[&#039;timeout&#039;])) {
+                $stream-&gt;setTimeout($config[&#039;timeout&#039;]);
+            }
+        }
+
+        return $transport;
+    }
+
+    /**
+     * Create an instance of the Symfony Sendmail Transport driver.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\SendmailTransport
+     */
+    protected function createSendmailTransport(array $config)
+    {
+        return new SendmailTransport(
+            $config[&#039;path&#039;] ?? $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;mail.sendmail&#039;)
+        );
+    }
+
+    /**
+     * Create an instance of the Symfony Amazon SES Transport driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Mail\Transport\SesTransport
+     */
+    protected function createSesTransport(array $config)
+    {
+        $config = array_merge(
+            $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;services.ses&#039;, []),
+            [&#039;version&#039; =&gt; &#039;latest&#039;, &#039;service&#039; =&gt; &#039;email&#039;],
+            $config
+        );
+
+        $config = Arr::except($config, [&#039;transport&#039;]);
+
+        return new SesTransport(
+            new SesClient($this-&gt;addSesCredentials($config)),
+            $config[&#039;options&#039;] ?? []
+        );
+    }
+
+    /**
+     * Create an instance of the Symfony Amazon SES V2 Transport driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Mail\Transport\SesV2Transport
+     */
+    protected function createSesV2Transport(array $config)
+    {
+        $config = array_merge(
+            $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;services.ses&#039;, []),
+            [&#039;version&#039; =&gt; &#039;latest&#039;],
+            $config
+        );
+
+        $config = Arr::except($config, [&#039;transport&#039;]);
+
+        return new SesV2Transport(
+            new SesV2Client($this-&gt;addSesCredentials($config)),
+            $config[&#039;options&#039;] ?? []
+        );
+    }
+
+    /**
+     * Add the SES credentials to the configuration array.
+     *
+     * @param  array  $config
+     * @return array
+     */
+    protected function addSesCredentials(array $config)
+    {
+        if (! empty($config[&#039;key&#039;]) &amp;&amp; ! empty($config[&#039;secret&#039;])) {
+            $config[&#039;credentials&#039;] = Arr::only($config, [&#039;key&#039;, &#039;secret&#039;]);
+
+            if (! empty($config[&#039;token&#039;])) {
+                $config[&#039;credentials&#039;][&#039;token&#039;] = $config[&#039;token&#039;];
+            }
+        }
+
+        return Arr::except($config, [&#039;token&#039;]);
+    }
+
+    /**
+     * Create an instance of the Resend Transport driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Mail\Transport\ResendTransport
+     */
+    protected function createResendTransport(array $config)
+    {
+        return new ResendTransport(
+            Resend::client($config[&#039;key&#039;] ?? $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;services.resend.key&#039;)),
+        );
+    }
+
+    /**
+     * Create an instance of the Symfony Mail Transport driver.
+     *
+     * @return \Symfony\Component\Mailer\Transport\SendmailTransport
+     */
+    protected function createMailTransport()
+    {
+        return new SendmailTransport;
+    }
+
+    /**
+     * Create an instance of the Symfony Mailgun Transport driver.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\TransportInterface
+     */
+    protected function createMailgunTransport(array $config)
+    {
+        $factory = new MailgunTransportFactory(null, $this-&gt;getHttpClient($config));
+
+        if (! isset($config[&#039;secret&#039;])) {
+            $config = $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;services.mailgun&#039;, []);
+        }
+
+        return $factory-&gt;create(new Dsn(
+            &#039;mailgun+&#039;.($config[&#039;scheme&#039;] ?? &#039;https&#039;),
+            $config[&#039;endpoint&#039;] ?? &#039;default&#039;,
+            $config[&#039;secret&#039;],
+            $config[&#039;domain&#039;]
+        ));
+    }
+
+    /**
+     * Create an instance of the Symfony Postmark Transport driver.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Bridge\Postmark\Transport\PostmarkApiTransport
+     */
+    protected function createPostmarkTransport(array $config)
+    {
+        $factory = new PostmarkTransportFactory(null, $this-&gt;getHttpClient($config));
+
+        $options = isset($config[&#039;message_stream_id&#039;])
+            ? [&#039;message_stream&#039; =&gt; $config[&#039;message_stream_id&#039;]]
+            : [];
+
+        return $factory-&gt;create(new Dsn(
+            &#039;postmark+api&#039;,
+            &#039;default&#039;,
+            $config[&#039;token&#039;]
+                ?? $config[&#039;key&#039;]
+                ?? $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;services.postmark.token&#039;)
+                ?? $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;services.postmark.key&#039;),
+            null,
+            null,
+            $options
+        ));
+    }
+
+    /**
+     * Create an instance of the Symfony Failover Transport driver.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\FailoverTransport
+     */
+    protected function createFailoverTransport(array $config)
+    {
+        return $this-&gt;createRoundrobinTransportOfClass($config, FailoverTransport::class);
+    }
+
+    /**
+     * Create an instance of the Symfony Roundrobin Transport driver.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\RoundRobinTransport
+     */
+    protected function createRoundrobinTransport(array $config)
+    {
+        return $this-&gt;createRoundrobinTransportOfClass($config, RoundRobinTransport::class);
+    }
+
+    /**
+     * Create an instance of supplied class extending the Symfony Roundrobin Transport driver.
+     *
+     * @template TClass of \Symfony\Component\Mailer\Transport\RoundRobinTransport
+     *
+     * @param  array  $config
+     * @param  class-string&lt;TClass&gt;  $class
+     * @return TClass
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function createRoundrobinTransportOfClass(array $config, string $class)
+    {
+        $transports = [];
+
+        foreach ($config[&#039;mailers&#039;] as $name) {
+            $config = $this-&gt;getConfig($name);
+
+            if (is_null($config)) {
+                throw new InvalidArgumentException(&quot;Mailer [{$name}] is not defined.&quot;);
+            }
+
+            // Now, we will check if the &quot;driver&quot; key exists and if it does we will set
+            // the transport configuration parameter in order to offer compatibility
+            // with any Laravel &lt;= 6.x application style mail configuration files.
+            $transports[] = $this-&gt;app[&#039;config&#039;][&#039;mail.driver&#039;]
+                ? $this-&gt;createSymfonyTransport(array_merge($config, [&#039;transport&#039; =&gt; $name]))
+                : $this-&gt;createSymfonyTransport($config);
+        }
+
+        return new $class($transports, $config[&#039;retry_after&#039;] ?? 60, $this-&gt;app-&gt;make(LoggerInterface::class));
+    }
+
+    /**
+     * Create an instance of the Log Transport driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Mail\Transport\LogTransport
+     */
+    protected function createLogTransport(array $config)
+    {
+        $logger = $this-&gt;app-&gt;make(LoggerInterface::class);
+
+        if ($logger instanceof LogManager) {
+            $logger = $logger-&gt;channel(
+                $config[&#039;channel&#039;] ?? $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;mail.log_channel&#039;)
+            );
+        }
+
+        return new LogTransport($logger);
+    }
+
+    /**
+     * Create an instance of the Array Transport Driver.
+     *
+     * @return \Illuminate\Mail\Transport\ArrayTransport
+     */
+    protected function createArrayTransport()
+    {
+        return new ArrayTransport;
+    }
+
+    /**
+     * Get a configured Symfony HTTP client instance.
+     *
+     * @return \Symfony\Contracts\HttpClient\HttpClientInterface|null
+     */
+    protected function getHttpClient(array $config)
+    {
+        if ($options = ($config[&#039;client&#039;] ?? false)) {
+            $maxHostConnections = Arr::pull($options, &#039;max_host_connections&#039;, 6);
+            $maxPendingPushes = Arr::pull($options, &#039;max_pending_pushes&#039;, 50);
+
+            return HttpClient::create($options, $maxHostConnections, $maxPendingPushes);
+        }
+    }
+
+    /**
+     * Set a global address on the mailer by type.
+     *
+     * @param  \Illuminate\Mail\Mailer  $mailer
+     * @param  array  $config
+     * @param  string  $type
+     * @return void
+     */
+    protected function setGlobalAddress($mailer, array $config, string $type)
+    {
+        $address = Arr::get($config, $type, $this-&gt;app[&#039;config&#039;][&#039;mail.&#039;.$type]);
+
+        if (is_array($address) &amp;&amp; isset($address[&#039;address&#039;])) {
+            $mailer-&gt;{&#039;always&#039;.Str::studly($type)}($address[&#039;address&#039;], $address[&#039;name&#039;]);
+        }
+    }
+
+    /**
+     * Get the mail connection configuration.
+     *
+     * @param  string  $name
+     * @return array
+     */
+    protected function getConfig(string $name)
+    {
+        // Here we will check if the &quot;driver&quot; key exists and if it does we will use
+        // the entire mail configuration file as the &quot;driver&quot; config in order to
+        // provide &quot;BC&quot; for any Laravel &lt;= 6.x style mail configuration files.
+        $config = $this-&gt;app[&#039;config&#039;][&#039;mail.driver&#039;]
+            ? $this-&gt;app[&#039;config&#039;][&#039;mail&#039;]
+            : $this-&gt;app[&#039;config&#039;][&quot;mail.mailers.{$name}&quot;];
+
+        if (isset($config[&#039;url&#039;])) {
+            $config = array_merge($config, (new ConfigurationUrlParser)-&gt;parseConfiguration($config));
+
+            $config[&#039;transport&#039;] = Arr::pull($config, &#039;driver&#039;);
+        }
+
+        return $config;
+    }
+
+    /**
+     * Get the default mail driver name.
+     *
+     * @return string
+     */
+    public function getDefaultDriver()
+    {
+        // Here we will check if the &quot;driver&quot; key exists and if it does we will use
+        // that as the default driver in order to provide support for old styles
+        // of the Laravel mail configuration file for backwards compatibility.
+        return $this-&gt;app[&#039;config&#039;][&#039;mail.driver&#039;] ??
+            $this-&gt;app[&#039;config&#039;][&#039;mail.default&#039;];
+    }
+
+    /**
+     * Set the default mail driver name.
+     *
+     * @param  string  $name
+     * @return void
+     */
+    public function setDefaultDriver(string $name)
+    {
+        if ($this-&gt;app[&#039;config&#039;][&#039;mail.driver&#039;]) {
+            $this-&gt;app[&#039;config&#039;][&#039;mail.driver&#039;] = $name;
+        }
+
+        $this-&gt;app[&#039;config&#039;][&#039;mail.default&#039;] = $name;
+    }
+
+    /**
+     * Disconnect the given mailer and remove from local cache.
+     *
+     * @param  string|null  $name
+     * @return void
+     */
+    public function purge($name = null)
+    {
+        $name = $name ?: $this-&gt;getDefaultDriver();
+
+        unset($this-&gt;mailers[$name]);
+    }
+
+    /**
+     * Register a custom transport creator Closure.
+     *
+     * @param  string  $driver
+     * @param  \Closure  $callback
+     * @return $this
+     */
+    public function extend($driver, Closure $callback)
+    {
+        $this-&gt;customCreators[$driver] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Get the application instance used by the manager.
+     *
+     * @return \Illuminate\Contracts\Foundation\Application
+     */
+    public function getApplication()
+    {
+        return $this-&gt;app;
+    }
+
+    /**
+     * Set the application instance used by the manager.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     * @return $this
+     */
+    public function setApplication($app)
+    {
+        $this-&gt;app = $app;
+
+        return $this;
+    }
+
+    /**
+     * Forget all of the resolved mailer instances.
+     *
+     * @return $this
+     */
+    public function forgetMailers()
+    {
+        $this-&gt;mailers = [];
+
+        return $this;
+    }
+
+    /**
+     * Dynamically call the default driver instance.
+     *
+     * @param  string  $method
+     * @param  array  $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        return $this-&gt;mailer()-&gt;$method(...$parameters);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Mail/MailServiceProvider.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Mail/Events -->
+
+</body>
+</html>

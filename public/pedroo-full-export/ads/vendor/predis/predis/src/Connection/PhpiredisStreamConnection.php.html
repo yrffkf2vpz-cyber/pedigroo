@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Connection/PhpiredisStreamConnection.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Connection;
+
+use Closure;
+use InvalidArgumentException;
+use Predis\Command\CommandInterface;
+use Predis\NotSupportedException;
+use Predis\Response\Error as ErrorResponse;
+use Predis\Response\Status as StatusResponse;
+
+/**
+ * This class provides the implementation of a Predis connection that uses PHP&#039;s
+ * streams for network communication and wraps the phpiredis C extension (PHP
+ * bindings for hiredis) to parse and serialize the Redis protocol.
+ *
+ * This class is intended to provide an optional low-overhead alternative for
+ * processing responses from Redis compared to the standard pure-PHP classes.
+ * Differences in speed when dealing with short inline responses are practically
+ * nonexistent, the actual speed boost is for big multibulk responses when this
+ * protocol processor can parse and return responses very fast.
+ *
+ * For instructions on how to build and install the phpiredis extension, please
+ * consult the repository of the project.
+ *
+ * The connection parameters supported by this class are:
+ *
+ *  - scheme: it can be either &#039;redis&#039;, &#039;tcp&#039; or &#039;unix&#039;.
+ *  - host: hostname or IP address of the server.
+ *  - port: TCP port of the server.
+ *  - path: path of a UNIX domain socket when scheme is &#039;unix&#039;.
+ *  - timeout: timeout to perform the connection.
+ *  - read_write_timeout: timeout of read / write operations.
+ *  - async_connect: performs the connection asynchronously.
+ *  - tcp_nodelay: enables or disables Nagle&#039;s algorithm for coalescing.
+ *  - persistent: the connection is left intact after a GC collection.
+ *
+ * @see https://github.com/nrk/phpiredis
+ * @deprecated 2.1.2
+ */
+class PhpiredisStreamConnection extends StreamConnection
+{
+    private $reader;
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __construct(ParametersInterface $parameters)
+    {
+        $this-&gt;assertExtensions();
+
+        parent::__construct($parameters);
+
+        $this-&gt;reader = $this-&gt;createReader();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __destruct()
+    {
+        parent::__destruct();
+
+        phpiredis_reader_destroy($this-&gt;reader);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function disconnect()
+    {
+        phpiredis_reader_reset($this-&gt;reader);
+
+        parent::disconnect();
+    }
+
+    /**
+     * Checks if the phpiredis extension is loaded in PHP.
+     */
+    private function assertExtensions()
+    {
+        if (!extension_loaded(&#039;phpiredis&#039;)) {
+            throw new NotSupportedException(
+                &#039;The &quot;phpiredis&quot; extension is required by this connection backend.&#039;
+            );
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function assertParameters(ParametersInterface $parameters)
+    {
+        switch ($parameters-&gt;scheme) {
+            case &#039;tcp&#039;:
+            case &#039;redis&#039;:
+            case &#039;unix&#039;:
+                break;
+
+            case &#039;tls&#039;:
+            case &#039;rediss&#039;:
+                throw new InvalidArgumentException(&#039;SSL encryption is not supported by this connection backend.&#039;);
+            default:
+                throw new InvalidArgumentException(&quot;Invalid scheme: &#039;$parameters-&gt;scheme&#039;.&quot;);
+        }
+
+        return $parameters;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function createStreamSocket(ParametersInterface $parameters, $address, $flags)
+    {
+        $socket = null;
+        $timeout = (isset($parameters-&gt;timeout) ? (float) $parameters-&gt;timeout : 5.0);
+        $context = stream_context_create([&#039;socket&#039; =&gt; [&#039;tcp_nodelay&#039; =&gt; (bool) $parameters-&gt;tcp_nodelay]]);
+
+        if (!$resource = @stream_socket_client($address, $errno, $errstr, $timeout, $flags, $context)) {
+            $this-&gt;onConnectionError(trim($errstr), $errno);
+        }
+
+        if (isset($parameters-&gt;read_write_timeout) &amp;&amp; function_exists(&#039;socket_import_stream&#039;)) {
+            $rwtimeout = (float) $parameters-&gt;read_write_timeout;
+            $rwtimeout = $rwtimeout &gt; 0 ? $rwtimeout : -1;
+
+            $timeout = [
+                &#039;sec&#039; =&gt; $timeoutSeconds = floor($rwtimeout),
+                &#039;usec&#039; =&gt; ($rwtimeout - $timeoutSeconds) * 1000000,
+            ];
+
+            $socket = $socket ?: socket_import_stream($resource);
+            @socket_set_option($socket, SOL_SOCKET, SO_SNDTIMEO, $timeout);
+            @socket_set_option($socket, SOL_SOCKET, SO_RCVTIMEO, $timeout);
+        }
+
+        if (isset($parameters-&gt;tcp_nodelay) &amp;&amp; function_exists(&#039;socket_import_stream&#039;)) {
+            $socket = $socket ?: socket_import_stream($resource);
+            socket_set_option($socket, SOL_TCP, TCP_NODELAY, (int) $parameters-&gt;tcp_nodelay);
+        }
+
+        return $resource;
+    }
+
+    /**
+     * Creates a new instance of the protocol reader resource.
+     *
+     * @return resource
+     */
+    private function createReader()
+    {
+        $reader = phpiredis_reader_create();
+
+        phpiredis_reader_set_status_handler($reader, $this-&gt;getStatusHandler());
+        phpiredis_reader_set_error_handler($reader, $this-&gt;getErrorHandler());
+
+        return $reader;
+    }
+
+    /**
+     * Returns the underlying protocol reader resource.
+     *
+     * @return resource
+     */
+    protected function getReader()
+    {
+        return $this-&gt;reader;
+    }
+
+    /**
+     * Returns the handler used by the protocol reader for inline responses.
+     *
+     * @return Closure
+     */
+    protected function getStatusHandler()
+    {
+        static $statusHandler;
+
+        if (!$statusHandler) {
+            $statusHandler = function ($payload) {
+                return StatusResponse::get($payload);
+            };
+        }
+
+        return $statusHandler;
+    }
+
+    /**
+     * Returns the handler used by the protocol reader for error responses.
+     *
+     * @return Closure
+     */
+    protected function getErrorHandler()
+    {
+        static $errorHandler;
+
+        if (!$errorHandler) {
+            $errorHandler = function ($errorMessage) {
+                return new ErrorResponse($errorMessage);
+            };
+        }
+
+        return $errorHandler;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function read()
+    {
+        $socket = $this-&gt;getResource();
+        $reader = $this-&gt;reader;
+
+        while (PHPIREDIS_READER_STATE_INCOMPLETE === $state = phpiredis_reader_get_state($reader)) {
+            $buffer = stream_socket_recvfrom($socket, 4096);
+
+            if ($buffer === false || $buffer === &#039;&#039;) {
+                $this-&gt;onConnectionError(&#039;Error while reading bytes from the server.&#039;);
+            }
+
+            phpiredis_reader_feed($reader, $buffer);
+        }
+
+        if ($state === PHPIREDIS_READER_STATE_COMPLETE) {
+            return phpiredis_reader_get_reply($reader);
+        } else {
+            $this-&gt;onProtocolError(phpiredis_reader_get_error($reader));
+
+            return;
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function writeRequest(CommandInterface $command)
+    {
+        $arguments = $command-&gt;getArguments();
+        array_unshift($arguments, $command-&gt;getId());
+
+        $this-&gt;write(phpiredis_format_command($arguments));
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __wakeup()
+    {
+        $this-&gt;assertExtensions();
+        $this-&gt;reader = $this-&gt;createReader();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Connection/RelayConnection.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Connection/Cluster -->
+
+</body>
+</html>

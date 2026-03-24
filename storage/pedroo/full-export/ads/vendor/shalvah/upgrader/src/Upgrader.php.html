@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/shalvah/upgrader/src/Upgrader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+
+namespace Shalvah\Upgrader;
+
+use Illuminate\Support\Arr;
+use PhpParser;
+use PhpParser\{Node,
+    Node\Stmt,
+    Node\Expr};
+
+class Upgrader
+{
+    use ReadsAndWritesAsts, ComparesAstNodes, ModifiesAsts;
+
+    public const CHANGE_REMOVED = &#039;removed&#039;;
+    public const CHANGE_MOVED = &#039;moved&#039;;
+    public const CHANGE_ADDED = &#039;added&#039;;
+    public const CHANGE_LIST_ITEM_ADDED = &#039;added_to_list&#039;;
+
+    protected array $changes = [];
+    protected array $configFiles = [];
+    protected array $movedKeys = [];
+    protected array $dontTouchKeys = [];
+
+    /** @var Stmt[] */
+    protected ?array $userOldConfigFileAst = [];
+    /** @var Stmt[] */
+    protected ?array $sampleNewConfigFileAst = [];
+
+    public function __construct(string $userOldConfigRelativePath, string $sampleNewConfigAbsolutePath)
+    {
+        $this-&gt;configFiles[&#039;user_old&#039;] = $userOldConfigRelativePath;
+        $this-&gt;configFiles[&#039;sample_new&#039;] = $sampleNewConfigAbsolutePath;
+    }
+
+    public static function ofConfigFile(string $userOldConfigRelativePath, string $sampleNewConfigAbsolutePath): self
+    {
+        return new self($userOldConfigRelativePath, $sampleNewConfigAbsolutePath);
+    }
+
+    public function move(string $oldKey, string $newKey): self
+    {
+        $this-&gt;movedKeys[$oldKey] = $newKey;
+        return $this;
+    }
+
+    /**
+     * &quot;Don&#039;t touch&quot; these config items.
+     * Useful if they contain arrays with keys specified by the user,
+     * or lists with values provided entirely by the user
+     */
+    public function dontTouch(string ...$keys): self
+    {
+        $this-&gt;dontTouchKeys = [...$this-&gt;dontTouchKeys, ...$keys];
+        return $this;
+    }
+
+    public function dryRun(): array
+    {
+        return $this-&gt;fetchChanges();
+    }
+
+    public function upgrade()
+    {
+        $this-&gt;fetchChanges();
+        $upgradedConfig = $this-&gt;applyChanges();
+        $this-&gt;writeAstToFile($upgradedConfig, $this-&gt;configFiles[&#039;user_old&#039;]);
+    }
+
+    protected function fetchChanges(): array
+    {
+        if (!empty($this-&gt;changes)) {
+            return $this-&gt;changes;
+        }
+
+        [$userCurrentConfigFile, $sampleNewConfigFile] = $this-&gt;parseConfigFiles();
+
+        $userCurrentConfigArray = Arr::first(
+            $userCurrentConfigFile, fn(Node $node) =&gt; $node instanceof Stmt\Return_
+        )-&gt;expr-&gt;items;
+        $sampleNewConfigArray = Arr::first(
+            $sampleNewConfigFile, fn(Node $node) =&gt; $node instanceof Stmt\Return_
+        )-&gt;expr-&gt;items;
+        $this-&gt;fetchAddedItems($userCurrentConfigArray, $sampleNewConfigArray);
+        $this-&gt;fetchRemovedAndMovedItems($userCurrentConfigArray, $sampleNewConfigArray);
+        return $this-&gt;changes;
+    }
+
+    /**
+     * @param Expr\ArrayItem[] $userCurrentConfig
+     * @param Expr\ArrayItem[] $incomingConfig
+     */
+    protected function fetchAddedItems(
+        array $userCurrentConfig, array $incomingConfig, string $rootKey = &#039;&#039;
+    )
+    {
+        if ($this-&gt;arrayIsList($incomingConfig)) {
+            // We&#039;re dealing with a list of items (numeric array)
+            $diff = $this-&gt;subtractOtherListFromList($incomingConfig, $userCurrentConfig);
+            foreach ($diff as $item) {
+                $this-&gt;changes[] = [
+                    &#039;type&#039; =&gt; self::CHANGE_LIST_ITEM_ADDED,
+                    &#039;key&#039; =&gt; $rootKey,
+                    &#039;value&#039; =&gt; $item[&#039;ast&#039;]-&gt;value,
+                    &#039;description&#039; =&gt; &quot;- &#039;{$item[&#039;text&#039;]}&#039; will be added to `$rootKey`.&quot;,
+                ];
+            }
+            return;
+        }
+
+        // TODO handle cases of mixed assoc- and list array
+        foreach ($incomingConfig as $arrayItem) {
+            // @phpstan-ignore-next-line Not yet sure how to handle mixed
+            $key = $arrayItem-&gt;key-&gt;value;
+            $value = $arrayItem-&gt;value;
+
+            $fullKey = $this-&gt;getFullKey($key, $rootKey);
+            if ($this-&gt;shouldntTouch($fullKey)) {
+                continue;
+            }
+
+            // Key is in new, but not in old
+            if (!$this-&gt;hasItem($userCurrentConfig, $key)) {
+                $this-&gt;changes[] = [
+                    &#039;type&#039; =&gt; self::CHANGE_ADDED,
+                    &#039;key&#039; =&gt; $fullKey,
+                    &#039;description&#039; =&gt; &quot;- `{$fullKey}` will be added.&quot;,
+                    &#039;value&#039; =&gt; $value,
+                    &#039;item&#039; =&gt; $this-&gt;getItem($incomingConfig, $key),
+                ];
+            } else {
+                if ($this-&gt;expressionNodeIsArray($value)) {
+                    // Key is in both old and new; recurse into array and compare the inner items
+                    $this-&gt;fetchAddedItems(
+                        $this-&gt;getItem($userCurrentConfig, $key)-&gt;value-&gt;items ?? [], $value-&gt;items ?? [], $fullKey
+                    );
+                }
+            }
+
+        }
+    }
+
+    /**
+     * @param Expr\ArrayItem[] $userCurrentConfig
+     * @param Expr\ArrayItem[]|null $incomingConfig
+     */
+    protected function fetchRemovedAndMovedItems(
+        array $userCurrentConfig, $incomingConfig, string $rootKey = &#039;&#039;
+    )
+    {
+        if ($this-&gt;arrayIsList($incomingConfig)) {
+            // A list of items (numeric array)
+            // We only add, not remove.
+            return;
+        }
+
+        // Loop over the old config
+        // TODO handle cases of mixed assoc- and list array
+        foreach ($userCurrentConfig as $arrayItem) {
+            // @phpstan-ignore-next-line Not yet sure how to handle mixed
+            $key = $arrayItem-&gt;key-&gt;value;
+            $value = $arrayItem-&gt;value;
+
+            $fullKey = $this-&gt;getFullKey($key, $rootKey);
+
+            // Key is in old, but was moved somewhere else in new
+            if ($this-&gt;wasKeyMoved($fullKey)) {
+                $this-&gt;changes[] = [
+                    &#039;type&#039; =&gt; self::CHANGE_MOVED,
+                    &#039;key&#039; =&gt; $fullKey,
+                    &#039;new_key&#039; =&gt; $this-&gt;movedKeys[$fullKey],
+                    &#039;description&#039; =&gt; &quot;- `$fullKey` will be moved to `{$this-&gt;movedKeys[$fullKey]}`.&quot;,
+                    &#039;new_value&#039; =&gt; $value,
+                ];
+                continue;
+            }
+
+            // Key is in old, but not in new
+            if (!$this-&gt;hasItem($incomingConfig, $key)) {
+                $this-&gt;changes[] = [
+                    &#039;type&#039; =&gt; self::CHANGE_REMOVED,
+                    &#039;key&#039; =&gt; $fullKey,
+                    &#039;description&#039; =&gt; &quot;- `$fullKey` will be removed.&quot;,
+                ];
+                continue;
+            }
+
+            if (!$this-&gt;shouldntTouch($fullKey) &amp;&amp; $this-&gt;expressionNodeIsArray($value)) {
+                // Key is in both old and new; recurse into array and compare the inner items
+                $this-&gt;fetchRemovedAndMovedItems(
+                    $value-&gt;items ?? [], $this-&gt;getItem($incomingConfig, $key)-&gt;value-&gt;items ?? [], $fullKey
+                );
+            }
+        }
+    }
+
+    protected function wasKeyMoved(string $oldKey): bool
+    {
+        return array_key_exists($oldKey, $this-&gt;movedKeys);
+    }
+
+    protected function shouldntTouch(string $key): bool
+    {
+        return in_array($key, $this-&gt;dontTouchKeys);
+    }
+
+    /**
+     * Resolve config item key with dot notation
+     */
+    private function getFullKey(string $key, string $rootKey = &#039;&#039;): string
+    {
+        if (empty($rootKey)) {
+            return $key;
+        }
+
+        return &quot;$rootKey.$key&quot;;
+    }
+
+    public function parseConfigFiles(): array
+    {
+        $userCurrentConfig = $this-&gt;getUserOldConfigFileAsAst();
+        $incomingConfig = $this-&gt;getSampleNewConfigFileAsAst();
+
+        return [$userCurrentConfig, $incomingConfig];
+    }
+
+    protected function getUserOldConfigFileAsAst(): array
+    {
+        if (!empty($this-&gt;userOldConfigFileAst)) {
+            return $this-&gt;userOldConfigFileAst;
+        }
+
+        $this-&gt;userOldConfigFileAst = $this-&gt;parseFilePreservingFormat($this-&gt;configFiles[&#039;user_old&#039;]);
+        return $this-&gt;userOldConfigFileAst;
+    }
+
+    protected function getSampleNewConfigFileAsAst(): array
+    {
+        if (!empty($this-&gt;sampleNewConfigFileAst)) {
+            return $this-&gt;sampleNewConfigFileAst;
+        }
+
+        $this-&gt;sampleNewConfigFileAst = $this-&gt;parseFile($this-&gt;configFiles[&#039;sample_new&#039;]);
+        return $this-&gt;sampleNewConfigFileAst;
+    }
+
+    protected function applyChanges(): array
+    {
+        $userConfigAst = $this-&gt;getUserOldConfigFileAsAst();
+        $configArray =&amp; Arr::first(
+            $userConfigAst, fn(Node $node) =&gt; $node instanceof Stmt\Return_
+        )-&gt;expr-&gt;items;
+
+        foreach ($this-&gt;changes as $change) {
+            switch ($change[&#039;type&#039;]) {
+                case self::CHANGE_ADDED:
+                    $this-&gt;addKey($configArray, $change[&#039;key&#039;], $change[&#039;item&#039;]);
+                    break;
+                case self::CHANGE_REMOVED:
+                    $this-&gt;deleteKey($configArray, $change[&#039;key&#039;]);
+                    break;
+                case self::CHANGE_MOVED:
+                    // Move old value to new key
+                    $this-&gt;setValue($configArray, $change[&#039;new_key&#039;], $change[&#039;new_value&#039;]);
+                    // Then delete old key
+                    $this-&gt;deleteKey($configArray, $change[&#039;key&#039;]);
+                    break;
+                case self::CHANGE_LIST_ITEM_ADDED:
+                    $this-&gt;pushItemOntoList($configArray, $change[&#039;key&#039;], $change[&#039;value&#039;]);
+                    break;
+            }
+        }
+
+        return $userConfigAst;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/spatie/backtrace/LICENSE.md -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/spatie -->
+
+</body>
+</html>

@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Bus/Batch.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Bus;
+
+use Carbon\CarbonImmutable;
+use Closure;
+use Illuminate\Bus\Events\BatchFinished;
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Contracts\Queue\Factory as QueueFactory;
+use Illuminate\Contracts\Support\Arrayable;
+use Illuminate\Queue\CallQueuedClosure;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use JsonSerializable;
+use Throwable;
+
+class Batch implements Arrayable, JsonSerializable
+{
+    /**
+     * The queue factory implementation.
+     *
+     * @var \Illuminate\Contracts\Queue\Factory
+     */
+    protected $queue;
+
+    /**
+     * The repository implementation.
+     *
+     * @var \Illuminate\Bus\BatchRepository
+     */
+    protected $repository;
+
+    /**
+     * The batch ID.
+     *
+     * @var string
+     */
+    public $id;
+
+    /**
+     * The batch name.
+     *
+     * @var string
+     */
+    public $name;
+
+    /**
+     * The total number of jobs that belong to the batch.
+     *
+     * @var int
+     */
+    public $totalJobs;
+
+    /**
+     * The total number of jobs that are still pending.
+     *
+     * @var int
+     */
+    public $pendingJobs;
+
+    /**
+     * The total number of jobs that have failed.
+     *
+     * @var int
+     */
+    public $failedJobs;
+
+    /**
+     * The IDs of the jobs that have failed.
+     *
+     * @var array
+     */
+    public $failedJobIds;
+
+    /**
+     * The batch options.
+     *
+     * @var array
+     */
+    public $options;
+
+    /**
+     * The date indicating when the batch was created.
+     *
+     * @var \Carbon\CarbonImmutable
+     */
+    public $createdAt;
+
+    /**
+     * The date indicating when the batch was cancelled.
+     *
+     * @var \Carbon\CarbonImmutable|null
+     */
+    public $cancelledAt;
+
+    /**
+     * The date indicating when the batch was finished.
+     *
+     * @var \Carbon\CarbonImmutable|null
+     */
+    public $finishedAt;
+
+    /**
+     * Create a new batch instance.
+     *
+     * @param  \Illuminate\Contracts\Queue\Factory  $queue
+     * @param  \Illuminate\Bus\BatchRepository  $repository
+     * @param  string  $id
+     * @param  string  $name
+     * @param  int  $totalJobs
+     * @param  int  $pendingJobs
+     * @param  int  $failedJobs
+     * @param  array  $failedJobIds
+     * @param  array  $options
+     * @param  \Carbon\CarbonImmutable  $createdAt
+     * @param  \Carbon\CarbonImmutable|null  $cancelledAt
+     * @param  \Carbon\CarbonImmutable|null  $finishedAt
+     */
+    public function __construct(
+        QueueFactory $queue,
+        BatchRepository $repository,
+        string $id,
+        string $name,
+        int $totalJobs,
+        int $pendingJobs,
+        int $failedJobs,
+        array $failedJobIds,
+        array $options,
+        CarbonImmutable $createdAt,
+        ?CarbonImmutable $cancelledAt = null,
+        ?CarbonImmutable $finishedAt = null,
+    ) {
+        $this-&gt;queue = $queue;
+        $this-&gt;repository = $repository;
+        $this-&gt;id = $id;
+        $this-&gt;name = $name;
+        $this-&gt;totalJobs = $totalJobs;
+        $this-&gt;pendingJobs = $pendingJobs;
+        $this-&gt;failedJobs = $failedJobs;
+        $this-&gt;failedJobIds = $failedJobIds;
+        $this-&gt;options = $options;
+        $this-&gt;createdAt = $createdAt;
+        $this-&gt;cancelledAt = $cancelledAt;
+        $this-&gt;finishedAt = $finishedAt;
+    }
+
+    /**
+     * Get a fresh instance of the batch represented by this ID.
+     *
+     * @return self
+     */
+    public function fresh()
+    {
+        return $this-&gt;repository-&gt;find($this-&gt;id);
+    }
+
+    /**
+     * Add additional jobs to the batch.
+     *
+     * @param  \Illuminate\Support\Enumerable|object|array  $jobs
+     * @return self
+     */
+    public function add($jobs)
+    {
+        $count = 0;
+
+        $jobs = Collection::wrap($jobs)-&gt;map(function ($job) use (&amp;$count) {
+            $job = $job instanceof Closure ? CallQueuedClosure::create($job) : $job;
+
+            if (is_array($job)) {
+                $count += count($job);
+
+                $chain = $this-&gt;prepareBatchedChain($job);
+
+                return $chain-&gt;first()
+                    -&gt;allOnQueue($this-&gt;options[&#039;queue&#039;] ?? null)
+                    -&gt;allOnConnection($this-&gt;options[&#039;connection&#039;] ?? null)
+                    -&gt;chain($chain-&gt;slice(1)-&gt;values()-&gt;all());
+            } else {
+                $job-&gt;withBatchId($this-&gt;id);
+
+                $count++;
+            }
+
+            return $job;
+        });
+
+        $this-&gt;repository-&gt;transaction(function () use ($jobs, $count) {
+            $this-&gt;repository-&gt;incrementTotalJobs($this-&gt;id, $count);
+
+            $this-&gt;queue-&gt;connection($this-&gt;options[&#039;connection&#039;] ?? null)-&gt;bulk(
+                $jobs-&gt;all(),
+                $data = &#039;&#039;,
+                $this-&gt;options[&#039;queue&#039;] ?? null
+            );
+        });
+
+        return $this-&gt;fresh();
+    }
+
+    /**
+     * Prepare a chain that exists within the jobs being added.
+     *
+     * @param  array  $chain
+     * @return \Illuminate\Support\Collection
+     */
+    protected function prepareBatchedChain(array $chain)
+    {
+        return (new Collection($chain))-&gt;map(function ($job) {
+            $job = $job instanceof Closure ? CallQueuedClosure::create($job) : $job;
+
+            return $job-&gt;withBatchId($this-&gt;id);
+        });
+    }
+
+    /**
+     * Get the total number of jobs that have been processed by the batch thus far.
+     *
+     * @return int
+     */
+    public function processedJobs()
+    {
+        return $this-&gt;totalJobs - $this-&gt;pendingJobs;
+    }
+
+    /**
+     * Get the percentage of jobs that have been processed (between 0-100).
+     *
+     * @return int
+     */
+    public function progress()
+    {
+        return $this-&gt;totalJobs &gt; 0 ? round(($this-&gt;processedJobs() / $this-&gt;totalJobs) * 100) : 0;
+    }
+
+    /**
+     * Record that a job within the batch finished successfully, executing any callbacks if necessary.
+     *
+     * @param  string  $jobId
+     * @return void
+     */
+    public function recordSuccessfulJob(string $jobId)
+    {
+        $counts = $this-&gt;decrementPendingJobs($jobId);
+
+        if ($this-&gt;hasProgressCallbacks()) {
+            $this-&gt;invokeCallbacks(&#039;progress&#039;);
+        }
+
+        if ($counts-&gt;pendingJobs === 0) {
+            $this-&gt;repository-&gt;markAsFinished($this-&gt;id);
+
+            $container = Container::getInstance();
+
+            if ($container-&gt;bound(Dispatcher::class)) {
+                $container-&gt;make(Dispatcher::class)-&gt;dispatch(new BatchFinished($this));
+            }
+        }
+
+        if ($counts-&gt;pendingJobs === 0 &amp;&amp; $this-&gt;hasThenCallbacks()) {
+            $this-&gt;invokeCallbacks(&#039;then&#039;);
+        }
+
+        if ($counts-&gt;allJobsHaveRanExactlyOnce() &amp;&amp; $this-&gt;hasFinallyCallbacks()) {
+            $this-&gt;invokeCallbacks(&#039;finally&#039;);
+        }
+    }
+
+    /**
+     * Decrement the pending jobs for the batch.
+     *
+     * @param  string  $jobId
+     * @return \Illuminate\Bus\UpdatedBatchJobCounts
+     */
+    public function decrementPendingJobs(string $jobId)
+    {
+        return $this-&gt;repository-&gt;decrementPendingJobs($this-&gt;id, $jobId);
+    }
+
+    /**
+     * Invoke the callbacks of the given type.
+     */
+    protected function invokeCallbacks(string $type, ?Throwable $e = null): void
+    {
+        $batch = $this-&gt;fresh();
+
+        foreach ($this-&gt;options[$type] ?? [] as $handler) {
+            $this-&gt;invokeHandlerCallback($handler, $batch, $e);
+        }
+    }
+
+    /**
+     * Determine if the batch has finished executing.
+     *
+     * @return bool
+     */
+    public function finished()
+    {
+        return ! is_null($this-&gt;finishedAt);
+    }
+
+    /**
+     * Determine if the batch has &quot;progress&quot; callbacks.
+     *
+     * @return bool
+     */
+    public function hasProgressCallbacks()
+    {
+        return isset($this-&gt;options[&#039;progress&#039;]) &amp;&amp; ! empty($this-&gt;options[&#039;progress&#039;]);
+    }
+
+    /**
+     * Determine if the batch has &quot;success&quot; callbacks.
+     *
+     * @return bool
+     */
+    public function hasThenCallbacks()
+    {
+        return isset($this-&gt;options[&#039;then&#039;]) &amp;&amp; ! empty($this-&gt;options[&#039;then&#039;]);
+    }
+
+    /**
+     * Determine if the batch allows jobs to fail without cancelling the batch.
+     *
+     * @return bool
+     */
+    public function allowsFailures()
+    {
+        return Arr::get($this-&gt;options, &#039;allowFailures&#039;, false) === true;
+    }
+
+    /**
+     * Determine if the batch has job failures.
+     *
+     * @return bool
+     */
+    public function hasFailures()
+    {
+        return $this-&gt;failedJobs &gt; 0;
+    }
+
+    /**
+     * Record that a job within the batch failed to finish successfully, executing any callbacks if necessary.
+     *
+     * @param  string  $jobId
+     * @param  \Throwable  $e
+     * @return void
+     */
+    public function recordFailedJob(string $jobId, $e)
+    {
+        $counts = $this-&gt;incrementFailedJobs($jobId);
+
+        if ($counts-&gt;failedJobs === 1 &amp;&amp; ! $this-&gt;allowsFailures()) {
+            $this-&gt;cancel();
+        }
+
+        if ($this-&gt;allowsFailures()) {
+            if ($this-&gt;hasProgressCallbacks()) {
+                $this-&gt;invokeCallbacks(&#039;progress&#039;, $e);
+            }
+
+            if ($this-&gt;hasFailureCallbacks()) {
+                $this-&gt;invokeCallbacks(&#039;failure&#039;, $e);
+            }
+        }
+
+        if ($counts-&gt;failedJobs === 1 &amp;&amp; $this-&gt;hasCatchCallbacks()) {
+            $this-&gt;invokeCallbacks(&#039;catch&#039;, $e);
+        }
+
+        if ($counts-&gt;allJobsHaveRanExactlyOnce() &amp;&amp; $this-&gt;hasFinallyCallbacks()) {
+            $this-&gt;invokeCallbacks(&#039;finally&#039;);
+        }
+    }
+
+    /**
+     * Increment the failed jobs for the batch.
+     *
+     * @param  string  $jobId
+     * @return \Illuminate\Bus\UpdatedBatchJobCounts
+     */
+    public function incrementFailedJobs(string $jobId)
+    {
+        return $this-&gt;repository-&gt;incrementFailedJobs($this-&gt;id, $jobId);
+    }
+
+    /**
+     * Determine if the batch has &quot;catch&quot; callbacks.
+     *
+     * @return bool
+     */
+    public function hasCatchCallbacks()
+    {
+        return isset($this-&gt;options[&#039;catch&#039;]) &amp;&amp; ! empty($this-&gt;options[&#039;catch&#039;]);
+    }
+
+    /**
+     * Determine if the batch has &quot;failure&quot; callbacks.
+     */
+    public function hasFailureCallbacks(): bool
+    {
+        return isset($this-&gt;options[&#039;failure&#039;]) &amp;&amp; ! empty($this-&gt;options[&#039;failure&#039;]);
+    }
+
+    /**
+     * Determine if the batch has &quot;finally&quot; callbacks.
+     *
+     * @return bool
+     */
+    public function hasFinallyCallbacks()
+    {
+        return isset($this-&gt;options[&#039;finally&#039;]) &amp;&amp; ! empty($this-&gt;options[&#039;finally&#039;]);
+    }
+
+    /**
+     * Cancel the batch.
+     *
+     * @return void
+     */
+    public function cancel()
+    {
+        $this-&gt;repository-&gt;cancel($this-&gt;id);
+    }
+
+    /**
+     * Determine if the batch has been cancelled.
+     *
+     * @return bool
+     */
+    public function canceled()
+    {
+        return $this-&gt;cancelled();
+    }
+
+    /**
+     * Determine if the batch has been cancelled.
+     *
+     * @return bool
+     */
+    public function cancelled()
+    {
+        return ! is_null($this-&gt;cancelledAt);
+    }
+
+    /**
+     * Delete the batch from storage.
+     *
+     * @return void
+     */
+    public function delete()
+    {
+        $this-&gt;repository-&gt;delete($this-&gt;id);
+    }
+
+    /**
+     * Invoke a batch callback handler.
+     *
+     * @param  callable  $handler
+     * @param  \Illuminate\Bus\Batch  $batch
+     * @param  \Throwable|null  $e
+     * @return void
+     */
+    protected function invokeHandlerCallback($handler, Batch $batch, ?Throwable $e = null)
+    {
+        try {
+            $handler($batch, $e);
+        } catch (Throwable $e) {
+            if (function_exists(&#039;report&#039;)) {
+                report($e);
+            }
+        }
+    }
+
+    /**
+     * Convert the batch to an array.
+     *
+     * @return array
+     */
+    public function toArray()
+    {
+        return [
+            &#039;id&#039; =&gt; $this-&gt;id,
+            &#039;name&#039; =&gt; $this-&gt;name,
+            &#039;totalJobs&#039; =&gt; $this-&gt;totalJobs,
+            &#039;pendingJobs&#039; =&gt; $this-&gt;pendingJobs,
+            &#039;processedJobs&#039; =&gt; $this-&gt;processedJobs(),
+            &#039;progress&#039; =&gt; $this-&gt;progress(),
+            &#039;failedJobs&#039; =&gt; $this-&gt;failedJobs,
+            &#039;options&#039; =&gt; $this-&gt;options,
+            &#039;createdAt&#039; =&gt; $this-&gt;createdAt,
+            &#039;cancelledAt&#039; =&gt; $this-&gt;cancelledAt,
+            &#039;finishedAt&#039; =&gt; $this-&gt;finishedAt,
+        ];
+    }
+
+    /**
+     * Get the JSON serializable representation of the object.
+     *
+     * @return array
+     */
+    public function jsonSerialize(): array
+    {
+        return $this-&gt;toArray();
+    }
+
+    /**
+     * Dynamically access the batch&#039;s &quot;options&quot; via properties.
+     *
+     * @param  string  $key
+     * @return mixed
+     */
+    public function __get($key)
+    {
+        return $this-&gt;options[$key] ?? null;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Bus/BatchFactory.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Bus/Events -->
+
+</body>
+</html>

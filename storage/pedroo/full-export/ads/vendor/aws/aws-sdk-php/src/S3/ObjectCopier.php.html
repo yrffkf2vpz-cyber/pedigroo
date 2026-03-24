@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/ObjectCopier.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\S3;
+
+use Aws\Arn\ArnParser;
+use Aws\Arn\S3\AccessPointArn;
+use Aws\Exception\MultipartUploadException;
+use Aws\Result;
+use Aws\S3\Exception\S3Exception;
+use GuzzleHttp\Promise\Coroutine;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Promise\PromisorInterface;
+use InvalidArgumentException;
+
+/**
+ * Copies objects from one S3 location to another, utilizing a multipart copy
+ * when appropriate.
+ */
+class ObjectCopier implements PromisorInterface
+{
+    const DEFAULT_MULTIPART_THRESHOLD = MultipartUploader::PART_MAX_SIZE;
+
+    private $client;
+    private $source;
+    private $destination;
+    private $acl;
+    private $options;
+
+    private static $defaults = [
+        &#039;before_lookup&#039; =&gt; null,
+        &#039;before_upload&#039; =&gt; null,
+        &#039;concurrency&#039;   =&gt; 5,
+        &#039;mup_threshold&#039; =&gt; self::DEFAULT_MULTIPART_THRESHOLD,
+        &#039;params&#039;        =&gt; [],
+        &#039;part_size&#039;     =&gt; null,
+        &#039;version_id&#039;    =&gt; null,
+    ];
+
+    /**
+     * @param S3ClientInterface $client         The S3 Client used to execute
+     *                                          the copy command(s).
+     * @param array             $source         The object to copy, specified as
+     *                                          an array with a &#039;Bucket&#039; and
+     *                                          &#039;Key&#039; keys. Provide a
+     *                                          &#039;VersionID&#039; key to copy a
+     *                                          specified version of an object.
+     * @param array             $destination    The bucket and key to which to
+     *                                          copy the $source, specified as
+     *                                          an array with a &#039;Bucket&#039; and
+     *                                          &#039;Key&#039; keys.
+     * @param string            $acl            ACL to apply to the copy
+     *                                          (default: private).
+     * @param array             $options        Options used to configure the
+     *                                          copy process. Options passed in
+     *                                          through &#039;params&#039; are added to
+     *                                          the sub commands.
+     *
+     * @throws InvalidArgumentException
+     */
+    public function __construct(
+        S3ClientInterface $client,
+        array $source,
+        array $destination,
+        $acl = &#039;private&#039;,
+        array $options = []
+    ) {
+        $this-&gt;validateLocation($source);
+        $this-&gt;validateLocation($destination);
+
+        $this-&gt;client = $client;
+        $this-&gt;source = $source;
+        $this-&gt;destination = $destination;
+        $this-&gt;acl = $acl;
+        $this-&gt;options = $options + self::$defaults;
+    }
+
+    /**
+     * Perform the configured copy asynchronously. Returns a promise that is
+     * fulfilled with the result of the CompleteMultipartUpload or CopyObject
+     * operation or rejected with an exception.
+     *
+     * @return Coroutine
+     */
+    public function promise(): PromiseInterface
+    {
+        return Coroutine::of(function () {
+            $headObjectCommand = $this-&gt;client-&gt;getCommand(
+                &#039;HeadObject&#039;,
+                $this-&gt;options[&#039;params&#039;] + $this-&gt;source
+            );
+            if (is_callable($this-&gt;options[&#039;before_lookup&#039;])) {
+                $this-&gt;options[&#039;before_lookup&#039;]($headObjectCommand);
+            }
+            $objectStats = (yield $this-&gt;client-&gt;executeAsync(
+                $headObjectCommand
+            ));
+
+            if ($objectStats[&#039;ContentLength&#039;] &gt; $this-&gt;options[&#039;mup_threshold&#039;]) {
+                $mup = new MultipartCopy(
+                    $this-&gt;client,
+                    $this-&gt;getSourcePath(),
+                    [&#039;source_metadata&#039; =&gt; $objectStats, &#039;acl&#039; =&gt; $this-&gt;acl]
+                        + $this-&gt;destination
+                        + $this-&gt;options
+                );
+
+                yield $mup-&gt;promise();
+            } else {
+                $defaults = [
+                    &#039;ACL&#039; =&gt; $this-&gt;acl,
+                    &#039;MetadataDirective&#039; =&gt; &#039;COPY&#039;,
+                    &#039;CopySource&#039; =&gt; $this-&gt;getSourcePath(),
+                ];
+
+                $params = array_diff_key($this-&gt;options, self::$defaults)
+                    + $this-&gt;destination + $defaults + $this-&gt;options[&#039;params&#039;];
+
+                yield $this-&gt;client-&gt;executeAsync(
+                    $this-&gt;client-&gt;getCommand(&#039;CopyObject&#039;, $params)
+                );
+            }
+        });
+    }
+
+    /**
+     * Perform the configured copy synchronously. Returns the result of the
+     * CompleteMultipartUpload or CopyObject operation.
+     *
+     * @return Result
+     *
+     * @throws S3Exception
+     * @throws MultipartUploadException
+     */
+    public function copy()
+    {
+        return $this-&gt;promise()-&gt;wait();
+    }
+
+    private function validateLocation(array $location)
+    {
+        if (empty($location[&#039;Bucket&#039;]) || empty($location[&#039;Key&#039;])) {
+            throw new \InvalidArgumentException(&#039;Locations provided to an&#039;
+                . &#039; Aws\S3\ObjectCopier must have a non-empty Bucket and Key&#039;);
+        }
+    }
+
+    private function getSourcePath()
+    {
+        $path = &quot;/{$this-&gt;source[&#039;Bucket&#039;]}/&quot;;
+        if (ArnParser::isArn($this-&gt;source[&#039;Bucket&#039;])) {
+            try {
+                new AccessPointArn($this-&gt;source[&#039;Bucket&#039;]);
+                $path = &quot;{$this-&gt;source[&#039;Bucket&#039;]}/object/&quot;;
+            } catch (\Exception $e) {
+                throw new \InvalidArgumentException(
+                    &#039;Provided ARN was a not a valid S3 access point ARN (&#039;
+                    . $e-&gt;getMessage() . &#039;)&#039;,
+                    0,
+                    $e
+                );
+            }
+        }
+
+        $sourcePath = $path . rawurlencode($this-&gt;source[&#039;Key&#039;]);
+        if (isset($this-&gt;source[&#039;VersionId&#039;])) {
+            $sourcePath .= &quot;?versionId={$this-&gt;source[&#039;VersionId&#039;]}&quot;;
+        }
+
+        return $sourcePath;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/ObjectUploader.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/Crypto -->
+
+</body>
+</html>

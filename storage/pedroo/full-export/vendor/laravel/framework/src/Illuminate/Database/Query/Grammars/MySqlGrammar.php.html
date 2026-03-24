@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Database/Query/Grammars/MySqlGrammar.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database\Query\Grammars;
+
+use Illuminate\Database\Query\Builder;
+use Illuminate\Database\Query\JoinLateralClause;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
+use InvalidArgumentException;
+
+class MySqlGrammar extends Grammar
+{
+    /**
+     * The grammar specific operators.
+     *
+     * @var string[]
+     */
+    protected $operators = [&#039;sounds like&#039;];
+
+    /**
+     * Compile a select query into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
+     */
+    public function compileSelect(Builder $query)
+    {
+        $sql = parent::compileSelect($query);
+
+        if ($query-&gt;timeout === null) {
+            return $sql;
+        }
+
+        $milliseconds = $query-&gt;timeout * 1000;
+
+        return preg_replace(
+            &#039;/^select\b/i&#039;,
+            &#039;select /*+ MAX_EXECUTION_TIME(&#039;.$milliseconds.&#039;) */&#039;,
+            $sql,
+            1
+        );
+    }
+
+    /**
+     * Compile a &quot;where like&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereLike(Builder $query, $where)
+    {
+        $where[&#039;operator&#039;] = $where[&#039;not&#039;] ? &#039;not &#039; : &#039;&#039;;
+
+        $where[&#039;operator&#039;] .= $where[&#039;caseSensitive&#039;] ? &#039;like binary&#039; : &#039;like&#039;;
+
+        return $this-&gt;whereBasic($query, $where);
+    }
+
+    /**
+     * Compile a &quot;where null safe equals&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNullSafeEquals(Builder $query, $where)
+    {
+        return $this-&gt;wrap($where[&#039;column&#039;]).&#039; &lt;=&gt; &#039;.$this-&gt;parameter($where[&#039;value&#039;]);
+    }
+
+    /**
+     * Add a &quot;where null&quot; clause to the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNull(Builder $query, $where)
+    {
+        $columnValue = (string) $this-&gt;getValue($where[&#039;column&#039;]);
+
+        if ($this-&gt;isJsonSelector($columnValue)) {
+            [$field, $path] = $this-&gt;wrapJsonFieldAndPath($columnValue);
+
+            return &#039;(json_extract(&#039;.$field.$path.&#039;) is null OR json_type(json_extract(&#039;.$field.$path.&#039;)) = \&#039;NULL\&#039;)&#039;;
+        }
+
+        return parent::whereNull($query, $where);
+    }
+
+    /**
+     * Add a &quot;where not null&quot; clause to the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNotNull(Builder $query, $where)
+    {
+        $columnValue = (string) $this-&gt;getValue($where[&#039;column&#039;]);
+
+        if ($this-&gt;isJsonSelector($columnValue)) {
+            [$field, $path] = $this-&gt;wrapJsonFieldAndPath($columnValue);
+
+            return &#039;(json_extract(&#039;.$field.$path.&#039;) is not null AND json_type(json_extract(&#039;.$field.$path.&#039;)) != \&#039;NULL\&#039;)&#039;;
+        }
+
+        return parent::whereNotNull($query, $where);
+    }
+
+    /**
+     * Compile a &quot;where fulltext&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    public function whereFullText(Builder $query, $where)
+    {
+        $columns = $this-&gt;columnize($where[&#039;columns&#039;]);
+
+        $value = $this-&gt;parameter($where[&#039;value&#039;]);
+
+        $mode = ($where[&#039;options&#039;][&#039;mode&#039;] ?? []) === &#039;boolean&#039;
+            ? &#039; in boolean mode&#039;
+            : &#039; in natural language mode&#039;;
+
+        $expanded = ($where[&#039;options&#039;][&#039;expanded&#039;] ?? []) &amp;&amp; ($where[&#039;options&#039;][&#039;mode&#039;] ?? []) !== &#039;boolean&#039;
+            ? &#039; with query expansion&#039;
+            : &#039;&#039;;
+
+        return &quot;match ({$columns}) against (&quot;.$value.&quot;{$mode}{$expanded})&quot;;
+    }
+
+    /**
+     * Compile the index hints for the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  \Illuminate\Database\Query\IndexHint  $indexHint
+     * @return string
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function compileIndexHint(Builder $query, $indexHint)
+    {
+        $index = $indexHint-&gt;index;
+
+        $indexes = array_map(&#039;trim&#039;, explode(&#039;,&#039;, $index));
+
+        foreach ($indexes as $i) {
+            if (! preg_match(&#039;/^[a-zA-Z0-9_$]+$/&#039;, $i)) {
+                throw new InvalidArgumentException(&#039;Index name contains invalid characters.&#039;);
+            }
+        }
+
+        return match ($indexHint-&gt;type) {
+            &#039;hint&#039; =&gt; &quot;use index ({$index})&quot;,
+            &#039;force&#039; =&gt; &quot;force index ({$index})&quot;,
+            default =&gt; &quot;ignore index ({$index})&quot;,
+        };
+    }
+
+    /**
+     * Compile a group limit clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
+     */
+    protected function compileGroupLimit(Builder $query)
+    {
+        return $this-&gt;useLegacyGroupLimit($query)
+            ? $this-&gt;compileLegacyGroupLimit($query)
+            : parent::compileGroupLimit($query);
+    }
+
+    /**
+     * Determine whether to use a legacy group limit clause for MySQL &lt; 8.0.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return bool
+     */
+    public function useLegacyGroupLimit(Builder $query)
+    {
+        $version = $query-&gt;getConnection()-&gt;getServerVersion();
+
+        return ! $query-&gt;getConnection()-&gt;isMaria() &amp;&amp; version_compare($version, &#039;8.0.11&#039;, &#039;&lt;&#039;);
+    }
+
+    /**
+     * Compile a group limit clause for MySQL &lt; 8.0.
+     *
+     * Derived from https://softonsofa.com/tweaking-eloquent-relations-how-to-get-n-related-models-per-parent/.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
+     */
+    protected function compileLegacyGroupLimit(Builder $query)
+    {
+        $limit = (int) $query-&gt;groupLimit[&#039;value&#039;];
+        $offset = $query-&gt;offset;
+
+        if (isset($offset)) {
+            $offset = (int) $offset;
+            $limit += $offset;
+
+            $query-&gt;offset = null;
+        }
+
+        $column = last(explode(&#039;.&#039;, $query-&gt;groupLimit[&#039;column&#039;]));
+        $column = $this-&gt;wrap($column);
+
+        $partition = &#039;, @laravel_row := if(@laravel_group = &#039;.$column.&#039;, @laravel_row + 1, 1) as `laravel_row`&#039;;
+        $partition .= &#039;, @laravel_group := &#039;.$column;
+
+        $orders = (array) $query-&gt;orders;
+
+        array_unshift($orders, [
+            &#039;column&#039; =&gt; $query-&gt;groupLimit[&#039;column&#039;],
+            &#039;direction&#039; =&gt; &#039;asc&#039;,
+        ]);
+
+        $query-&gt;orders = $orders;
+
+        $components = $this-&gt;compileComponents($query);
+
+        $sql = $this-&gt;concatenate($components);
+
+        $from = &#039;(select @laravel_row := 0, @laravel_group := 0) as `laravel_vars`, (&#039;.$sql.&#039;) as `laravel_table`&#039;;
+
+        $sql = &#039;select `laravel_table`.*&#039;.$partition.&#039; from &#039;.$from.&#039; having `laravel_row` &lt;= &#039;.$limit;
+
+        if (isset($offset)) {
+            $sql .= &#039; and `laravel_row` &gt; &#039;.$offset;
+        }
+
+        return $sql.&#039; order by `laravel_row`&#039;;
+    }
+
+    /**
+     * Compile an insert ignore statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
+     * @return string
+     */
+    public function compileInsertOrIgnore(Builder $query, array $values)
+    {
+        return Str::replaceFirst(&#039;insert&#039;, &#039;insert ignore&#039;, $this-&gt;compileInsert($query, $values));
+    }
+
+    /**
+     * Compile an insert ignore statement using a subquery into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $columns
+     * @param  string  $sql
+     * @return string
+     */
+    public function compileInsertOrIgnoreUsing(Builder $query, array $columns, string $sql)
+    {
+        return Str::replaceFirst(&#039;insert&#039;, &#039;insert ignore&#039;, $this-&gt;compileInsertUsing($query, $columns, $sql));
+    }
+
+    /**
+     * Compile a &quot;JSON contains&quot; statement into SQL.
+     *
+     * @param  string  $column
+     * @param  string  $value
+     * @return string
+     */
+    protected function compileJsonContains($column, $value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($column);
+
+        return &#039;json_contains(&#039;.$field.&#039;, &#039;.$value.$path.&#039;)&#039;;
+    }
+
+    /**
+     * Compile a &quot;JSON overlaps&quot; statement into SQL.
+     *
+     * @param  string  $column
+     * @param  string  $value
+     * @return string
+     */
+    protected function compileJsonOverlaps($column, $value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($column);
+
+        return &#039;json_overlaps(&#039;.$field.&#039;, &#039;.$value.$path.&#039;)&#039;;
+    }
+
+    /**
+     * Compile a &quot;JSON contains key&quot; statement into SQL.
+     *
+     * @param  string  $column
+     * @return string
+     */
+    protected function compileJsonContainsKey($column)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($column);
+
+        return &#039;ifnull(json_contains_path(&#039;.$field.&#039;, \&#039;one\&#039;&#039;.$path.&#039;), 0)&#039;;
+    }
+
+    /**
+     * Compile a &quot;JSON length&quot; statement into SQL.
+     *
+     * @param  string  $column
+     * @param  string  $operator
+     * @param  string  $value
+     * @return string
+     */
+    protected function compileJsonLength($column, $operator, $value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($column);
+
+        return &#039;json_length(&#039;.$field.$path.&#039;) &#039;.$operator.&#039; &#039;.$value;
+    }
+
+    /**
+     * Compile a &quot;JSON value cast&quot; statement into SQL.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    public function compileJsonValueCast($value)
+    {
+        return &#039;cast(&#039;.$value.&#039; as json)&#039;;
+    }
+
+    /**
+     * Compile the random statement into SQL.
+     *
+     * @param  string|int  $seed
+     * @return string
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function compileRandom($seed)
+    {
+        if ($seed === &#039;&#039; || $seed === null) {
+            return &#039;RAND()&#039;;
+        }
+
+        if (! is_numeric($seed)) {
+            throw new InvalidArgumentException(&#039;The seed value must be numeric.&#039;);
+        }
+
+        return &#039;RAND(&#039;.(int) $seed.&#039;)&#039;;
+    }
+
+    /**
+     * Compile the lock into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  bool|string  $value
+     * @return string
+     */
+    protected function compileLock(Builder $query, $value)
+    {
+        if (! is_string($value)) {
+            return $value ? &#039;for update&#039; : &#039;lock in share mode&#039;;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Compile an insert statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
+     * @return string
+     */
+    public function compileInsert(Builder $query, array $values)
+    {
+        if (empty($values)) {
+            $values = [[]];
+        }
+
+        return parent::compileInsert($query, $values);
+    }
+
+    /**
+     * Compile the columns for an update statement.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
+     * @return string
+     */
+    protected function compileUpdateColumns(Builder $query, array $values)
+    {
+        return (new Collection($values))-&gt;map(function ($value, $key) {
+            if ($this-&gt;isJsonSelector($key)) {
+                return $this-&gt;compileJsonUpdateColumn($key, $value);
+            }
+
+            return $this-&gt;wrap($key).&#039; = &#039;.$this-&gt;parameter($value);
+        })-&gt;implode(&#039;, &#039;);
+    }
+
+    /**
+     * Compile an &quot;upsert&quot; statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
+     * @param  array  $uniqueBy
+     * @param  array  $update
+     * @return string
+     */
+    public function compileUpsert(Builder $query, array $values, array $uniqueBy, array $update)
+    {
+        $useUpsertAlias = $query-&gt;connection-&gt;getConfig(&#039;use_upsert_alias&#039;);
+
+        $sql = $this-&gt;compileInsert($query, $values);
+
+        if ($useUpsertAlias) {
+            $sql .= &#039; as laravel_upsert_alias&#039;;
+        }
+
+        $sql .= &#039; on duplicate key update &#039;;
+
+        $columns = (new Collection($update))-&gt;map(function ($value, $key) use ($useUpsertAlias) {
+            if (! is_numeric($key)) {
+                return $this-&gt;wrap($key).&#039; = &#039;.$this-&gt;parameter($value);
+            }
+
+            return $useUpsertAlias
+                ? $this-&gt;wrap($value).&#039; = &#039;.$this-&gt;wrap(&#039;laravel_upsert_alias&#039;).&#039;.&#039;.$this-&gt;wrap($value)
+                : $this-&gt;wrap($value).&#039; = values(&#039;.$this-&gt;wrap($value).&#039;)&#039;;
+        })-&gt;implode(&#039;, &#039;);
+
+        return $sql.$columns;
+    }
+
+    /**
+     * Compile a &quot;lateral join&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\JoinLateralClause  $join
+     * @param  string  $expression
+     * @return string
+     */
+    public function compileJoinLateral(JoinLateralClause $join, string $expression): string
+    {
+        return trim(&quot;{$join-&gt;type} join lateral {$expression} on true&quot;);
+    }
+
+    /**
+     * Prepare a JSON column being updated using the JSON_SET function.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return string
+     */
+    protected function compileJsonUpdateColumn($key, $value)
+    {
+        if (is_bool($value)) {
+            $value = $value ? &#039;true&#039; : &#039;false&#039;;
+        } elseif (is_array($value)) {
+            $value = &#039;cast(? as json)&#039;;
+        } else {
+            $value = $this-&gt;parameter($value);
+        }
+
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($key);
+
+        return &quot;{$field} = json_set({$field}{$path}, {$value})&quot;;
+    }
+
+    /**
+     * Compile an update statement without joins into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  string  $table
+     * @param  string  $columns
+     * @param  string  $where
+     * @return string
+     */
+    protected function compileUpdateWithoutJoins(Builder $query, $table, $columns, $where)
+    {
+        $sql = parent::compileUpdateWithoutJoins($query, $table, $columns, $where);
+
+        if (! empty($query-&gt;orders)) {
+            $sql .= &#039; &#039;.$this-&gt;compileOrders($query, $query-&gt;orders);
+        }
+
+        if (isset($query-&gt;limit)) {
+            $sql .= &#039; &#039;.$this-&gt;compileLimit($query, $query-&gt;limit);
+        }
+
+        return $sql;
+    }
+
+    /**
+     * Prepare the bindings for an update statement.
+     *
+     * Booleans, integers, and doubles are inserted into JSON updates as raw values.
+     *
+     * @param  array  $bindings
+     * @param  array  $values
+     * @return array
+     */
+    #[\Override]
+    public function prepareBindingsForUpdate(array $bindings, array $values)
+    {
+        $values = (new Collection($values))
+            -&gt;reject(fn ($value, $column) =&gt; $this-&gt;isJsonSelector($column) &amp;&amp; is_bool($value))
+            -&gt;map(fn ($value) =&gt; is_array($value) ? json_encode($value) : $value)
+            -&gt;all();
+
+        return parent::prepareBindingsForUpdate($bindings, $values);
+    }
+
+    /**
+     * Compile a delete query that does not use joins.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  string  $table
+     * @param  string  $where
+     * @return string
+     */
+    protected function compileDeleteWithoutJoins(Builder $query, $table, $where)
+    {
+        $sql = parent::compileDeleteWithoutJoins($query, $table, $where);
+
+        // When using MySQL, delete statements may contain order by statements and limits
+        // so we will compile both of those here. Once we have finished compiling this
+        // we will return the completed SQL statement so it will be executed for us.
+        if (! empty($query-&gt;orders)) {
+            $sql .= &#039; &#039;.$this-&gt;compileOrders($query, $query-&gt;orders);
+        }
+
+        if (isset($query-&gt;limit)) {
+            $sql .= &#039; &#039;.$this-&gt;compileLimit($query, $query-&gt;limit);
+        }
+
+        return $sql;
+    }
+
+    /**
+     * Compile a query to get the number of open connections for a database.
+     *
+     * @return string
+     */
+    public function compileThreadCount()
+    {
+        return &#039;select variable_value as `Value` from performance_schema.session_status where variable_name = \&#039;threads_connected\&#039;&#039;;
+    }
+
+    /**
+     * Wrap a single string in keyword identifiers.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function wrapValue($value)
+    {
+        return $value === &#039;*&#039; ? $value : &#039;`&#039;.str_replace(&#039;`&#039;, &#039;``&#039;, $value).&#039;`&#039;;
+    }
+
+    /**
+     * Wrap the given JSON selector.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function wrapJsonSelector($value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($value);
+
+        return &#039;json_unquote(json_extract(&#039;.$field.$path.&#039;))&#039;;
+    }
+
+    /**
+     * Wrap the given JSON selector for boolean values.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function wrapJsonBooleanSelector($value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($value);
+
+        return &#039;json_extract(&#039;.$field.$path.&#039;)&#039;;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Database/Query/Grammars/PostgresGrammar.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Database/Query/Processors -->
+
+</body>
+</html>

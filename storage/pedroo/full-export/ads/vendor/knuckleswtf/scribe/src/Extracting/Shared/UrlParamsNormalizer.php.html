@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Extracting/Shared/UrlParamsNormalizer.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Extracting\Shared;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Routing\Route;
+use Illuminate\Support\Str;
+use ReflectionEnum;
+use ReflectionException;
+use ReflectionFunctionAbstract;
+
+/*
+ * See https://laravel.com/docs/9.x/routing#route-model-binding
+ */
+class UrlParamsNormalizer
+{
+    /**
+     * Normalize a URL from Laravel-style to something that&#039;s clearer for a non-Laravel user.
+     * For instance, `/posts/{post}` would be clearer as `/posts/{id}`,
+     * and `/users/{user}/posts/{post}` would be clearer as `/users/{user_id}/posts/{id}`
+     *
+     * @param \Illuminate\Routing\Route $route
+     * @param \ReflectionFunctionAbstract $method
+     *
+     * @return string
+     */
+    public static function normalizeParameterNamesInRouteUri(Route $route, ReflectionFunctionAbstract $method): string
+    {
+        $params = [];
+        $uri = $route-&gt;uri;
+        preg_match_all(&#039;#\{(\w+?)}#&#039;, $uri, $params);
+
+        $resourceRouteNames = [&quot;.index&quot;, &quot;.show&quot;, &quot;.update&quot;, &quot;.destroy&quot;, &quot;.store&quot;];
+
+        $typeHintedEloquentModels = self::getTypeHintedEloquentModels($method);
+        $routeName = $route-&gt;action[&#039;as&#039;] ?? &#039;&#039;;
+        if (Str::endsWith($routeName, $resourceRouteNames)) {
+            // Note that resource routes can be nested eg users.posts.show
+            $pluralResources = explode(&#039;.&#039;, $routeName);
+            array_pop($pluralResources); // Remove the name of the action (eg `show`)
+
+            $alreadyFoundResourceParam = false;
+            foreach (array_reverse($pluralResources) as $pluralResource) {
+                $singularResource = Str::singular($pluralResource);
+
+                // Laravel turns hyphens in parameters to underscores
+                // (`cool-things/{cool-thing}` to `cool-things/{cool_thing_id}`)
+                // so we do the same
+                $singularResourceParam = str_replace(&#039;-&#039;, &#039;_&#039;, $singularResource);
+
+                $urlPatternsToSearchFor = [
+                    &quot;{$pluralResource}/{{$singularResourceParam}}&quot;,
+                    &quot;{$pluralResource}/{{$singularResource}}&quot;,
+                    &quot;{$pluralResource}/{{$singularResourceParam}?}&quot;,
+                    &quot;{$pluralResource}/{{$singularResource}?}&quot;,
+                ];
+
+                $binding = self::getRouteKeyForUrlParam(
+                    $route, $singularResource, $typeHintedEloquentModels, &#039;id&#039;
+                );
+
+                if (!$alreadyFoundResourceParam) {
+                    // This is the first resource param (from the end).
+                    // We set it to `params/{id}` (or whatever field it&#039;s bound to)
+                    $replaceWith = [
+                        &quot;$pluralResource/{{$binding}}&quot;,
+                        &quot;$pluralResource/{{$binding}}&quot;,
+                        &quot;$pluralResource/{{$binding}?}&quot;,
+                        &quot;$pluralResource/{{$binding}?}&quot;,
+                    ];
+                    $alreadyFoundResourceParam = true;
+                } else {
+                    // Other resource parameters will be `params/{&lt;param&gt;_id}`
+                    $replaceWith = [
+                        &quot;{$pluralResource}/{{$singularResourceParam}_{$binding}}&quot;,
+                        &quot;{$pluralResource}/{{$singularResource}_{$binding}}&quot;,
+                        &quot;{$pluralResource}/{{$singularResourceParam}_{$binding}?}&quot;,
+                        &quot;{$pluralResource}/{{$singularResource}_{$binding}?}&quot;,
+                    ];
+                }
+                $uri = str_replace($urlPatternsToSearchFor, $replaceWith, $uri);
+            }
+        }
+
+        foreach ($params[1] as $param) {
+            // For non-resource parameters, if there&#039;s a field binding/type-hinted variable, replace that too:
+            if ($binding = self::getRouteKeyForUrlParam($route, $param, $typeHintedEloquentModels)) {
+                $urlPatternsToSearchFor = [&quot;{{$param}}&quot;, &quot;{{$param}?}&quot;];
+                $replaceWith = [&quot;{{$param}_{$binding}}&quot;, &quot;{{$param}_{$binding}?}&quot;];
+                $uri = str_replace($urlPatternsToSearchFor, $replaceWith, $uri);
+            }
+        }
+
+        return $uri;
+    }
+
+    /**
+     * Return the type-hinted method arguments in the action that are Eloquent models,
+     * The arguments will be returned as an array of the form: [&lt;variable_name&gt; =&gt; $instance]
+     */
+    public static function getTypeHintedEloquentModels(ReflectionFunctionAbstract $method): array
+    {
+        $arguments = [];
+        foreach ($method-&gt;getParameters() as $argument) {
+            if (($instance = self::instantiateMethodArgument($argument)) &amp;&amp; $instance instanceof Model) {
+                $arguments[$argument-&gt;getName()] = $instance;
+            }
+        }
+
+        return $arguments;
+    }
+
+
+    /**
+     * Return the type-hinted method arguments in the action that are enums,
+     * The arguments will be returned as an array of the form: [&lt;variable_name&gt; =&gt; $instance]
+     */
+    public static function getTypeHintedEnums(ReflectionFunctionAbstract $method): array
+    {
+        $arguments = [];
+        foreach ($method-&gt;getParameters() as $argument) {
+            $argumentType = $argument-&gt;getType();
+            if (!($argumentType instanceof \ReflectionNamedType)) continue;
+            try {
+                $reflectionEnum = new ReflectionEnum($argumentType-&gt;getName());
+                $arguments[$argument-&gt;getName()] = $reflectionEnum;
+            } catch (ReflectionException) {
+                continue;
+            }
+        }
+
+        return $arguments;
+    }
+
+    /**
+     * Given a URL that uses Eloquent model binding (for instance `/posts/{post}` -&gt; `public function show(Post
+     * $post)`), we need to figure out the field that Eloquent uses to retrieve the Post object. By default, this would
+     * be `id`, but can be configured in a couple of ways:
+     *
+     * - Inline: `/posts/{post:slug}`
+     * - `class Post { public function getRouteKeyName() { return &#039;slug&#039;; } }`
+     *
+     * There are other ways, but they&#039;re dynamic and beyond our scope.
+     *
+     * @param \Illuminate\Routing\Route $route
+     * @param string $paramName The name of the URL parameter
+     * @param array&lt;string, Model&gt; $typeHintedEloquentModels
+     * @param string|null $default Default field to use
+     *
+     * @return string|null
+     */
+    protected static function getRouteKeyForUrlParam(
+        Route $route, string $paramName, array $typeHintedEloquentModels = [], ?string $default = null
+    ): ?string
+    {
+        if ($binding = self::getInlineRouteKey($route, $paramName)) {
+            return $binding;
+        }
+
+        return self::getRouteKeyFromModel($paramName, $typeHintedEloquentModels) ?: $default;
+    }
+
+    /**
+     * Return the `slug` in /posts/{post:slug}
+     *
+     * @param \Illuminate\Routing\Route $route
+     * @param string $paramName
+     *
+     * @return string|null
+     */
+    protected static function getInlineRouteKey(Route $route, string $paramName): ?string
+    {
+        return $route-&gt;bindingFieldFor($paramName);
+    }
+
+    /**
+     * Check if there&#039;s a type-hinted argument on the controller method matching the URL param name:
+     * eg /posts/{post} -&gt; public function show(Post $post)
+     * If there is, check if it&#039;s an Eloquent model.
+     * If it is, return it&#039;s `getRouteKeyName()`.
+     *
+     * @param string $paramName
+     * @param Model[] $typeHintedEloquentModels
+     *
+     * @return string|null
+     */
+    protected static function getRouteKeyFromModel(string $paramName, array $typeHintedEloquentModels): ?string
+    {
+        // Ensure param name is in camelCase so it matches the argument name (e.g. The &#039;$userAddress&#039; in `function show(BigThing $userAddress`)
+        $paramName = Str::camel($paramName);
+
+        if (array_key_exists($paramName, $typeHintedEloquentModels)) {
+            $argumentInstance = $typeHintedEloquentModels[$paramName];
+            return $argumentInstance-&gt;getRouteKeyName();
+        }
+
+        return null;
+    }
+
+    /**
+     * Instantiate an argument on a controller method via its typehint. For instance, $post in:
+     *
+     * public function show(Post $post)
+     *
+     * This method takes in a method argument and returns an instance, or null if it couldn&#039;t be instantiated safely.
+     * Cases where instantiation may fail:
+     * - the argument has no type (eg `public function show($postId)`)
+     * - the argument has a primitive type (eg `public function show(string $postId)`)
+     * - the argument is an injected dependency that itself needs other dependencies
+     *   (eg `public function show(PostsManager $manager)`)
+     *
+     * @param \ReflectionParameter $argument
+     *
+     * @return object|null
+     */
+    protected static function instantiateMethodArgument(\ReflectionParameter $argument): ?object
+    {
+        $argumentType = $argument-&gt;getType();
+        // No type-hint, or primitive type
+        if (!($argumentType instanceof \ReflectionNamedType)) return null;
+
+        $argumentClassName = $argumentType-&gt;getName();
+        if (class_exists($argumentClassName)) {
+            try {
+                return new $argumentClassName;
+            } catch (\Throwable $e) {
+                return null;
+            }
+        }
+
+        if (interface_exists($argumentClassName)) {
+            try {
+                return app($argumentClassName);
+            } catch (\Throwable $e) {
+                return null;
+            }
+        }
+
+        return null;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Extracting/Shared/ValidationRulesFinders/RequestValidate.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Extracting/Shared/ValidationRulesFinders -->
+
+</body>
+</html>

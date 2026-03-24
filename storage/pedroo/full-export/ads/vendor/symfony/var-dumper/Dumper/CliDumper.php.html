@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/var-dumper/Dumper/CliDumper.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\VarDumper\Dumper;
+
+use Symfony\Component\ErrorHandler\ErrorRenderer\FileLinkFormatter;
+use Symfony\Component\VarDumper\Cloner\Cursor;
+use Symfony\Component\VarDumper\Cloner\Stub;
+
+/**
+ * CliDumper dumps variables for command line output.
+ *
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ */
+class CliDumper extends AbstractDumper
+{
+    public static bool $defaultColors;
+    /** @var callable|resource|string|null */
+    public static $defaultOutput = &#039;php://stdout&#039;;
+
+    protected bool $colors;
+    protected int $maxStringWidth = 0;
+    protected array $styles = [
+        // See http://en.wikipedia.org/wiki/ANSI_escape_code#graphics
+        &#039;default&#039; =&gt; &#039;0;38;5;208&#039;,
+        &#039;num&#039; =&gt; &#039;1;38;5;38&#039;,
+        &#039;const&#039; =&gt; &#039;1;38;5;208&#039;,
+        &#039;virtual&#039; =&gt; &#039;3&#039;,
+        &#039;str&#039; =&gt; &#039;1;38;5;113&#039;,
+        &#039;note&#039; =&gt; &#039;38;5;38&#039;,
+        &#039;ref&#039; =&gt; &#039;38;5;247&#039;,
+        &#039;public&#039; =&gt; &#039;39&#039;,
+        &#039;protected&#039; =&gt; &#039;39&#039;,
+        &#039;private&#039; =&gt; &#039;39&#039;,
+        &#039;meta&#039; =&gt; &#039;38;5;170&#039;,
+        &#039;key&#039; =&gt; &#039;38;5;113&#039;,
+        &#039;index&#039; =&gt; &#039;38;5;38&#039;,
+    ];
+
+    protected static string $controlCharsRx = &#039;/[\x00-\x1F\x7F]+/&#039;;
+    protected static array $controlCharsMap = [
+        &quot;\t&quot; =&gt; &#039;\t&#039;,
+        &quot;\n&quot; =&gt; &#039;\n&#039;,
+        &quot;\v&quot; =&gt; &#039;\v&#039;,
+        &quot;\f&quot; =&gt; &#039;\f&#039;,
+        &quot;\r&quot; =&gt; &#039;\r&#039;,
+        &quot;\033&quot; =&gt; &#039;\e&#039;,
+    ];
+    protected static string $unicodeCharsRx = &quot;/[\u{00A0}\u{00AD}\u{034F}\u{061C}\u{115F}\u{1160}\u{17B4}\u{17B5}\u{180E}\u{2000}-\u{200F}\u{202F}\u{205F}\u{2060}-\u{2064}\u{206A}-\u{206F}\u{3000}\u{2800}\u{3164}\u{FEFF}\u{FFA0}\u{1D159}\u{1D173}-\u{1D17A}]/u&quot;;
+
+    protected bool $collapseNextHash = false;
+    protected bool $expandNextHash = false;
+
+    private array $displayOptions = [
+        &#039;fileLinkFormat&#039; =&gt; null,
+    ];
+
+    private bool $handlesHrefGracefully;
+
+    public function __construct($output = null, ?string $charset = null, int $flags = 0)
+    {
+        parent::__construct($output, $charset, $flags);
+
+        if (&#039;\\&#039; === \DIRECTORY_SEPARATOR &amp;&amp; !$this-&gt;isWindowsTrueColor()) {
+            // Use only the base 16 xterm colors when using ANSICON or standard Windows 10 CLI
+            $this-&gt;setStyles([
+                &#039;default&#039; =&gt; &#039;31&#039;,
+                &#039;num&#039; =&gt; &#039;1;34&#039;,
+                &#039;const&#039; =&gt; &#039;1;31&#039;,
+                &#039;str&#039; =&gt; &#039;1;32&#039;,
+                &#039;note&#039; =&gt; &#039;34&#039;,
+                &#039;ref&#039; =&gt; &#039;1;30&#039;,
+                &#039;meta&#039; =&gt; &#039;35&#039;,
+                &#039;key&#039; =&gt; &#039;32&#039;,
+                &#039;index&#039; =&gt; &#039;34&#039;,
+            ]);
+        }
+
+        $this-&gt;displayOptions[&#039;fileLinkFormat&#039;] = class_exists(FileLinkFormatter::class) ? new FileLinkFormatter() : (\ini_get(&#039;xdebug.file_link_format&#039;) ?: get_cfg_var(&#039;xdebug.file_link_format&#039;) ?: &#039;file://%f#L%l&#039;);
+    }
+
+    /**
+     * Enables/disables colored output.
+     */
+    public function setColors(bool $colors): void
+    {
+        $this-&gt;colors = $colors;
+    }
+
+    /**
+     * Sets the maximum number of characters per line for dumped strings.
+     */
+    public function setMaxStringWidth(int $maxStringWidth): void
+    {
+        $this-&gt;maxStringWidth = $maxStringWidth;
+    }
+
+    /**
+     * Configures styles.
+     *
+     * @param array $styles A map of style names to style definitions
+     */
+    public function setStyles(array $styles): void
+    {
+        $this-&gt;styles = $styles + $this-&gt;styles;
+    }
+
+    /**
+     * Configures display options.
+     *
+     * @param array $displayOptions A map of display options to customize the behavior
+     */
+    public function setDisplayOptions(array $displayOptions): void
+    {
+        $this-&gt;displayOptions = $displayOptions + $this-&gt;displayOptions;
+    }
+
+    public function dumpScalar(Cursor $cursor, string $type, string|int|float|bool|null $value): void
+    {
+        $this-&gt;dumpKey($cursor);
+        $this-&gt;collapseNextHash = $this-&gt;expandNextHash = false;
+
+        $style = &#039;const&#039;;
+        $attr = $cursor-&gt;attr;
+
+        switch ($type) {
+            case &#039;default&#039;:
+                $style = &#039;default&#039;;
+                break;
+
+            case &#039;label&#039;:
+                $this-&gt;styles += [&#039;label&#039; =&gt; $this-&gt;styles[&#039;default&#039;]];
+                $style = &#039;label&#039;;
+                break;
+
+            case &#039;integer&#039;:
+                $style = &#039;num&#039;;
+
+                if (isset($this-&gt;styles[&#039;integer&#039;])) {
+                    $style = &#039;integer&#039;;
+                }
+
+                break;
+
+            case &#039;double&#039;:
+                $style = &#039;num&#039;;
+
+                if (isset($this-&gt;styles[&#039;float&#039;])) {
+                    $style = &#039;float&#039;;
+                }
+
+                $value = match (true) {
+                    \INF === $value =&gt; &#039;INF&#039;,
+                    -\INF === $value =&gt; &#039;-INF&#039;,
+                    is_nan($value) =&gt; &#039;NAN&#039;,
+                    default =&gt; !str_contains($value = (string) $value, $this-&gt;decimalPoint) ? $value .= $this-&gt;decimalPoint.&#039;0&#039; : $value,
+                };
+                break;
+
+            case &#039;NULL&#039;:
+                $value = &#039;null&#039;;
+                break;
+
+            case &#039;boolean&#039;:
+                $value = $value ? &#039;true&#039; : &#039;false&#039;;
+                break;
+
+            default:
+                $attr += [&#039;value&#039; =&gt; $this-&gt;utf8Encode($value)];
+                $value = $this-&gt;utf8Encode($type);
+                break;
+        }
+
+        $this-&gt;line .= $this-&gt;style($style, $value, $attr);
+
+        $this-&gt;endValue($cursor);
+    }
+
+    public function dumpString(Cursor $cursor, string $str, bool $bin, int $cut): void
+    {
+        $this-&gt;dumpKey($cursor);
+        $this-&gt;collapseNextHash = $this-&gt;expandNextHash = false;
+        $attr = $cursor-&gt;attr;
+
+        if ($bin) {
+            $str = $this-&gt;utf8Encode($str);
+        }
+        if (&#039;&#039; === $str) {
+            $this-&gt;line .= &#039;&quot;&quot;&#039;;
+            if ($cut) {
+                $this-&gt;line .= &#039;…&#039;.$cut;
+            }
+            $this-&gt;endValue($cursor);
+        } else {
+            $attr += [
+                &#039;length&#039; =&gt; 0 &lt;= $cut ? mb_strlen($str, &#039;UTF-8&#039;) + $cut : 0,
+                &#039;binary&#039; =&gt; $bin,
+            ];
+            $str = $bin &amp;&amp; str_contains($str, &quot;\0&quot;) ? [$str] : explode(&quot;\n&quot;, $str);
+            if (isset($str[1]) &amp;&amp; !isset($str[2]) &amp;&amp; !isset($str[1][0])) {
+                unset($str[1]);
+                $str[0] .= &quot;\n&quot;;
+            }
+            $m = \count($str) - 1;
+            $i = $lineCut = 0;
+
+            if (self::DUMP_STRING_LENGTH &amp; $this-&gt;flags) {
+                $this-&gt;line .= &#039;(&#039;.$attr[&#039;length&#039;].&#039;) &#039;;
+            }
+            if ($bin) {
+                $this-&gt;line .= &#039;b&#039;;
+            }
+
+            if ($m) {
+                $this-&gt;line .= &#039;&quot;&quot;&quot;&#039;;
+                $this-&gt;dumpLine($cursor-&gt;depth);
+            } else {
+                $this-&gt;line .= &#039;&quot;&#039;;
+            }
+
+            foreach ($str as $str) {
+                if ($i &lt; $m) {
+                    $str .= &quot;\n&quot;;
+                }
+                if (0 &lt; $this-&gt;maxStringWidth &amp;&amp; $this-&gt;maxStringWidth &lt; $len = mb_strlen($str, &#039;UTF-8&#039;)) {
+                    $str = mb_substr($str, 0, $this-&gt;maxStringWidth, &#039;UTF-8&#039;);
+                    $lineCut = $len - $this-&gt;maxStringWidth;
+                }
+                if ($m &amp;&amp; 0 &lt; $cursor-&gt;depth) {
+                    $this-&gt;line .= $this-&gt;indentPad;
+                }
+                if (&#039;&#039; !== $str) {
+                    $this-&gt;line .= $this-&gt;style(&#039;str&#039;, $str, $attr);
+                }
+                if ($i++ == $m) {
+                    if ($m) {
+                        if (&#039;&#039; !== $str) {
+                            $this-&gt;dumpLine($cursor-&gt;depth);
+                            if (0 &lt; $cursor-&gt;depth) {
+                                $this-&gt;line .= $this-&gt;indentPad;
+                            }
+                        }
+                        $this-&gt;line .= &#039;&quot;&quot;&quot;&#039;;
+                    } else {
+                        $this-&gt;line .= &#039;&quot;&#039;;
+                    }
+                    if ($cut &lt; 0) {
+                        $this-&gt;line .= &#039;…&#039;;
+                        $lineCut = 0;
+                    } elseif ($cut) {
+                        $lineCut += $cut;
+                    }
+                }
+                if ($lineCut) {
+                    $this-&gt;line .= &#039;…&#039;.$lineCut;
+                    $lineCut = 0;
+                }
+
+                if ($i &gt; $m) {
+                    $this-&gt;endValue($cursor);
+                } else {
+                    $this-&gt;dumpLine($cursor-&gt;depth);
+                }
+            }
+        }
+    }
+
+    public function enterHash(Cursor $cursor, int $type, string|int|null $class, bool $hasChild): void
+    {
+        $this-&gt;colors ??= $this-&gt;supportsColors();
+
+        $this-&gt;dumpKey($cursor);
+        $this-&gt;expandNextHash = false;
+        $attr = $cursor-&gt;attr;
+
+        if ($this-&gt;collapseNextHash) {
+            $cursor-&gt;skipChildren = true;
+            $this-&gt;collapseNextHash = $hasChild = false;
+        }
+
+        $class = $this-&gt;utf8Encode($class);
+        if (Cursor::HASH_OBJECT === $type) {
+            $prefix = $class &amp;&amp; &#039;stdClass&#039; !== $class ? $this-&gt;style(&#039;note&#039;, $class, $attr).(empty($attr[&#039;cut_hash&#039;]) ? &#039; {&#039; : &#039;&#039;) : &#039;{&#039;;
+        } elseif (Cursor::HASH_RESOURCE === $type) {
+            $prefix = $this-&gt;style(&#039;note&#039;, $class.&#039; resource&#039;, $attr).($hasChild ? &#039; {&#039; : &#039; &#039;);
+        } else {
+            $prefix = $class &amp;&amp; !(self::DUMP_LIGHT_ARRAY &amp; $this-&gt;flags) ? $this-&gt;style(&#039;note&#039;, &#039;array:&#039;.$class).&#039; [&#039; : &#039;[&#039;;
+        }
+
+        if (($cursor-&gt;softRefCount || 0 &lt; $cursor-&gt;softRefHandle) &amp;&amp; empty($attr[&#039;cut_hash&#039;])) {
+            $prefix .= $this-&gt;style(&#039;ref&#039;, (Cursor::HASH_RESOURCE === $type ? &#039;@&#039; : &#039;#&#039;).(0 &lt; $cursor-&gt;softRefHandle ? $cursor-&gt;softRefHandle : $cursor-&gt;softRefTo), [&#039;count&#039; =&gt; $cursor-&gt;softRefCount]);
+        } elseif ($cursor-&gt;hardRefTo &amp;&amp; !$cursor-&gt;refIndex &amp;&amp; $class) {
+            $prefix .= $this-&gt;style(&#039;ref&#039;, &#039;&amp;&#039;.$cursor-&gt;hardRefTo, [&#039;count&#039; =&gt; $cursor-&gt;hardRefCount]);
+        } elseif (!$hasChild &amp;&amp; Cursor::HASH_RESOURCE === $type) {
+            $prefix = substr($prefix, 0, -1);
+        }
+
+        $this-&gt;line .= $prefix;
+
+        if ($hasChild) {
+            $this-&gt;dumpLine($cursor-&gt;depth);
+        }
+    }
+
+    public function leaveHash(Cursor $cursor, int $type, string|int|null $class, bool $hasChild, int $cut): void
+    {
+        if (empty($cursor-&gt;attr[&#039;cut_hash&#039;])) {
+            $this-&gt;dumpEllipsis($cursor, $hasChild, $cut);
+            $this-&gt;line .= Cursor::HASH_OBJECT === $type ? &#039;}&#039; : (Cursor::HASH_RESOURCE !== $type ? &#039;]&#039; : ($hasChild ? &#039;}&#039; : &#039;&#039;));
+        }
+
+        $this-&gt;endValue($cursor);
+    }
+
+    /**
+     * Dumps an ellipsis for cut children.
+     *
+     * @param bool $hasChild When the dump of the hash has child item
+     * @param int  $cut      The number of items the hash has been cut by
+     */
+    protected function dumpEllipsis(Cursor $cursor, bool $hasChild, int $cut): void
+    {
+        if ($cut) {
+            $this-&gt;line .= &#039; …&#039;;
+            if (0 &lt; $cut) {
+                $this-&gt;line .= $cut;
+            }
+            if ($hasChild) {
+                $this-&gt;dumpLine($cursor-&gt;depth + 1);
+            }
+        }
+    }
+
+    /**
+     * Dumps a key in a hash structure.
+     */
+    protected function dumpKey(Cursor $cursor): void
+    {
+        if (null !== $key = $cursor-&gt;hashKey) {
+            if ($cursor-&gt;hashKeyIsBinary) {
+                $key = $this-&gt;utf8Encode($key);
+            }
+            $attr = [
+                &#039;binary&#039; =&gt; $cursor-&gt;hashKeyIsBinary,
+                &#039;virtual&#039; =&gt; $cursor-&gt;attr[&#039;virtual&#039;] ?? false,
+            ];
+            $bin = $cursor-&gt;hashKeyIsBinary ? &#039;b&#039; : &#039;&#039;;
+            $style = &#039;key&#039;;
+            switch ($cursor-&gt;hashType) {
+                default:
+                case Cursor::HASH_INDEXED:
+                    if (self::DUMP_LIGHT_ARRAY &amp; $this-&gt;flags) {
+                        break;
+                    }
+                    $style = &#039;index&#039;;
+                    // no break
+                case Cursor::HASH_ASSOC:
+                    if (\is_int($key)) {
+                        $this-&gt;line .= $this-&gt;style($style, $key).&#039; =&gt; &#039;;
+                    } else {
+                        $this-&gt;line .= $bin.&#039;&quot;&#039;.$this-&gt;style($style, $key).&#039;&quot; =&gt; &#039;;
+                    }
+                    break;
+
+                case Cursor::HASH_RESOURCE:
+                    $key = &quot;\0~\0&quot;.$key;
+                    // no break
+                case Cursor::HASH_OBJECT:
+                    if (!isset($key[0]) || &quot;\0&quot; !== $key[0]) {
+                        $this-&gt;line .= &#039;+&#039;.$bin.$this-&gt;style(&#039;public&#039;, $key, $attr).&#039;: &#039;;
+                    } elseif (0 &lt; strpos($key, &quot;\0&quot;, 1)) {
+                        $key = explode(&quot;\0&quot;, substr($key, 1), 2);
+
+                        switch ($key[0][0]) {
+                            case &#039;+&#039;: // User inserted keys
+                                $attr[&#039;dynamic&#039;] = true;
+                                $this-&gt;line .= &#039;+&#039;.$bin.&#039;&quot;&#039;.$this-&gt;style(&#039;public&#039;, $key[1], $attr).&#039;&quot;: &#039;;
+                                break 2;
+                            case &#039;~&#039;:
+                                $style = &#039;meta&#039;;
+                                if (isset($key[0][1])) {
+                                    parse_str(substr($key[0], 1), $attr);
+                                    $attr += [&#039;binary&#039; =&gt; $cursor-&gt;hashKeyIsBinary];
+                                }
+                                break;
+                            case &#039;*&#039;:
+                                $style = &#039;protected&#039;;
+                                $bin = &#039;#&#039;.$bin;
+                                break;
+                            default:
+                                $attr[&#039;class&#039;] = $key[0];
+                                $style = &#039;private&#039;;
+                                $bin = &#039;-&#039;.$bin;
+                                break;
+                        }
+
+                        if (isset($attr[&#039;collapse&#039;])) {
+                            if ($attr[&#039;collapse&#039;]) {
+                                $this-&gt;collapseNextHash = true;
+                            } else {
+                                $this-&gt;expandNextHash = true;
+                            }
+                        }
+
+                        $this-&gt;line .= $bin.$this-&gt;style($style, $key[1], $attr).($attr[&#039;separator&#039;] ?? &#039;: &#039;);
+                    } else {
+                        // This case should not happen
+                        $this-&gt;line .= &#039;-&#039;.$bin.&#039;&quot;&#039;.$this-&gt;style(&#039;private&#039;, $key, [&#039;class&#039; =&gt; &#039;&#039;]).&#039;&quot;: &#039;;
+                    }
+                    break;
+            }
+
+            if ($cursor-&gt;hardRefTo) {
+                $this-&gt;line .= $this-&gt;style(&#039;ref&#039;, &#039;&amp;&#039;.($cursor-&gt;hardRefCount ? $cursor-&gt;hardRefTo : &#039;&#039;), [&#039;count&#039; =&gt; $cursor-&gt;hardRefCount]).&#039; &#039;;
+            }
+        }
+    }
+
+    /**
+     * Decorates a value with some style.
+     *
+     * @param string $style The type of style being applied
+     * @param string $value The value being styled
+     * @param array  $attr  Optional context information
+     */
+    protected function style(string $style, string $value, array $attr = []): string
+    {
+        $this-&gt;colors ??= $this-&gt;supportsColors();
+
+        $this-&gt;handlesHrefGracefully ??= &#039;JetBrains-JediTerm&#039; !== getenv(&#039;TERMINAL_EMULATOR&#039;)
+            &amp;&amp; (!getenv(&#039;KONSOLE_VERSION&#039;) || (int) getenv(&#039;KONSOLE_VERSION&#039;) &gt; 201100)
+            &amp;&amp; !isset($_SERVER[&#039;IDEA_INITIAL_DIRECTORY&#039;]);
+
+        if (isset($attr[&#039;ellipsis&#039;], $attr[&#039;ellipsis-type&#039;])) {
+            $prefix = substr($value, 0, -$attr[&#039;ellipsis&#039;]);
+            if (&#039;cli&#039; === \PHP_SAPI &amp;&amp; &#039;path&#039; === $attr[&#039;ellipsis-type&#039;] &amp;&amp; isset($_SERVER[$pwd = &#039;\\&#039; === \DIRECTORY_SEPARATOR ? &#039;CD&#039; : &#039;PWD&#039;]) &amp;&amp; str_starts_with($prefix, $_SERVER[$pwd])) {
+                $prefix = &#039;.&#039;.substr($prefix, \strlen($_SERVER[$pwd]));
+            }
+            if (!empty($attr[&#039;ellipsis-tail&#039;])) {
+                $prefix .= substr($value, -$attr[&#039;ellipsis&#039;], $attr[&#039;ellipsis-tail&#039;]);
+                $value = substr($value, -$attr[&#039;ellipsis&#039;] + $attr[&#039;ellipsis-tail&#039;]);
+            } else {
+                $value = substr($value, -$attr[&#039;ellipsis&#039;]);
+            }
+
+            $value = $this-&gt;style(&#039;default&#039;, $prefix).$this-&gt;style($style, $value);
+
+            goto href;
+        }
+
+        $map = static::$controlCharsMap;
+        $startCchr = $this-&gt;colors ? &quot;\033[m\033[{$this-&gt;styles[&#039;default&#039;]}m&quot; : &#039;&#039;;
+        $endCchr = $this-&gt;colors ? &quot;\033[m\033[{$this-&gt;styles[$style]}m&quot; : &#039;&#039;;
+        $value = preg_replace_callback(static::$controlCharsRx, function ($c) use ($map, $startCchr, $endCchr) {
+            $s = $startCchr;
+            $c = $c[$i = 0];
+            do {
+                $s .= $map[$c[$i]] ?? \sprintf(&#039;\x%02X&#039;, \ord($c[$i]));
+            } while (isset($c[++$i]));
+
+            return $s.$endCchr;
+        }, $value, -1, $cchrCount);
+
+        if (!($attr[&#039;binary&#039;] ?? false)) {
+            $value = preg_replace_callback(static::$unicodeCharsRx, function ($c) use (&amp;$cchrCount, $startCchr, $endCchr) {
+                ++$cchrCount;
+
+                return $startCchr.&#039;\u{&#039;.strtoupper(dechex(mb_ord($c[0]))).&#039;}&#039;.$endCchr;
+            }, $value);
+        }
+
+        if ($this-&gt;colors &amp;&amp; &#039;&#039; !== $value) {
+            if ($cchrCount &amp;&amp; &quot;\033&quot; === $value[0]) {
+                $value = substr($value, \strlen($startCchr));
+            } else {
+                $value = &quot;\033[{$this-&gt;styles[$style]}m&quot;.$value;
+            }
+            if ($cchrCount &amp;&amp; str_ends_with($value, $endCchr)) {
+                $value = substr($value, 0, -\strlen($endCchr));
+            } else {
+                $value .= &quot;\033[{$this-&gt;styles[&#039;default&#039;]}m&quot;;
+            }
+        }
+
+        href:
+        if ($this-&gt;colors &amp;&amp; $this-&gt;handlesHrefGracefully) {
+            if (isset($attr[&#039;file&#039;]) &amp;&amp; $href = $this-&gt;getSourceLink($attr[&#039;file&#039;], $attr[&#039;line&#039;] ?? 0)) {
+                if (&#039;note&#039; === $style) {
+                    $value .= &quot;\033]8;;{$href}\033\\^\033]8;;\033\\&quot;;
+                } else {
+                    $attr[&#039;href&#039;] = $href;
+                }
+            }
+            if (isset($attr[&#039;href&#039;])) {
+                if (&#039;label&#039; === $style) {
+                    $value .= &#039;^&#039;;
+                }
+                $value = &quot;\033]8;;{$attr[&#039;href&#039;]}\033\\{$value}\033]8;;\033\\&quot;;
+            }
+        }
+
+        if (&#039;label&#039; === $style &amp;&amp; &#039;&#039; !== $value) {
+            $value .= &#039; &#039;;
+        }
+        if ($this-&gt;colors &amp;&amp; ($attr[&#039;virtual&#039;] ?? false)) {
+            $value = &quot;\033[{$this-&gt;styles[&#039;virtual&#039;]}m&quot;.$value;
+        }
+
+        return $value;
+    }
+
+    protected function supportsColors(): bool
+    {
+        if ($this-&gt;outputStream !== static::$defaultOutput) {
+            return $this-&gt;hasColorSupport($this-&gt;outputStream);
+        }
+        if (isset(static::$defaultColors)) {
+            return static::$defaultColors;
+        }
+        if (isset($_SERVER[&#039;argv&#039;][1])) {
+            $colors = $_SERVER[&#039;argv&#039;];
+            $i = \count($colors);
+            while (--$i &gt; 0) {
+                if (isset($colors[$i][5])) {
+                    switch ($colors[$i]) {
+                        case &#039;--ansi&#039;:
+                        case &#039;--color&#039;:
+                        case &#039;--color=yes&#039;:
+                        case &#039;--color=force&#039;:
+                        case &#039;--color=always&#039;:
+                        case &#039;--colors=always&#039;:
+                            return static::$defaultColors = true;
+
+                        case &#039;--no-ansi&#039;:
+                        case &#039;--color=no&#039;:
+                        case &#039;--color=none&#039;:
+                        case &#039;--color=never&#039;:
+                        case &#039;--colors=never&#039;:
+                            return static::$defaultColors = false;
+                    }
+                }
+            }
+        }
+
+        $h = stream_get_meta_data($this-&gt;outputStream) + [&#039;wrapper_type&#039; =&gt; null];
+        $h = &#039;Output&#039; === $h[&#039;stream_type&#039;] &amp;&amp; &#039;PHP&#039; === $h[&#039;wrapper_type&#039;] ? fopen(&#039;php://stdout&#039;, &#039;w&#039;) : $this-&gt;outputStream;
+
+        return static::$defaultColors = $this-&gt;hasColorSupport($h);
+    }
+
+    protected function dumpLine(int $depth, bool $endOfValue = false): void
+    {
+        if ($this-&gt;colors ??= $this-&gt;supportsColors()) {
+            $this-&gt;line = \sprintf(&quot;\033[%sm%s\033[m&quot;, $this-&gt;styles[&#039;default&#039;], $this-&gt;line);
+        }
+        parent::dumpLine($depth);
+    }
+
+    protected function endValue(Cursor $cursor): void
+    {
+        if (-1 === $cursor-&gt;hashType) {
+            return;
+        }
+
+        if (Stub::ARRAY_INDEXED === $cursor-&gt;hashType || Stub::ARRAY_ASSOC === $cursor-&gt;hashType) {
+            if (self::DUMP_TRAILING_COMMA &amp; $this-&gt;flags &amp;&amp; 0 &lt; $cursor-&gt;depth) {
+                $this-&gt;line .= &#039;,&#039;;
+            } elseif (self::DUMP_COMMA_SEPARATOR &amp; $this-&gt;flags &amp;&amp; 1 &lt; $cursor-&gt;hashLength - $cursor-&gt;hashIndex) {
+                $this-&gt;line .= &#039;,&#039;;
+            }
+        }
+
+        $this-&gt;dumpLine($cursor-&gt;depth, true);
+    }
+
+    /**
+     * Returns true if the stream supports colorization.
+     *
+     * Reference: Composer\XdebugHandler\Process::supportsColor
+     * https://github.com/composer/xdebug-handler
+     */
+    private function hasColorSupport(mixed $stream): bool
+    {
+        if (!\is_resource($stream) || &#039;stream&#039; !== get_resource_type($stream)) {
+            return false;
+        }
+
+        // Follow https://no-color.org/
+        if (&#039;&#039; !== (($_SERVER[&#039;NO_COLOR&#039;] ?? getenv(&#039;NO_COLOR&#039;))[0] ?? &#039;&#039;)) {
+            return false;
+        }
+
+        // Follow https://force-color.org/
+        if (&#039;&#039; !== (($_SERVER[&#039;FORCE_COLOR&#039;] ?? getenv(&#039;FORCE_COLOR&#039;))[0] ?? &#039;&#039;)) {
+            return true;
+        }
+
+        // Detect msysgit/mingw and assume this is a tty because detection
+        // does not work correctly, see https://github.com/composer/composer/issues/9690
+        if (!@stream_isatty($stream) &amp;&amp; !\in_array(strtoupper((string) getenv(&#039;MSYSTEM&#039;)), [&#039;MINGW32&#039;, &#039;MINGW64&#039;], true)) {
+            return false;
+        }
+
+        if (&#039;\\&#039; === \DIRECTORY_SEPARATOR &amp;&amp; @sapi_windows_vt100_support($stream)) {
+            return true;
+        }
+
+        if (&#039;Hyper&#039; === getenv(&#039;TERM_PROGRAM&#039;)
+            || false !== getenv(&#039;COLORTERM&#039;)
+            || false !== getenv(&#039;ANSICON&#039;)
+            || &#039;ON&#039; === getenv(&#039;ConEmuANSI&#039;)
+        ) {
+            return true;
+        }
+
+        if (&#039;dumb&#039; === $term = (string) getenv(&#039;TERM&#039;)) {
+            return false;
+        }
+
+        // See https://github.com/chalk/supports-color/blob/d4f413efaf8da045c5ab440ed418ef02dbb28bf1/index.js#L157
+        return preg_match(&#039;/^((screen|xterm|vt100|vt220|putty|rxvt|ansi|cygwin|linux).*)|(.*-256(color)?(-bce)?)$/&#039;, $term);
+    }
+
+    /**
+     * Returns true if the Windows terminal supports true color.
+     *
+     * Note that this does not check an output stream, but relies on environment
+     * variables from known implementations, or a PHP and Windows version that
+     * supports true color.
+     */
+    private function isWindowsTrueColor(): bool
+    {
+        $result = 183 &lt;= getenv(&#039;ANSICON_VER&#039;)
+            || &#039;ON&#039; === getenv(&#039;ConEmuANSI&#039;)
+            || &#039;xterm&#039; === getenv(&#039;TERM&#039;)
+            || &#039;Hyper&#039; === getenv(&#039;TERM_PROGRAM&#039;);
+
+        if (!$result) {
+            $version = \sprintf(
+                &#039;%s.%s.%s&#039;,
+                PHP_WINDOWS_VERSION_MAJOR,
+                PHP_WINDOWS_VERSION_MINOR,
+                PHP_WINDOWS_VERSION_BUILD
+            );
+            $result = $version &gt;= &#039;10.0.15063&#039;;
+        }
+
+        return $result;
+    }
+
+    private function getSourceLink(string $file, int $line): string|false
+    {
+        if ($fmt = $this-&gt;displayOptions[&#039;fileLinkFormat&#039;]) {
+            return \is_string($fmt) ? strtr($fmt, [&#039;%f&#039; =&gt; $file, &#039;%l&#039; =&gt; $line]) : ($fmt-&gt;format($file, $line) ?: &#039;file://&#039;.$file.&#039;#L&#039;.$line);
+        }
+
+        return false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/var-dumper/Dumper/ContextProvider/CliContextProvider.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/var-dumper/Dumper/ContextProvider -->
+
+</body>
+</html>

@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Filesystem/FilesystemManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Filesystem;
+
+use Aws\S3\S3Client;
+use Closure;
+use Illuminate\Contracts\Filesystem\Factory as FactoryContract;
+use Illuminate\Support\Arr;
+use InvalidArgumentException;
+use League\Flysystem\AwsS3V3\AwsS3V3Adapter as S3Adapter;
+use League\Flysystem\AwsS3V3\PortableVisibilityConverter as AwsS3PortableVisibilityConverter;
+use League\Flysystem\Filesystem as Flysystem;
+use League\Flysystem\FilesystemAdapter as FlysystemAdapter;
+use League\Flysystem\Ftp\FtpAdapter;
+use League\Flysystem\Ftp\FtpConnectionOptions;
+use League\Flysystem\Local\LocalFilesystemAdapter as LocalAdapter;
+use League\Flysystem\PathPrefixing\PathPrefixedAdapter;
+use League\Flysystem\PhpseclibV3\SftpAdapter;
+use League\Flysystem\PhpseclibV3\SftpConnectionProvider;
+use League\Flysystem\ReadOnly\ReadOnlyFilesystemAdapter;
+use League\Flysystem\UnixVisibility\PortableVisibilityConverter;
+use League\Flysystem\Visibility;
+
+use function Illuminate\Support\enum_value;
+
+/**
+ * @mixin \Illuminate\Contracts\Filesystem\Filesystem
+ * @mixin \Illuminate\Filesystem\FilesystemAdapter
+ */
+class FilesystemManager implements FactoryContract
+{
+    /**
+     * The application instance.
+     *
+     * @var \Illuminate\Contracts\Foundation\Application
+     */
+    protected $app;
+
+    /**
+     * The array of resolved filesystem drivers.
+     *
+     * @var array
+     */
+    protected $disks = [];
+
+    /**
+     * The registered custom driver creators.
+     *
+     * @var array
+     */
+    protected $customCreators = [];
+
+    /**
+     * Create a new filesystem manager instance.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     */
+    public function __construct($app)
+    {
+        $this-&gt;app = $app;
+    }
+
+    /**
+     * Get a filesystem instance.
+     *
+     * @param  string|null  $name
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    public function drive($name = null)
+    {
+        return $this-&gt;disk($name);
+    }
+
+    /**
+     * Get a filesystem instance.
+     *
+     * @param  \UnitEnum|string|null  $name
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    public function disk($name = null)
+    {
+        $name = enum_value($name) ?: $this-&gt;getDefaultDriver();
+
+        return $this-&gt;disks[$name] = $this-&gt;get($name);
+    }
+
+    /**
+     * Get a default cloud filesystem instance.
+     *
+     * @return \Illuminate\Contracts\Filesystem\Cloud
+     */
+    public function cloud()
+    {
+        $name = $this-&gt;getDefaultCloudDriver();
+
+        return $this-&gt;disks[$name] = $this-&gt;get($name);
+    }
+
+    /**
+     * Build an on-demand disk.
+     *
+     * @param  string|array  $config
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    public function build($config)
+    {
+        return $this-&gt;resolve(&#039;ondemand&#039;, is_array($config) ? $config : [
+            &#039;driver&#039; =&gt; &#039;local&#039;,
+            &#039;root&#039; =&gt; $config,
+        ]);
+    }
+
+    /**
+     * Attempt to get the disk from the local cache.
+     *
+     * @param  string  $name
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    protected function get($name)
+    {
+        return $this-&gt;disks[$name] ?? $this-&gt;resolve($name);
+    }
+
+    /**
+     * Resolve the given disk.
+     *
+     * @param  string  $name
+     * @param  array|null  $config
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function resolve($name, $config = null)
+    {
+        $config ??= $this-&gt;getConfig($name);
+
+        if (empty($config[&#039;driver&#039;])) {
+            throw new InvalidArgumentException(&quot;Disk [{$name}] does not have a configured driver.&quot;);
+        }
+
+        $driver = $config[&#039;driver&#039;];
+
+        if (isset($this-&gt;customCreators[$driver])) {
+            return $this-&gt;callCustomCreator($config);
+        }
+
+        $driverMethod = &#039;create&#039;.ucfirst($driver).&#039;Driver&#039;;
+
+        if (! method_exists($this, $driverMethod)) {
+            throw new InvalidArgumentException(&quot;Driver [{$driver}] is not supported.&quot;);
+        }
+
+        return $this-&gt;{$driverMethod}($config, $name);
+    }
+
+    /**
+     * Call a custom driver creator.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    protected function callCustomCreator(array $config)
+    {
+        return $this-&gt;customCreators[$config[&#039;driver&#039;]]($this-&gt;app, $config);
+    }
+
+    /**
+     * Create an instance of the local driver.
+     *
+     * @param  array  $config
+     * @param  string  $name
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    public function createLocalDriver(array $config, string $name = &#039;local&#039;)
+    {
+        $visibility = PortableVisibilityConverter::fromArray(
+            $config[&#039;permissions&#039;] ?? [],
+            $config[&#039;directory_visibility&#039;] ?? $config[&#039;visibility&#039;] ?? Visibility::PRIVATE
+        );
+
+        $links = ($config[&#039;links&#039;] ?? null) === &#039;skip&#039;
+            ? LocalAdapter::SKIP_LINKS
+            : LocalAdapter::DISALLOW_LINKS;
+
+        $adapter = new LocalAdapter(
+            $config[&#039;root&#039;], $visibility, $config[&#039;lock&#039;] ?? LOCK_EX, $links
+        );
+
+        return (new LocalFilesystemAdapter(
+            $this-&gt;createFlysystem($adapter, $config), $adapter, $config
+        ))-&gt;diskName(
+            $name
+        )-&gt;shouldServeSignedUrls(
+            $config[&#039;serve&#039;] ?? false,
+            fn () =&gt; $this-&gt;app[&#039;url&#039;],
+        );
+    }
+
+    /**
+     * Create an instance of the ftp driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    public function createFtpDriver(array $config)
+    {
+        if (! isset($config[&#039;root&#039;])) {
+            $config[&#039;root&#039;] = &#039;&#039;;
+        }
+
+        $adapter = new FtpAdapter(FtpConnectionOptions::fromArray($config));
+
+        return new FilesystemAdapter($this-&gt;createFlysystem($adapter, $config), $adapter, $config);
+    }
+
+    /**
+     * Create an instance of the sftp driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    public function createSftpDriver(array $config)
+    {
+        $provider = SftpConnectionProvider::fromArray($config);
+
+        $root = $config[&#039;root&#039;] ?? &#039;&#039;;
+
+        $visibility = PortableVisibilityConverter::fromArray(
+            $config[&#039;permissions&#039;] ?? []
+        );
+
+        $adapter = new SftpAdapter($provider, $root, $visibility);
+
+        return new FilesystemAdapter($this-&gt;createFlysystem($adapter, $config), $adapter, $config);
+    }
+
+    /**
+     * Create an instance of the Amazon S3 driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Filesystem\Cloud
+     */
+    public function createS3Driver(array $config)
+    {
+        $s3Config = $this-&gt;formatS3Config($config);
+
+        $root = (string) ($s3Config[&#039;root&#039;] ?? &#039;&#039;);
+
+        $visibility = new AwsS3PortableVisibilityConverter(
+            $config[&#039;visibility&#039;] ?? Visibility::PUBLIC
+        );
+
+        $streamReads = $s3Config[&#039;stream_reads&#039;] ?? false;
+
+        $client = new S3Client($s3Config);
+
+        $adapter = new S3Adapter($client, $s3Config[&#039;bucket&#039;], $root, $visibility, null, $config[&#039;options&#039;] ?? [], $streamReads);
+
+        return new AwsS3V3Adapter(
+            $this-&gt;createFlysystem($adapter, $config), $adapter, $s3Config, $client
+        );
+    }
+
+    /**
+     * Format the given S3 configuration with the default options.
+     *
+     * @param  array  $config
+     * @return array
+     */
+    protected function formatS3Config(array $config)
+    {
+        $config += [&#039;version&#039; =&gt; &#039;latest&#039;];
+
+        if (! empty($config[&#039;key&#039;]) &amp;&amp; ! empty($config[&#039;secret&#039;])) {
+            $config[&#039;credentials&#039;] = Arr::only($config, [&#039;key&#039;, &#039;secret&#039;]);
+
+            if (! empty($config[&#039;token&#039;])) {
+                $config[&#039;credentials&#039;][&#039;token&#039;] = $config[&#039;token&#039;];
+            }
+        }
+
+        return Arr::except($config, [&#039;token&#039;]);
+    }
+
+    /**
+     * Create a scoped driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Filesystem\Filesystem
+     */
+    public function createScopedDriver(array $config)
+    {
+        if (empty($config[&#039;disk&#039;])) {
+            throw new InvalidArgumentException(&#039;Scoped disk is missing &quot;disk&quot; configuration option.&#039;);
+        } elseif (empty($config[&#039;prefix&#039;])) {
+            throw new InvalidArgumentException(&#039;Scoped disk is missing &quot;prefix&quot; configuration option.&#039;);
+        }
+
+        return $this-&gt;build(tap(
+            is_string($config[&#039;disk&#039;]) ? $this-&gt;getConfig($config[&#039;disk&#039;]) : $config[&#039;disk&#039;],
+            function (&amp;$parent) use ($config) {
+                if (empty($parent[&#039;prefix&#039;])) {
+                    $parent[&#039;prefix&#039;] = $config[&#039;prefix&#039;];
+                } else {
+                    $separator = $parent[&#039;directory_separator&#039;] ?? DIRECTORY_SEPARATOR;
+
+                    $parentPrefix = rtrim($parent[&#039;prefix&#039;], $separator);
+                    $scopedPrefix = ltrim($config[&#039;prefix&#039;], $separator);
+
+                    $parent[&#039;prefix&#039;] = &quot;{$parentPrefix}{$separator}{$scopedPrefix}&quot;;
+                }
+
+                if (isset($config[&#039;visibility&#039;])) {
+                    $parent[&#039;visibility&#039;] = $config[&#039;visibility&#039;];
+                }
+
+                if (isset($config[&#039;throw&#039;])) {
+                    $parent[&#039;throw&#039;] = $config[&#039;throw&#039;];
+                }
+            }
+        ));
+    }
+
+    /**
+     * Create a Flysystem instance with the given adapter.
+     *
+     * @param  \League\Flysystem\FilesystemAdapter  $adapter
+     * @param  array  $config
+     * @return \League\Flysystem\FilesystemOperator
+     */
+    protected function createFlysystem(FlysystemAdapter $adapter, array $config)
+    {
+        if ($config[&#039;read-only&#039;] ?? false) {
+            $adapter = new ReadOnlyFilesystemAdapter($adapter);
+        }
+
+        if (! empty($config[&#039;prefix&#039;])) {
+            $adapter = new PathPrefixedAdapter($adapter, $config[&#039;prefix&#039;]);
+        }
+
+        if (str_contains($config[&#039;endpoint&#039;] ?? &#039;&#039;, &#039;r2.cloudflarestorage.com&#039;)) {
+            $config[&#039;retain_visibility&#039;] = false;
+        }
+
+        return new Flysystem($adapter, Arr::only($config, [
+            &#039;directory_visibility&#039;,
+            &#039;disable_asserts&#039;,
+            &#039;retain_visibility&#039;,
+            &#039;temporary_url&#039;,
+            &#039;url&#039;,
+            &#039;visibility&#039;,
+        ]));
+    }
+
+    /**
+     * Set the given disk instance.
+     *
+     * @param  string  $name
+     * @param  mixed  $disk
+     * @return $this
+     */
+    public function set($name, $disk)
+    {
+        $this-&gt;disks[$name] = $disk;
+
+        return $this;
+    }
+
+    /**
+     * Get the filesystem connection configuration.
+     *
+     * @param  string  $name
+     * @return array
+     */
+    protected function getConfig($name)
+    {
+        return $this-&gt;app[&#039;config&#039;][&quot;filesystems.disks.{$name}&quot;] ?: [];
+    }
+
+    /**
+     * Get the default driver name.
+     *
+     * @return string
+     */
+    public function getDefaultDriver()
+    {
+        return $this-&gt;app[&#039;config&#039;][&#039;filesystems.default&#039;];
+    }
+
+    /**
+     * Get the default cloud driver name.
+     *
+     * @return string
+     */
+    public function getDefaultCloudDriver()
+    {
+        return $this-&gt;app[&#039;config&#039;][&#039;filesystems.cloud&#039;] ?? &#039;s3&#039;;
+    }
+
+    /**
+     * Unset the given disk instances.
+     *
+     * @param  array|string  $disk
+     * @return $this
+     */
+    public function forgetDisk($disk)
+    {
+        foreach ((array) $disk as $diskName) {
+            unset($this-&gt;disks[$diskName]);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Disconnect the given disk and remove from local cache.
+     *
+     * @param  string|null  $name
+     * @return void
+     */
+    public function purge($name = null)
+    {
+        $name ??= $this-&gt;getDefaultDriver();
+
+        unset($this-&gt;disks[$name]);
+    }
+
+    /**
+     * Register a custom driver creator Closure.
+     *
+     * @param  string  $driver
+     * @param  \Closure  $callback
+     * @return $this
+     */
+    public function extend($driver, Closure $callback)
+    {
+        $this-&gt;customCreators[$driver] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Set the application instance used by the manager.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     * @return $this
+     */
+    public function setApplication($app)
+    {
+        $this-&gt;app = $app;
+
+        return $this;
+    }
+
+    /**
+     * Dynamically call the default driver instance.
+     *
+     * @param  string  $method
+     * @param  array  $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        return $this-&gt;disk()-&gt;$method(...$parameters);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Filesystem/FilesystemServiceProvider.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Foundation -->
+
+</body>
+</html>

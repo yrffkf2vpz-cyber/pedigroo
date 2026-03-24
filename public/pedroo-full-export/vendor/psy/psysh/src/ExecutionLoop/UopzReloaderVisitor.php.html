@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/psy/psysh/src/ExecutionLoop/UopzReloaderVisitor.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\ExecutionLoop;
+
+use PhpParser\Node;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Stmt;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\PrettyPrinter;
+use ReflectionClass;
+
+/**
+ * AST visitor that reloads code definitions using uopz.
+ *
+ * Traverses the parsed AST and uses uopz to reload:
+ * - Class methods (via uopz_set_return with closure)
+ * - Functions (via uopz_set_return)
+ * - Class and global constants (via uopz_redefine)
+ *
+ * Safety checks:
+ * - Conditional code (functions/constants inside if blocks) is skipped by default
+ *   because reloading may not match runtime conditions
+ * - Static variables in functions/methods trigger a warning (state will reset)
+ * - Structural changes (new properties, inheritance) cannot be applied
+ *
+ * When force-reload is enabled (via `yolo` command), safety checks are bypassed
+ * and the code is reloaded anyway.
+ */
+class UopzReloaderVisitor extends NodeVisitorAbstract
+{
+    private PrettyPrinter\Standard $printer;
+
+    /** @var bool Whether to bypass safety warnings */
+    private bool $forceReload;
+
+    private string $namespace = &#039;&#039;;
+    private ?string $currentClass = null;
+    private ?string $currentFunction = null;
+
+    /** @var string[] Warning messages generated during traversal */
+    private array $warnings = [];
+
+    /** @var bool Whether any elements were skipped (not force-reloaded) */
+    private bool $hasSkips = false;
+
+    /** @var int Nesting depth inside conditional/control structures */
+    private int $conditionalDepth = 0;
+
+    /**
+     * @param bool $forceReload Whether to bypass safety warnings
+     */
+    public function __construct(PrettyPrinter\Standard $printer, bool $forceReload = false)
+    {
+        $this-&gt;printer = $printer;
+        $this-&gt;forceReload = $forceReload;
+    }
+
+    /**
+     * Check if any warnings were generated during reloading.
+     */
+    public function hasWarnings(): bool
+    {
+        return \count($this-&gt;warnings) &gt; 0;
+    }
+
+    /**
+     * Get all warnings generated during reloading.
+     *
+     * @return string[]
+     */
+    public function getWarnings(): array
+    {
+        return $this-&gt;warnings;
+    }
+
+    /**
+     * Check if any elements were skipped during reloading.
+     */
+    public function hasSkips(): bool
+    {
+        return $this-&gt;hasSkips;
+    }
+
+    /**
+     * Add a warning message.
+     */
+    private function addWarning(string $message): void
+    {
+        $this-&gt;warnings[] = $message;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function enterNode(Node $node)
+    {
+        // Track namespace
+        if ($node instanceof Stmt\Namespace_) {
+            $this-&gt;namespace = $node-&gt;name ? $node-&gt;name-&gt;toString() : &#039;&#039;;
+        }
+
+        // Track current class and check for limitations
+        if ($node instanceof Stmt\Class_ || $node instanceof Stmt\Interface_ || $node instanceof Stmt\Trait_) {
+            $name = $node-&gt;name ? $node-&gt;name-&gt;toString() : null;
+            $this-&gt;currentClass = $name ? $this-&gt;getFullyQualifiedName($name) : null;
+
+            if ($this-&gt;currentClass) {
+                $this-&gt;checkClassLimitations($this-&gt;currentClass, $node);
+            }
+        }
+
+        // Track when we enter conditional/control structures at global scope
+        if ($this-&gt;currentClass === null &amp;&amp; $this-&gt;currentFunction === null &amp;&amp; $this-&gt;isControlStructure($node)) {
+            $this-&gt;conditionalDepth++;
+        }
+
+        // Detect side effects at global/namespace scope (but not if we&#039;re already tracking it as conditional)
+        if ($this-&gt;currentClass === null &amp;&amp; $this-&gt;currentFunction === null &amp;&amp; $this-&gt;conditionalDepth === 0) {
+            $this-&gt;checkForSideEffects($node);
+        }
+
+        // Reload class methods
+        if ($node instanceof Stmt\ClassMethod &amp;&amp; $this-&gt;currentClass) {
+            $this-&gt;reloadMethod($this-&gt;currentClass, $node);
+        }
+
+        // Reload functions (skip if inside conditional, unless force mode)
+        if ($node instanceof Stmt\Function_) {
+            // Track that we&#039;re entering a function
+            $this-&gt;currentFunction = $node-&gt;name-&gt;toString();
+
+            if ($this-&gt;conditionalDepth &gt; 0 &amp;&amp; $this-&gt;currentClass === null) {
+                $funcName = $node-&gt;name-&gt;toString();
+                $snippet = \sprintf(&#039;if (...) { function %s() ... }&#039;, $funcName);
+
+                if ($this-&gt;forceReload) {
+                    $this-&gt;addWarning(\sprintf(&#039;YOLO: Force-reloaded %s&#039;, $snippet));
+                    $this-&gt;reloadFunction($node);
+                } else {
+                    $this-&gt;addWarning(\sprintf(&#039;Skipped conditional: %s (use `yolo` to force)&#039;, $snippet));
+                    $this-&gt;hasSkips = true;
+                }
+            } else {
+                $this-&gt;reloadFunction($node);
+            }
+        }
+
+        // Reload constants
+        if ($node instanceof Stmt\ClassConst &amp;&amp; $this-&gt;currentClass) {
+            $this-&gt;reloadClassConstants($this-&gt;currentClass, $node);
+        }
+
+        if ($node instanceof Stmt\Const_) {
+            if ($this-&gt;conditionalDepth &gt; 0 &amp;&amp; $this-&gt;currentClass === null) {
+                $constNode = $node-&gt;consts[0] ?? null;
+                $constName = $constNode ? $constNode-&gt;name-&gt;toString() : &#039;CONST&#039;;
+                $snippet = \sprintf(&#039;if (...) { const %s = ...; }&#039;, $constName);
+
+                if ($this-&gt;forceReload) {
+                    $this-&gt;addWarning(\sprintf(&#039;YOLO: Force-reloaded %s&#039;, $snippet));
+                    $this-&gt;reloadGlobalConstants($node);
+                } else {
+                    $this-&gt;addWarning(\sprintf(&#039;Skipped conditional: %s (use `yolo` to force)&#039;, $snippet));
+                    $this-&gt;hasSkips = true;
+                }
+            } else {
+                $this-&gt;reloadGlobalConstants($node);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function leaveNode(Node $node)
+    {
+        // Clear current class when leaving class/interface/trait
+        if ($node instanceof Stmt\Class_ || $node instanceof Stmt\Interface_ || $node instanceof Stmt\Trait_) {
+            $this-&gt;currentClass = null;
+        }
+
+        // Clear current function when leaving function
+        if ($node instanceof Stmt\Function_) {
+            $this-&gt;currentFunction = null;
+        }
+
+        // Track when we leave conditional/control structures at global scope
+        if ($this-&gt;currentClass === null &amp;&amp; $this-&gt;currentFunction === null &amp;&amp; $this-&gt;isControlStructure($node)) {
+            $this-&gt;conditionalDepth--;
+        }
+
+        return null;
+    }
+
+    /**
+     * Reload a class method using uopz_set_return.
+     */
+    private function reloadMethod(string $className, Stmt\ClassMethod $method): void
+    {
+        $methodName = $method-&gt;name-&gt;toString();
+
+        // Skip abstract methods
+        if ($method-&gt;isAbstract()) {
+            return;
+        }
+
+        // Check for static variables in method body
+        if ($this-&gt;hasStaticVariables($method-&gt;stmts)) {
+            $snippet = \sprintf(&#039;%s::%s() { static $var = ...; }&#039;, $className, $methodName);
+            $this-&gt;addWarning(\sprintf(&#039;Static vars will reset: %s&#039;, $snippet));
+        }
+
+        $closure = $this-&gt;createClosure($method-&gt;params, $method-&gt;stmts, $method-&gt;returnType);
+        if ($closure !== null) {
+            try {
+                \uopz_set_return($className, $methodName, $closure, true);
+            } catch (\Throwable $e) {
+                $this-&gt;addWarning(\sprintf(&#039;Failed to reload %s::%s(): %s&#039;, $className, $methodName, $e-&gt;getMessage()));
+            }
+        }
+    }
+
+    /**
+     * Reload a function using uopz_set_return.
+     */
+    private function reloadFunction(Stmt\Function_ $function): void
+    {
+        $functionName = $this-&gt;getFullyQualifiedName($function-&gt;name-&gt;toString());
+
+        // New function; just define it via eval
+        if (!\function_exists($functionName)) {
+            try {
+                $code = &#039;&#039;;
+                if ($this-&gt;namespace !== &#039;&#039;) {
+                    $code .= &#039;namespace &#039;.$this-&gt;namespace.&#039;; &#039;;
+                }
+                $code .= $this-&gt;printer-&gt;prettyPrint([$function]);
+                eval($code);
+            } catch (\Throwable $e) {
+                $this-&gt;addWarning(\sprintf(&#039;Failed to add %s(): %s&#039;, $functionName, $e-&gt;getMessage()));
+            }
+
+            return;
+        }
+
+        // Existing function; check for static variables (state will reset on reload)
+        if ($this-&gt;hasStaticVariables($function-&gt;stmts)) {
+            $snippet = \sprintf(&#039;%s() { static $var = ...; }&#039;, $functionName);
+            $this-&gt;addWarning(\sprintf(&#039;Static vars will reset: %s&#039;, $snippet));
+        }
+
+        // Use uopz to override existing function
+        $closure = $this-&gt;createClosure($function-&gt;params, $function-&gt;stmts, $function-&gt;returnType);
+        if ($closure !== null) {
+            try {
+                \uopz_set_return($functionName, $closure, true);
+            } catch (\Throwable $e) {
+                $this-&gt;addWarning(\sprintf(&#039;Failed to reload %s(): %s&#039;, $functionName, $e-&gt;getMessage()));
+            }
+        }
+    }
+
+    /**
+     * Create a closure from parameters and statements.
+     *
+     * @param Node\Param[] $params
+     * @param Stmt[]|null  $stmts
+     * @param Node|null    $returnType
+     *
+     * @return \Closure|null
+     */
+    private function createClosure(array $params, ?array $stmts, ?Node $returnType = null): ?\Closure
+    {
+        $paramStrs = [];
+        foreach ($params as $param) {
+            $paramStr = &#039;&#039;;
+
+            if ($param-&gt;type) {
+                $paramStr .= $this-&gt;printer-&gt;prettyPrint([$param-&gt;type]).&#039; &#039;;
+            }
+
+            if ($param-&gt;variadic) {
+                $paramStr .= &#039;...&#039;;
+            }
+
+            if ($param-&gt;byRef) {
+                $paramStr .= &#039;&amp;&#039;;
+            }
+
+            $paramStr .= &#039;$&#039;.$param-&gt;var-&gt;name;
+
+            if ($param-&gt;default) {
+                $paramStr .= &#039; = &#039;.$this-&gt;printer-&gt;prettyPrintExpr($param-&gt;default);
+            }
+
+            $paramStrs[] = $paramStr;
+        }
+
+        $paramList = \implode(&#039;, &#039;, $paramStrs);
+
+        $returnTypeStr = &#039;&#039;;
+        if ($returnType !== null) {
+            $returnTypeStr = &#039;: &#039;.$this-&gt;printer-&gt;prettyPrint([$returnType]);
+        }
+
+        $body = &#039;&#039;;
+        if ($stmts) {
+            $bodyStmts = [];
+            foreach ($stmts as $stmt) {
+                $bodyStmts[] = $this-&gt;printer-&gt;prettyPrint([$stmt]);
+            }
+            $body = \implode(&quot;\n&quot;, $bodyStmts);
+        }
+
+        $closureCode = \sprintf(&quot;return function(%s)%s {\n%s\n};&quot;, $paramList, $returnTypeStr, $body);
+
+        try {
+            return eval($closureCode);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Reload class constants using uopz_redefine.
+     */
+    private function reloadClassConstants(string $className, Stmt\ClassConst $const): void
+    {
+        foreach ($const-&gt;consts as $constNode) {
+            $constName = $constNode-&gt;name-&gt;toString();
+            $value = $this-&gt;evaluateConstValue($constNode-&gt;value);
+
+            try {
+                \uopz_redefine($className, $constName, $value);
+            } catch (\Throwable $e) {
+                $this-&gt;addWarning(\sprintf(&#039;Failed to reload %s::%s: %s&#039;, $className, $constName, $e-&gt;getMessage()));
+            }
+        }
+    }
+
+    /**
+     * Reload global constants using uopz_redefine.
+     */
+    private function reloadGlobalConstants(Stmt\Const_ $const): void
+    {
+        foreach ($const-&gt;consts as $constNode) {
+            $constName = $this-&gt;getFullyQualifiedName($constNode-&gt;name-&gt;toString());
+            $value = $this-&gt;evaluateConstValue($constNode-&gt;value);
+
+            try {
+                \uopz_redefine($constName, $value);
+            } catch (\Throwable $e) {
+                $this-&gt;addWarning(\sprintf(&#039;Failed to reload %s: %s&#039;, $constName, $e-&gt;getMessage()));
+            }
+        }
+    }
+
+    /**
+     * Evaluate a constant value from AST node.
+     *
+     * @return mixed
+     */
+    private function evaluateConstValue(Expr $expr)
+    {
+        // For simple scalar values, we can evaluate directly
+        try {
+            $code = &#039;&lt;?php return &#039;.$this-&gt;printer-&gt;prettyPrintExpr($expr).&#039;;&#039;;
+
+            return eval(\substr($code, 6));
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Get a fully-qualified name (class, function, constant, etc).
+     */
+    private function getFullyQualifiedName(string $name): string
+    {
+        if ($this-&gt;namespace &amp;&amp; \strpos($name, &#039;\\&#039;) !== 0) {
+            return $this-&gt;namespace.&#039;\\&#039;.$name;
+        }
+
+        return $name;
+    }
+
+    /**
+     * Check if a node is a control structure.
+     */
+    private function isControlStructure(Node $node): bool
+    {
+        return $node instanceof Stmt\If_ ||
+               $node instanceof Stmt\Switch_ ||
+               $node instanceof Stmt\For_ ||
+               $node instanceof Stmt\Foreach_ ||
+               $node instanceof Stmt\While_ ||
+               $node instanceof Stmt\Do_ ||
+               $node instanceof Stmt\TryCatch;
+    }
+
+    /**
+     * Check if statements contain static variable declarations.
+     *
+     * @param Stmt[]|null $stmts
+     */
+    private function hasStaticVariables(?array $stmts): bool
+    {
+        if ($stmts === null) {
+            return false;
+        }
+
+        foreach ($stmts as $stmt) {
+            // Direct static declaration
+            if ($stmt instanceof Stmt\Static_) {
+                return true;
+            }
+
+            // Recursively check nested structures (if/for/while/etc)
+            if ($stmt instanceof Stmt\If_) {
+                if ($this-&gt;hasStaticVariables($stmt-&gt;stmts)) {
+                    return true;
+                }
+                foreach ($stmt-&gt;elseifs as $elseif) {
+                    if ($this-&gt;hasStaticVariables($elseif-&gt;stmts)) {
+                        return true;
+                    }
+                }
+                if ($stmt-&gt;else &amp;&amp; $this-&gt;hasStaticVariables($stmt-&gt;else-&gt;stmts)) {
+                    return true;
+                }
+            }
+
+            if ($stmt instanceof Stmt\For_ ||
+                $stmt instanceof Stmt\Foreach_ ||
+                $stmt instanceof Stmt\While_ ||
+                $stmt instanceof Stmt\Do_) {
+                if ($this-&gt;hasStaticVariables($stmt-&gt;stmts)) {
+                    return true;
+                }
+            }
+
+            if ($stmt instanceof Stmt\Switch_) {
+                foreach ($stmt-&gt;cases as $case) {
+                    if ($this-&gt;hasStaticVariables($case-&gt;stmts)) {
+                        return true;
+                    }
+                }
+            }
+
+            if ($stmt instanceof Stmt\TryCatch) {
+                if ($this-&gt;hasStaticVariables($stmt-&gt;stmts)) {
+                    return true;
+                }
+                foreach ($stmt-&gt;catches as $catch) {
+                    if ($this-&gt;hasStaticVariables($catch-&gt;stmts)) {
+                        return true;
+                    }
+                }
+                if ($stmt-&gt;finally &amp;&amp; $this-&gt;hasStaticVariables($stmt-&gt;finally-&gt;stmts)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check for side effects that won&#039;t be re-executed on reload.
+     *
+     * Detects top-level code that has side effects (function calls, variable
+     * assignments, etc.) which will not be re-run when the file is reloaded.
+     */
+    private function checkForSideEffects(Node $node): void
+    {
+        // Skip declarations (these are handled by uopz)
+        if ($node instanceof Stmt\Class_ ||
+            $node instanceof Stmt\Interface_ ||
+            $node instanceof Stmt\Trait_ ||
+            $node instanceof Stmt\Function_ ||
+            $node instanceof Stmt\Const_ ||
+            $node instanceof Stmt\Namespace_ ||
+            $node instanceof Stmt\Use_) {
+            return;
+        }
+
+        // Only check statements, not expressions (to avoid duplicate warnings)
+        // Expression statements contain the actual expression
+        if ($node instanceof Stmt\Expression) {
+            $expr = $node-&gt;expr;
+            $snippet = $this-&gt;printer-&gt;prettyPrintExpr($expr);
+
+            // Truncate long snippets
+            if (\strlen($snippet) &gt; 50) {
+                $snippet = \substr($snippet, 0, 47).&#039;...&#039;;
+            }
+
+            $this-&gt;addWarning(\sprintf(&#039;Not re-run: %s&#039;, $snippet));
+
+            return;
+        }
+
+        // Echo/print statements
+        if ($node instanceof Stmt\Echo_) {
+            $firstExpr = $node-&gt;exprs[0] ?? null;
+            $snippet = $firstExpr !== null
+                ? &#039;echo &#039;.$this-&gt;printer-&gt;prettyPrintExpr($firstExpr)
+                : &#039;echo ...&#039;;
+            if (\strlen($snippet) &gt; 50) {
+                $snippet = \substr($snippet, 0, 47).&#039;...&#039;;
+            }
+            $this-&gt;addWarning(\sprintf(&#039;Not re-run: %s&#039;, $snippet));
+
+            return;
+        }
+
+        // Global variable declarations
+        if ($node instanceof Stmt\Global_) {
+            $varNames = [];
+            foreach ($node-&gt;vars as $var) {
+                if ($var instanceof Expr\Variable) {
+                    $varNames[] = &#039;$&#039;.$var-&gt;name;
+                }
+            }
+            $snippet = &#039;global &#039;.\implode(&#039;, &#039;, $varNames);
+            $this-&gt;addWarning(\sprintf(&#039;Not re-run: %s&#039;, $snippet));
+
+            return;
+        }
+
+        // Static variable declarations (inside functions are OK, but top-level would be unusual)
+        if ($node instanceof Stmt\Static_) {
+            $varNames = [];
+            foreach ($node-&gt;vars as $var) {
+                $varNames[] = &#039;$&#039;.$var-&gt;var-&gt;name;
+            }
+            $snippet = &#039;static &#039;.\implode(&#039;, &#039;, $varNames);
+            $this-&gt;addWarning(\sprintf(&#039;Not re-run: %s&#039;, $snippet));
+
+            return;
+        }
+
+        // If/switch/for/while/etc control structures at top level
+        if ($this-&gt;isControlStructure($node)) {
+            $type = &#039;if&#039;;
+            if ($node instanceof Stmt\Switch_) {
+                $type = &#039;switch&#039;;
+            } elseif ($node instanceof Stmt\For_) {
+                $type = &#039;for&#039;;
+            } elseif ($node instanceof Stmt\Foreach_) {
+                $type = &#039;foreach&#039;;
+            } elseif ($node instanceof Stmt\While_) {
+                $type = &#039;while&#039;;
+            } elseif ($node instanceof Stmt\Do_) {
+                $type = &#039;do-while&#039;;
+            } elseif ($node instanceof Stmt\TryCatch) {
+                $type = &#039;try-catch&#039;;
+            }
+
+            $this-&gt;addWarning(\sprintf(&#039;Not re-run: %s (...) { ... }&#039;, $type));
+
+            return;
+        }
+    }
+
+    /**
+     * Check for known limitations when reloading a class.
+     */
+    private function checkClassLimitations(string $className, Node $node): void
+    {
+        // Check if class already exists
+        if (!\class_exists($className, false) &amp;&amp; !\interface_exists($className, false) &amp;&amp; !\trait_exists($className, false)) {
+            // New class/interface/trait - uopz cannot add these
+            $type = $node instanceof Stmt\Interface_ ? &#039;interface&#039; : ($node instanceof Stmt\Trait_ ? &#039;trait&#039; : &#039;class&#039;);
+            $this-&gt;addWarning(\sprintf(&#039;Cannot add %s %s&#039;, $type, $className));
+
+            return;
+        }
+
+        // For existing classes, check for structural changes
+        if (!($node instanceof Stmt\Class_)) {
+            return;
+        }
+
+        // Check for new properties (cannot be added)
+        foreach ($node-&gt;stmts as $stmt) {
+            if ($stmt instanceof Stmt\Property) {
+                foreach ($stmt-&gt;props as $prop) {
+                    $propName = $prop-&gt;name-&gt;toString();
+                    if (!\property_exists($className, $propName)) {
+                        $visibility = $stmt-&gt;isPublic() ? &#039;public&#039; : ($stmt-&gt;isProtected() ? &#039;protected&#039; : &#039;private&#039;);
+                        $static = $stmt-&gt;isStatic() ? &#039;static &#039; : &#039;&#039;;
+                        $this-&gt;addWarning(\sprintf(&#039;Cannot add %s$%s&#039;, $static.$visibility.&#039; &#039;, $propName));
+                    }
+                }
+            }
+
+            // Check for new methods (will try to add but may fail silently)
+            if ($stmt instanceof Stmt\ClassMethod) {
+                $methodName = $stmt-&gt;name-&gt;toString();
+                if (!\method_exists($className, $methodName)) {
+                    $this-&gt;addWarning(\sprintf(&#039;Cannot add %s::%s()&#039;, $className, $methodName));
+                }
+            }
+        }
+
+        // Check for inheritance changes
+        if ($node-&gt;extends) {
+            $newParent = $node-&gt;extends-&gt;toString();
+            $reflection = new ReflectionClass($className);
+            $currentParent = $reflection-&gt;getParentClass();
+
+            if ($currentParent &amp;&amp; $currentParent-&gt;getName() !== $this-&gt;getFullyQualifiedName($newParent)) {
+                $this-&gt;addWarning(\sprintf(&#039;Cannot change parent of %s&#039;, $className));
+            }
+        }
+
+        // Check for interface changes
+        if ($node-&gt;implements) {
+            $newInterfaces = \array_map(function ($interface) {
+                return $this-&gt;getFullyQualifiedName($interface-&gt;toString());
+            }, $node-&gt;implements);
+
+            $reflection = new ReflectionClass($className);
+            $currentInterfaces = $reflection-&gt;getInterfaceNames();
+
+            $added = \array_diff($newInterfaces, $currentInterfaces);
+            $removed = \array_diff($currentInterfaces, $newInterfaces);
+
+            if (\count($added) &gt; 0 || \count($removed) &gt; 0) {
+                $this-&gt;addWarning(\sprintf(&#039;Cannot change interfaces of %s&#039;, $className));
+            }
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/psy/psysh/src/ExecutionLoopClosure.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/psy/psysh/src/Formatter -->
+
+</body>
+</html>

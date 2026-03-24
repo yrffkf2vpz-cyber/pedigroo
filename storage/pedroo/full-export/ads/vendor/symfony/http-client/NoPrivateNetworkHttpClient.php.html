@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/NoPrivateNetworkHttpClient.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient;
+
+use Psr\Log\LoggerAwareInterface;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Response\AsyncContext;
+use Symfony\Component\HttpClient\Response\AsyncResponse;
+use Symfony\Component\HttpFoundation\IpUtils;
+use Symfony\Contracts\HttpClient\ChunkInterface;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+use Symfony\Contracts\Service\ResetInterface;
+
+/**
+ * Decorator that blocks requests to private networks by default.
+ *
+ * @author Hallison Boaventura &lt;hallisonboaventura@gmail.com&gt;
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ */
+final class NoPrivateNetworkHttpClient implements HttpClientInterface, LoggerAwareInterface, ResetInterface
+{
+    use AsyncDecoratorTrait;
+    use HttpClientTrait;
+
+    private array $defaultOptions = self::OPTIONS_DEFAULTS;
+    private HttpClientInterface $client;
+    private ?array $subnets;
+    private int $ipFlags;
+    private \ArrayObject $dnsCache;
+
+    /**
+     * @param string|array|null $subnets String or array of subnets using CIDR notation that should be considered private.
+     *                                   If null is passed, the standard private subnets will be used.
+     */
+    public function __construct(HttpClientInterface $client, string|array|null $subnets = null)
+    {
+        if (!class_exists(IpUtils::class)) {
+            throw new \LogicException(\sprintf(&#039;You cannot use &quot;%s&quot; if the HttpFoundation component is not installed. Try running &quot;composer require symfony/http-foundation&quot;.&#039;, __CLASS__));
+        }
+
+        if (null === $subnets) {
+            $ipFlags = \FILTER_FLAG_IPV4 | \FILTER_FLAG_IPV6;
+        } else {
+            $ipFlags = 0;
+            foreach ((array) $subnets as $subnet) {
+                $ipFlags |= str_contains($subnet, &#039;:&#039;) ? \FILTER_FLAG_IPV6 : \FILTER_FLAG_IPV4;
+            }
+        }
+
+        if (!\defined(&#039;STREAM_PF_INET6&#039;)) {
+            $ipFlags &amp;= ~\FILTER_FLAG_IPV6;
+        }
+
+        $this-&gt;client = $client;
+        $this-&gt;subnets = null !== $subnets ? (array) $subnets : null;
+        $this-&gt;ipFlags = $ipFlags;
+        $this-&gt;dnsCache = new \ArrayObject();
+    }
+
+    public function request(string $method, string $url, array $options = []): ResponseInterface
+    {
+        [$url, $options] = self::prepareRequest($method, $url, $options, $this-&gt;defaultOptions, true);
+
+        $redirectHeaders = parse_url($url[&#039;authority&#039;]);
+        $host = $redirectHeaders[&#039;host&#039;];
+        $url = implode(&#039;&#039;, $url);
+        $dnsCache = $this-&gt;dnsCache;
+
+        $ip = self::dnsResolve($dnsCache, $host, $this-&gt;ipFlags, $options);
+        self::ipCheck($ip, $this-&gt;subnets, $this-&gt;ipFlags, $host, $url);
+
+        $onProgress = $options[&#039;on_progress&#039;] ?? null;
+        $subnets = $this-&gt;subnets;
+        $ipFlags = $this-&gt;ipFlags;
+
+        $options[&#039;on_progress&#039;] = static function (int $dlNow, int $dlSize, array $info) use ($onProgress, $subnets, $ipFlags): void {
+            static $lastPrimaryIp = &#039;&#039;;
+
+            if (!\in_array($info[&#039;primary_ip&#039;] ?? &#039;&#039;, [&#039;&#039;, $lastPrimaryIp], true)) {
+                self::ipCheck($info[&#039;primary_ip&#039;], $subnets, $ipFlags, null, $info[&#039;url&#039;]);
+                $lastPrimaryIp = $info[&#039;primary_ip&#039;];
+            }
+
+            null !== $onProgress &amp;&amp; $onProgress($dlNow, $dlSize, $info);
+        };
+
+        if (0 &gt;= $maxRedirects = $options[&#039;max_redirects&#039;]) {
+            return new AsyncResponse($this-&gt;client, $method, $url, $options);
+        }
+
+        $options[&#039;max_redirects&#039;] = 0;
+        $redirectHeaders[&#039;with_auth&#039;] = $redirectHeaders[&#039;no_auth&#039;] = $options[&#039;headers&#039;];
+
+        if (isset($options[&#039;normalized_headers&#039;][&#039;host&#039;]) || isset($options[&#039;normalized_headers&#039;][&#039;authorization&#039;]) || isset($options[&#039;normalized_headers&#039;][&#039;cookie&#039;])) {
+            $redirectHeaders[&#039;no_auth&#039;] = array_filter($redirectHeaders[&#039;no_auth&#039;], static function ($h) {
+                return 0 !== stripos($h, &#039;Host:&#039;) &amp;&amp; 0 !== stripos($h, &#039;Authorization:&#039;) &amp;&amp; 0 !== stripos($h, &#039;Cookie:&#039;);
+            });
+        }
+
+        return new AsyncResponse($this-&gt;client, $method, $url, $options, static function (ChunkInterface $chunk, AsyncContext $context) use (&amp;$method, &amp;$options, $maxRedirects, &amp;$redirectHeaders, $subnets, $ipFlags, $dnsCache): \Generator {
+            if (null !== $chunk-&gt;getError() || $chunk-&gt;isTimeout() || !$chunk-&gt;isFirst()) {
+                yield $chunk;
+
+                return;
+            }
+
+            $statusCode = $context-&gt;getStatusCode();
+
+            if ($statusCode &lt; 300 || 400 &lt;= $statusCode || null === $url = $context-&gt;getInfo(&#039;redirect_url&#039;)) {
+                $context-&gt;passthru();
+
+                yield $chunk;
+
+                return;
+            }
+
+            $host = parse_url($url, \PHP_URL_HOST);
+            $ip = self::dnsResolve($dnsCache, $host, $ipFlags, $options);
+            self::ipCheck($ip, $subnets, $ipFlags, $host, $url);
+
+            // Do like curl and browsers: turn POST to GET on 301, 302 and 303
+            if (303 === $statusCode || &#039;POST&#039; === $method &amp;&amp; \in_array($statusCode, [301, 302], true)) {
+                $method = &#039;HEAD&#039; === $method ? &#039;HEAD&#039; : &#039;GET&#039;;
+                unset($options[&#039;body&#039;], $options[&#039;json&#039;]);
+
+                if (isset($options[&#039;normalized_headers&#039;][&#039;content-length&#039;]) || isset($options[&#039;normalized_headers&#039;][&#039;content-type&#039;]) || isset($options[&#039;normalized_headers&#039;][&#039;transfer-encoding&#039;])) {
+                    $filterContentHeaders = static function ($h) {
+                        return 0 !== stripos($h, &#039;Content-Length:&#039;) &amp;&amp; 0 !== stripos($h, &#039;Content-Type:&#039;) &amp;&amp; 0 !== stripos($h, &#039;Transfer-Encoding:&#039;);
+                    };
+                    $options[&#039;headers&#039;] = array_filter($options[&#039;headers&#039;], $filterContentHeaders);
+                    $redirectHeaders[&#039;no_auth&#039;] = array_filter($redirectHeaders[&#039;no_auth&#039;], $filterContentHeaders);
+                    $redirectHeaders[&#039;with_auth&#039;] = array_filter($redirectHeaders[&#039;with_auth&#039;], $filterContentHeaders);
+                }
+            }
+
+            // Authorization and Cookie headers MUST NOT follow except for the initial host name
+            $port = parse_url($url, \PHP_URL_PORT);
+            $options[&#039;headers&#039;] = $redirectHeaders[&#039;host&#039;] === $host &amp;&amp; ($redirectHeaders[&#039;port&#039;] ?? null) === $port ? $redirectHeaders[&#039;with_auth&#039;] : $redirectHeaders[&#039;no_auth&#039;];
+
+            static $redirectCount = 0;
+            $context-&gt;setInfo(&#039;redirect_count&#039;, ++$redirectCount);
+
+            $context-&gt;replaceRequest($method, $url, $options);
+
+            if ($redirectCount &gt;= $maxRedirects) {
+                $context-&gt;passthru();
+            }
+        });
+    }
+
+    /**
+     * @deprecated since Symfony 7.1, configure the logger on the wrapped HTTP client directly instead
+     */
+    public function setLogger(LoggerInterface $logger): void
+    {
+        trigger_deprecation(&#039;symfony/http-client&#039;, &#039;7.1&#039;, &#039;Configure the logger on the wrapped HTTP client directly instead.&#039;);
+
+        if ($this-&gt;client instanceof LoggerAwareInterface) {
+            $this-&gt;client-&gt;setLogger($logger);
+        }
+    }
+
+    public function withOptions(array $options): static
+    {
+        $clone = clone $this;
+        $clone-&gt;client = $this-&gt;client-&gt;withOptions($options);
+        $clone-&gt;defaultOptions = self::mergeDefaultOptions($options, $this-&gt;defaultOptions);
+
+        return $clone;
+    }
+
+    public function reset(): void
+    {
+        $this-&gt;dnsCache-&gt;exchangeArray([]);
+
+        if ($this-&gt;client instanceof ResetInterface) {
+            $this-&gt;client-&gt;reset();
+        }
+    }
+
+    private static function dnsResolve(\ArrayObject $dnsCache, string $host, int $ipFlags, array &amp;$options): string
+    {
+        if ($ip = filter_var(trim($host, &#039;[]&#039;), \FILTER_VALIDATE_IP) ?: $options[&#039;resolve&#039;][$host] ?? false) {
+            return $ip;
+        }
+
+        if ($dnsCache-&gt;offsetExists($host)) {
+            return $dnsCache[$host];
+        }
+
+        if ((\FILTER_FLAG_IPV4 &amp; $ipFlags) &amp;&amp; $ip = gethostbynamel($host)) {
+            return $options[&#039;resolve&#039;][$host] = $dnsCache[$host] = $ip[0];
+        }
+
+        if (!(\FILTER_FLAG_IPV6 &amp; $ipFlags)) {
+            return $host;
+        }
+
+        if ($ip = dns_get_record($host, \DNS_AAAA)) {
+            $ip = $ip[0][&#039;ipv6&#039;];
+        } elseif (\extension_loaded(&#039;sockets&#039;)) {
+            if (!$info = socket_addrinfo_lookup($host, 0, [&#039;ai_socktype&#039; =&gt; \SOCK_STREAM, &#039;ai_family&#039; =&gt; \AF_INET6])) {
+                return $host;
+            }
+
+            $ip = socket_addrinfo_explain($info[0])[&#039;ai_addr&#039;][&#039;sin6_addr&#039;];
+        } elseif (&#039;localhost&#039; === $host || &#039;localhost.&#039; === $host) {
+            $ip = &#039;::1&#039;;
+        } else {
+            return $host;
+        }
+
+        return $options[&#039;resolve&#039;][$host] = $dnsCache[$host] = $ip;
+    }
+
+    private static function ipCheck(string $ip, ?array $subnets, int $ipFlags, ?string $host, string $url): void
+    {
+        if (null === $subnets) {
+            // Quick check, but not reliable enough, see https://github.com/php/php-src/issues/16944
+            $ipFlags |= \FILTER_FLAG_NO_PRIV_RANGE | \FILTER_FLAG_NO_RES_RANGE;
+        }
+
+        if (false !== filter_var($ip, \FILTER_VALIDATE_IP, $ipFlags) &amp;&amp; !IpUtils::checkIp($ip, $subnets ?? IpUtils::PRIVATE_SUBNETS)) {
+            return;
+        }
+
+        if (null !== $host) {
+            $type = &#039;Host&#039;;
+        } else {
+            $host = $ip;
+            $type = &#039;IP&#039;;
+        }
+
+        throw new TransportException($type.\sprintf(&#039; &quot;%s&quot; is blocked for &quot;%s&quot;.&#039;, $host, $url));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Psr18Client.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Caching -->
+
+</body>
+</html>

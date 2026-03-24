@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Foundation/Providers/FoundationServiceProvider.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Foundation\Providers;
+
+use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Contracts\Console\Kernel as ConsoleKernel;
+use Illuminate\Contracts\Container\Container;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Contracts\Foundation\ExceptionRenderer;
+use Illuminate\Contracts\Foundation\MaintenanceMode as MaintenanceModeContract;
+use Illuminate\Contracts\View\Factory;
+use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\Grammar;
+use Illuminate\Foundation\Console\CliDumper;
+use Illuminate\Foundation\Exceptions\Renderer\Listener;
+use Illuminate\Foundation\Exceptions\Renderer\Mappers\BladeMapper;
+use Illuminate\Foundation\Exceptions\Renderer\Renderer;
+use Illuminate\Foundation\Http\HtmlDumper;
+use Illuminate\Foundation\MaintenanceModeManager;
+use Illuminate\Foundation\Precognition;
+use Illuminate\Foundation\Vite;
+use Illuminate\Http\Client\Factory as HttpFactory;
+use Illuminate\Http\Request;
+use Illuminate\Log\Events\MessageLogged;
+use Illuminate\Queue\Events\JobAttempted;
+use Illuminate\Support\AggregateServiceProvider;
+use Illuminate\Support\Defer\DeferredCallbackCollection;
+use Illuminate\Support\Facades\URL;
+use Illuminate\Support\Uri;
+use Illuminate\Testing\LoggedExceptionCollection;
+use Illuminate\Testing\ParallelTestingServiceProvider;
+use Illuminate\Validation\ValidationException;
+use Symfony\Component\ErrorHandler\ErrorRenderer\HtmlErrorRenderer;
+use Symfony\Component\VarDumper\Caster\StubCaster;
+use Symfony\Component\VarDumper\Cloner\AbstractCloner;
+
+class FoundationServiceProvider extends AggregateServiceProvider
+{
+    /**
+     * The provider class names.
+     *
+     * @var string[]
+     */
+    protected $providers = [
+        FormRequestServiceProvider::class,
+        ParallelTestingServiceProvider::class,
+    ];
+
+    /**
+     * The singletons to register into the container.
+     *
+     * @var array
+     */
+    public $singletons = [
+        HttpFactory::class =&gt; HttpFactory::class,
+        Vite::class =&gt; Vite::class,
+    ];
+
+    /**
+     * Boot the service provider.
+     *
+     * @return void
+     */
+    public function boot()
+    {
+        if ($this-&gt;app-&gt;runningInConsole()) {
+            $this-&gt;publishes([
+                __DIR__.&#039;/../Exceptions/views&#039; =&gt; $this-&gt;app-&gt;resourcePath(&#039;views/errors/&#039;),
+            ], &#039;laravel-errors&#039;);
+        }
+
+        if ($this-&gt;app-&gt;hasDebugModeEnabled() &amp;&amp; ! $this-&gt;app-&gt;has(ExceptionRenderer::class)) {
+            $this-&gt;app-&gt;make(Listener::class)-&gt;registerListeners(
+                $this-&gt;app-&gt;make(Dispatcher::class)
+            );
+        }
+    }
+
+    /**
+     * Register the service provider.
+     *
+     * @return void
+     */
+    public function register()
+    {
+        parent::register();
+
+        $this-&gt;registerConsoleSchedule();
+        $this-&gt;registerDumper();
+        $this-&gt;registerRequestValidation();
+        $this-&gt;registerRequestSignatureValidation();
+        $this-&gt;registerUriUrlGeneration();
+        $this-&gt;registerDeferHandler();
+        $this-&gt;registerExceptionTracking();
+        $this-&gt;registerExceptionRenderer();
+        $this-&gt;registerMaintenanceModeManager();
+    }
+
+    /**
+     * Register the console schedule implementation.
+     *
+     * @return void
+     */
+    public function registerConsoleSchedule()
+    {
+        $this-&gt;app-&gt;singleton(Schedule::class, function ($app) {
+            return $app-&gt;make(ConsoleKernel::class)-&gt;resolveConsoleSchedule();
+        });
+    }
+
+    /**
+     * Register a var dumper (with source) to debug variables.
+     *
+     * @return void
+     */
+    public function registerDumper()
+    {
+        AbstractCloner::$defaultCasters[ConnectionInterface::class] ??= [StubCaster::class, &#039;cutInternals&#039;];
+        AbstractCloner::$defaultCasters[Container::class] ??= [StubCaster::class, &#039;cutInternals&#039;];
+        AbstractCloner::$defaultCasters[Dispatcher::class] ??= [StubCaster::class, &#039;cutInternals&#039;];
+        AbstractCloner::$defaultCasters[Factory::class] ??= [StubCaster::class, &#039;cutInternals&#039;];
+        AbstractCloner::$defaultCasters[Grammar::class] ??= [StubCaster::class, &#039;cutInternals&#039;];
+
+        $basePath = $this-&gt;app-&gt;basePath();
+
+        $compiledViewPath = $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;view.compiled&#039;);
+
+        $format = $_SERVER[&#039;VAR_DUMPER_FORMAT&#039;] ?? null;
+
+        match (true) {
+            &#039;html&#039; == $format =&gt; HtmlDumper::register($basePath, $compiledViewPath),
+            &#039;cli&#039; == $format =&gt; CliDumper::register($basePath, $compiledViewPath),
+            &#039;server&#039; == $format =&gt; null,
+            $format &amp;&amp; &#039;tcp&#039; == parse_url($format, PHP_URL_SCHEME) =&gt; null,
+            default =&gt; in_array(PHP_SAPI, [&#039;cli&#039;, &#039;phpdbg&#039;]) ? CliDumper::register($basePath, $compiledViewPath) : HtmlDumper::register($basePath, $compiledViewPath),
+        };
+    }
+
+    /**
+     * Register the &quot;validate&quot; macro on the request.
+     *
+     * @return void
+     */
+    public function registerRequestValidation()
+    {
+        Request::macro(&#039;validate&#039;, function (array $rules, ...$params) {
+            return tap(validator($this-&gt;all(), $rules, ...$params), function ($validator) {
+                if ($this-&gt;isPrecognitive()) {
+                    $validator-&gt;after(Precognition::afterValidationHook($this))
+                        -&gt;setRules(
+                            $this-&gt;filterPrecognitiveRules($validator-&gt;getRulesWithoutPlaceholders())
+                        );
+                }
+            })-&gt;validate();
+        });
+
+        Request::macro(&#039;validateWithBag&#039;, function (string $errorBag, array $rules, ...$params) {
+            try {
+                return $this-&gt;validate($rules, ...$params);
+            } catch (ValidationException $e) {
+                $e-&gt;errorBag = $errorBag;
+
+                throw $e;
+            }
+        });
+    }
+
+    /**
+     * Register the &quot;hasValidSignature&quot; macro on the request.
+     *
+     * @return void
+     */
+    public function registerRequestSignatureValidation()
+    {
+        Request::macro(&#039;hasValidSignature&#039;, function ($absolute = true) {
+            return URL::hasValidSignature($this, $absolute);
+        });
+
+        Request::macro(&#039;hasValidRelativeSignature&#039;, function () {
+            return URL::hasValidSignature($this, $absolute = false);
+        });
+
+        Request::macro(&#039;hasValidSignatureWhileIgnoring&#039;, function ($ignoreQuery = [], $absolute = true) {
+            return URL::hasValidSignature($this, $absolute, $ignoreQuery);
+        });
+
+        Request::macro(&#039;hasValidRelativeSignatureWhileIgnoring&#039;, function ($ignoreQuery = []) {
+            return URL::hasValidSignature($this, $absolute = false, $ignoreQuery);
+        });
+    }
+
+    /**
+     * Register the URL resolver for the URI generator.
+     *
+     * @return void
+     */
+    protected function registerUriUrlGeneration()
+    {
+        Uri::setUrlGeneratorResolver(fn () =&gt; app(&#039;url&#039;));
+    }
+
+    /**
+     * Register the &quot;defer&quot; function termination handler.
+     *
+     * @return void
+     */
+    protected function registerDeferHandler()
+    {
+        $this-&gt;app-&gt;scoped(DeferredCallbackCollection::class);
+
+        $this-&gt;app[&#039;events&#039;]-&gt;listen(function (CommandFinished $event) {
+            app(DeferredCallbackCollection::class)-&gt;invokeWhen(fn ($callback) =&gt; app()-&gt;runningInConsole() &amp;&amp; ($event-&gt;exitCode === 0 || $callback-&gt;always));
+        });
+
+        $this-&gt;app[&#039;events&#039;]-&gt;listen(function (JobAttempted $event) {
+            app(DeferredCallbackCollection::class)-&gt;invokeWhen(static fn ($callback) =&gt; ! in_array($event-&gt;connectionName, [&#039;sync&#039;, &#039;deferred&#039;]) &amp;&amp; ($event-&gt;successful() || $callback-&gt;always));
+        });
+    }
+
+    /**
+     * Register an event listener to track logged exceptions.
+     *
+     * @return void
+     */
+    protected function registerExceptionTracking()
+    {
+        if (! $this-&gt;app-&gt;runningUnitTests()) {
+            return;
+        }
+
+        $this-&gt;app-&gt;instance(
+            LoggedExceptionCollection::class,
+            new LoggedExceptionCollection
+        );
+
+        $this-&gt;app-&gt;make(&#039;events&#039;)-&gt;listen(MessageLogged::class, function ($event) {
+            if (isset($event-&gt;context[&#039;exception&#039;])) {
+                $this-&gt;app-&gt;make(LoggedExceptionCollection::class)
+                    -&gt;push($event-&gt;context[&#039;exception&#039;]);
+            }
+        });
+    }
+
+    /**
+     * Register the exceptions renderer.
+     *
+     * @return void
+     */
+    protected function registerExceptionRenderer()
+    {
+        $this-&gt;loadViewsFrom(__DIR__.&#039;/../Exceptions/views&#039;, &#039;laravel-exceptions&#039;);
+
+        if (! $this-&gt;app-&gt;hasDebugModeEnabled()) {
+            return;
+        }
+
+        $this-&gt;loadViewsFrom(__DIR__.&#039;/../resources/exceptions/renderer&#039;, &#039;laravel-exceptions-renderer&#039;);
+
+        $this-&gt;app-&gt;singleton(Renderer::class, function (Application $app) {
+            $errorRenderer = new HtmlErrorRenderer(
+                $app[&#039;config&#039;]-&gt;get(&#039;app.debug&#039;),
+            );
+
+            return new Renderer(
+                $app-&gt;make(Factory::class),
+                $app-&gt;make(Listener::class),
+                $errorRenderer,
+                $app-&gt;make(BladeMapper::class),
+                $app-&gt;basePath(),
+            );
+        });
+
+        $this-&gt;app-&gt;singleton(Listener::class);
+    }
+
+    /**
+     * Register the maintenance mode manager service.
+     *
+     * @return void
+     */
+    public function registerMaintenanceModeManager()
+    {
+        $this-&gt;app-&gt;singleton(MaintenanceModeManager::class);
+
+        $this-&gt;app-&gt;bind(
+            MaintenanceModeContract::class,
+            fn () =&gt; $this-&gt;app-&gt;make(MaintenanceModeManager::class)-&gt;driver()
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Foundation/Queue/InteractsWithUniqueJobs.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Foundation/Queue -->
+
+</body>
+</html>

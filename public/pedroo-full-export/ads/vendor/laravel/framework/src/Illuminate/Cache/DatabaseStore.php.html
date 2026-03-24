@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Cache/DatabaseStore.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Cache;
+
+use Closure;
+use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Contracts\Cache\Store;
+use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\PostgresConnection;
+use Illuminate\Database\QueryException;
+use Illuminate\Database\SQLiteConnection;
+use Illuminate\Database\SqlServerConnection;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\InteractsWithTime;
+use Illuminate\Support\Str;
+
+class DatabaseStore implements LockProvider, Store
+{
+    use InteractsWithTime;
+
+    /**
+     * The database connection instance.
+     *
+     * @var \Illuminate\Database\ConnectionInterface
+     */
+    protected $connection;
+
+    /**
+     * The database connection instance that should be used to manage locks.
+     *
+     * @var \Illuminate\Database\ConnectionInterface
+     */
+    protected $lockConnection;
+
+    /**
+     * The name of the cache table.
+     *
+     * @var string
+     */
+    protected $table;
+
+    /**
+     * A string that should be prepended to keys.
+     *
+     * @var string
+     */
+    protected $prefix;
+
+    /**
+     * The name of the cache locks table.
+     *
+     * @var string
+     */
+    protected $lockTable;
+
+    /**
+     * An array representation of the lock lottery odds.
+     *
+     * @var array
+     */
+    protected $lockLottery;
+
+    /**
+     * The default number of seconds that a lock should be held.
+     *
+     * @var int
+     */
+    protected $defaultLockTimeoutInSeconds;
+
+    /**
+     * Create a new database store.
+     *
+     * @param  \Illuminate\Database\ConnectionInterface  $connection
+     * @param  string  $table
+     * @param  string  $prefix
+     * @param  string  $lockTable
+     * @param  array  $lockLottery
+     * @param  int  $defaultLockTimeoutInSeconds
+     */
+    public function __construct(
+        ConnectionInterface $connection,
+        $table,
+        $prefix = &#039;&#039;,
+        $lockTable = &#039;cache_locks&#039;,
+        $lockLottery = [2, 100],
+        $defaultLockTimeoutInSeconds = 86400,
+    ) {
+        $this-&gt;table = $table;
+        $this-&gt;prefix = $prefix;
+        $this-&gt;connection = $connection;
+        $this-&gt;lockTable = $lockTable;
+        $this-&gt;lockLottery = $lockLottery;
+        $this-&gt;defaultLockTimeoutInSeconds = $defaultLockTimeoutInSeconds;
+    }
+
+    /**
+     * Retrieve an item from the cache by key.
+     *
+     * @param  string  $key
+     * @return mixed
+     */
+    public function get($key)
+    {
+        return $this-&gt;many([$key])[$key];
+    }
+
+    /**
+     * Retrieve multiple items from the cache by key.
+     *
+     * Items not found in the cache will have a null value.
+     *
+     * @return array
+     */
+    public function many(array $keys)
+    {
+        if (count($keys) === 0) {
+            return [];
+        }
+
+        $results = array_fill_keys($keys, null);
+
+        // First we will retrieve all of the items from the cache using their keys and
+        // the prefix value. Then we will need to iterate through each of the items
+        // and convert them to an object when they are currently in array format.
+        $values = $this-&gt;table()
+            -&gt;whereIn(&#039;key&#039;, array_map(function ($key) {
+                return $this-&gt;prefix.$key;
+            }, $keys))
+            -&gt;get()
+            -&gt;map(function ($value) {
+                return is_array($value) ? (object) $value : $value;
+            });
+
+        $currentTime = $this-&gt;currentTime();
+
+        // If this cache expiration date is past the current time, we will remove this
+        // item from the cache. Then we will return a null value since the cache is
+        // expired. We will use &quot;Carbon&quot; to make this comparison with the column.
+        [$values, $expired] = $values-&gt;partition(function ($cache) use ($currentTime) {
+            return $cache-&gt;expiration &gt; $currentTime;
+        });
+
+        if ($expired-&gt;isNotEmpty()) {
+            $this-&gt;forgetManyIfExpired($expired-&gt;pluck(&#039;key&#039;)-&gt;all(), prefixed: true);
+        }
+
+        return Arr::map($results, function ($value, $key) use ($values) {
+            if ($cache = $values-&gt;firstWhere(&#039;key&#039;, $this-&gt;prefix.$key)) {
+                return $this-&gt;unserialize($cache-&gt;value);
+            }
+
+            return $value;
+        });
+    }
+
+    /**
+     * Store an item in the cache for a given number of seconds.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  int  $seconds
+     * @return bool
+     */
+    public function put($key, $value, $seconds)
+    {
+        return $this-&gt;putMany([$key =&gt; $value], $seconds);
+    }
+
+    /**
+     * Store multiple items in the cache for a given number of seconds.
+     *
+     * @param  array  $values
+     * @param  int  $seconds
+     * @return bool
+     */
+    public function putMany(array $values, $seconds)
+    {
+        $serializedValues = [];
+
+        $expiration = $this-&gt;getTime() + $seconds;
+
+        foreach ($values as $key =&gt; $value) {
+            $serializedValues[] = [
+                &#039;key&#039; =&gt; $this-&gt;prefix.$key,
+                &#039;value&#039; =&gt; $this-&gt;serialize($value),
+                &#039;expiration&#039; =&gt; $expiration,
+            ];
+        }
+
+        return $this-&gt;table()-&gt;upsert($serializedValues, &#039;key&#039;) &gt; 0;
+    }
+
+    /**
+     * Store an item in the cache if the key doesn&#039;t exist.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  int  $seconds
+     * @return bool
+     */
+    public function add($key, $value, $seconds)
+    {
+        if (! is_null($this-&gt;get($key))) {
+            return false;
+        }
+
+        $key = $this-&gt;prefix.$key;
+        $value = $this-&gt;serialize($value);
+        $expiration = $this-&gt;getTime() + $seconds;
+
+        if (! $this-&gt;getConnection() instanceof SqlServerConnection) {
+            return $this-&gt;table()-&gt;insertOrIgnore(compact(&#039;key&#039;, &#039;value&#039;, &#039;expiration&#039;)) &gt; 0;
+        }
+
+        try {
+            return $this-&gt;table()-&gt;insert(compact(&#039;key&#039;, &#039;value&#039;, &#039;expiration&#039;));
+        } catch (QueryException) {
+            // ...
+        }
+
+        return false;
+    }
+
+    /**
+     * Increment the value of an item in the cache.
+     *
+     * @param  string  $key
+     * @param  int  $value
+     * @return int|false
+     */
+    public function increment($key, $value = 1)
+    {
+        return $this-&gt;incrementOrDecrement($key, $value, function ($current, $value) {
+            return $current + $value;
+        });
+    }
+
+    /**
+     * Decrement the value of an item in the cache.
+     *
+     * @param  string  $key
+     * @param  int  $value
+     * @return int|false
+     */
+    public function decrement($key, $value = 1)
+    {
+        return $this-&gt;incrementOrDecrement($key, $value, function ($current, $value) {
+            return $current - $value;
+        });
+    }
+
+    /**
+     * Increment or decrement an item in the cache.
+     *
+     * @param  string  $key
+     * @param  int|float  $value
+     * @param  \Closure  $callback
+     * @return int|false
+     */
+    protected function incrementOrDecrement($key, $value, Closure $callback)
+    {
+        return $this-&gt;connection-&gt;transaction(function () use ($key, $value, $callback) {
+            $prefixed = $this-&gt;prefix.$key;
+
+            $cache = $this-&gt;table()-&gt;where(&#039;key&#039;, $prefixed)
+                -&gt;lockForUpdate()-&gt;first();
+
+            // If there is no value in the cache, we will return false here. Otherwise the
+            // value will be decrypted and we will proceed with this function to either
+            // increment or decrement this value based on the given action callbacks.
+            if (is_null($cache)) {
+                return false;
+            }
+
+            $cache = is_array($cache) ? (object) $cache : $cache;
+
+            $current = $this-&gt;unserialize($cache-&gt;value);
+
+            // Here we&#039;ll call this callback function that was given to the function which
+            // is used to either increment or decrement the function. We use a callback
+            // so we do not have to recreate all this logic in each of the functions.
+            $new = $callback((int) $current, $value);
+
+            if (! is_numeric($current)) {
+                return false;
+            }
+
+            // Here we will update the values in the table. We will also encrypt the value
+            // since database cache values are encrypted by default with secure storage
+            // that can&#039;t be easily read. We will return the new value after storing.
+            $this-&gt;table()-&gt;where(&#039;key&#039;, $prefixed)-&gt;update([
+                &#039;value&#039; =&gt; $this-&gt;serialize($new),
+            ]);
+
+            return $new;
+        });
+    }
+
+    /**
+     * Get the current system time.
+     *
+     * @return int
+     */
+    protected function getTime()
+    {
+        return $this-&gt;currentTime();
+    }
+
+    /**
+     * Store an item in the cache indefinitely.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return bool
+     */
+    public function forever($key, $value)
+    {
+        return $this-&gt;put($key, $value, 315360000);
+    }
+
+    /**
+     * Get a lock instance.
+     *
+     * @param  string  $name
+     * @param  int  $seconds
+     * @param  string|null  $owner
+     * @return \Illuminate\Contracts\Cache\Lock
+     */
+    public function lock($name, $seconds = 0, $owner = null)
+    {
+        return new DatabaseLock(
+            $this-&gt;lockConnection ?? $this-&gt;connection,
+            $this-&gt;lockTable,
+            $this-&gt;prefix.$name,
+            $seconds,
+            $owner,
+            $this-&gt;lockLottery,
+            $this-&gt;defaultLockTimeoutInSeconds
+        );
+    }
+
+    /**
+     * Restore a lock instance using the owner identifier.
+     *
+     * @param  string  $name
+     * @param  string  $owner
+     * @return \Illuminate\Contracts\Cache\Lock
+     */
+    public function restoreLock($name, $owner)
+    {
+        return $this-&gt;lock($name, 0, $owner);
+    }
+
+    /**
+     * Remove an item from the cache.
+     *
+     * @param  string  $key
+     * @return bool
+     */
+    public function forget($key)
+    {
+        return $this-&gt;forgetMany([$key]);
+    }
+
+    /**
+     * Remove an item from the cache if it is expired.
+     *
+     * @param  string  $key
+     * @return bool
+     */
+    public function forgetIfExpired($key)
+    {
+        return $this-&gt;forgetManyIfExpired([$key]);
+    }
+
+    /**
+     * Remove all items from the cache.
+     *
+     * @param  array  $keys
+     * @return bool
+     */
+    protected function forgetMany(array $keys)
+    {
+        $this-&gt;table()-&gt;whereIn(&#039;key&#039;, (new Collection($keys))-&gt;flatMap(fn ($key) =&gt; [
+            $this-&gt;prefix.$key,
+            &quot;{$this-&gt;prefix}illuminate:cache:flexible:created:{$key}&quot;,
+        ])-&gt;all())-&gt;delete();
+
+        return true;
+    }
+
+    /**
+     * Remove all expired items from the given set from the cache.
+     *
+     * @param  array  $keys
+     * @param  bool  $prefixed
+     * @return bool
+     */
+    protected function forgetManyIfExpired(array $keys, bool $prefixed = false)
+    {
+        $this-&gt;table()
+            -&gt;whereIn(&#039;key&#039;, (new Collection($keys))-&gt;flatMap(fn ($key) =&gt; $prefixed ? [
+                $key,
+                $this-&gt;prefix.&#039;illuminate:cache:flexible:created:&#039;.Str::chopStart($key, $this-&gt;prefix),
+            ] : [
+                &quot;{$this-&gt;prefix}{$key}&quot;,
+                &quot;{$this-&gt;prefix}illuminate:cache:flexible:created:{$key}&quot;,
+            ])-&gt;all())
+            -&gt;where(&#039;expiration&#039;, &#039;&lt;=&#039;, $this-&gt;getTime())
+            -&gt;delete();
+
+        return true;
+    }
+
+    /**
+     * Remove all items from the cache.
+     *
+     * @return bool
+     */
+    public function flush()
+    {
+        $this-&gt;table()-&gt;delete();
+
+        return true;
+    }
+
+    /**
+     * Get a query builder for the cache table.
+     *
+     * @return \Illuminate\Database\Query\Builder
+     */
+    protected function table()
+    {
+        return $this-&gt;connection-&gt;table($this-&gt;table);
+    }
+
+    /**
+     * Get the underlying database connection.
+     *
+     * @return \Illuminate\Database\ConnectionInterface
+     */
+    public function getConnection()
+    {
+        return $this-&gt;connection;
+    }
+
+    /**
+     * Set the underlying database connection.
+     *
+     * @param  \Illuminate\Database\ConnectionInterface  $connection
+     * @return $this
+     */
+    public function setConnection($connection)
+    {
+        $this-&gt;connection = $connection;
+
+        return $this;
+    }
+
+    /**
+     * Get the connection used to manage locks.
+     *
+     * @return \Illuminate\Database\ConnectionInterface
+     */
+    public function getLockConnection()
+    {
+        return $this-&gt;lockConnection;
+    }
+
+    /**
+     * Specify the connection that should be used to manage locks.
+     *
+     * @param  \Illuminate\Database\ConnectionInterface  $connection
+     * @return $this
+     */
+    public function setLockConnection($connection)
+    {
+        $this-&gt;lockConnection = $connection;
+
+        return $this;
+    }
+
+    /**
+     * Get the cache key prefix.
+     *
+     * @return string
+     */
+    public function getPrefix()
+    {
+        return $this-&gt;prefix;
+    }
+
+    /**
+     * Set the cache key prefix.
+     *
+     * @param  string  $prefix
+     * @return void
+     */
+    public function setPrefix($prefix)
+    {
+        $this-&gt;prefix = $prefix;
+    }
+
+    /**
+     * Serialize the given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    protected function serialize($value)
+    {
+        $result = serialize($value);
+
+        if (($this-&gt;connection instanceof PostgresConnection ||
+             $this-&gt;connection instanceof SQLiteConnection) &amp;&amp;
+            str_contains($result, &quot;\0&quot;)) {
+            $result = base64_encode($result);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Unserialize the given value.
+     *
+     * @param  string  $value
+     * @return mixed
+     */
+    protected function unserialize($value)
+    {
+        if (($this-&gt;connection instanceof PostgresConnection ||
+             $this-&gt;connection instanceof SQLiteConnection) &amp;&amp;
+            ! Str::contains($value, [&#039;:&#039;, &#039;;&#039;])) {
+            $value = base64_decode($value);
+        }
+
+        return unserialize($value);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Cache/DynamoDbLock.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Cache/Console -->
+
+</body>
+</html>

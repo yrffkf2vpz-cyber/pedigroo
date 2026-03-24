@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/event-dispatcher/DependencyInjection/RegisterListenersPass.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\EventDispatcher\DependencyInjection;
+
+use Symfony\Component\DependencyInjection\Argument\ServiceClosureArgument;
+use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
+use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\EventDispatcher\EventDispatcher;
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Contracts\EventDispatcher\Event;
+
+/**
+ * Compiler pass to register tagged services for an event dispatcher.
+ */
+class RegisterListenersPass implements CompilerPassInterface
+{
+    private array $hotPathEvents = [];
+    private array $noPreloadEvents = [];
+
+    /**
+     * @return $this
+     */
+    public function setHotPathEvents(array $hotPathEvents): static
+    {
+        $this-&gt;hotPathEvents = array_flip($hotPathEvents);
+
+        return $this;
+    }
+
+    /**
+     * @return $this
+     */
+    public function setNoPreloadEvents(array $noPreloadEvents): static
+    {
+        $this-&gt;noPreloadEvents = array_flip($noPreloadEvents);
+
+        return $this;
+    }
+
+    public function process(ContainerBuilder $container): void
+    {
+        if (!$container-&gt;hasDefinition(&#039;event_dispatcher&#039;) &amp;&amp; !$container-&gt;hasAlias(&#039;event_dispatcher&#039;)) {
+            return;
+        }
+
+        $aliases = [];
+
+        if ($container-&gt;hasParameter(&#039;event_dispatcher.event_aliases&#039;)) {
+            $aliases = $container-&gt;getParameter(&#039;event_dispatcher.event_aliases&#039;);
+        }
+
+        $globalDispatcherDefinition = $container-&gt;findDefinition(&#039;event_dispatcher&#039;);
+
+        foreach ($container-&gt;findTaggedServiceIds(&#039;kernel.event_listener&#039;, true) as $id =&gt; $events) {
+            $noPreload = 0;
+
+            $resolvedEvents = [];
+            foreach ($events as $event) {
+                if (!isset($event[&#039;event&#039;])) {
+                    if ($container-&gt;getDefinition($id)-&gt;hasTag(&#039;kernel.event_subscriber&#039;)) {
+                        continue;
+                    }
+
+                    $event[&#039;method&#039;] ??= &#039;__invoke&#039;;
+                    $eventNames = $this-&gt;getEventFromTypeDeclaration($container, $id, $event[&#039;method&#039;]);
+                } else {
+                    $eventNames = [$event[&#039;event&#039;]];
+                }
+
+                foreach ($eventNames as $eventName) {
+                    $event[&#039;event&#039;] = $aliases[$eventName] ?? $eventName;
+                    $resolvedEvents[] = $event;
+                }
+            }
+
+            foreach ($resolvedEvents as $event) {
+                $priority = $event[&#039;priority&#039;] ?? 0;
+
+                if (!isset($event[&#039;method&#039;])) {
+                    $event[&#039;method&#039;] = &#039;on&#039;.preg_replace_callback([
+                        &#039;/(?&lt;=\b|_)[a-z]/i&#039;,
+                        &#039;/[^a-z0-9]/i&#039;,
+                    ], fn ($matches) =&gt; strtoupper($matches[0]), $event[&#039;event&#039;]);
+                    $event[&#039;method&#039;] = preg_replace(&#039;/[^a-z0-9]/i&#039;, &#039;&#039;, $event[&#039;method&#039;]);
+
+                    if (null !== ($class = $container-&gt;getDefinition($id)-&gt;getClass()) &amp;&amp; ($r = $container-&gt;getReflectionClass($class, false)) &amp;&amp; !$r-&gt;hasMethod($event[&#039;method&#039;])) {
+                        if (!$r-&gt;hasMethod(&#039;__invoke&#039;)) {
+                            throw new InvalidArgumentException(\sprintf(&#039;None of the &quot;%s&quot; or &quot;__invoke&quot; methods exist for the service &quot;%s&quot;. Please define the &quot;method&quot; attribute on &quot;kernel.event_listener&quot; tags.&#039;, $event[&#039;method&#039;], $id));
+                        }
+
+                        $event[&#039;method&#039;] = &#039;__invoke&#039;;
+                    }
+                }
+
+                $dispatcherDefinition = $globalDispatcherDefinition;
+                if (isset($event[&#039;dispatcher&#039;])) {
+                    $dispatcherDefinition = $container-&gt;findDefinition($event[&#039;dispatcher&#039;]);
+                }
+
+                $dispatcherDefinition-&gt;addMethodCall(&#039;addListener&#039;, [$event[&#039;event&#039;], [new ServiceClosureArgument(new Reference($id)), $event[&#039;method&#039;]], $priority]);
+
+                if (isset($this-&gt;hotPathEvents[$event[&#039;event&#039;]])) {
+                    $container-&gt;getDefinition($id)-&gt;addTag(&#039;container.hot_path&#039;);
+                } elseif (isset($this-&gt;noPreloadEvents[$event[&#039;event&#039;]])) {
+                    ++$noPreload;
+                }
+            }
+
+            if ($noPreload &amp;&amp; \count($events) === $noPreload) {
+                $container-&gt;getDefinition($id)-&gt;addTag(&#039;container.no_preload&#039;);
+            }
+        }
+
+        $extractingDispatcher = new ExtractingEventDispatcher();
+
+        foreach ($container-&gt;findTaggedServiceIds(&#039;kernel.event_subscriber&#039;, true) as $id =&gt; $tags) {
+            $def = $container-&gt;getDefinition($id);
+
+            // We must assume that the class value has been correctly filled, even if the service is created by a factory
+            $class = $def-&gt;getClass();
+
+            if (!$r = $container-&gt;getReflectionClass($class)) {
+                throw new InvalidArgumentException(\sprintf(&#039;Class &quot;%s&quot; used for service &quot;%s&quot; cannot be found.&#039;, $class, $id));
+            }
+            if (!$r-&gt;isSubclassOf(EventSubscriberInterface::class)) {
+                throw new InvalidArgumentException(\sprintf(&#039;Service &quot;%s&quot; must implement interface &quot;%s&quot;.&#039;, $id, EventSubscriberInterface::class));
+            }
+            $class = $r-&gt;name;
+
+            $dispatcherDefinitions = [];
+            foreach ($tags as $attributes) {
+                if (!isset($attributes[&#039;dispatcher&#039;]) || isset($dispatcherDefinitions[$attributes[&#039;dispatcher&#039;]])) {
+                    continue;
+                }
+
+                $dispatcherDefinitions[$attributes[&#039;dispatcher&#039;]] = $container-&gt;findDefinition($attributes[&#039;dispatcher&#039;]);
+            }
+
+            if (!$dispatcherDefinitions) {
+                $dispatcherDefinitions = [$globalDispatcherDefinition];
+            }
+
+            $noPreload = 0;
+            ExtractingEventDispatcher::$aliases = $aliases;
+            ExtractingEventDispatcher::$subscriber = $class;
+            $extractingDispatcher-&gt;addSubscriber($extractingDispatcher);
+            foreach ($extractingDispatcher-&gt;listeners as $args) {
+                $args[1] = [new ServiceClosureArgument(new Reference($id)), $args[1]];
+                foreach ($dispatcherDefinitions as $dispatcherDefinition) {
+                    $dispatcherDefinition-&gt;addMethodCall(&#039;addListener&#039;, $args);
+                }
+
+                if (isset($this-&gt;hotPathEvents[$args[0]])) {
+                    $container-&gt;getDefinition($id)-&gt;addTag(&#039;container.hot_path&#039;);
+                } elseif (isset($this-&gt;noPreloadEvents[$args[0]])) {
+                    ++$noPreload;
+                }
+            }
+            if ($noPreload &amp;&amp; \count($extractingDispatcher-&gt;listeners) === $noPreload) {
+                $container-&gt;getDefinition($id)-&gt;addTag(&#039;container.no_preload&#039;);
+            }
+            $extractingDispatcher-&gt;listeners = [];
+            ExtractingEventDispatcher::$aliases = [];
+        }
+    }
+
+    /**
+     * @return string[]
+     */
+    private function getEventFromTypeDeclaration(ContainerBuilder $container, string $id, string $method): array
+    {
+        if (
+            null === ($class = $container-&gt;getDefinition($id)-&gt;getClass())
+            || !($r = $container-&gt;getReflectionClass($class, false))
+            || !$r-&gt;hasMethod($method)
+            || 1 &gt; ($m = $r-&gt;getMethod($method))-&gt;getNumberOfParameters()
+            || !(($type = $m-&gt;getParameters()[0]-&gt;getType()) instanceof \ReflectionNamedType || $type instanceof \ReflectionUnionType)
+        ) {
+            throw new InvalidArgumentException(\sprintf(&#039;Service &quot;%s&quot; must define the &quot;event&quot; attribute on &quot;kernel.event_listener&quot; tags.&#039;, $id));
+        }
+
+        $types = $type instanceof \ReflectionUnionType ? $type-&gt;getTypes() : [$type];
+
+        $names = [];
+        foreach ($types as $type) {
+            if (!$type instanceof \ReflectionNamedType
+                || $type-&gt;isBuiltin()
+                || Event::class === ($name = $type-&gt;getName())
+            ) {
+                continue;
+            }
+
+            $names[] = $name;
+        }
+
+        if (!$names) {
+            throw new InvalidArgumentException(\sprintf(&#039;Service &quot;%s&quot; must define the &quot;event&quot; attribute on &quot;kernel.event_listener&quot; tags.&#039;, $id));
+        }
+
+        return $names;
+    }
+}
+
+/**
+ * @internal
+ */
+class ExtractingEventDispatcher extends EventDispatcher implements EventSubscriberInterface
+{
+    public array $listeners = [];
+
+    public static array $aliases = [];
+    public static string $subscriber;
+
+    public function addListener(string $eventName, callable|array $listener, int $priority = 0): void
+    {
+        $this-&gt;listeners[] = [$eventName, $listener[1], $priority];
+    }
+
+    public static function getSubscribedEvents(): array
+    {
+        $events = [];
+
+        foreach ([self::$subscriber, &#039;getSubscribedEvents&#039;]() as $eventName =&gt; $params) {
+            $events[self::$aliases[$eventName] ?? $eventName] = $params;
+        }
+
+        return $events;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/event-dispatcher/EventDispatcher.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/event-dispatcher-contracts -->
+
+</body>
+</html>

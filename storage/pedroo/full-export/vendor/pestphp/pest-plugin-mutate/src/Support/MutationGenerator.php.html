@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest-plugin-mutate/src/Support/MutationGenerator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Mutate\Support;
+
+use Pest\Mutate\Contracts\Mutator;
+use Pest\Mutate\Factories\NodeTraverserFactory;
+use Pest\Mutate\Mutation;
+use Pest\Support\Str;
+use PhpParser\Node;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use PhpParser\Parser;
+use Symfony\Component\Finder\SplFileInfo;
+
+class MutationGenerator
+{
+    private bool $mutated;
+
+    private int $offset;
+
+    private Node $originalNode; // @phpstan-ignore-line
+
+    private ?Node $modifiedNode = null; // @phpstan-ignore-line
+
+    /**
+     * @param  array&lt;int, class-string&lt;Mutator&gt;&gt;  $mutators
+     * @param  array&lt;int, int&gt;  $linesToMutate
+     * @param  array&lt;int, string&gt;  $classesToMutate
+     * @return array&lt;int, Mutation&gt;
+     */
+    public function generate(
+        SplFileInfo $file,
+        array $mutators,
+        array $linesToMutate = [],
+        array $classesToMutate = [],
+    ): array {
+        $mutations = [];
+
+        $contents = $file-&gt;getContents();
+
+        if ($this-&gt;doesNotContainClassToMutate($contents, $classesToMutate)) {
+            return $mutations;
+        }
+
+        $mutatorsToIgnoreByLine = [];
+        foreach (explode(PHP_EOL, $contents) as $lineNumber =&gt; $line) {
+            if (str_contains($line, &#039;@pest-mutate-ignore&#039;)) {
+                if (Str::after($line, &#039;@pest-mutate-ignore:&#039;) !== $line) {
+                    $mutatorsToIgnore = explode(&#039;,&#039;, Str::after($line, &#039;@pest-mutate-ignore:&#039;));
+                    $mutatorsToIgnore = array_map(fn (string $mutator): string =&gt; trim($mutator), $mutatorsToIgnore);
+                }
+                $mutatorsToIgnoreByLine[$lineNumber + 1] = $mutatorsToIgnore ?? [&#039;all&#039;];
+            }
+        }
+
+        $parser = PhpParserFactory::make();
+
+        $mutators = $this-&gt;filterMutators($mutators, $contents, $parser);
+
+        $cache = MutationCache::instance();
+        foreach ($mutators as $mutator) {
+            if ($cache-&gt;has($file, $contents, $linesToMutate, $mutator)) {
+                $newMutations = $cache-&gt;get($file, $contents, $linesToMutate, $mutator);
+            } else {
+                $newMutations = [];
+
+                $this-&gt;offset = 0; // @pest-mutate-ignore: IntegerIncrement,IntegerDecrement
+
+                while (true) {
+                    $this-&gt;mutated = false;
+
+                    $traverser = NodeTraverserFactory::create();
+                    $traverser-&gt;addVisitor(new NodeVisitor(
+                        mutator: $mutator,
+                        offset: $this-&gt;offset,
+                        linesToMutate: $linesToMutate,
+                        mutatorsToIgnoreByLine: $mutatorsToIgnoreByLine,
+                        hasAlreadyMutated: $this-&gt;hasMutated(...),
+                        trackMutation: $this-&gt;trackMutation(...),
+                    ));
+
+                    $stmts = $parser-&gt;parse($contents);
+
+                    assert($stmts !== null);
+
+                    $modifiedAst = $traverser-&gt;traverse($stmts);
+
+                    if (! $this-&gt;mutated) { // @phpstan-ignore-line
+                        break;
+                    }
+
+                    $newMutations[] = Mutation::create(  // @phpstan-ignore-line
+                        file: $file,
+                        mutator: $mutator,
+                        originalNode: $this-&gt;originalNode,
+                        modifiedNode: $this-&gt;modifiedNode,
+                        modifiedAst: $modifiedAst,
+                    );
+                }
+
+                $cache-&gt;put($file, $contents, $linesToMutate, $mutator, $newMutations);
+            }
+
+            $mutations = [
+                ...$mutations,
+                ...$newMutations,
+            ];
+        }
+
+        //        // filter out mutations that are ignored
+        //        $mutations = array_filter($mutations, function (Mutation $mutation) use ($ignoreComments): bool {
+        //            foreach ($ignoreComments as $comment) {
+        //                if ($comment[&#039;line&#039;] === $mutation-&gt;startLine) {
+        //                    return false;
+        //                }
+        //            }
+        //
+        //            return true;
+        //        });
+
+        // sort mutations by line number
+        usort($mutations, fn (Mutation $a, Mutation $b): int =&gt; $a-&gt;startLine &lt;=&gt; $b-&gt;startLine);
+
+        return $mutations;
+    }
+
+    private function trackMutation(int $nodeCount, Node $original, ?Node $modified): void
+    {
+        $this-&gt;mutated = true;
+        $this-&gt;offset = $nodeCount;
+        $this-&gt;originalNode = $original;
+        $this-&gt;modifiedNode = $modified;
+    }
+
+    private function hasMutated(): bool
+    {
+        return $this-&gt;mutated;
+    }
+
+    /**
+     * @param  array&lt;int, string&gt;  $classesToMutate
+     */
+    private function doesNotContainClassToMutate(string $contents, array $classesToMutate): bool
+    {
+        if ($classesToMutate === []) {
+            return false;
+        }
+
+        foreach ($classesToMutate as $classOrNamespace) {
+            $parts = explode(&#039;\\&#039;, $classOrNamespace);
+            $class = array_pop($parts);
+            $namespace = preg_quote(implode(&#039;\\&#039;, $parts));
+            $classOrNamespace = preg_quote($classOrNamespace);
+
+            if (preg_match(&quot;/namespace\\s+$namespace/&quot;, $contents) === 1 &amp;&amp; preg_match(&quot;/(?:class|trait)\\s+$class.*/&quot;, $contents) === 1) {
+                return false;
+            }
+
+            if (preg_match(&quot;/(?:class|trait)\\s+$class\[{\\s*\]/&quot;, $contents) === 1) {
+                return false;
+            }
+
+            if (preg_match(&quot;/namespace\\s+$classOrNamespace/&quot;, $contents) === 1) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param  array&lt;int, class-string&lt;Mutator&gt;&gt;  $mutators
+     * @return array&lt;int, class-string&lt;Mutator&gt;&gt;
+     */
+    private function filterMutators(array $mutators, string $contents, Parser $parser): array
+    {
+        $nodeTypes = [];
+
+        $traverser = new NodeTraverser;
+        $traverser-&gt;addVisitor(new class(function (string $nodeType) use (&amp;$nodeTypes): string {
+            return $nodeTypes[] = $nodeType;
+        }) extends NodeVisitorAbstract {
+
+            /**
+             * @param  callable  $callback
+             */
+            public function __construct(private $callback) // @pest-ignore-type
+            {}
+
+            public function enterNode(Node $node): ?Node
+            {
+                ($this-&gt;callback)($node::class);
+
+                return null;
+            }
+        });
+        $traverser-&gt;traverse($parser-&gt;parse($contents)); // @phpstan-ignore-line
+
+        $nodeTypes = array_unique($nodeTypes);
+
+        $mutatorsToUse = [];
+        foreach ($nodeTypes as $nodeType) {
+            foreach (MutatorMap::get()[$nodeType] ?? [] as $mutator) {
+                $mutatorsToUse[] = $mutator;
+            }
+        }
+
+        return array_intersect($mutators, $mutatorsToUse);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest-plugin-mutate/src/Support/MutationTestResult.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest-plugin-mutate/src/Support/Configuration -->
+
+</body>
+</html>

@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Response/TraceableResponse.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Response;
+
+use Symfony\Component\HttpClient\Chunk\ErrorChunk;
+use Symfony\Component\HttpClient\Exception\ClientException;
+use Symfony\Component\HttpClient\Exception\RedirectionException;
+use Symfony\Component\HttpClient\Exception\ServerException;
+use Symfony\Component\HttpClient\TraceableHttpClient;
+use Symfony\Component\Stopwatch\StopwatchEvent;
+use Symfony\Contracts\HttpClient\Exception\ClientExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\RedirectionExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\ServerExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+
+/**
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+class TraceableResponse implements ResponseInterface, StreamableInterface
+{
+    public function __construct(
+        private HttpClientInterface $client,
+        private ResponseInterface $response,
+        private mixed &amp;$content = false,
+        private ?StopwatchEvent $event = null,
+    ) {
+    }
+
+    public function __serialize(): array
+    {
+        throw new \BadMethodCallException(&#039;Cannot serialize &#039;.__CLASS__);
+    }
+
+    public function __unserialize(array $data): void
+    {
+        throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+    }
+
+    public function __destruct()
+    {
+        try {
+            if (method_exists($this-&gt;response, &#039;__destruct&#039;)) {
+                $this-&gt;response-&gt;__destruct();
+            }
+        } finally {
+            if ($this-&gt;event?-&gt;isStarted()) {
+                $this-&gt;event-&gt;stop();
+            }
+        }
+    }
+
+    public function getStatusCode(): int
+    {
+        try {
+            return $this-&gt;response-&gt;getStatusCode();
+        } finally {
+            if ($this-&gt;event?-&gt;isStarted()) {
+                $this-&gt;event-&gt;lap();
+            }
+        }
+    }
+
+    public function getHeaders(bool $throw = true): array
+    {
+        try {
+            return $this-&gt;response-&gt;getHeaders($throw);
+        } finally {
+            if ($this-&gt;event?-&gt;isStarted()) {
+                $this-&gt;event-&gt;lap();
+            }
+        }
+    }
+
+    public function getContent(bool $throw = true): string
+    {
+        try {
+            if (false === $this-&gt;content) {
+                return $this-&gt;response-&gt;getContent($throw);
+            }
+
+            return $this-&gt;content = $this-&gt;response-&gt;getContent(false);
+        } finally {
+            if ($this-&gt;event?-&gt;isStarted()) {
+                $this-&gt;event-&gt;stop();
+            }
+            if ($throw) {
+                $this-&gt;checkStatusCode($this-&gt;response-&gt;getStatusCode());
+            }
+        }
+    }
+
+    public function toArray(bool $throw = true): array
+    {
+        try {
+            if (false === $this-&gt;content) {
+                return $this-&gt;response-&gt;toArray($throw);
+            }
+
+            return $this-&gt;content = $this-&gt;response-&gt;toArray(false);
+        } finally {
+            if ($this-&gt;event?-&gt;isStarted()) {
+                $this-&gt;event-&gt;stop();
+            }
+            if ($throw) {
+                $this-&gt;checkStatusCode($this-&gt;response-&gt;getStatusCode());
+            }
+        }
+    }
+
+    public function cancel(): void
+    {
+        $this-&gt;response-&gt;cancel();
+
+        if ($this-&gt;event?-&gt;isStarted()) {
+            $this-&gt;event-&gt;stop();
+        }
+    }
+
+    public function getInfo(?string $type = null): mixed
+    {
+        return $this-&gt;response-&gt;getInfo($type);
+    }
+
+    /**
+     * Casts the response to a PHP stream resource.
+     *
+     * @return resource
+     *
+     * @throws TransportExceptionInterface   When a network error occurs
+     * @throws RedirectionExceptionInterface On a 3xx when $throw is true and the &quot;max_redirects&quot; option has been reached
+     * @throws ClientExceptionInterface      On a 4xx when $throw is true
+     * @throws ServerExceptionInterface      On a 5xx when $throw is true
+     */
+    public function toStream(bool $throw = true)
+    {
+        if ($throw) {
+            // Ensure headers arrived
+            $this-&gt;response-&gt;getHeaders(true);
+        }
+
+        if ($this-&gt;response instanceof StreamableInterface) {
+            return $this-&gt;response-&gt;toStream(false);
+        }
+
+        return StreamWrapper::createResource($this-&gt;response, $this-&gt;client);
+    }
+
+    /**
+     * @internal
+     */
+    public static function stream(HttpClientInterface $client, iterable $responses, ?float $timeout): \Generator
+    {
+        $wrappedResponses = [];
+        $traceableMap = new \SplObjectStorage();
+
+        foreach ($responses as $r) {
+            if (!$r instanceof self) {
+                throw new \TypeError(\sprintf(&#039;&quot;%s::stream()&quot; expects parameter 1 to be an iterable of TraceableResponse objects, &quot;%s&quot; given.&#039;, TraceableHttpClient::class, get_debug_type($r)));
+            }
+
+            $traceableMap[$r-&gt;response] = $r;
+            $wrappedResponses[] = $r-&gt;response;
+            if ($r-&gt;event &amp;&amp; !$r-&gt;event-&gt;isStarted()) {
+                $r-&gt;event-&gt;start();
+            }
+        }
+
+        foreach ($client-&gt;stream($wrappedResponses, $timeout) as $r =&gt; $chunk) {
+            if ($traceableMap[$r]-&gt;event &amp;&amp; $traceableMap[$r]-&gt;event-&gt;isStarted()) {
+                try {
+                    if ($chunk-&gt;isTimeout() || !$chunk-&gt;isLast()) {
+                        $traceableMap[$r]-&gt;event-&gt;lap();
+                    } else {
+                        $traceableMap[$r]-&gt;event-&gt;stop();
+                    }
+                } catch (TransportExceptionInterface $e) {
+                    $traceableMap[$r]-&gt;event-&gt;stop();
+                    if ($chunk instanceof ErrorChunk) {
+                        $chunk-&gt;didThrow(false);
+                    } else {
+                        $chunk = new ErrorChunk($chunk-&gt;getOffset(), $e);
+                    }
+                }
+            }
+            yield $traceableMap[$r] =&gt; $chunk;
+        }
+    }
+
+    private function checkStatusCode(int $code): void
+    {
+        if (500 &lt;= $code) {
+            throw new ServerException($this);
+        }
+
+        if (400 &lt;= $code) {
+            throw new ClientException($this);
+        }
+
+        if (300 &lt;= $code) {
+            throw new RedirectionException($this);
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Response/TransportResponseTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Retry -->
+
+</body>
+</html>

@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/psy/psysh/src/Command/ReflectingCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\Command;
+
+use PhpParser\NodeTraverser;
+use PhpParser\PrettyPrinter\Standard as Printer;
+use Psy\CodeCleaner;
+use Psy\CodeCleaner\NoReturnValue;
+use Psy\CodeCleanerAware;
+use Psy\Context;
+use Psy\ContextAware;
+use Psy\Exception\ErrorException;
+use Psy\Exception\RuntimeException;
+use Psy\Exception\UnexpectedTargetException;
+use Psy\Reflection\ReflectionConstant;
+use Psy\Sudo\SudoVisitor;
+use Psy\Util\Mirror;
+use Psy\Util\Str;
+use Symfony\Component\Console\Formatter\OutputFormatter;
+use Symfony\Component\Console\Output\ConsoleOutput;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * An abstract command with helpers for inspecting the current context.
+ */
+abstract class ReflectingCommand extends Command implements ContextAware, CodeCleanerAware
+{
+    const CLASS_OR_FUNC = &#039;/^[\\\\\w]+$/&#039;;
+    const CLASS_MEMBER = &#039;/^([\\\\\w]+)::(\w+)$/&#039;;
+    const CLASS_STATIC = &#039;/^([\\\\\w]+)::\$(\w+)$/&#039;;
+    const INSTANCE_MEMBER = &#039;/^(\$\w+)(::|-&gt;)(\w+)$/&#039;;
+
+    protected Context $context;
+    protected CodeCleaner $cleaner;
+    private CodeArgumentParser $parser;
+    private NodeTraverser $traverser;
+    private Printer $printer;
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __construct($name = null)
+    {
+        $this-&gt;parser = new CodeArgumentParser();
+
+        // @todo Pass visitor directly to once we drop support for PHP-Parser 4.x
+        $this-&gt;traverser = new NodeTraverser();
+        $this-&gt;traverser-&gt;addVisitor(new SudoVisitor());
+
+        $this-&gt;printer = new Printer();
+
+        parent::__construct($name);
+    }
+
+    /**
+     * ContextAware interface.
+     *
+     * @param Context $context
+     */
+    public function setContext(Context $context)
+    {
+        $this-&gt;context = $context;
+    }
+
+    /**
+     * CodeCleanerAware interface.
+     */
+    public function setCodeCleaner(CodeCleaner $cleaner)
+    {
+        $this-&gt;cleaner = $cleaner;
+    }
+
+    /**
+     * Get the target for a value.
+     *
+     * @throws \InvalidArgumentException when the value specified can&#039;t be resolved
+     *
+     * @param string $valueName Function, class, variable, constant, method or property name
+     *
+     * @return array (class or instance name, member name, kind)
+     */
+    protected function getTarget(string $valueName): array
+    {
+        $valueName = \trim($valueName);
+        $matches = [];
+        switch (true) {
+            case \preg_match(self::CLASS_OR_FUNC, $valueName, $matches):
+                return [$this-&gt;resolveName($matches[0], true), null, 0];
+
+            case \preg_match(self::CLASS_MEMBER, $valueName, $matches):
+                return [$this-&gt;resolveName($matches[1]), $matches[2], Mirror::CONSTANT | Mirror::METHOD];
+
+            case \preg_match(self::CLASS_STATIC, $valueName, $matches):
+                return [$this-&gt;resolveName($matches[1]), $matches[2], Mirror::STATIC_PROPERTY | Mirror::PROPERTY];
+
+            case \preg_match(self::INSTANCE_MEMBER, $valueName, $matches):
+                if ($matches[2] === &#039;-&gt;&#039;) {
+                    $kind = Mirror::METHOD | Mirror::PROPERTY;
+                } else {
+                    $kind = Mirror::CONSTANT | Mirror::METHOD;
+                }
+
+                return [$this-&gt;resolveObject($matches[1]), $matches[3], $kind];
+
+            default:
+                return [$this-&gt;resolveObject($valueName), null, 0];
+        }
+    }
+
+    /**
+     * Resolve a class or function name (with the current shell namespace).
+     *
+     * @throws ErrorException when `self` or `static` is used in a non-class scope
+     *
+     * @param string $name
+     * @param bool   $includeFunctions (default: false)
+     */
+    protected function resolveName(string $name, bool $includeFunctions = false): string
+    {
+        $shell = $this-&gt;getShell();
+
+        // While not *technically* 100% accurate, let&#039;s treat `self` and `static` as equivalent.
+        if (\in_array(\strtolower($name), [&#039;self&#039;, &#039;static&#039;])) {
+            if ($boundClass = $shell-&gt;getBoundClass()) {
+                return $boundClass;
+            }
+
+            if ($boundObject = $shell-&gt;getBoundObject()) {
+                return \get_class($boundObject);
+            }
+
+            $msg = \sprintf(&#039;Cannot use &quot;%s&quot; when no class scope is active&#039;, \strtolower($name));
+            throw new ErrorException($msg, 0, \E_USER_ERROR, &quot;eval()&#039;d code&quot;, 1);
+        }
+
+        if (\substr($name, 0, 1) === &#039;\\&#039;) {
+            return $name;
+        }
+
+        // Use CodeCleaner to resolve the name through use statements and namespace
+        if (Str::isValidClassName($name)) {
+            $resolved = $this-&gt;cleaner-&gt;resolveClassName($name);
+
+            // If we got a different name back, use it
+            if ($resolved !== $name) {
+                return $resolved;
+            }
+
+            // Fall back to the old resolveCode approach for edge cases
+            try {
+                $resolved = $this-&gt;resolveCode($name.&#039;::class&#039;);
+                if ($resolved !== $name) {
+                    return $resolved;
+                }
+            } catch (RuntimeException $e) {
+                // Fall through to namespace check
+            }
+        }
+
+        if ($namespace = $shell-&gt;getNamespace()) {
+            $fullName = $namespace.&#039;\\&#039;.$name;
+
+            if (\class_exists($fullName) || \interface_exists($fullName) || ($includeFunctions &amp;&amp; \function_exists($fullName))) {
+                return $fullName;
+            }
+        }
+
+        return $name;
+    }
+
+    /**
+     * Get a Reflector and documentation for a function, class or instance, constant, method or property.
+     *
+     * @param string               $valueName Function, class, variable, constant, method or property name
+     * @param OutputInterface|null $output    Optional output for displaying cleaner messages
+     *
+     * @return array (value, Reflector)
+     */
+    protected function getTargetAndReflector(string $valueName, ?OutputInterface $output = null): array
+    {
+        list($value, $member, $kind) = $this-&gt;getTarget($valueName);
+
+        // Display any implicit use statements that were added during name resolution
+        if ($output !== null) {
+            $this-&gt;writeCleanerMessages($output);
+        }
+
+        return [$value, Mirror::get($value, $member, $kind)];
+    }
+
+    /**
+     * Resolve code to a value in the current scope.
+     *
+     * @throws RuntimeException when the code does not return a value in the current scope
+     *
+     * @param string $code
+     *
+     * @return mixed Variable value
+     */
+    protected function resolveCode(string $code)
+    {
+        try {
+            // Add an implicit `sudo` to target resolution.
+            $nodes = $this-&gt;traverser-&gt;traverse($this-&gt;parser-&gt;parse($code));
+            $sudoCode = $this-&gt;printer-&gt;prettyPrint($nodes);
+            $value = $this-&gt;getShell()-&gt;execute($sudoCode, true);
+        } catch (\Throwable $e) {
+            // Swallow all exceptions?
+        }
+
+        if (!isset($value) || $value instanceof NoReturnValue) {
+            throw new RuntimeException(&#039;Unknown target: &#039;.$code);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Resolve code to an object in the current scope.
+     *
+     * @throws UnexpectedTargetException when the code resolves to a non-object value
+     *
+     * @param string $code
+     *
+     * @return object Variable instance
+     */
+    private function resolveObject(string $code)
+    {
+        $value = $this-&gt;resolveCode($code);
+
+        if (!\is_object($value)) {
+            throw new UnexpectedTargetException($value, &#039;Unable to inspect a non-object&#039;);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Get a variable from the current shell scope.
+     *
+     * @param string $name
+     *
+     * @return mixed
+     */
+    protected function getScopeVariable(string $name)
+    {
+        return $this-&gt;context-&gt;get($name);
+    }
+
+    /**
+     * Get all scope variables from the current shell scope.
+     *
+     * @return array
+     */
+    protected function getScopeVariables(): array
+    {
+        return $this-&gt;context-&gt;getAll();
+    }
+
+    /**
+     * Given a Reflector instance, set command-scope variables in the shell
+     * execution context. This is used to inject magic $__class, $__method and
+     * $__file variables (as well as a handful of others).
+     *
+     * @param \Reflector $reflector
+     */
+    protected function setCommandScopeVariables(\Reflector $reflector)
+    {
+        $vars = [];
+
+        switch (\get_class($reflector)) {
+            case \ReflectionClass::class:
+            case \ReflectionObject::class:
+                $vars[&#039;__class&#039;] = $reflector-&gt;name;
+                if ($reflector-&gt;inNamespace()) {
+                    $vars[&#039;__namespace&#039;] = $reflector-&gt;getNamespaceName();
+                }
+                break;
+
+            case \ReflectionMethod::class:
+                $vars[&#039;__method&#039;] = \sprintf(&#039;%s::%s&#039;, $reflector-&gt;class, $reflector-&gt;name);
+                $vars[&#039;__class&#039;] = $reflector-&gt;class;
+                $classReflector = $reflector-&gt;getDeclaringClass();
+                if ($classReflector-&gt;inNamespace()) {
+                    $vars[&#039;__namespace&#039;] = $classReflector-&gt;getNamespaceName();
+                }
+                break;
+
+            case \ReflectionFunction::class:
+                $vars[&#039;__function&#039;] = $reflector-&gt;name;
+                if ($reflector-&gt;inNamespace()) {
+                    $vars[&#039;__namespace&#039;] = $reflector-&gt;getNamespaceName();
+                }
+                break;
+
+            case \ReflectionGenerator::class:
+                $funcReflector = $reflector-&gt;getFunction();
+                $vars[&#039;__function&#039;] = $funcReflector-&gt;name;
+                if ($funcReflector-&gt;inNamespace()) {
+                    $vars[&#039;__namespace&#039;] = $funcReflector-&gt;getNamespaceName();
+                }
+                if ($fileName = $reflector-&gt;getExecutingFile()) {
+                    $vars[&#039;__file&#039;] = $fileName;
+                    $vars[&#039;__line&#039;] = $reflector-&gt;getExecutingLine();
+                    $vars[&#039;__dir&#039;] = \dirname($fileName);
+                }
+                break;
+
+            case \ReflectionProperty::class:
+            case \ReflectionClassConstant::class:
+                $classReflector = $reflector-&gt;getDeclaringClass();
+                $vars[&#039;__class&#039;] = $classReflector-&gt;name;
+                if ($classReflector-&gt;inNamespace()) {
+                    $vars[&#039;__namespace&#039;] = $classReflector-&gt;getNamespaceName();
+                }
+                // no line for these, but this&#039;ll do
+                if ($fileName = $reflector-&gt;getDeclaringClass()-&gt;getFileName()) {
+                    $vars[&#039;__file&#039;] = $fileName;
+                    $vars[&#039;__dir&#039;] = \dirname($fileName);
+                }
+                break;
+
+            case ReflectionConstant::class:
+                if ($reflector-&gt;inNamespace()) {
+                    $vars[&#039;__namespace&#039;] = $reflector-&gt;getNamespaceName();
+                }
+                break;
+        }
+
+        if ($reflector instanceof \ReflectionClass || $reflector instanceof \ReflectionFunctionAbstract) {
+            if ($fileName = $reflector-&gt;getFileName()) {
+                $vars[&#039;__file&#039;] = $fileName;
+                $vars[&#039;__line&#039;] = $reflector-&gt;getStartLine();
+                $vars[&#039;__dir&#039;] = \dirname($fileName);
+            }
+        }
+
+        $this-&gt;context-&gt;setCommandScopeVariables($vars);
+    }
+
+    /**
+     * Write log messages (e.g. implicit use statements) from CodeCleaner passes.
+     */
+    protected function writeCleanerMessages(OutputInterface $output)
+    {
+        // Write to stderr if this is a ConsoleOutput
+        if ($output instanceof ConsoleOutput) {
+            $output = $output-&gt;getErrorOutput();
+        }
+
+        foreach ($this-&gt;cleaner-&gt;getMessages() as $message) {
+            $output-&gt;writeln(\sprintf(&#039;&lt;whisper&gt;%s&lt;/whisper&gt;&#039;, OutputFormatter::escape($message)));
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/psy/psysh/src/Command/ShowCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/psy/psysh/src/Command/ListCommand -->
+
+</body>
+</html>

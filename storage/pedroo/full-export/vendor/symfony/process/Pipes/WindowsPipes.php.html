@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/process/Pipes/WindowsPipes.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Process\Pipes;
+
+use Symfony\Component\Process\Exception\RuntimeException;
+use Symfony\Component\Process\Process;
+
+/**
+ * WindowsPipes implementation uses temporary files as handles.
+ *
+ * @see https://bugs.php.net/51800
+ * @see https://bugs.php.net/65650
+ *
+ * @author Romain Neutron &lt;imprec@gmail.com&gt;
+ *
+ * @internal
+ */
+class WindowsPipes extends AbstractPipes
+{
+    private array $files = [];
+    private array $fileHandles = [];
+    private array $lockHandles = [];
+    private array $readBytes = [
+        Process::STDOUT =&gt; 0,
+        Process::STDERR =&gt; 0,
+    ];
+
+    public function __construct(
+        mixed $input,
+        private bool $haveReadSupport,
+    ) {
+        if ($this-&gt;haveReadSupport) {
+            // Fix for PHP bug #51800: reading from STDOUT pipe hangs forever on Windows if the output is too big.
+            // Workaround for this problem is to use temporary files instead of pipes on Windows platform.
+            //
+            // @see https://bugs.php.net/51800
+            $pipes = [
+                Process::STDOUT =&gt; Process::OUT,
+                Process::STDERR =&gt; Process::ERR,
+            ];
+            $tmpDir = sys_get_temp_dir();
+            $lastError = &#039;unknown reason&#039;;
+            set_error_handler(function ($type, $msg) use (&amp;$lastError) { $lastError = $msg; });
+            for ($i = 0;; ++$i) {
+                foreach ($pipes as $pipe =&gt; $name) {
+                    $file = \sprintf(&#039;%s\\sf_proc_%02X.%s&#039;, $tmpDir, $i, $name);
+
+                    if (!$h = fopen($file.&#039;.lock&#039;, &#039;w&#039;)) {
+                        if (file_exists($file.&#039;.lock&#039;)) {
+                            continue 2;
+                        }
+                        restore_error_handler();
+                        throw new RuntimeException(&#039;A temporary file could not be opened to write the process output: &#039;.$lastError);
+                    }
+                    if (!flock($h, \LOCK_EX | \LOCK_NB)) {
+                        continue 2;
+                    }
+                    if (isset($this-&gt;lockHandles[$pipe])) {
+                        flock($this-&gt;lockHandles[$pipe], \LOCK_UN);
+                        fclose($this-&gt;lockHandles[$pipe]);
+                    }
+                    $this-&gt;lockHandles[$pipe] = $h;
+
+                    if (!($h = fopen($file, &#039;w&#039;)) || !fclose($h) || !$h = fopen($file, &#039;r&#039;)) {
+                        flock($this-&gt;lockHandles[$pipe], \LOCK_UN);
+                        fclose($this-&gt;lockHandles[$pipe]);
+                        unset($this-&gt;lockHandles[$pipe]);
+                        continue 2;
+                    }
+                    $this-&gt;fileHandles[$pipe] = $h;
+                    $this-&gt;files[$pipe] = $file;
+                }
+                break;
+            }
+            restore_error_handler();
+        }
+
+        parent::__construct($input);
+    }
+
+    public function __serialize(): array
+    {
+        throw new \BadMethodCallException(&#039;Cannot serialize &#039;.__CLASS__);
+    }
+
+    public function __unserialize(array $data): void
+    {
+        throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+    }
+
+    public function __destruct()
+    {
+        $this-&gt;close();
+    }
+
+    public function getDescriptors(): array
+    {
+        if (!$this-&gt;haveReadSupport) {
+            $nullstream = fopen(&#039;NUL&#039;, &#039;c&#039;);
+
+            return [
+                [&#039;pipe&#039;, &#039;r&#039;],
+                $nullstream,
+                $nullstream,
+            ];
+        }
+
+        // We&#039;re not using pipe on Windows platform as it hangs (https://bugs.php.net/51800)
+        // We&#039;re not using file handles as it can produce corrupted output https://bugs.php.net/65650
+        // So we redirect output within the commandline and pass the nul device to the process
+        return [
+            [&#039;pipe&#039;, &#039;r&#039;],
+            [&#039;file&#039;, &#039;NUL&#039;, &#039;w&#039;],
+            [&#039;file&#039;, &#039;NUL&#039;, &#039;w&#039;],
+        ];
+    }
+
+    public function getFiles(): array
+    {
+        return $this-&gt;files;
+    }
+
+    public function readAndWrite(bool $blocking, bool $close = false): array
+    {
+        $this-&gt;unblock();
+        $w = $this-&gt;write();
+        $read = $r = $e = [];
+
+        if ($blocking) {
+            if ($w) {
+                @stream_select($r, $w, $e, 0, Process::TIMEOUT_PRECISION * 1E6);
+            } elseif ($this-&gt;fileHandles) {
+                usleep((int) (Process::TIMEOUT_PRECISION * 1E6));
+            }
+        }
+        foreach ($this-&gt;fileHandles as $type =&gt; $fileHandle) {
+            $data = stream_get_contents($fileHandle, -1, $this-&gt;readBytes[$type]);
+
+            if (isset($data[0])) {
+                $this-&gt;readBytes[$type] += \strlen($data);
+                $read[$type] = $data;
+            }
+            if ($close) {
+                ftruncate($fileHandle, 0);
+                fclose($fileHandle);
+                flock($this-&gt;lockHandles[$type], \LOCK_UN);
+                fclose($this-&gt;lockHandles[$type]);
+                unset($this-&gt;fileHandles[$type], $this-&gt;lockHandles[$type]);
+            }
+        }
+
+        return $read;
+    }
+
+    public function haveReadSupport(): bool
+    {
+        return $this-&gt;haveReadSupport;
+    }
+
+    public function areOpen(): bool
+    {
+        return $this-&gt;pipes &amp;&amp; $this-&gt;fileHandles;
+    }
+
+    public function close(): void
+    {
+        parent::close();
+        foreach ($this-&gt;fileHandles as $type =&gt; $handle) {
+            ftruncate($handle, 0);
+            fclose($handle);
+            flock($this-&gt;lockHandles[$type], \LOCK_UN);
+            fclose($this-&gt;lockHandles[$type]);
+        }
+        $this-&gt;fileHandles = $this-&gt;lockHandles = [];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/process/Process.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/routing -->
+
+</body>
+</html>

@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Session/Store.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Session;
+
+use BackedEnum;
+use Closure;
+use Illuminate\Contracts\Session\Session;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Date;
+use Illuminate\Support\MessageBag;
+use Illuminate\Support\Str;
+use Illuminate\Support\Traits\Macroable;
+use Illuminate\Support\Uri;
+use Illuminate\Support\ViewErrorBag;
+use RuntimeException;
+use SessionHandlerInterface;
+use stdClass;
+use UnitEnum;
+
+use function Illuminate\Support\enum_value;
+
+class Store implements Session
+{
+    use Macroable;
+
+    /**
+     * The length of session ID strings.
+     *
+     * @var int
+     */
+    protected const SESSION_ID_LENGTH = 40;
+
+    /**
+     * The session ID.
+     *
+     * @var string
+     */
+    protected $id;
+
+    /**
+     * The session name.
+     *
+     * @var string
+     */
+    protected $name;
+
+    /**
+     * The session attributes.
+     *
+     * @var array
+     */
+    protected $attributes = [];
+
+    /**
+     * The session handler implementation.
+     *
+     * @var \SessionHandlerInterface
+     */
+    protected $handler;
+
+    /**
+     * The session store&#039;s serialization strategy.
+     *
+     * @var string
+     */
+    protected $serialization = &#039;php&#039;;
+
+    /**
+     * Session store started status.
+     *
+     * @var bool
+     */
+    protected $started = false;
+
+    /**
+     * Create a new session instance.
+     *
+     * @param  string  $name
+     * @param  \SessionHandlerInterface  $handler
+     * @param  string|null  $id
+     * @param  string  $serialization
+     */
+    public function __construct($name, SessionHandlerInterface $handler, $id = null, $serialization = &#039;php&#039;)
+    {
+        $this-&gt;setId($id);
+        $this-&gt;name = $name;
+        $this-&gt;handler = $handler;
+        $this-&gt;serialization = $serialization;
+    }
+
+    /**
+     * Start the session, reading the data from a handler.
+     *
+     * @return bool
+     */
+    public function start()
+    {
+        $this-&gt;loadSession();
+
+        if (! $this-&gt;has(&#039;_token&#039;)) {
+            $this-&gt;regenerateToken();
+        }
+
+        return $this-&gt;started = true;
+    }
+
+    /**
+     * Load the session data from the handler.
+     *
+     * @return void
+     */
+    protected function loadSession()
+    {
+        $this-&gt;attributes = array_replace($this-&gt;attributes, $this-&gt;readFromHandler());
+
+        $this-&gt;marshalErrorBag();
+    }
+
+    /**
+     * Read the session data from the handler.
+     *
+     * @return array
+     */
+    protected function readFromHandler()
+    {
+        if ($data = $this-&gt;handler-&gt;read($this-&gt;getId())) {
+            if ($this-&gt;serialization === &#039;json&#039;) {
+                $data = json_decode($this-&gt;prepareForUnserialize($data), true);
+            } else {
+                $data = @unserialize($this-&gt;prepareForUnserialize($data));
+            }
+
+            if ($data !== false &amp;&amp; is_array($data)) {
+                return $data;
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * Prepare the raw string data from the session for unserialization.
+     *
+     * @param  string  $data
+     * @return string
+     */
+    protected function prepareForUnserialize($data)
+    {
+        return $data;
+    }
+
+    /**
+     * Marshal the ViewErrorBag when using JSON serialization for sessions.
+     *
+     * @return void
+     */
+    protected function marshalErrorBag()
+    {
+        if ($this-&gt;serialization !== &#039;json&#039; || $this-&gt;missing(&#039;errors&#039;)) {
+            return;
+        }
+
+        $errorBag = new ViewErrorBag;
+
+        foreach ($this-&gt;get(&#039;errors&#039;) as $key =&gt; $value) {
+            $messageBag = new MessageBag($value[&#039;messages&#039;]);
+
+            $errorBag-&gt;put($key, $messageBag-&gt;setFormat($value[&#039;format&#039;]));
+        }
+
+        $this-&gt;put(&#039;errors&#039;, $errorBag);
+    }
+
+    /**
+     * Save the session data to storage.
+     *
+     * @return void
+     */
+    public function save()
+    {
+        $this-&gt;ageFlashData();
+
+        $this-&gt;prepareErrorBagForSerialization();
+
+        $this-&gt;handler-&gt;write($this-&gt;getId(), $this-&gt;prepareForStorage(
+            $this-&gt;serialization === &#039;json&#039; ? json_encode($this-&gt;attributes) : serialize($this-&gt;attributes)
+        ));
+
+        $this-&gt;started = false;
+    }
+
+    /**
+     * Prepare the ViewErrorBag instance for JSON serialization.
+     *
+     * @return void
+     */
+    protected function prepareErrorBagForSerialization()
+    {
+        if ($this-&gt;serialization !== &#039;json&#039; || $this-&gt;missing(&#039;errors&#039;)) {
+            return;
+        }
+
+        $errors = [];
+
+        foreach ($this-&gt;attributes[&#039;errors&#039;]-&gt;getBags() as $key =&gt; $value) {
+            $errors[$key] = [
+                &#039;format&#039; =&gt; $value-&gt;getFormat(),
+                &#039;messages&#039; =&gt; $value-&gt;getMessages(),
+            ];
+        }
+
+        $this-&gt;attributes[&#039;errors&#039;] = $errors;
+    }
+
+    /**
+     * Prepare the serialized session data for storage.
+     *
+     * @param  string  $data
+     * @return string
+     */
+    protected function prepareForStorage($data)
+    {
+        return $data;
+    }
+
+    /**
+     * Age the flash data for the session.
+     *
+     * @return void
+     */
+    public function ageFlashData()
+    {
+        $this-&gt;forget($this-&gt;get(&#039;_flash.old&#039;, []));
+
+        $this-&gt;put(&#039;_flash.old&#039;, $this-&gt;get(&#039;_flash.new&#039;, []));
+
+        $this-&gt;put(&#039;_flash.new&#039;, []);
+    }
+
+    /**
+     * Get all of the session data.
+     *
+     * @return array
+     */
+    public function all()
+    {
+        return $this-&gt;attributes;
+    }
+
+    /**
+     * Get a subset of the session data.
+     *
+     * @param  array  $keys
+     * @return array
+     */
+    public function only(array $keys)
+    {
+        return Arr::only($this-&gt;attributes, $keys);
+    }
+
+    /**
+     * Get all the session data except for a specified array of items.
+     *
+     * @param  array  $keys
+     * @return array
+     */
+    public function except(array $keys)
+    {
+        return Arr::except($this-&gt;attributes, $keys);
+    }
+
+    /**
+     * Checks if a key exists.
+     *
+     * @param  \UnitEnum|string|array  $key
+     * @return bool
+     */
+    public function exists($key)
+    {
+        $placeholder = new stdClass;
+
+        return ! (new Collection(is_array($key) ? $key : func_get_args()))-&gt;contains(function ($key) use ($placeholder) {
+            return $this-&gt;get($key, $placeholder) === $placeholder;
+        });
+    }
+
+    /**
+     * Determine if the given key is missing from the session data.
+     *
+     * @param  \UnitEnum|string|array  $key
+     * @return bool
+     */
+    public function missing($key)
+    {
+        return ! $this-&gt;exists($key);
+    }
+
+    /**
+     * Determine if a key is present and not null.
+     *
+     * @param  \UnitEnum|string|array  $key
+     * @return bool
+     */
+    public function has($key)
+    {
+        return ! (new Collection(is_array($key) ? $key : func_get_args()))-&gt;contains(function ($key) {
+            return is_null($this-&gt;get($key));
+        });
+    }
+
+    /**
+     * Determine if any of the given keys are present and not null.
+     *
+     * @param  \UnitEnum|string|array  $key
+     * @return bool
+     */
+    public function hasAny($key)
+    {
+        return (new Collection(is_array($key) ? $key : func_get_args()))-&gt;filter(function ($key) {
+            return ! is_null($this-&gt;get($key));
+        })-&gt;count() &gt;= 1;
+    }
+
+    /**
+     * Get an item from the session.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  mixed  $default
+     * @return mixed
+     */
+    public function get($key, $default = null)
+    {
+        return Arr::get($this-&gt;attributes, enum_value($key), $default);
+    }
+
+    /**
+     * Get the value of a given key and then forget it.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  mixed  $default
+     * @return mixed
+     */
+    public function pull($key, $default = null)
+    {
+        return Arr::pull($this-&gt;attributes, enum_value($key), $default);
+    }
+
+    /**
+     * Determine if the session contains old input.
+     *
+     * @param  string|null  $key
+     * @return bool
+     */
+    public function hasOldInput($key = null)
+    {
+        $old = $this-&gt;getOldInput($key);
+
+        return is_null($key) ? count($old) &gt; 0 : ! is_null($old);
+    }
+
+    /**
+     * Get the requested item from the flashed input array.
+     *
+     * @param  string|null  $key
+     * @param  mixed  $default
+     * @return mixed
+     */
+    public function getOldInput($key = null, $default = null)
+    {
+        return Arr::get($this-&gt;get(&#039;_old_input&#039;, []), $key, $default);
+    }
+
+    /**
+     * Replace the given session attributes entirely.
+     *
+     * @param  array  $attributes
+     * @return void
+     */
+    public function replace(array $attributes)
+    {
+        $this-&gt;put($attributes);
+    }
+
+    /**
+     * Put a key / value pair or array of key / value pairs in the session.
+     *
+     * @param  \UnitEnum|string|array  $key
+     * @param  mixed  $value
+     * @return void
+     */
+    public function put($key, $value = null)
+    {
+        if (! is_array($key)) {
+            $key = [enum_value($key) =&gt; $value];
+        }
+
+        foreach ($key as $arrayKey =&gt; $arrayValue) {
+            Arr::set($this-&gt;attributes, enum_value($arrayKey), $arrayValue);
+        }
+    }
+
+    /**
+     * Get an item from the session, or store the default value.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  \Closure  $callback
+     * @return mixed
+     */
+    public function remember($key, Closure $callback)
+    {
+        if (! is_null($value = $this-&gt;get($key))) {
+            return $value;
+        }
+
+        return tap($callback(), function ($value) use ($key) {
+            $this-&gt;put($key, $value);
+        });
+    }
+
+    /**
+     * Push a value onto a session array.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  mixed  $value
+     * @return void
+     */
+    public function push($key, $value)
+    {
+        $array = $this-&gt;get($key, []);
+
+        $array[] = $value;
+
+        $this-&gt;put($key, $array);
+    }
+
+    /**
+     * Increment the value of an item in the session.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  int  $amount
+     * @return mixed
+     */
+    public function increment($key, $amount = 1)
+    {
+        $this-&gt;put($key, $value = $this-&gt;get($key, 0) + $amount);
+
+        return $value;
+    }
+
+    /**
+     * Decrement the value of an item in the session.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  int  $amount
+     * @return int
+     */
+    public function decrement($key, $amount = 1)
+    {
+        return $this-&gt;increment($key, $amount * -1);
+    }
+
+    /**
+     * Flash a key / value pair to the session.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  mixed  $value
+     * @return void
+     */
+    public function flash(BackedEnum|UnitEnum|string $key, $value = true)
+    {
+        $key = enum_value($key);
+
+        $this-&gt;put($key, $value);
+
+        $this-&gt;push(&#039;_flash.new&#039;, $key);
+
+        $this-&gt;removeFromOldFlashData([$key]);
+    }
+
+    /**
+     * Flash a key / value pair to the session for immediate use.
+     *
+     * @param  \UnitEnum|string  $key
+     * @param  mixed  $value
+     * @return void
+     */
+    public function now($key, $value)
+    {
+        $key = enum_value($key);
+
+        $this-&gt;put($key, $value);
+
+        $this-&gt;push(&#039;_flash.old&#039;, $key);
+    }
+
+    /**
+     * Reflash all of the session flash data.
+     *
+     * @return void
+     */
+    public function reflash()
+    {
+        $this-&gt;mergeNewFlashes($this-&gt;get(&#039;_flash.old&#039;, []));
+
+        $this-&gt;put(&#039;_flash.old&#039;, []);
+    }
+
+    /**
+     * Reflash a subset of the current flash data.
+     *
+     * @param  mixed  $keys
+     * @return void
+     */
+    public function keep($keys = null)
+    {
+        $this-&gt;mergeNewFlashes($keys = is_array($keys) ? $keys : func_get_args());
+
+        $this-&gt;removeFromOldFlashData($keys);
+    }
+
+    /**
+     * Merge new flash keys into the new flash array.
+     *
+     * @param  array  $keys
+     * @return void
+     */
+    protected function mergeNewFlashes(array $keys)
+    {
+        $values = array_unique(array_merge($this-&gt;get(&#039;_flash.new&#039;, []), $keys));
+
+        $this-&gt;put(&#039;_flash.new&#039;, $values);
+    }
+
+    /**
+     * Remove the given keys from the old flash data.
+     *
+     * @param  array  $keys
+     * @return void
+     */
+    protected function removeFromOldFlashData(array $keys)
+    {
+        $this-&gt;put(&#039;_flash.old&#039;, array_diff($this-&gt;get(&#039;_flash.old&#039;, []), $keys));
+    }
+
+    /**
+     * Flash an input array to the session.
+     *
+     * @param  array  $value
+     * @return void
+     */
+    public function flashInput(array $value)
+    {
+        $this-&gt;flash(&#039;_old_input&#039;, $value);
+    }
+
+    /**
+     * Get the session cache instance.
+     *
+     * @return \Illuminate\Contracts\Cache\Repository
+     */
+    public function cache()
+    {
+        return Cache::store(&#039;session&#039;);
+    }
+
+    /**
+     * Remove an item from the session, returning its value.
+     *
+     * @param  \UnitEnum|string  $key
+     * @return mixed
+     */
+    public function remove($key)
+    {
+        return Arr::pull($this-&gt;attributes, enum_value($key));
+    }
+
+    /**
+     * Remove one or many items from the session.
+     *
+     * @param  \UnitEnum|string|array  $keys
+     * @return void
+     */
+    public function forget($keys)
+    {
+        Arr::forget($this-&gt;attributes, (new Collection((array) $keys))-&gt;map(fn ($key) =&gt; enum_value($key))-&gt;all());
+    }
+
+    /**
+     * Remove all of the items from the session.
+     *
+     * @return void
+     */
+    public function flush()
+    {
+        $this-&gt;attributes = [];
+    }
+
+    /**
+     * Flush the session data and regenerate the ID.
+     *
+     * @return bool
+     */
+    public function invalidate()
+    {
+        $this-&gt;flush();
+
+        return $this-&gt;migrate(true);
+    }
+
+    /**
+     * Generate a new session identifier.
+     *
+     * @param  bool  $destroy
+     * @return bool
+     */
+    public function regenerate($destroy = false)
+    {
+        return tap($this-&gt;migrate($destroy), function () {
+            $this-&gt;regenerateToken();
+        });
+    }
+
+    /**
+     * Generate a new session ID for the session.
+     *
+     * @param  bool  $destroy
+     * @return bool
+     */
+    public function migrate($destroy = false)
+    {
+        if ($destroy) {
+            $this-&gt;handler-&gt;destroy($this-&gt;getId());
+        }
+
+        $this-&gt;setExists(false);
+
+        $this-&gt;setId($this-&gt;generateSessionId());
+
+        return true;
+    }
+
+    /**
+     * Determine if the session has been started.
+     *
+     * @return bool
+     */
+    public function isStarted()
+    {
+        return $this-&gt;started;
+    }
+
+    /**
+     * Get the name of the session.
+     *
+     * @return string
+     */
+    public function getName()
+    {
+        return $this-&gt;name;
+    }
+
+    /**
+     * Set the name of the session.
+     *
+     * @param  string  $name
+     * @return void
+     */
+    public function setName($name)
+    {
+        $this-&gt;name = $name;
+    }
+
+    /**
+     * Get the current session ID.
+     *
+     * @return string
+     */
+    public function id()
+    {
+        return $this-&gt;getId();
+    }
+
+    /**
+     * Get the current session ID.
+     *
+     * @return string
+     */
+    public function getId()
+    {
+        return $this-&gt;id;
+    }
+
+    /**
+     * Set the session ID.
+     *
+     * @param  string|null  $id
+     * @return void
+     */
+    public function setId($id)
+    {
+        $this-&gt;id = $this-&gt;isValidId($id) ? $id : $this-&gt;generateSessionId();
+    }
+
+    /**
+     * Determine if this is a valid session ID.
+     *
+     * @param  string|null  $id
+     * @return bool
+     */
+    public function isValidId($id)
+    {
+        return is_string($id) &amp;&amp; ctype_alnum($id) &amp;&amp; strlen($id) === self::SESSION_ID_LENGTH;
+    }
+
+    /**
+     * Get a new, random session ID.
+     *
+     * @return string
+     */
+    protected function generateSessionId()
+    {
+        return Str::random(self::SESSION_ID_LENGTH);
+    }
+
+    /**
+     * Set the existence of the session on the handler if applicable.
+     *
+     * @param  bool  $value
+     * @return void
+     */
+    public function setExists($value)
+    {
+        if ($this-&gt;handler instanceof ExistenceAwareInterface) {
+            $this-&gt;handler-&gt;setExists($value);
+        }
+    }
+
+    /**
+     * Get the CSRF token value.
+     *
+     * @return string
+     */
+    public function token()
+    {
+        return $this-&gt;get(&#039;_token&#039;);
+    }
+
+    /**
+     * Regenerate the CSRF token value.
+     *
+     * @return void
+     */
+    public function regenerateToken()
+    {
+        $this-&gt;put(&#039;_token&#039;, Str::random(self::SESSION_ID_LENGTH));
+    }
+
+    /**
+     * Determine if the previous URI is available.
+     *
+     * @return bool
+     */
+    public function hasPreviousUri()
+    {
+        return ! is_null($this-&gt;previousUrl());
+    }
+
+    /**
+     * Get the previous URL from the session as a URI instance.
+     *
+     * @return \Illuminate\Support\Uri
+     *
+     * @throws \RuntimeException
+     */
+    public function previousUri()
+    {
+        if ($previousUrl = $this-&gt;previousUrl()) {
+            return Uri::of($previousUrl);
+        }
+
+        throw new RuntimeException(&#039;Unable to generate URI instance for previous URL. No previous URL detected.&#039;);
+    }
+
+    /**
+     * Get the previous URL from the session.
+     *
+     * @return string|null
+     */
+    public function previousUrl()
+    {
+        return $this-&gt;get(&#039;_previous.url&#039;);
+    }
+
+    /**
+     * Set the &quot;previous&quot; URL in the session.
+     *
+     * @param  string  $url
+     * @return void
+     */
+    public function setPreviousUrl($url)
+    {
+        $this-&gt;put(&#039;_previous.url&#039;, $url);
+    }
+
+    /**
+     * Get the previous route name from the session.
+     *
+     * @return string|null
+     */
+    public function previousRoute()
+    {
+        return $this-&gt;get(&#039;_previous.route&#039;);
+    }
+
+    /**
+     * Set the &quot;previous&quot; route name in the session.
+     *
+     * @param  string|null  $route
+     * @return void
+     */
+    public function setPreviousRoute($route)
+    {
+        $this-&gt;put(&#039;_previous.route&#039;, $route);
+    }
+
+    /**
+     * Specify that the user has confirmed their password.
+     *
+     * @return void
+     */
+    public function passwordConfirmed()
+    {
+        $this-&gt;put(&#039;auth.password_confirmed_at&#039;, Date::now()-&gt;unix());
+    }
+
+    /**
+     * Get the underlying session handler implementation.
+     *
+     * @return \SessionHandlerInterface
+     */
+    public function getHandler()
+    {
+        return $this-&gt;handler;
+    }
+
+    /**
+     * Set the underlying session handler implementation.
+     *
+     * @param  \SessionHandlerInterface  $handler
+     * @return \SessionHandlerInterface
+     */
+    public function setHandler(SessionHandlerInterface $handler)
+    {
+        return $this-&gt;handler = $handler;
+    }
+
+    /**
+     * Determine if the session handler needs a request.
+     *
+     * @return bool
+     */
+    public function handlerNeedsRequest()
+    {
+        return $this-&gt;handler instanceof CookieSessionHandler;
+    }
+
+    /**
+     * Set the request on the handler instance.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return void
+     */
+    public function setRequestOnHandler($request)
+    {
+        if ($this-&gt;handlerNeedsRequest()) {
+            $this-&gt;handler-&gt;setRequest($request);
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Session/SymfonySessionDecorator.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Session/Console -->
+
+</body>
+</html>

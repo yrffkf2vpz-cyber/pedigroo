@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Broadcasting/Broadcasters/RedisBroadcaster.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Broadcasting\Broadcasters;
+
+use Illuminate\Broadcasting\BroadcastException;
+use Illuminate\Contracts\Redis\Factory as Redis;
+use Illuminate\Redis\Connections\PhpRedisClusterConnection;
+use Illuminate\Redis\Connections\PredisClusterConnection;
+use Illuminate\Redis\Connections\PredisConnection;
+use Illuminate\Support\Arr;
+use Predis\Connection\Cluster\RedisCluster;
+use Predis\Connection\ConnectionException;
+use RedisException;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+
+class RedisBroadcaster extends Broadcaster
+{
+    use UsePusherChannelConventions;
+
+    /**
+     * The Redis instance.
+     *
+     * @var \Illuminate\Contracts\Redis\Factory
+     */
+    protected $redis;
+
+    /**
+     * The Redis connection to use for broadcasting.
+     *
+     * @var string|null
+     */
+    protected $connection = null;
+
+    /**
+     * The Redis key prefix.
+     *
+     * @var string
+     */
+    protected $prefix = &#039;&#039;;
+
+    /**
+     * Create a new broadcaster instance.
+     *
+     * @param  \Illuminate\Contracts\Redis\Factory  $redis
+     * @param  string|null  $connection
+     * @param  string  $prefix
+     */
+    public function __construct(Redis $redis, $connection = null, $prefix = &#039;&#039;)
+    {
+        $this-&gt;redis = $redis;
+        $this-&gt;prefix = $prefix;
+        $this-&gt;connection = $connection;
+    }
+
+    /**
+     * Authenticate the incoming request for a given channel.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return mixed
+     *
+     * @throws \Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException
+     */
+    public function auth($request)
+    {
+        $channelName = $this-&gt;normalizeChannelName(
+            str_replace($this-&gt;prefix, &#039;&#039;, $request-&gt;channel_name)
+        );
+
+        if (empty($request-&gt;channel_name) ||
+            ($this-&gt;isGuardedChannel($request-&gt;channel_name) &amp;&amp;
+            ! $this-&gt;retrieveUser($request, $channelName))) {
+            throw new AccessDeniedHttpException;
+        }
+
+        return parent::verifyUserCanAccessChannel(
+            $request, $channelName
+        );
+    }
+
+    /**
+     * Return the valid authentication response.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  mixed  $result
+     * @return mixed
+     */
+    public function validAuthenticationResponse($request, $result)
+    {
+        if (is_bool($result)) {
+            return json_encode($result);
+        }
+
+        $channelName = $this-&gt;normalizeChannelName($request-&gt;channel_name);
+
+        $user = $this-&gt;retrieveUser($request, $channelName);
+
+        $broadcastIdentifier = method_exists($user, &#039;getAuthIdentifierForBroadcasting&#039;)
+            ? $user-&gt;getAuthIdentifierForBroadcasting()
+            : $user-&gt;getAuthIdentifier();
+
+        return json_encode([&#039;channel_data&#039; =&gt; [
+            &#039;user_id&#039; =&gt; $broadcastIdentifier,
+            &#039;user_info&#039; =&gt; $result,
+        ]]);
+    }
+
+    /**
+     * Broadcast the given event.
+     *
+     * @param  array  $channels
+     * @param  string  $event
+     * @param  array  $payload
+     * @return void
+     *
+     * @throws \Illuminate\Broadcasting\BroadcastException
+     */
+    public function broadcast(array $channels, $event, array $payload = [])
+    {
+        if (empty($channels)) {
+            return;
+        }
+
+        $connection = $this-&gt;redis-&gt;connection($this-&gt;connection);
+
+        $payload = json_encode([
+            &#039;event&#039; =&gt; $event,
+            &#039;data&#039; =&gt; $payload,
+            &#039;socket&#039; =&gt; Arr::pull($payload, &#039;socket&#039;),
+        ]);
+
+        try {
+            if ($connection instanceof PhpRedisClusterConnection) {
+                foreach ($channels as $channel) {
+                    $connection-&gt;publish($channel, $payload);
+                }
+            } elseif ($connection instanceof PredisClusterConnection &amp;&amp;
+                $connection-&gt;client()-&gt;getConnection() instanceof RedisCluster) {
+                $randomClusterNodeConnection = new PredisConnection(
+                    $connection-&gt;client()-&gt;getClientBy(&#039;slot&#039;, mt_rand(0, 16383))
+                );
+
+                if ($events = $connection-&gt;getEventDispatcher()) {
+                    $randomClusterNodeConnection-&gt;setEventDispatcher($events);
+                }
+
+                $randomClusterNodeConnection-&gt;eval(
+                    $this-&gt;broadcastMultipleChannelsScript(),
+                    0, $payload, ...$this-&gt;formatChannels($channels)
+                );
+            } else {
+                $connection-&gt;eval(
+                    $this-&gt;broadcastMultipleChannelsScript(),
+                    0, $payload, ...$this-&gt;formatChannels($channels)
+                );
+            }
+        } catch (ConnectionException|RedisException $e) {
+            throw new BroadcastException(
+                sprintf(&#039;Redis error: %s.&#039;, $e-&gt;getMessage())
+            );
+        }
+    }
+
+    /**
+     * Get the Lua script for broadcasting to multiple channels.
+     *
+     * ARGV[1] - The payload
+     * ARGV[2...] - The channels
+     *
+     * @return string
+     */
+    protected function broadcastMultipleChannelsScript()
+    {
+        return &lt;&lt;&lt;&#039;LUA&#039;
+for i = 2, #ARGV do
+  redis.call(&#039;publish&#039;, ARGV[i], ARGV[1])
+end
+LUA;
+    }
+
+    /**
+     * Format the channel array into an array of strings.
+     *
+     * @param  array  $channels
+     * @return array
+     */
+    protected function formatChannels(array $channels)
+    {
+        return array_map(function ($channel) {
+            return $this-&gt;prefix.$channel;
+        }, parent::formatChannels($channels));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Broadcasting/Broadcasters/UsePusherChannelConventions.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Bus -->
+
+</body>
+</html>

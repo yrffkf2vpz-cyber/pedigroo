@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/GroupedEndpoints/GroupedEndpointsFromApp.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\GroupedEndpoints;
+
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
+use Knuckles\Camel\Camel;
+use Knuckles\Camel\Extraction\ExtractedEndpointData;
+use Knuckles\Camel\Output\OutputEndpointData;
+use Knuckles\Scribe\Commands\GenerateDocumentation;
+use Knuckles\Scribe\Exceptions\CouldntGetRouteDetails;
+use Knuckles\Scribe\Extracting\ApiDetails;
+use Knuckles\Scribe\Extracting\Extractor;
+use Knuckles\Scribe\Matching\MatchedRoute;
+use Knuckles\Scribe\Matching\RouteMatcherInterface;
+use Knuckles\Scribe\Tools\ConsoleOutputUtils as c;
+use Knuckles\Scribe\Tools\DocumentationConfig;
+use Knuckles\Scribe\Tools\ErrorHandlingUtils as e;
+use Knuckles\Scribe\Tools\PathConfig;
+use Knuckles\Scribe\Tools\Utils;
+use Knuckles\Scribe\Tools\Utils as u;
+use Mpociot\Reflection\DocBlock;
+use Mpociot\Reflection\DocBlock\Tag;
+use ReflectionClass;
+use Symfony\Component\Yaml\Yaml;
+
+class GroupedEndpointsFromApp implements GroupedEndpointsContract
+{
+    private DocumentationConfig $docConfig;
+    private bool $encounteredErrors = false;
+
+    public static string $camelDir;
+    public static string $cacheDir;
+
+    public function __construct(
+        private GenerateDocumentation $command,
+        private RouteMatcherInterface $routeMatcher,
+        protected PathConfig $paths,
+        private bool $preserveUserChanges = true
+    ) {
+        $this-&gt;docConfig = $command-&gt;getDocConfig();
+
+        static::$camelDir = Camel::camelDir($this-&gt;paths);
+        static::$cacheDir = Camel::cacheDir($this-&gt;paths);
+    }
+
+    public function get(): array
+    {
+        $groupedEndpoints = $this-&gt;extractEndpointsInfoAndWriteToDisk($this-&gt;routeMatcher, $this-&gt;preserveUserChanges);
+        $this-&gt;extractAndWriteApiDetailsToDisk();
+
+        return $groupedEndpoints;
+    }
+
+    public function hasEncounteredErrors(): bool
+    {
+        return $this-&gt;encounteredErrors;
+    }
+
+    protected function extractEndpointsInfoAndWriteToDisk(RouteMatcherInterface $routeMatcher, bool $preserveUserChanges): array
+    {
+        $latestEndpointsData = [];
+        $cachedEndpoints = [];
+
+        if ($preserveUserChanges &amp;&amp; is_dir(static::$camelDir) &amp;&amp; is_dir(static::$cacheDir)) {
+            $latestEndpointsData = Camel::loadEndpointsToFlatPrimitivesArray(static::$camelDir);
+            $cachedEndpoints = Camel::loadEndpointsToFlatPrimitivesArray(static::$cacheDir);
+        }
+
+        $routes = $routeMatcher-&gt;getRoutes($this-&gt;docConfig-&gt;get(&#039;routes&#039;, []));
+        $endpoints = $this-&gt;extractEndpointsInfoFromLaravelApp($routes, $cachedEndpoints, $latestEndpointsData);
+
+        $groupedEndpoints = collect($endpoints)-&gt;groupBy(&#039;metadata.groupName&#039;)-&gt;map(function (Collection $endpointsInGroup) {
+            return [
+                &#039;name&#039; =&gt; $endpointsInGroup-&gt;first(function (ExtractedEndpointData $endpointData) {
+                        return !empty($endpointData-&gt;metadata-&gt;groupName);
+                    })-&gt;metadata-&gt;groupName ?? &#039;&#039;,
+                &#039;description&#039; =&gt; $endpointsInGroup-&gt;first(function (ExtractedEndpointData $endpointData) {
+                        return !empty($endpointData-&gt;metadata-&gt;groupDescription);
+                    })-&gt;metadata-&gt;groupDescription ?? &#039;&#039;,
+                &#039;endpoints&#039; =&gt; $endpointsInGroup-&gt;toArray(),
+            ];
+        })-&gt;all();
+        $this-&gt;writeEndpointsToDisk($groupedEndpoints);
+
+        return $groupedEndpoints;
+    }
+
+    /**
+     * @param MatchedRoute[] $matches
+     * @param array $cachedEndpoints
+     * @param array $latestEndpointsData
+     *
+     * @return array
+     * @throws \Exception
+     */
+    private function extractEndpointsInfoFromLaravelApp(array $matches, array $cachedEndpoints, array $latestEndpointsData): array
+    {
+        $extractor = $this-&gt;makeExtractor();
+
+        $parsedEndpoints = [];
+
+        foreach ($matches as $routeItem) {
+            $route = $routeItem-&gt;getRoute();
+
+            $routeControllerAndMethod = u::getRouteClassAndMethodNames($route);
+            if (!$this-&gt;isValidRoute($routeControllerAndMethod)) {
+                c::warn(&#039;Skipping invalid route: &#039; . c::getRouteRepresentation($route));
+                continue;
+            }
+
+            if (!$this-&gt;doesControllerMethodExist($routeControllerAndMethod)) {
+                c::warn(&#039;Skipping route: &#039; . c::getRouteRepresentation($route) . &#039; - Controller method does not exist.&#039;);
+                continue;
+            }
+
+            if ($this-&gt;isRouteHiddenFromDocumentation($routeControllerAndMethod)) {
+                c::warn(&#039;Skipping route: &#039; . c::getRouteRepresentation($route) . &#039;: @hideFromAPIDocumentation was specified.&#039;);
+                continue;
+            }
+
+            try {
+                c::info(&#039;Processing route: &#039; . c::getRouteRepresentation($route));
+                $currentEndpointData = $extractor-&gt;processRoute($route, $routeItem-&gt;getRules());
+                // If latest data is different from cached data, merge latest into current
+                $currentEndpointData = $this-&gt;mergeAnyEndpointDataUpdates($currentEndpointData, $cachedEndpoints, $latestEndpointsData);
+                $parsedEndpoints[] = $currentEndpointData;
+                c::success(&#039;Processed route: &#039; . c::getRouteRepresentation($route));
+            } catch (\Exception $exception) {
+                $this-&gt;encounteredErrors = true;
+                c::error(&#039;Failed processing route: &#039; . c::getRouteRepresentation($route) . &#039; - Exception encountered.&#039;);
+                e::dumpExceptionIfVerbose($exception);
+            }
+        }
+
+        return $parsedEndpoints;
+    }
+
+    /**
+     * @param ExtractedEndpointData $endpointData
+     * @param array[] $cachedEndpoints
+     * @param array[] $latestEndpointsData
+     *
+     * @return ExtractedEndpointData The extracted endpoint data
+     */
+    private function mergeAnyEndpointDataUpdates(ExtractedEndpointData $endpointData, array $cachedEndpoints, array $latestEndpointsData): ExtractedEndpointData
+    {
+        // First, find the corresponding endpoint in cached and latest
+        $thisEndpointCached = Arr::first($cachedEndpoints, function (array $endpoint) use ($endpointData) {
+            return $endpoint[&#039;uri&#039;] === $endpointData-&gt;uri &amp;&amp; $endpoint[&#039;httpMethods&#039;] === $endpointData-&gt;httpMethods;
+        });
+        if (!$thisEndpointCached) {
+            return $endpointData;
+        }
+
+        $thisEndpointLatest = Arr::first($latestEndpointsData, function (array $endpoint) use ($endpointData) {
+            return $endpoint[&#039;uri&#039;] === $endpointData-&gt;uri &amp;&amp; $endpoint[&#039;httpMethods&#039;] == $endpointData-&gt;httpMethods;
+        });
+        if (!$thisEndpointLatest) {
+            return $endpointData;
+        }
+
+        // Then compare cached and latest to see what sections changed.
+        $properties = [
+            &#039;metadata&#039;,
+            &#039;headers&#039;,
+            &#039;urlParameters&#039;,
+            &#039;queryParameters&#039;,
+            &#039;bodyParameters&#039;,
+            &#039;responses&#039;,
+            &#039;responseFields&#039;,
+        ];
+
+        $changed = [];
+        foreach ($properties as $property) {
+            if ($thisEndpointCached[$property] != $thisEndpointLatest[$property]) {
+                $changed[] = $property;
+            }
+        }
+
+        // Finally, merge any changed sections.
+        $thisEndpointLatest = OutputEndpointData::create($thisEndpointLatest);
+        foreach ($changed as $property) {
+            $endpointData-&gt;$property = $thisEndpointLatest-&gt;$property;
+        }
+        return $endpointData;
+    }
+
+    protected function writeEndpointsToDisk(array $grouped): void
+    {
+        Utils::deleteFilesMatching(static::$camelDir, function ($file) {
+            /** @var array|\League\Flysystem\StorageAttributes $file */
+            return !Str::startsWith(basename($file[&#039;path&#039;]), &#039;custom.&#039;);
+        });
+        Utils::deleteDirectoryAndContents(static::$cacheDir);
+
+        if (!is_dir(static::$camelDir)) {
+            mkdir(static::$camelDir, 0777, true);
+        }
+
+        if (!is_dir(static::$cacheDir)) {
+            mkdir(static::$cacheDir, 0777, true);
+        }
+
+        $fileNameIndex = 0;
+        foreach ($grouped as $group) {
+            $yaml = Yaml::dump(
+                $group, 20, 2,
+                Yaml::DUMP_EMPTY_ARRAY_AS_SEQUENCE | Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_MULTI_LINE_LITERAL_BLOCK
+            );
+
+            // Format numbers as two digits so they are sorted properly when retrieving later
+            // (ie &quot;10.yaml&quot; comes after &quot;9.yaml&quot;, not after &quot;1.yaml&quot;)
+            $fileName = sprintf(&quot;%02d.yaml&quot;, $fileNameIndex);
+            $fileNameIndex++;
+
+            file_put_contents(static::$camelDir . &quot;/$fileName&quot;, $yaml);
+            file_put_contents(static::$cacheDir . &quot;/$fileName&quot;, &quot;## Autogenerated by Scribe. DO NOT MODIFY.\n\n&quot; . $yaml);
+        }
+    }
+
+    private function isValidRoute(?array $routeControllerAndMethod): bool
+    {
+        if (is_array($routeControllerAndMethod)) {
+            if (count($routeControllerAndMethod) &lt; 2) {
+                throw CouldntGetRouteDetails::new();
+            }
+            [$classOrObject, $method] = $routeControllerAndMethod;
+            if (u::isInvokableObject($classOrObject)) {
+                return true;
+            }
+            $routeControllerAndMethod = $classOrObject . &#039;@&#039; . $method;
+        }
+
+        return !is_callable($routeControllerAndMethod) &amp;&amp; !is_null($routeControllerAndMethod);
+    }
+
+    private function doesControllerMethodExist(array $routeControllerAndMethod): bool
+    {
+        if (count($routeControllerAndMethod) &lt; 2) {
+            throw CouldntGetRouteDetails::new();
+        }
+        [$class, $method] = $routeControllerAndMethod;
+        $reflection = new ReflectionClass($class);
+
+        if ($reflection-&gt;hasMethod($method)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function isRouteHiddenFromDocumentation(array $routeControllerAndMethod): bool
+    {
+        if (!($class = $routeControllerAndMethod[0]) instanceof \Closure) {
+            $classDocBlock = new DocBlock((new ReflectionClass($class))-&gt;getDocComment() ?: &#039;&#039;);
+            $shouldIgnoreClass = collect($classDocBlock-&gt;getTags())
+                -&gt;filter(function (Tag $tag) {
+                    return Str::lower($tag-&gt;getName()) === &#039;hidefromapidocumentation&#039;;
+                })-&gt;isNotEmpty();
+
+            if ($shouldIgnoreClass) {
+                return true;
+            }
+        }
+
+        $methodDocBlock = new DocBlock(u::getReflectedRouteMethod($routeControllerAndMethod)-&gt;getDocComment() ?: &#039;&#039;);
+        $shouldIgnoreMethod = collect($methodDocBlock-&gt;getTags())
+            -&gt;filter(function (Tag $tag) {
+                return Str::lower($tag-&gt;getName()) === &#039;hidefromapidocumentation&#039;;
+            })-&gt;isNotEmpty();
+
+        return $shouldIgnoreMethod;
+    }
+
+    protected function extractAndWriteApiDetailsToDisk(): void
+    {
+        $apiDetails = $this-&gt;makeApiDetails();
+
+        $apiDetails-&gt;writeMarkdownFiles();
+    }
+
+    protected function makeApiDetails(): ApiDetails
+    {
+        return new ApiDetails($this-&gt;paths, $this-&gt;docConfig, !$this-&gt;command-&gt;option(&#039;force&#039;));
+    }
+
+    /**
+     * Make a new extractor.
+     *
+     * @return Extractor
+     */
+    protected function makeExtractor(): Extractor
+    {
+        return new Extractor($this-&gt;docConfig);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/GroupedEndpoints/GroupedEndpointsFromCamelDir.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Matching -->
+
+</body>
+</html>

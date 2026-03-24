@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-kernel/HttpCache/HttpCache.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+/*
+ * This code is partially based on the Rack-Cache library by Ryan Tomayko,
+ * which is released under the MIT license.
+ * (based on commit 02d2b48d75bcb63cf1c0c7149c077ad256542801)
+ */
+
+namespace Symfony\Component\HttpKernel\HttpCache;
+
+use Symfony\Component\HttpFoundation\Exception\SuspiciousOperationException;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\HttpKernelInterface;
+use Symfony\Component\HttpKernel\TerminableInterface;
+
+/**
+ * Cache provides HTTP caching.
+ *
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ */
+class HttpCache implements HttpKernelInterface, TerminableInterface
+{
+    public const BODY_EVAL_BOUNDARY_LENGTH = 24;
+
+    private Request $request;
+    private ?ResponseCacheStrategyInterface $surrogateCacheStrategy = null;
+    private array $options = [];
+    private array $traces = [];
+
+    /**
+     * Constructor.
+     *
+     * The available options are:
+     *
+     *   * debug                  If true, exceptions are thrown when things go wrong. Otherwise, the cache
+     *                            will try to carry on and deliver a meaningful response.
+     *
+     *   * trace_level            May be one of &#039;none&#039;, &#039;short&#039; and &#039;full&#039;. For &#039;short&#039;, a concise trace of the
+     *                            main request will be added as an HTTP header. &#039;full&#039; will add traces for all
+     *                            requests (including ESI subrequests). (default: &#039;full&#039; if in debug; &#039;none&#039; otherwise)
+     *
+     *   * trace_header           Header name to use for traces. (default: X-Symfony-Cache)
+     *
+     *   * default_ttl            The number of seconds that a cache entry should be considered
+     *                            fresh when no explicit freshness information is provided in
+     *                            a response. Explicit Cache-Control or Expires headers
+     *                            override this value. (default: 0)
+     *
+     *   * private_headers        Set of request headers that trigger &quot;private&quot; cache-control behavior
+     *                            on responses that don&#039;t explicitly state whether the response is
+     *                            public or private via a Cache-Control directive. (default: Authorization and Cookie)
+     *
+     *   * skip_response_headers  Set of response headers that are never cached even if a response is cacheable (public).
+     *                            (default: Set-Cookie)
+     *
+     *   * allow_reload           Specifies whether the client can force a cache reload by including a
+     *                            Cache-Control &quot;no-cache&quot; directive in the request. Set it to ``true``
+     *                            for compliance with RFC 2616. (default: false)
+     *
+     *   * allow_revalidate       Specifies whether the client can force a cache revalidate by including
+     *                            a Cache-Control &quot;max-age=0&quot; directive in the request. Set it to ``true``
+     *                            for compliance with RFC 2616. (default: false)
+     *
+     *   * stale_while_revalidate Specifies the default number of seconds (the granularity is the second as the
+     *                            Response TTL precision is a second) during which the cache can immediately return
+     *                            a stale response while it revalidates it in the background (default: 2).
+     *                            This setting is overridden by the stale-while-revalidate HTTP Cache-Control
+     *                            extension (see RFC 5861).
+     *
+     *   * stale_if_error         Specifies the default number of seconds (the granularity is the second) during which
+     *                            the cache can serve a stale response when an error is encountered (default: 60).
+     *                            This setting is overridden by the stale-if-error HTTP Cache-Control extension
+     *                            (see RFC 5861).
+     */
+    public function __construct(
+        private HttpKernelInterface $kernel,
+        private StoreInterface $store,
+        private ?SurrogateInterface $surrogate = null,
+        array $options = [],
+    ) {
+        // needed in case there is a fatal error because the backend is too slow to respond
+        register_shutdown_function($this-&gt;store-&gt;cleanup(...));
+
+        $this-&gt;options = array_merge([
+            &#039;debug&#039; =&gt; false,
+            &#039;default_ttl&#039; =&gt; 0,
+            &#039;private_headers&#039; =&gt; [&#039;Authorization&#039;, &#039;Cookie&#039;],
+            &#039;skip_response_headers&#039; =&gt; [&#039;Set-Cookie&#039;],
+            &#039;allow_reload&#039; =&gt; false,
+            &#039;allow_revalidate&#039; =&gt; false,
+            &#039;stale_while_revalidate&#039; =&gt; 2,
+            &#039;stale_if_error&#039; =&gt; 60,
+            &#039;trace_level&#039; =&gt; &#039;none&#039;,
+            &#039;trace_header&#039; =&gt; &#039;X-Symfony-Cache&#039;,
+        ], $options);
+
+        if (!isset($options[&#039;trace_level&#039;])) {
+            $this-&gt;options[&#039;trace_level&#039;] = $this-&gt;options[&#039;debug&#039;] ? &#039;full&#039; : &#039;none&#039;;
+        }
+    }
+
+    /**
+     * Gets the current store.
+     */
+    public function getStore(): StoreInterface
+    {
+        return $this-&gt;store;
+    }
+
+    /**
+     * Returns an array of events that took place during processing of the last request.
+     */
+    public function getTraces(): array
+    {
+        return $this-&gt;traces;
+    }
+
+    private function addTraces(Response $response): void
+    {
+        $traceString = null;
+
+        if (&#039;full&#039; === $this-&gt;options[&#039;trace_level&#039;]) {
+            $traceString = $this-&gt;getLog();
+        }
+
+        if (&#039;short&#039; === $this-&gt;options[&#039;trace_level&#039;] &amp;&amp; $masterId = array_key_first($this-&gt;traces)) {
+            $traceString = implode(&#039;/&#039;, $this-&gt;traces[$masterId]);
+        }
+
+        if (null !== $traceString) {
+            $response-&gt;headers-&gt;add([$this-&gt;options[&#039;trace_header&#039;] =&gt; $traceString]);
+        }
+    }
+
+    /**
+     * Returns a log message for the events of the last request processing.
+     */
+    public function getLog(): string
+    {
+        $log = [];
+        foreach ($this-&gt;traces as $request =&gt; $traces) {
+            $log[] = \sprintf(&#039;%s: %s&#039;, $request, implode(&#039;, &#039;, $traces));
+        }
+
+        return implode(&#039;; &#039;, $log);
+    }
+
+    /**
+     * Gets the Request instance associated with the main request.
+     */
+    public function getRequest(): Request
+    {
+        return $this-&gt;request;
+    }
+
+    /**
+     * Gets the Kernel instance.
+     */
+    public function getKernel(): HttpKernelInterface
+    {
+        return $this-&gt;kernel;
+    }
+
+    /**
+     * Gets the Surrogate instance.
+     *
+     * @throws \LogicException
+     */
+    public function getSurrogate(): SurrogateInterface
+    {
+        return $this-&gt;surrogate;
+    }
+
+    public function handle(Request $request, int $type = HttpKernelInterface::MAIN_REQUEST, bool $catch = true): Response
+    {
+        // FIXME: catch exceptions and implement a 500 error page here? -&gt; in Varnish, there is a built-in error page mechanism
+        if (HttpKernelInterface::MAIN_REQUEST === $type) {
+            $this-&gt;traces = [];
+            // Keep a clone of the original request for surrogates so they can access it.
+            // We must clone here to get a separate instance because the application will modify the request during
+            // the application flow (we know it always does because we do ourselves by setting REMOTE_ADDR to 127.0.0.1
+            // and adding the X-Forwarded-For header, see HttpCache::forward()).
+            $this-&gt;request = clone $request;
+            if (null !== $this-&gt;surrogate) {
+                $this-&gt;surrogateCacheStrategy = $this-&gt;surrogate-&gt;createCacheStrategy();
+            }
+        }
+
+        $this-&gt;traces[$this-&gt;getTraceKey($request)] = [];
+
+        if (!$request-&gt;isMethodSafe()) {
+            $response = $this-&gt;invalidate($request, $catch);
+        } elseif ($request-&gt;headers-&gt;has(&#039;expect&#039;) || !$request-&gt;isMethodCacheable()) {
+            $response = $this-&gt;pass($request, $catch);
+        } elseif ($this-&gt;options[&#039;allow_reload&#039;] &amp;&amp; $request-&gt;isNoCache()) {
+            /*
+                If allow_reload is configured and the client requests &quot;Cache-Control: no-cache&quot;,
+                reload the cache by fetching a fresh response and caching it (if possible).
+            */
+            $this-&gt;record($request, &#039;reload&#039;);
+            $response = $this-&gt;fetch($request, $catch);
+        } else {
+            $response = null;
+            do {
+                try {
+                    $response = $this-&gt;lookup($request, $catch);
+                } catch (CacheWasLockedException) {
+                }
+            } while (null === $response);
+        }
+
+        $this-&gt;restoreResponseBody($request, $response);
+
+        if (HttpKernelInterface::MAIN_REQUEST === $type) {
+            $this-&gt;addTraces($response);
+        }
+
+        if (null !== $this-&gt;surrogate) {
+            if (HttpKernelInterface::MAIN_REQUEST === $type) {
+                $this-&gt;surrogateCacheStrategy-&gt;update($response);
+            } else {
+                $this-&gt;surrogateCacheStrategy-&gt;add($response);
+            }
+        }
+
+        $response-&gt;prepare($request);
+
+        if (HttpKernelInterface::MAIN_REQUEST === $type) {
+            $response-&gt;isNotModified($request);
+        }
+
+        return $response;
+    }
+
+    public function terminate(Request $request, Response $response): void
+    {
+        // Do not call any listeners in case of a cache hit.
+        // This ensures identical behavior as if you had a separate
+        // reverse caching proxy such as Varnish and the like.
+        if (\in_array(&#039;fresh&#039;, $this-&gt;traces[$this-&gt;getTraceKey($request)] ?? [], true)) {
+            return;
+        }
+
+        if ($this-&gt;getKernel() instanceof TerminableInterface) {
+            $this-&gt;getKernel()-&gt;terminate($request, $response);
+        }
+    }
+
+    /**
+     * Forwards the Request to the backend without storing the Response in the cache.
+     *
+     * @param bool $catch Whether to process exceptions
+     */
+    protected function pass(Request $request, bool $catch = false): Response
+    {
+        $this-&gt;record($request, &#039;pass&#039;);
+
+        return $this-&gt;forward($request, $catch);
+    }
+
+    /**
+     * Invalidates non-safe methods (like POST, PUT, and DELETE).
+     *
+     * @param bool $catch Whether to process exceptions
+     *
+     * @throws \Exception
+     *
+     * @see RFC2616 13.10
+     */
+    protected function invalidate(Request $request, bool $catch = false): Response
+    {
+        $response = $this-&gt;pass($request, $catch);
+
+        // invalidate only when the response is successful
+        if ($response-&gt;isSuccessful() || $response-&gt;isRedirect()) {
+            try {
+                $this-&gt;store-&gt;invalidate($request);
+
+                // As per the RFC, invalidate Location and Content-Location URLs if present
+                foreach ([&#039;Location&#039;, &#039;Content-Location&#039;] as $header) {
+                    if ($uri = $response-&gt;headers-&gt;get($header)) {
+                        $subRequest = Request::create($uri, &#039;get&#039;, [], [], [], $request-&gt;server-&gt;all());
+
+                        $this-&gt;store-&gt;invalidate($subRequest);
+                    }
+                }
+
+                $this-&gt;record($request, &#039;invalidate&#039;);
+            } catch (\Exception $e) {
+                $this-&gt;record($request, &#039;invalidate-failed&#039;);
+
+                if ($this-&gt;options[&#039;debug&#039;]) {
+                    throw $e;
+                }
+            }
+        }
+
+        return $response;
+    }
+
+    /**
+     * Lookups a Response from the cache for the given Request.
+     *
+     * When a matching cache entry is found and is fresh, it uses it as the
+     * response without forwarding any request to the backend. When a matching
+     * cache entry is found but is stale, it attempts to &quot;validate&quot; the entry with
+     * the backend using conditional GET. When no matching cache entry is found,
+     * it triggers &quot;miss&quot; processing.
+     *
+     * @param bool $catch Whether to process exceptions
+     *
+     * @throws \Exception
+     */
+    protected function lookup(Request $request, bool $catch = false): Response
+    {
+        try {
+            $entry = $this-&gt;store-&gt;lookup($request);
+        } catch (\Exception $e) {
+            $this-&gt;record($request, &#039;lookup-failed&#039;);
+
+            if ($this-&gt;options[&#039;debug&#039;]) {
+                throw $e;
+            }
+
+            return $this-&gt;pass($request, $catch);
+        }
+
+        if (null === $entry) {
+            $this-&gt;record($request, &#039;miss&#039;);
+
+            return $this-&gt;fetch($request, $catch);
+        }
+
+        if (!$this-&gt;isFreshEnough($request, $entry)) {
+            $this-&gt;record($request, &#039;stale&#039;);
+
+            return $this-&gt;validate($request, $entry, $catch);
+        }
+
+        if ($entry-&gt;headers-&gt;hasCacheControlDirective(&#039;no-cache&#039;)) {
+            return $this-&gt;validate($request, $entry, $catch);
+        }
+
+        $this-&gt;record($request, &#039;fresh&#039;);
+
+        $entry-&gt;headers-&gt;set(&#039;Age&#039;, $entry-&gt;getAge());
+
+        return $entry;
+    }
+
+    /**
+     * Validates that a cache entry is fresh.
+     *
+     * The original request is used as a template for a conditional
+     * GET request with the backend.
+     *
+     * @param bool $catch Whether to process exceptions
+     */
+    protected function validate(Request $request, Response $entry, bool $catch = false): Response
+    {
+        $subRequest = clone $request;
+
+        // send no head requests because we want content
+        if (&#039;HEAD&#039; === $request-&gt;getMethod()) {
+            $subRequest-&gt;setMethod(&#039;GET&#039;);
+        }
+
+        // add our cached last-modified validator
+        if ($entry-&gt;headers-&gt;has(&#039;Last-Modified&#039;)) {
+            $subRequest-&gt;headers-&gt;set(&#039;If-Modified-Since&#039;, $entry-&gt;headers-&gt;get(&#039;Last-Modified&#039;));
+        }
+
+        // Add our cached etag validator to the environment.
+        // We keep the etags from the client to handle the case when the client
+        // has a different private valid entry which is not cached here.
+        $cachedEtags = $entry-&gt;getEtag() ? [$entry-&gt;getEtag()] : [];
+        $requestEtags = $request-&gt;getETags();
+        if ($etags = array_unique(array_merge($cachedEtags, $requestEtags))) {
+            $subRequest-&gt;headers-&gt;set(&#039;If-None-Match&#039;, implode(&#039;, &#039;, $etags));
+        }
+
+        $response = $this-&gt;forward($subRequest, $catch, $entry);
+
+        if (304 == $response-&gt;getStatusCode()) {
+            $this-&gt;record($request, &#039;valid&#039;);
+
+            // return the response and not the cache entry if the response is valid but not cached
+            $etag = $response-&gt;getEtag();
+            if ($etag &amp;&amp; \in_array($etag, $requestEtags, true) &amp;&amp; !\in_array($etag, $cachedEtags, true)) {
+                return $response;
+            }
+
+            $entry = clone $entry;
+            $entry-&gt;headers-&gt;remove(&#039;Date&#039;);
+
+            foreach ([&#039;Date&#039;, &#039;Expires&#039;, &#039;Cache-Control&#039;, &#039;ETag&#039;, &#039;Last-Modified&#039;] as $name) {
+                if ($response-&gt;headers-&gt;has($name)) {
+                    $entry-&gt;headers-&gt;set($name, $response-&gt;headers-&gt;get($name));
+                }
+            }
+
+            $response = $entry;
+        } else {
+            $this-&gt;record($request, &#039;invalid&#039;);
+        }
+
+        if ($response-&gt;isCacheable()) {
+            $this-&gt;store($request, $response);
+        }
+
+        return $response;
+    }
+
+    /**
+     * Unconditionally fetches a fresh response from the backend and
+     * stores it in the cache if is cacheable.
+     *
+     * @param bool $catch Whether to process exceptions
+     */
+    protected function fetch(Request $request, bool $catch = false): Response
+    {
+        $subRequest = clone $request;
+
+        // send no head requests because we want content
+        if (&#039;HEAD&#039; === $request-&gt;getMethod()) {
+            $subRequest-&gt;setMethod(&#039;GET&#039;);
+        }
+
+        // avoid that the backend sends no content
+        $subRequest-&gt;headers-&gt;remove(&#039;If-Modified-Since&#039;);
+        $subRequest-&gt;headers-&gt;remove(&#039;If-None-Match&#039;);
+
+        $response = $this-&gt;forward($subRequest, $catch);
+
+        if ($response-&gt;isCacheable()) {
+            $this-&gt;store($request, $response);
+        }
+
+        return $response;
+    }
+
+    /**
+     * Forwards the Request to the backend and returns the Response.
+     *
+     * All backend requests (cache passes, fetches, cache validations)
+     * run through this method.
+     *
+     * @param bool          $catch Whether to catch exceptions or not
+     * @param Response|null $entry A Response instance (the stale entry if present, null otherwise)
+     */
+    protected function forward(Request $request, bool $catch = false, ?Response $entry = null): Response
+    {
+        $this-&gt;surrogate?-&gt;addSurrogateCapability($request);
+
+        // always a &quot;master&quot; request (as the real master request can be in cache)
+        $response = SubRequestHandler::handle($this-&gt;kernel, $request, HttpKernelInterface::MAIN_REQUEST, $catch);
+
+        /*
+         * Support stale-if-error given on Responses or as a config option.
+         * RFC 7234 summarizes in Section 4.2.4 (but also mentions with the individual
+         * Cache-Control directives) that
+         *
+         *      A cache MUST NOT generate a stale response if it is prohibited by an
+         *      explicit in-protocol directive (e.g., by a &quot;no-store&quot; or &quot;no-cache&quot;
+         *      cache directive, a &quot;must-revalidate&quot; cache-response-directive, or an
+         *      applicable &quot;s-maxage&quot; or &quot;proxy-revalidate&quot; cache-response-directive;
+         *      see Section 5.2.2).
+         *
+         * https://tools.ietf.org/html/rfc7234#section-4.2.4
+         *
+         * We deviate from this in one detail, namely that we *do* serve entries in the
+         * stale-if-error case even if they have a `s-maxage` Cache-Control directive.
+         */
+        if (null !== $entry
+            &amp;&amp; \in_array($response-&gt;getStatusCode(), [500, 502, 503, 504], true)
+            &amp;&amp; !$entry-&gt;headers-&gt;hasCacheControlDirective(&#039;no-cache&#039;)
+            &amp;&amp; !$entry-&gt;mustRevalidate()
+        ) {
+            if (null === $age = $entry-&gt;headers-&gt;getCacheControlDirective(&#039;stale-if-error&#039;)) {
+                $age = $this-&gt;options[&#039;stale_if_error&#039;];
+            }
+
+            /*
+             * stale-if-error gives the (extra) time that the Response may be used *after* it has become stale.
+             * So we compare the time the $entry has been sitting in the cache already with the
+             * time it was fresh plus the allowed grace period.
+             */
+            if ($entry-&gt;getAge() &lt;= $entry-&gt;getMaxAge() + $age) {
+                $this-&gt;record($request, &#039;stale-if-error&#039;);
+
+                return $entry;
+            }
+        }
+
+        /*
+            RFC 7231 Sect. 7.1.1.2 says that a server that does not have a reasonably accurate
+            clock MUST NOT send a &quot;Date&quot; header, although it MUST send one in most other cases
+            except for 1xx or 5xx responses where it MAY do so.
+
+            Anyway, a client that received a message without a &quot;Date&quot; header MUST add it.
+        */
+        if (!$response-&gt;headers-&gt;has(&#039;Date&#039;)) {
+            $response-&gt;setDate(\DateTimeImmutable::createFromFormat(&#039;U&#039;, time()));
+        }
+
+        $this-&gt;processResponseBody($request, $response);
+
+        if ($this-&gt;isPrivateRequest($request) &amp;&amp; !$response-&gt;headers-&gt;hasCacheControlDirective(&#039;public&#039;)) {
+            $response-&gt;setPrivate();
+        } elseif ($this-&gt;options[&#039;default_ttl&#039;] &gt; 0 &amp;&amp; null === $response-&gt;getTtl() &amp;&amp; !$response-&gt;headers-&gt;getCacheControlDirective(&#039;must-revalidate&#039;)) {
+            $response-&gt;setTtl($this-&gt;options[&#039;default_ttl&#039;]);
+        }
+
+        return $response;
+    }
+
+    /**
+     * Checks whether the cache entry is &quot;fresh enough&quot; to satisfy the Request.
+     */
+    protected function isFreshEnough(Request $request, Response $entry): bool
+    {
+        if (!$entry-&gt;isFresh()) {
+            return $this-&gt;lock($request, $entry);
+        }
+
+        if ($this-&gt;options[&#039;allow_revalidate&#039;] &amp;&amp; null !== $maxAge = $request-&gt;headers-&gt;getCacheControlDirective(&#039;max-age&#039;)) {
+            return $maxAge &gt; 0 &amp;&amp; $maxAge &gt;= $entry-&gt;getAge();
+        }
+
+        return true;
+    }
+
+    /**
+     * Locks a Request during the call to the backend.
+     *
+     * @return bool true if the cache entry can be returned even if it is staled, false otherwise
+     */
+    protected function lock(Request $request, Response $entry): bool
+    {
+        // try to acquire a lock to call the backend
+        $lock = $this-&gt;store-&gt;lock($request);
+
+        if (true === $lock) {
+            // we have the lock, call the backend
+            return false;
+        }
+
+        // there is already another process calling the backend
+
+        // May we serve a stale response?
+        if ($this-&gt;mayServeStaleWhileRevalidate($entry)) {
+            $this-&gt;record($request, &#039;stale-while-revalidate&#039;);
+
+            return true;
+        }
+
+        $this-&gt;record($request, &#039;waiting&#039;);
+
+        // wait for the lock to be released
+        if ($this-&gt;waitForLock($request)) {
+            throw new CacheWasLockedException(); // unwind back to handle(), try again
+        } else {
+            // backend is slow as hell, send a 503 response (to avoid the dog pile effect)
+            $entry-&gt;setStatusCode(503);
+            $entry-&gt;setContent(&#039;503 Service Unavailable&#039;);
+            $entry-&gt;headers-&gt;set(&#039;Retry-After&#039;, 10);
+        }
+
+        return true;
+    }
+
+    /**
+     * Writes the Response to the cache.
+     *
+     * @throws \Exception
+     */
+    protected function store(Request $request, Response $response): void
+    {
+        try {
+            $restoreHeaders = [];
+            foreach ($this-&gt;options[&#039;skip_response_headers&#039;] as $header) {
+                if (!$response-&gt;headers-&gt;has($header)) {
+                    continue;
+                }
+
+                $restoreHeaders[$header] = $response-&gt;headers-&gt;all($header);
+                $response-&gt;headers-&gt;remove($header);
+            }
+
+            $this-&gt;store-&gt;write($request, $response);
+            $this-&gt;record($request, &#039;store&#039;);
+
+            $response-&gt;headers-&gt;set(&#039;Age&#039;, $response-&gt;getAge());
+        } catch (\Exception $e) {
+            $this-&gt;record($request, &#039;store-failed&#039;);
+
+            if ($this-&gt;options[&#039;debug&#039;]) {
+                throw $e;
+            }
+        } finally {
+            foreach ($restoreHeaders as $header =&gt; $values) {
+                $response-&gt;headers-&gt;set($header, $values);
+            }
+        }
+
+        // now that the response is cached, release the lock
+        $this-&gt;store-&gt;unlock($request);
+    }
+
+    /**
+     * Restores the Response body.
+     */
+    private function restoreResponseBody(Request $request, Response $response): void
+    {
+        if ($response-&gt;headers-&gt;has(&#039;X-Body-Eval&#039;)) {
+            \assert(self::BODY_EVAL_BOUNDARY_LENGTH === 24);
+
+            ob_start();
+
+            $content = $response-&gt;getContent();
+            $boundary = substr($content, 0, 24);
+            $j = strpos($content, $boundary, 24);
+            echo substr($content, 24, $j - 24);
+            $i = $j + 24;
+
+            while (false !== $j = strpos($content, $boundary, $i)) {
+                [$uri, $alt, $ignoreErrors, $part] = explode(&quot;\n&quot;, substr($content, $i, $j - $i), 4);
+                $i = $j + 24;
+
+                echo $this-&gt;surrogate-&gt;handle($this, $uri, $alt, $ignoreErrors);
+                echo $part;
+            }
+
+            $response-&gt;setContent(ob_get_clean());
+            $response-&gt;headers-&gt;remove(&#039;X-Body-Eval&#039;);
+            if (!$response-&gt;headers-&gt;has(&#039;Transfer-Encoding&#039;)) {
+                $response-&gt;headers-&gt;set(&#039;Content-Length&#039;, \strlen($response-&gt;getContent()));
+            }
+        } elseif ($response-&gt;headers-&gt;has(&#039;X-Body-File&#039;)) {
+            // Response does not include possibly dynamic content (ESI, SSI), so we need
+            // not handle the content for HEAD requests
+            if (!$request-&gt;isMethod(&#039;HEAD&#039;)) {
+                $response-&gt;setContent(file_get_contents($response-&gt;headers-&gt;get(&#039;X-Body-File&#039;)));
+            }
+        } else {
+            return;
+        }
+
+        $response-&gt;headers-&gt;remove(&#039;X-Body-File&#039;);
+    }
+
+    protected function processResponseBody(Request $request, Response $response): void
+    {
+        if ($this-&gt;surrogate?-&gt;needsParsing($response)) {
+            $this-&gt;surrogate-&gt;process($request, $response);
+        }
+    }
+
+    /**
+     * Checks if the Request includes authorization or other sensitive information
+     * that should cause the Response to be considered private by default.
+     */
+    private function isPrivateRequest(Request $request): bool
+    {
+        foreach ($this-&gt;options[&#039;private_headers&#039;] as $key) {
+            $key = strtolower(str_replace(&#039;HTTP_&#039;, &#039;&#039;, $key));
+
+            if (&#039;cookie&#039; === $key) {
+                if (\count($request-&gt;cookies-&gt;all())) {
+                    return true;
+                }
+            } elseif ($request-&gt;headers-&gt;has($key)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Records that an event took place.
+     */
+    private function record(Request $request, string $event): void
+    {
+        $this-&gt;traces[$this-&gt;getTraceKey($request)][] = $event;
+    }
+
+    /**
+     * Calculates the key we use in the &quot;trace&quot; array for a given request.
+     */
+    private function getTraceKey(Request $request): string
+    {
+        $path = $request-&gt;getPathInfo();
+        if ($qs = $request-&gt;getQueryString()) {
+            $path .= &#039;?&#039;.$qs;
+        }
+
+        try {
+            return $request-&gt;getMethod().&#039; &#039;.$path;
+        } catch (SuspiciousOperationException) {
+            return &#039;_BAD_METHOD_ &#039;.$path;
+        }
+    }
+
+    /**
+     * Checks whether the given (cached) response may be served as &quot;stale&quot; when a revalidation
+     * is currently in progress.
+     */
+    private function mayServeStaleWhileRevalidate(Response $entry): bool
+    {
+        $timeout = $entry-&gt;headers-&gt;getCacheControlDirective(&#039;stale-while-revalidate&#039;);
+        $timeout ??= $this-&gt;options[&#039;stale_while_revalidate&#039;];
+
+        $age = $entry-&gt;getAge();
+        $maxAge = $entry-&gt;getMaxAge() ?? 0;
+        $ttl = $maxAge - $age;
+
+        return abs($ttl) &lt; $timeout;
+    }
+
+    /**
+     * Waits for the store to release a locked entry.
+     */
+    private function waitForLock(Request $request): bool
+    {
+        $wait = 0;
+        while ($this-&gt;store-&gt;isLocked($request) &amp;&amp; $wait &lt; 100) {
+            usleep(50000);
+            ++$wait;
+        }
+
+        return $wait &lt; 100;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-kernel/HttpCache/ResponseCacheStrategy.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-kernel/Log -->
+
+</body>
+</html>

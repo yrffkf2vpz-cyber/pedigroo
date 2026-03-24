@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/brianium/paratest/src/WrapperRunner/SuiteLoader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace ParaTest\WrapperRunner;
+
+use Generator;
+use ParaTest\Options;
+use PHPUnit\Event\Facade as EventFacade;
+use PHPUnit\Framework\Test;
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\TestSuite;
+use PHPUnit\Runner\Extension\ExtensionBootstrapper;
+use PHPUnit\Runner\Extension\Facade as ExtensionFacade;
+use PHPUnit\Runner\Extension\PharLoader;
+use PHPUnit\Runner\Phpt\TestCase as PhptTestCase;
+use PHPUnit\Runner\ResultCache\DefaultResultCache;
+use PHPUnit\Runner\ResultCache\NullResultCache;
+use PHPUnit\Runner\TestSuiteSorter;
+use PHPUnit\TestRunner\TestResult\Facade as TestResultFacade;
+use PHPUnit\TextUI\Command\Result;
+use PHPUnit\TextUI\Command\WarmCodeCoverageCacheCommand;
+use PHPUnit\TextUI\Configuration\CodeCoverageFilterRegistry;
+use PHPUnit\TextUI\Configuration\PhpHandler;
+use PHPUnit\TextUI\Configuration\TestSuiteBuilder;
+use PHPUnit\TextUI\TestSuiteFilterProcessor;
+use ReflectionClass;
+use ReflectionProperty;
+use Symfony\Component\Console\Output\OutputInterface;
+
+use function array_keys;
+use function array_merge;
+use function array_slice;
+use function assert;
+use function ceil;
+use function count;
+use function is_int;
+use function is_string;
+use function mt_srand;
+use function ob_get_clean;
+use function ob_start;
+use function preg_quote;
+use function sprintf;
+use function str_starts_with;
+use function strlen;
+use function substr;
+
+/** @internal */
+final readonly class SuiteLoader
+{
+    public int $testCount;
+    /** @var list&lt;non-empty-string&gt; */
+    public array $tests;
+
+    public function __construct(
+        private Options $options,
+        OutputInterface $output,
+        CodeCoverageFilterRegistry $codeCoverageFilterRegistry,
+    ) {
+        (new PhpHandler())-&gt;handle($this-&gt;options-&gt;configuration-&gt;php());
+
+        if ($this-&gt;options-&gt;configuration-&gt;hasBootstrap()) {
+            $bootstrapFilename = $this-&gt;options-&gt;configuration-&gt;bootstrap();
+            include_once $bootstrapFilename;
+            EventFacade::emitter()-&gt;testRunnerBootstrapFinished($bootstrapFilename);
+        }
+
+        if (! $this-&gt;options-&gt;configuration-&gt;noExtensions()) {
+            if ($this-&gt;options-&gt;configuration-&gt;hasPharExtensionDirectory()) {
+                (new PharLoader())-&gt;loadPharExtensionsInDirectory(
+                    $this-&gt;options-&gt;configuration-&gt;pharExtensionDirectory(),
+                );
+            }
+
+            $extensionFacade       = new ExtensionFacade();
+            $extensionBootstrapper = new ExtensionBootstrapper(
+                $this-&gt;options-&gt;configuration,
+                $extensionFacade,
+            );
+
+            foreach ($this-&gt;options-&gt;configuration-&gt;extensionBootstrappers() as $bootstrapper) {
+                $extensionBootstrapper-&gt;bootstrap(
+                    $bootstrapper[&#039;className&#039;],
+                    $bootstrapper[&#039;parameters&#039;],
+                );
+            }
+        }
+
+        TestResultFacade::init();
+        EventFacade::instance()-&gt;seal();
+
+        $testSuite = (new TestSuiteBuilder())-&gt;build($this-&gt;options-&gt;configuration);
+
+        if ($this-&gt;options-&gt;hasShard()) {
+            $this-&gt;shardTests($testSuite);
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;executionOrder() === TestSuiteSorter::ORDER_RANDOMIZED) {
+            mt_srand($this-&gt;options-&gt;configuration-&gt;randomOrderSeed());
+        }
+
+        if (
+            $this-&gt;options-&gt;configuration-&gt;executionOrder() !== TestSuiteSorter::ORDER_DEFAULT ||
+            $this-&gt;options-&gt;configuration-&gt;executionOrderDefects() !== TestSuiteSorter::ORDER_DEFAULT ||
+            $this-&gt;options-&gt;configuration-&gt;resolveDependencies()
+        ) {
+            $resultCache = new NullResultCache();
+            if ($this-&gt;options-&gt;configuration-&gt;cacheResult()) {
+                $resultCache = new DefaultResultCache($this-&gt;options-&gt;configuration-&gt;testResultCacheFile());
+                $resultCache-&gt;load();
+            }
+
+            (new TestSuiteSorter($resultCache))-&gt;reorderTestsInSuite(
+                $testSuite,
+                $this-&gt;options-&gt;configuration-&gt;executionOrder(),
+                $this-&gt;options-&gt;configuration-&gt;resolveDependencies(),
+                $this-&gt;options-&gt;configuration-&gt;executionOrderDefects(),
+            );
+        }
+
+        (new TestSuiteFilterProcessor())-&gt;process($this-&gt;options-&gt;configuration, $testSuite);
+
+        $this-&gt;testCount = count($testSuite);
+
+        $files = [];
+        $tests = [];
+        foreach ($this-&gt;loadFiles($testSuite) as $file =&gt; $test) {
+            $files[$file] = null;
+
+            if ($test instanceof PhptTestCase) {
+                $tests[] = $file;
+            } else {
+                $name = $test-&gt;name();
+                if ($test-&gt;providedData() !== []) {
+                    $dataName = $test-&gt;dataName();
+                    if ($this-&gt;options-&gt;functional) {
+                        $name = sprintf(&#039;/%s%s$/&#039;, preg_quote($name, &#039;/&#039;), preg_quote($test-&gt;dataSetAsString(), &#039;/&#039;));
+                    } else {
+                        if (is_int($dataName)) {
+                            $name .= &#039;#&#039; . $dataName;
+                        } else {
+                            $name .= &#039;@&#039; . $dataName;
+                        }
+                    }
+                } else {
+                    $name = sprintf(&#039;/%s$/&#039;, $name);
+                }
+
+                $tests[] = &quot;$file\0$name&quot;;
+            }
+        }
+
+        $this-&gt;tests = $this-&gt;options-&gt;functional
+            ? $tests
+            : array_keys($files);
+
+        if (! $this-&gt;options-&gt;configuration-&gt;hasCoverageReport()) {
+            return;
+        }
+
+        ob_start();
+        $result       = (new WarmCodeCoverageCacheCommand(
+            $this-&gt;options-&gt;configuration,
+            $codeCoverageFilterRegistry,
+        ))-&gt;execute();
+        $ob_get_clean = ob_get_clean();
+        assert($ob_get_clean !== false);
+        $output-&gt;write($ob_get_clean);
+        $output-&gt;write($result-&gt;output());
+        if ($result-&gt;shellExitCode() !== Result::SUCCESS) {
+            exit($result-&gt;shellExitCode());
+        }
+    }
+
+    /** @return Generator&lt;non-empty-string, (PhptTestCase|TestCase)&gt; */
+    private function loadFiles(TestSuite $testSuite): Generator
+    {
+        foreach ($testSuite as $test) {
+            if ($test instanceof TestSuite) {
+                yield from $this-&gt;loadFiles($test);
+
+                continue;
+            }
+
+            if ($test instanceof PhptTestCase) {
+                $refProperty = new ReflectionProperty(PhptTestCase::class, &#039;filename&#039;);
+                $filename    = $refProperty-&gt;getValue($test);
+                assert(is_string($filename) &amp;&amp; $filename !== &#039;&#039;);
+                $filename = $this-&gt;stripCwd($filename);
+
+                yield $filename =&gt; $test;
+
+                continue;
+            }
+
+            if ($test instanceof TestCase) {
+                $refClass = new ReflectionClass($test);
+                $filename = $refClass-&gt;getFileName();
+                assert(is_string($filename));
+                $filename = $this-&gt;stripCwd($filename);
+
+                yield $filename =&gt; $test;
+
+                continue;
+            }
+        }
+    }
+
+    /**
+     * @param non-empty-string $filename
+     *
+     * @return non-empty-string
+     */
+    private function stripCwd(string $filename): string
+    {
+        if (! str_starts_with($filename, $this-&gt;options-&gt;cwd)) {
+            return $filename;
+        }
+
+        $substr = substr($filename, 1 + strlen($this-&gt;options-&gt;cwd));
+        assert($substr !== &#039;&#039;);
+
+        return $substr;
+    }
+
+    private function shardTests(TestSuite $suite): void
+    {
+        $tests = $this-&gt;extractTestsInSuite($suite);
+
+        $shards        = $this-&gt;options-&gt;totalShards;
+        $current       = $this-&gt;options-&gt;currentShard - 1; // 0 indexed. Shard 1 is in reality shard 0
+        $total         = count($tests);
+        $testsPerShard = (int) ceil($total / $shards);
+        $offset        = $testsPerShard * $current;
+
+        $suite-&gt;setTests(array_slice($tests, $offset, $testsPerShard));
+    }
+
+    /** @return list&lt;Test&gt; */
+    private function extractTestsInSuite(TestSuite $suite): array
+    {
+        $extractedTests = [];
+        $suiteItems     = $suite-&gt;tests();
+
+        foreach ($suiteItems as $item) {
+            if ($item instanceof TestSuite) {
+                $extractedTests = array_merge($extractedTests, $this-&gt;extractTestsInSuite($item));
+            } else {
+                $extractedTests[] = $item;
+            }
+        }
+
+        return $extractedTests;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/brianium/paratest/src/WrapperRunner/WorkerCrashedException.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/brick -->
+
+</body>
+</html>

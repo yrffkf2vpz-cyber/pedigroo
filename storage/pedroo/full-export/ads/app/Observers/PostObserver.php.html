@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Observers/PostObserver.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Observers;
+
+use App\Helpers\Common\Files\Storage\StorageDisk;
+use App\Models\Payment;
+use App\Models\Permission;
+use App\Models\Picture;
+use App\Models\Post;
+use App\Models\PostValue;
+use App\Models\SavedPost;
+use App\Models\Scopes\StrictActiveScope;
+use App\Models\Scopes\ValidPeriodScope;
+use App\Models\Thread;
+use App\Models\User;
+use App\Notifications\PostActivated;
+use App\Notifications\PostNotification;
+use App\Notifications\PostReviewed;
+use extras\addons\reviews\app\Models\Review;
+use Illuminate\Support\Facades\Notification;
+use Throwable;
+
+class PostObserver extends BaseObserver
+{
+	/**
+	 * Listen to the Entry created event.
+	 *
+	 * @param Post $post
+	 * @return void
+	 */
+	public function created(Post $post)
+	{
+		// Send Admin Notification Email
+		if (config(&#039;settings.mail.admin_notification&#039;) == &#039;1&#039;) {
+			try {
+				// Get all admin users
+				$admins = User::permission(Permission::getStaffPermissions())-&gt;get();
+				if ($admins-&gt;count() &gt; 0) {
+					Notification::send($admins, new PostNotification($post));
+				}
+			} catch (Throwable $e) {
+			}
+		}
+	}
+	
+	/**
+	 * Listen to the Entry deleting event.
+	 *
+	 * @param Post $post
+	 * @return void
+	 */
+	public function deleting(Post $post)
+	{
+		// Storage Disk Init.
+		$disk = StorageDisk::getDisk();
+		
+		// Delete all the Post&#039;s Custom Fields Values
+		$postValues = PostValue::where(&#039;post_id&#039;, $post-&gt;id)-&gt;get();
+		if ($postValues-&gt;count() &gt; 0) {
+			foreach ($postValues as $postValue) {
+				$postValue-&gt;delete();
+			}
+		}
+		
+		// Delete all Threads
+		$messages = Thread::where(&#039;post_id&#039;, $post-&gt;id);
+		if ($messages-&gt;count() &gt; 0) {
+			foreach ($messages-&gt;cursor() as $message) {
+				$message-&gt;forceDelete();
+			}
+		}
+		
+		// Delete all Saved Posts
+		$savedPosts = SavedPost::where(&#039;post_id&#039;, $post-&gt;id);
+		if ($savedPosts-&gt;count() &gt; 0) {
+			foreach ($savedPosts-&gt;cursor() as $savedPost) {
+				$savedPost-&gt;delete();
+			}
+		}
+		
+		// Delete all Pictures
+		$pictures = Picture::where(&#039;post_id&#039;, $post-&gt;id);
+		if ($pictures-&gt;count() &gt; 0) {
+			foreach ($pictures-&gt;cursor() as $picture) {
+				$picture-&gt;delete();
+			}
+		}
+		
+		// Delete the Payment(s) of this Post
+		$payments = Payment::query()
+			-&gt;withoutGlobalScopes([ValidPeriodScope::class, StrictActiveScope::class])
+			-&gt;whereMorphedTo(&#039;payable&#039;, $post)
+			-&gt;get();
+		if ($payments-&gt;count() &gt; 0) {
+			foreach ($payments as $payment) {
+				$payment-&gt;delete();
+			}
+		}
+		
+		// Check Reviews addon
+		if (config(&#039;addons.reviews.installed&#039;)) {
+			try {
+				// Delete the reviews of this Post
+				$reviews = Review::where(&#039;post_id&#039;, $post-&gt;id);
+				if ($reviews-&gt;count() &gt; 0) {
+					foreach ($reviews-&gt;cursor() as $review) {
+						$review-&gt;delete();
+					}
+				}
+			} catch (Throwable $e) {
+			}
+		}
+		
+		// Remove the listing media folder
+		if (!empty($post-&gt;country_code) &amp;&amp; !empty($post-&gt;id)) {
+			$directoryPath = &#039;files/&#039; . strtolower($post-&gt;country_code) . &#039;/&#039; . $post-&gt;id;
+			
+			if ($disk-&gt;exists($directoryPath)) {
+				$disk-&gt;deleteDirectory($directoryPath);
+			}
+		}
+	}
+	
+	/**
+	 * Listen to the Entry saved event.
+	 *
+	 * @param Post $post
+	 * @return void
+	 */
+	public function saved(Post $post)
+	{
+		$this-&gt;sendNotification($post);
+		
+		// Create a new email token if the post&#039;s email is marked as unverified
+		if (empty($post-&gt;email_verified_at)) {
+			if (empty($post-&gt;email_token)) {
+				$post-&gt;email_token = generateToken(hashed: true);
+				$post-&gt;saveQuietly();
+			}
+		}
+		
+		// Create a new phone token if the post&#039;s phone number is marked as unverified
+		if (empty($post-&gt;phone_verified_at)) {
+			if (empty($post-&gt;phone_token)) {
+				$post-&gt;phone_token = generateOtp(defaultOtpLength());
+				$post-&gt;saveQuietly();
+			}
+		}
+	}
+	
+	/**
+	 * Send Notification
+	 *
+	 * - If the user&#039;s email address or phone number was not verified and has just been verified
+	 *   (including when the user was recently created)
+	 * - If the listing was not reviewed and has just been reviewed
+	 *  (including when the listing was recently created)
+	 *
+	 * @param Post $post
+	 * @return void
+	 */
+	private function sendNotification(Post $post)
+	{
+		try {
+			if ($post-&gt;wasRecentlyCreated) {
+				// verified
+				$postWasNotVerified = true;
+				
+				// reviewed
+				$postWasNotReviewed = true;
+			} else {
+				$original = $post-&gt;getOriginal();
+				
+				// verified
+				$postEmailWasNotVerified = ($post-&gt;wasChanged(&#039;email_verified_at&#039;) &amp;&amp; empty(data_get($original, &#039;email_verified_at&#039;)));
+				$postPhoneWasNotVerified = ($post-&gt;wasChanged(&#039;phone_verified_at&#039;) &amp;&amp; empty(data_get($original, &#039;phone_verified_at&#039;)));
+				$postWasNotVerified = ($postEmailWasNotVerified || $postPhoneWasNotVerified);
+				
+				// reviewed
+				$postWasNotReviewed = ($post-&gt;wasChanged(&#039;reviewed_at&#039;) &amp;&amp; empty(data_get($original, &#039;reviewed_at&#039;)));
+			}
+			// verified
+			$postIsVerified = (!empty($post-&gt;email_verified_at) &amp;&amp; !empty($post-&gt;phone_verified_at));
+			$postHasJustBeenVerified = ($postIsVerified &amp;&amp; $postWasNotVerified);
+			
+			// reviewed
+			$postIsReviewed = (!empty($post-&gt;reviewed_at));
+			$postHasJustBeenReviewed = ($postIsReviewed &amp;&amp; $postWasNotReviewed);
+			
+			if ($postIsVerified) {
+				if (listingsNeedToBeReviewed()) {
+					if ($postHasJustBeenReviewed) {
+						$post-&gt;notify(new PostReviewed($post));
+					} else {
+						if ($postHasJustBeenVerified) {
+							$post-&gt;notify(new PostActivated($post));
+						}
+					}
+				} else {
+					if ($postHasJustBeenVerified) {
+						$post-&gt;notify(new PostReviewed($post));
+					}
+				}
+			}
+		} catch (Throwable $e) {
+			abort(500, $e-&gt;getMessage());
+		}
+	}
+	
+	/**
+	 * Listen to the Entry deleted event.
+	 *
+	 * @param Post $post
+	 * @return void
+	 */
+	public function deleted(Post $post)
+	{
+		// ...
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Observers/PostValueObserver.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Observers/Traits -->
+
+</body>
+</html>

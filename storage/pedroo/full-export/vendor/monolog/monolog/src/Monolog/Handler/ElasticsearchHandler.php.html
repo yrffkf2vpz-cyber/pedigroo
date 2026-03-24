@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/monolog/monolog/src/Monolog/Handler/ElasticsearchHandler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+
+/*
+ * This file is part of the Monolog package.
+ *
+ * (c) Jordi Boggiano &lt;j.boggiano@seld.be&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Monolog\Handler;
+
+use Elastic\Elasticsearch\Response\Elasticsearch;
+use Throwable;
+use RuntimeException;
+use Monolog\Level;
+use Monolog\Formatter\FormatterInterface;
+use Monolog\Formatter\ElasticsearchFormatter;
+use InvalidArgumentException;
+use Elasticsearch\Common\Exceptions\RuntimeException as ElasticsearchRuntimeException;
+use Elasticsearch\Client;
+use Monolog\LogRecord;
+use Elastic\Elasticsearch\Exception\InvalidArgumentException as ElasticInvalidArgumentException;
+use Elastic\Elasticsearch\Client as Client8;
+
+/**
+ * Elasticsearch handler
+ *
+ * @link https://www.elastic.co/guide/en/elasticsearch/client/php-api/current/index.html
+ *
+ * Simple usage example:
+ *
+ *    $client = \Elasticsearch\ClientBuilder::create()
+ *        -&gt;setHosts($hosts)
+ *        -&gt;build();
+ *
+ *    $options = array(
+ *        &#039;index&#039; =&gt; &#039;elastic_index_name&#039;,
+ *        &#039;type&#039;  =&gt; &#039;elastic_doc_type&#039;,
+ *    );
+ *    $handler = new ElasticsearchHandler($client, $options);
+ *    $log = new Logger(&#039;application&#039;);
+ *    $log-&gt;pushHandler($handler);
+ *
+ * @author Avtandil Kikabidze &lt;akalongman@gmail.com&gt;
+ * @phpstan-type Options array{
+ *     index: string,
+ *     type: string,
+ *     ignore_error: bool,
+ *     op_type: &#039;index&#039;|&#039;create&#039;
+ * }
+ * @phpstan-type InputOptions array{
+ *     index?: string,
+ *     type?: string,
+ *     ignore_error?: bool,
+ *     op_type?: &#039;index&#039;|&#039;create&#039;
+ * }
+ */
+class ElasticsearchHandler extends AbstractProcessingHandler
+{
+    protected Client|Client8 $client;
+
+    /**
+     * @var mixed[] Handler config options
+     * @phpstan-var Options
+     */
+    protected array $options;
+
+    /**
+     * @var bool
+     */
+    private $needsType;
+
+    /**
+     * @param Client|Client8 $client  Elasticsearch Client object
+     * @param mixed[]        $options Handler configuration
+     *
+     * @phpstan-param InputOptions $options
+     */
+    public function __construct(Client|Client8 $client, array $options = [], int|string|Level $level = Level::Debug, bool $bubble = true)
+    {
+        parent::__construct($level, $bubble);
+        $this-&gt;client = $client;
+        $this-&gt;options = array_merge(
+            [
+                &#039;index&#039;        =&gt; &#039;monolog&#039;, // Elastic index name
+                &#039;type&#039;         =&gt; &#039;_doc&#039;,    // Elastic document type
+                &#039;ignore_error&#039; =&gt; false,     // Suppress Elasticsearch exceptions
+                &#039;op_type&#039;      =&gt; &#039;index&#039;,   // Elastic op_type (index or create) (https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-index_.html#docs-index-api-op_type)
+            ],
+            $options
+        );
+
+        if ($client instanceof Client8 || $client::VERSION[0] === &#039;7&#039;) {
+            $this-&gt;needsType = false;
+            // force the type to _doc for ES8/ES7
+            $this-&gt;options[&#039;type&#039;] = &#039;_doc&#039;;
+        } else {
+            $this-&gt;needsType = true;
+        }
+    }
+
+    /**
+     * @inheritDoc
+     */
+    protected function write(LogRecord $record): void
+    {
+        $this-&gt;bulkSend([$record-&gt;formatted]);
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setFormatter(FormatterInterface $formatter): HandlerInterface
+    {
+        if ($formatter instanceof ElasticsearchFormatter) {
+            return parent::setFormatter($formatter);
+        }
+
+        throw new InvalidArgumentException(&#039;ElasticsearchHandler is only compatible with ElasticsearchFormatter&#039;);
+    }
+
+    /**
+     * Getter options
+     *
+     * @return mixed[]
+     *
+     * @phpstan-return Options
+     */
+    public function getOptions(): array
+    {
+        return $this-&gt;options;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    protected function getDefaultFormatter(): FormatterInterface
+    {
+        return new ElasticsearchFormatter($this-&gt;options[&#039;index&#039;], $this-&gt;options[&#039;type&#039;]);
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function handleBatch(array $records): void
+    {
+        $documents = $this-&gt;getFormatter()-&gt;formatBatch($records);
+        $this-&gt;bulkSend($documents);
+    }
+
+    /**
+     * Use Elasticsearch bulk API to send list of documents
+     *
+     * @param  array&lt;array&lt;mixed&gt;&gt; $records Records + _index/_type keys
+     * @throws \RuntimeException
+     */
+    protected function bulkSend(array $records): void
+    {
+        try {
+            $params = [
+                &#039;body&#039; =&gt; [],
+            ];
+
+            foreach ($records as $record) {
+                $params[&#039;body&#039;][] = [
+                    $this-&gt;options[&#039;op_type&#039;] =&gt; $this-&gt;needsType ? [
+                        &#039;_index&#039; =&gt; $record[&#039;_index&#039;],
+                        &#039;_type&#039;  =&gt; $record[&#039;_type&#039;],
+                    ] : [
+                        &#039;_index&#039; =&gt; $record[&#039;_index&#039;],
+                    ],
+                ];
+                unset($record[&#039;_index&#039;], $record[&#039;_type&#039;]);
+
+                $params[&#039;body&#039;][] = $record;
+            }
+
+            /** @var Elasticsearch */
+            $responses = $this-&gt;client-&gt;bulk($params);
+
+            if ($responses[&#039;errors&#039;] === true) {
+                throw $this-&gt;createExceptionFromResponses($responses);
+            }
+        } catch (Throwable $e) {
+            if (! $this-&gt;options[&#039;ignore_error&#039;]) {
+                throw new RuntimeException(&#039;Error sending messages to Elasticsearch&#039;, 0, $e);
+            }
+        }
+    }
+
+    /**
+     * Creates elasticsearch exception from responses array
+     *
+     * Only the first error is converted into an exception.
+     *
+     * @param mixed[]|Elasticsearch $responses returned by $this-&gt;client-&gt;bulk()
+     */
+    protected function createExceptionFromResponses($responses): Throwable
+    {
+        foreach ($responses[&#039;items&#039;] ?? [] as $item) {
+            if (isset($item[&#039;index&#039;][&#039;error&#039;])) {
+                return $this-&gt;createExceptionFromError($item[&#039;index&#039;][&#039;error&#039;]);
+            }
+        }
+
+        if (class_exists(ElasticInvalidArgumentException::class)) {
+            return new ElasticInvalidArgumentException(&#039;Elasticsearch failed to index one or more records.&#039;);
+        }
+
+        if (class_exists(ElasticsearchRuntimeException::class)) {
+            return new ElasticsearchRuntimeException(&#039;Elasticsearch failed to index one or more records.&#039;);
+        }
+
+        throw new \LogicException(&#039;Unsupported elastic search client version&#039;);
+    }
+
+    /**
+     * Creates elasticsearch exception from error array
+     *
+     * @param mixed[] $error
+     */
+    protected function createExceptionFromError(array $error): Throwable
+    {
+        $previous = isset($error[&#039;caused_by&#039;]) ? $this-&gt;createExceptionFromError($error[&#039;caused_by&#039;]) : null;
+
+        if (class_exists(ElasticInvalidArgumentException::class)) {
+            return new ElasticInvalidArgumentException($error[&#039;type&#039;] . &#039;: &#039; . $error[&#039;reason&#039;], 0, $previous);
+        }
+
+        if (class_exists(ElasticsearchRuntimeException::class)) {
+            return new ElasticsearchRuntimeException($error[&#039;type&#039;].&#039;: &#039;.$error[&#039;reason&#039;], 0, $previous);
+        }
+
+        throw new \LogicException(&#039;Unsupported elastic search client version&#039;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/monolog/monolog/src/Monolog/Handler/ErrorLogHandler.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/monolog/monolog/src/Monolog/Handler/Curl -->
+
+</body>
+</html>

@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Bus/PendingBatch.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Bus;
+
+use Closure;
+use Illuminate\Bus\Events\BatchDispatched;
+use Illuminate\Contracts\Container\Container;
+use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Traits\Conditionable;
+use Laravel\SerializableClosure\SerializableClosure;
+use RuntimeException;
+use Throwable;
+use UnitEnum;
+
+use function Illuminate\Support\enum_value;
+
+class PendingBatch
+{
+    use Conditionable;
+
+    /**
+     * The IoC container instance.
+     *
+     * @var \Illuminate\Contracts\Container\Container
+     */
+    protected $container;
+
+    /**
+     * The batch name.
+     *
+     * @var string
+     */
+    public $name = &#039;&#039;;
+
+    /**
+     * The jobs that belong to the batch.
+     *
+     * @var \Illuminate\Support\Collection
+     */
+    public $jobs;
+
+    /**
+     * The batch options.
+     *
+     * @var array
+     */
+    public $options = [];
+
+    /**
+     * Jobs that have been verified to contain the Batchable trait.
+     *
+     * @var array&lt;class-string, bool&gt;
+     */
+    protected static $batchableClasses = [];
+
+    /**
+     * Create a new pending batch instance.
+     *
+     * @param  \Illuminate\Contracts\Container\Container  $container
+     * @param  \Illuminate\Support\Collection  $jobs
+     */
+    public function __construct(Container $container, Collection $jobs)
+    {
+        $this-&gt;container = $container;
+
+        $this-&gt;jobs = $jobs-&gt;filter()-&gt;values()-&gt;each(function (object|array $job) {
+            $this-&gt;ensureJobIsBatchable($job);
+        });
+    }
+
+    /**
+     * Add jobs to the batch.
+     *
+     * @param  iterable|object|array  $jobs
+     * @return $this
+     */
+    public function add($jobs)
+    {
+        $jobs = is_iterable($jobs) ? $jobs : Arr::wrap($jobs);
+
+        foreach ($jobs as $job) {
+            $this-&gt;ensureJobIsBatchable($job);
+
+            $this-&gt;jobs-&gt;push($job);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Ensure the given job is batchable.
+     *
+     * @param  object|array  $job
+     * @return void
+     */
+    protected function ensureJobIsBatchable(object|array $job): void
+    {
+        foreach (Arr::wrap($job) as $job) {
+            if ($job instanceof PendingBatch || $job instanceof Closure) {
+                return;
+            }
+
+            if (! (static::$batchableClasses[$job::class] ?? false) &amp;&amp; ! in_array(Batchable::class, class_uses_recursive($job))) {
+                static::$batchableClasses[$job::class] = false;
+
+                throw new RuntimeException(sprintf(&#039;Attempted to batch job [%s], but it does not use the Batchable trait.&#039;, $job::class));
+            }
+
+            static::$batchableClasses[$job::class] = true;
+        }
+    }
+
+    /**
+     * Add a callback to be executed when the batch is stored.
+     *
+     * @param  callable  $callback
+     * @return $this
+     */
+    public function before($callback)
+    {
+        $this-&gt;registerCallback(&#039;before&#039;, $callback);
+
+        return $this;
+    }
+
+    /**
+     * Get the &quot;before&quot; callbacks that have been registered with the pending batch.
+     *
+     * @return array
+     */
+    public function beforeCallbacks()
+    {
+        return $this-&gt;options[&#039;before&#039;] ?? [];
+    }
+
+    /**
+     * Add a callback to be executed after a job in the batch have executed successfully.
+     *
+     * @param  callable  $callback
+     * @return $this
+     */
+    public function progress($callback)
+    {
+        $this-&gt;registerCallback(&#039;progress&#039;, $callback);
+
+        return $this;
+    }
+
+    /**
+     * Get the &quot;progress&quot; callbacks that have been registered with the pending batch.
+     *
+     * @return array
+     */
+    public function progressCallbacks()
+    {
+        return $this-&gt;options[&#039;progress&#039;] ?? [];
+    }
+
+    /**
+     * Add a callback to be executed after all jobs in the batch have executed successfully.
+     *
+     * @param  callable  $callback
+     * @return $this
+     */
+    public function then($callback)
+    {
+        $this-&gt;registerCallback(&#039;then&#039;, $callback);
+
+        return $this;
+    }
+
+    /**
+     * Get the &quot;then&quot; callbacks that have been registered with the pending batch.
+     *
+     * @return array
+     */
+    public function thenCallbacks()
+    {
+        return $this-&gt;options[&#039;then&#039;] ?? [];
+    }
+
+    /**
+     * Add a callback to be executed after the first failing job in the batch.
+     *
+     * @param  callable  $callback
+     * @return $this
+     */
+    public function catch($callback)
+    {
+        $this-&gt;registerCallback(&#039;catch&#039;, $callback);
+
+        return $this;
+    }
+
+    /**
+     * Get the &quot;catch&quot; callbacks that have been registered with the pending batch.
+     *
+     * @return array
+     */
+    public function catchCallbacks()
+    {
+        return $this-&gt;options[&#039;catch&#039;] ?? [];
+    }
+
+    /**
+     * Add a callback to be executed after the batch has finished executing.
+     *
+     * @param  callable  $callback
+     * @return $this
+     */
+    public function finally($callback)
+    {
+        $this-&gt;registerCallback(&#039;finally&#039;, $callback);
+
+        return $this;
+    }
+
+    /**
+     * Get the &quot;finally&quot; callbacks that have been registered with the pending batch.
+     *
+     * @return array
+     */
+    public function finallyCallbacks()
+    {
+        return $this-&gt;options[&#039;finally&#039;] ?? [];
+    }
+
+    /**
+     * Indicate that the batch should not be canceled when a job within the batch fails.
+     *
+     * Optionally, add callbacks to be executed upon each job failure.
+     *
+     * @phpstan-type TParam (Closure(\Illuminate\Bus\Batch, \Throwable|null): mixed)|(callable(\Illuminate\Bus\Batch, \Throwable|null): mixed)
+     *
+     * @param  bool|TParam|array&lt;array-key, TParam&gt;  $param
+     * @return $this
+     */
+    public function allowFailures($param = true)
+    {
+        if (! is_bool($param)) {
+            $param = Arr::wrap($param);
+
+            foreach ($param as $callback) {
+                if (is_callable($callback)) {
+                    $this-&gt;registerCallback(&#039;failure&#039;, $callback);
+                }
+            }
+        }
+
+        $this-&gt;options[&#039;allowFailures&#039;] = ! ($param === false);
+
+        return $this;
+    }
+
+    /**
+     * Determine if the pending batch allows jobs to fail without cancelling the batch.
+     *
+     * @return bool
+     */
+    public function allowsFailures()
+    {
+        return Arr::get($this-&gt;options, &#039;allowFailures&#039;, false) === true;
+    }
+
+    /**
+     * Get the &quot;failure&quot; callbacks that have been registered with the pending batch.
+     *
+     * @return array&lt;array-key, Closure|callable&gt;
+     */
+    public function failureCallbacks(): array
+    {
+        return $this-&gt;options[&#039;failure&#039;] ?? [];
+    }
+
+    /**
+     * Register a callback with proper serialization.
+     */
+    private function registerCallback(string $type, Closure|callable $callback): void
+    {
+        $this-&gt;options[$type][] = $callback instanceof Closure
+            ? new SerializableClosure($callback)
+            : $callback;
+    }
+
+    /**
+     * Set the name for the batch.
+     *
+     * @param  string  $name
+     * @return $this
+     */
+    public function name(string $name)
+    {
+        $this-&gt;name = $name;
+
+        return $this;
+    }
+
+    /**
+     * Specify the queue connection that the batched jobs should run on.
+     *
+     * @param  \UnitEnum|string  $connection
+     * @return $this
+     */
+    public function onConnection(UnitEnum|string $connection)
+    {
+        $this-&gt;options[&#039;connection&#039;] = enum_value($connection);
+
+        return $this;
+    }
+
+    /**
+     * Get the connection used by the pending batch.
+     *
+     * @return string|null
+     */
+    public function connection()
+    {
+        return $this-&gt;options[&#039;connection&#039;] ?? null;
+    }
+
+    /**
+     * Specify the queue that the batched jobs should run on.
+     *
+     * @param  \UnitEnum|string|null  $queue
+     * @return $this
+     */
+    public function onQueue($queue)
+    {
+        $this-&gt;options[&#039;queue&#039;] = enum_value($queue);
+
+        return $this;
+    }
+
+    /**
+     * Get the queue used by the pending batch.
+     *
+     * @return string|null
+     */
+    public function queue()
+    {
+        return $this-&gt;options[&#039;queue&#039;] ?? null;
+    }
+
+    /**
+     * Add additional data into the batch&#039;s options array.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return $this
+     */
+    public function withOption(string $key, $value)
+    {
+        $this-&gt;options[$key] = $value;
+
+        return $this;
+    }
+
+    /**
+     * Dispatch the batch.
+     *
+     * @return \Illuminate\Bus\Batch
+     *
+     * @throws \Throwable
+     */
+    public function dispatch()
+    {
+        $repository = $this-&gt;container-&gt;make(BatchRepository::class);
+
+        try {
+            $batch = $this-&gt;store($repository);
+
+            $batch = $batch-&gt;add($this-&gt;jobs);
+        } catch (Throwable $e) {
+            if (isset($batch)) {
+                $repository-&gt;delete($batch-&gt;id);
+            }
+
+            throw $e;
+        }
+
+        $this-&gt;container-&gt;make(EventDispatcher::class)-&gt;dispatch(
+            new BatchDispatched($batch)
+        );
+
+        return $batch;
+    }
+
+    /**
+     * Dispatch the batch after the response is sent to the browser.
+     *
+     * @return \Illuminate\Bus\Batch
+     */
+    public function dispatchAfterResponse()
+    {
+        $repository = $this-&gt;container-&gt;make(BatchRepository::class);
+
+        $batch = $this-&gt;store($repository);
+
+        if ($batch) {
+            $this-&gt;container-&gt;terminating(function () use ($batch) {
+                $this-&gt;dispatchExistingBatch($batch);
+            });
+        }
+
+        return $batch;
+    }
+
+    /**
+     * Dispatch an existing batch.
+     *
+     * @param  \Illuminate\Bus\Batch  $batch
+     * @return void
+     *
+     * @throws \Throwable
+     */
+    protected function dispatchExistingBatch($batch)
+    {
+        try {
+            $batch = $batch-&gt;add($this-&gt;jobs);
+        } catch (Throwable $e) {
+            $batch-&gt;delete();
+
+            throw $e;
+        }
+
+        $this-&gt;container-&gt;make(EventDispatcher::class)-&gt;dispatch(
+            new BatchDispatched($batch)
+        );
+    }
+
+    /**
+     * Dispatch the batch if the given truth test passes.
+     *
+     * @param  bool|\Closure  $boolean
+     * @return \Illuminate\Bus\Batch|null
+     */
+    public function dispatchIf($boolean)
+    {
+        return value($boolean) ? $this-&gt;dispatch() : null;
+    }
+
+    /**
+     * Dispatch the batch unless the given truth test passes.
+     *
+     * @param  bool|\Closure  $boolean
+     * @return \Illuminate\Bus\Batch|null
+     */
+    public function dispatchUnless($boolean)
+    {
+        return ! value($boolean) ? $this-&gt;dispatch() : null;
+    }
+
+    /**
+     * Store the batch using the given repository.
+     *
+     * @param  \Illuminate\Bus\BatchRepository  $repository
+     * @return \Illuminate\Bus\Batch
+     */
+    protected function store($repository)
+    {
+        $batch = $repository-&gt;store($this);
+
+        (new Collection($this-&gt;beforeCallbacks()))-&gt;each(function ($handler) use ($batch) {
+            try {
+                return $handler($batch);
+            } catch (Throwable $e) {
+                if (function_exists(&#039;report&#039;)) {
+                    report($e);
+                }
+            }
+        });
+
+        return $batch;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Bus/PrunableBatchRepository.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Bus/Events -->
+
+</body>
+</html>

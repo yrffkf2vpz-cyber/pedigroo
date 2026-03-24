@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Net/SCP.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Pure-PHP implementation of SCP.
+ *
+ * PHP version 5
+ *
+ * The API for this library is modeled after the API from PHP&#039;s {@link http://php.net/book.ftp FTP extension}.
+ *
+ * Here&#039;s a short example of how to use this library:
+ * &lt;code&gt;
+ * &lt;?php
+ *    include &#039;vendor/autoload.php&#039;;
+ *
+ *    $scp = new \phpseclib3\Net\SCP(&#039;www.domain.tld&#039;);
+ *    if (!$scp-&gt;login(&#039;username&#039;, &#039;password&#039;)) {
+ *        exit(&#039;Login Failed&#039;);
+ *    }
+ *
+ *    echo $scp-&gt;exec(&#039;pwd&#039;) . &quot;\r\n&quot;;
+ *    $scp-&gt;put(&#039;filename.ext&#039;, &#039;hello, world!&#039;);
+ *    echo $scp-&gt;exec(&#039;ls -latr&#039;);
+ * ?&gt;
+ * &lt;/code&gt;
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2009 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\Net;
+
+use phpseclib3\Common\Functions\Strings;
+use phpseclib3\Exception\FileNotFoundException;
+
+/**
+ * Pure-PHP implementations of SCP.
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+class SCP extends SSH2
+{
+    /**
+     * Reads data from a local file.
+     *
+     * @see \phpseclib3\Net\SCP::put()
+     */
+    const SOURCE_LOCAL_FILE = 1;
+    /**
+     * Reads data from a string.
+     *
+     * @see \phpseclib3\Net\SCP::put()
+     */
+    // this value isn&#039;t really used anymore but i&#039;m keeping it reserved for historical reasons
+    const SOURCE_STRING = 2;
+    /**
+     * SCP.php doesn&#039;t support SOURCE_CALLBACK because, with that one, we don&#039;t know the size, in advance
+     */
+    //const SOURCE_CALLBACK = 16;
+
+    /**
+     * Error information
+     *
+     * @see self::getSCPErrors()
+     * @see self::getLastSCPError()
+     * @var array
+     */
+    private $scp_errors = [];
+
+    /**
+     * Uploads a file to the SCP server.
+     *
+     * By default, \phpseclib\Net\SCP::put() does not read from the local filesystem.  $data is dumped directly into $remote_file.
+     * So, for example, if you set $data to &#039;filename.ext&#039; and then do \phpseclib\Net\SCP::get(), you will get a file, twelve bytes
+     * long, containing &#039;filename.ext&#039; as its contents.
+     *
+     * Setting $mode to self::SOURCE_LOCAL_FILE will change the above behavior.  With self::SOURCE_LOCAL_FILE, $remote_file will
+     * contain as many bytes as filename.ext does on your local filesystem.  If your filename.ext is 1MB then that is how
+     * large $remote_file will be, as well.
+     *
+     * Currently, only binary mode is supported.  As such, if the line endings need to be adjusted, you will need to take
+     * care of that, yourself.
+     *
+     * @param string $remote_file
+     * @param string $data
+     * @param int $mode
+     * @param callable $callback
+     * @return bool
+     * @access public
+     */
+    public function put($remote_file, $data, $mode = self::SOURCE_STRING, $callback = null)
+    {
+        if (!($this-&gt;bitmap &amp; self::MASK_LOGIN)) {
+            return false;
+        }
+
+        if (empty($remote_file)) {
+            // remote file cannot be blank
+            return false;
+        }
+
+        if (!$this-&gt;exec(&#039;scp -t &#039; . escapeshellarg($remote_file), false)) { // -t = to
+            return false;
+        }
+
+        $temp = $this-&gt;get_channel_packet(self::CHANNEL_EXEC, true);
+        if ($temp !== chr(0)) {
+            $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+            return false;
+        }
+
+        $packet_size = $this-&gt;packet_size_client_to_server[self::CHANNEL_EXEC] - 4;
+
+        $remote_file = basename($remote_file);
+
+        $dataCallback = false;
+        switch (true) {
+            case is_resource($data):
+                $mode = $mode &amp; ~self::SOURCE_LOCAL_FILE;
+                $info = stream_get_meta_data($data);
+                if (isset($info[&#039;wrapper_type&#039;]) &amp;&amp; $info[&#039;wrapper_type&#039;] == &#039;PHP&#039; &amp;&amp; $info[&#039;stream_type&#039;] == &#039;Input&#039;) {
+                    $fp = fopen(&#039;php://memory&#039;, &#039;w+&#039;);
+                    stream_copy_to_stream($data, $fp);
+                    rewind($fp);
+                } else {
+                    $fp = $data;
+                }
+                break;
+            case $mode &amp; self::SOURCE_LOCAL_FILE:
+                if (!is_file($data)) {
+                    throw new FileNotFoundException(&quot;$data is not a valid file&quot;);
+                }
+                $fp = @fopen($data, &#039;rb&#039;);
+                if (!$fp) {
+                    $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+                    return false;
+                }
+        }
+
+        if (isset($fp)) {
+            $stat = fstat($fp);
+            $size = !empty($stat) ? $stat[&#039;size&#039;] : 0;
+        } else {
+            $size = strlen($data);
+        }
+
+        $sent = 0;
+        $size = $size &lt; 0 ? ($size &amp; 0x7FFFFFFF) + 0x80000000 : $size;
+
+        $temp = &#039;C0644 &#039; . $size . &#039; &#039; . $remote_file . &quot;\n&quot;;
+        $this-&gt;send_channel_packet(self::CHANNEL_EXEC, $temp);
+
+        $temp = $this-&gt;get_channel_packet(self::CHANNEL_EXEC, true);
+        if ($temp !== chr(0)) {
+            $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+            return false;
+        }
+
+        $sent = 0;
+        while ($sent &lt; $size) {
+            $temp = $mode &amp; self::SOURCE_STRING ? substr($data, $sent, $packet_size) : fread($fp, $packet_size);
+            $this-&gt;send_channel_packet(self::CHANNEL_EXEC, $temp);
+            $sent += strlen($temp);
+
+            if (is_callable($callback)) {
+                call_user_func($callback, $sent);
+            }
+        }
+        $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+
+        if ($mode != self::SOURCE_STRING) {
+            fclose($fp);
+        }
+
+        return true;
+    }
+
+    /**
+     * Downloads a file from the SCP server.
+     *
+     * Returns a string containing the contents of $remote_file if $local_file is left undefined or a boolean false if
+     * the operation was unsuccessful.  If $local_file is defined, returns true or false depending on the success of the
+     * operation
+     *
+     * @param string $remote_file
+     * @param string $local_file
+     * @return mixed
+     * @access public
+     */
+    public function get($remote_file, $local_file = null, $progressCallback = null)
+    {
+        if (!($this-&gt;bitmap &amp; self::MASK_LOGIN)) {
+            return false;
+        }
+
+        if (!$this-&gt;exec(&#039;scp -f &#039; . escapeshellarg($remote_file), false)) { // -f = from
+            return false;
+        }
+
+        $this-&gt;send_channel_packet(self::CHANNEL_EXEC, chr(0));
+
+        $info = $this-&gt;get_channel_packet(self::CHANNEL_EXEC, true);
+        // per https://goteleport.com/blog/scp-familiar-simple-insecure-slow/ non-zero responses mean there are errors
+        if ($info[0] === chr(1) || $info[0] == chr(2)) {
+            $type = $info[0] === chr(1) ? &#039;warning&#039; : &#039;error&#039;;
+            $this-&gt;scp_errors[] = &quot;$type: &quot; . substr($info, 1);
+            $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+            return false;
+        }
+
+        $this-&gt;send_channel_packet(self::CHANNEL_EXEC, chr(0));
+
+        if (!preg_match(&#039;#(?&lt;perms&gt;[^ ]+) (?&lt;size&gt;\d+) (?&lt;name&gt;.+)#&#039;, rtrim($info), $info)) {
+            $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+            return false;
+        }
+
+        $fclose_check = false;
+        if (is_resource($local_file)) {
+            $fp = $local_file;
+        } elseif (!is_null($local_file)) {
+            $fp = @fopen($local_file, &#039;wb&#039;);
+            if (!$fp) {
+                $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+                return false;
+            }
+            $fclose_check = true;
+        } else {
+            $content = &#039;&#039;;
+        }
+
+        $size = 0;
+        while (true) {
+            $data = $this-&gt;get_channel_packet(self::CHANNEL_EXEC, true);
+            // Terminate the loop in case the server repeatedly sends an empty response
+            if ($data === false) {
+                $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+                // no data received from server
+                return false;
+            }
+            // SCP usually seems to split stuff out into 16k chunks
+            $length = strlen($data);
+            $size += $length;
+            $end = $size &gt; $info[&#039;size&#039;];
+            if ($end) {
+                $diff = $size - $info[&#039;size&#039;];
+                $offset = $length - $diff;
+                if ($data[$offset] === chr(0)) {
+                    $data = substr($data, 0, -$diff);
+                } else {
+                    $type = $data[$offset] === chr(1) ? &#039;warning&#039; : &#039;error&#039;;
+                    $this-&gt;scp_errors[] = &quot;$type: &quot; . substr($data, 1);
+                    $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+                    return false;
+                }
+            }
+
+            if (is_null($local_file)) {
+                $content .= $data;
+            } else {
+                fputs($fp, $data);
+            }
+
+            if (is_callable($progressCallback)) {
+                call_user_func($progressCallback, $size);
+            }
+
+            if ($end) {
+                break;
+            }
+        }
+
+        $this-&gt;close_channel(self::CHANNEL_EXEC, true);
+
+        if ($fclose_check) {
+            fclose($fp);
+        }
+
+        // if $content isn&#039;t set that means a file was written to
+        return isset($content) ? $content : true;
+    }
+
+    /**
+     * Returns all errors on the SCP layer
+     *
+     * @return array
+     */
+    public function getSCPErrors()
+    {
+        return $this-&gt;scp_errors;
+    }
+
+    /**
+     * Returns the last error on the SCP layer
+     *
+     * @return string
+     */
+    public function getLastSCPError()
+    {
+        return count($this-&gt;scp_errors) ? $this-&gt;scp_errors[count($this-&gt;scp_errors) - 1] : &#039;&#039;;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Net/SFTP.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Net/SFTP -->
+
+</body>
+</html>

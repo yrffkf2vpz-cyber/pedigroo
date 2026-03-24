@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/Payment/MakePayment.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services\Payment;
+
+use App\Helpers\Services\Payment\PaymentUrlsTrait;
+use App\Http\Resources\PostResource;
+use App\Http\Resources\UserResource;
+use App\Models\PaymentMethod;
+use App\Models\Post;
+use App\Models\Scopes\ReviewedScope;
+use App\Models\Scopes\VerifiedScope;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Throwable;
+
+trait MakePayment
+{
+	use PaymentUrlsTrait;
+	
+	/**
+	 * Send Payment
+	 * Note: Used by API and Web calls
+	 *
+	 * @param \Illuminate\Http\Request $request
+	 * @param \App\Models\Post|\App\Models\User $payable
+	 * @return \Illuminate\Http\JsonResponse|\Illuminate\Http\RedirectResponse|mixed
+	 */
+	public function sendPayment(Request $request, Post|User $payable)
+	{
+		// Get the payable full name with namespace
+		$payableType = get_class($payable);
+		
+		$isPromoting = (str_ends_with($payableType, &#039;Post&#039;));
+		$isSubscripting = (str_ends_with($payableType, &#039;User&#039;));
+		$isPayableTypeFound = ($isPromoting || $isSubscripting);
+		
+		// Replace patterns in URLs
+		$this-&gt;apiUri = self::replacePatternsInUrls($payable, $this-&gt;apiUri);
+		
+		if ($isPayableTypeFound) {
+			// Result Data Structure
+			$resData = [
+				&#039;success&#039; =&gt; true,
+				&#039;message&#039; =&gt; $this-&gt;apiMsg[&#039;payable&#039;][&#039;success&#039;],
+				&#039;result&#039;  =&gt; $isPromoting ? new PostResource($payable) : new UserResource($payable),
+				&#039;extra&#039;   =&gt; [
+					&#039;payment&#039;          =&gt; [
+						&#039;success&#039; =&gt; false,
+						&#039;message&#039; =&gt; $this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;],
+						&#039;result&#039;  =&gt; null,
+					],
+					&#039;previousUrl&#039;      =&gt; $this-&gt;apiUri[&#039;previousUrl&#039;],
+					&#039;nextUrl&#039;          =&gt; $this-&gt;apiUri[&#039;nextUrl&#039;],
+					&#039;paymentCancelUrl&#039; =&gt; $this-&gt;apiUri[&#039;paymentCancelUrl&#039;],
+					&#039;paymentReturnUrl&#039; =&gt; $this-&gt;apiUri[&#039;paymentReturnUrl&#039;],
+				],
+			];
+			
+			// Get Payment Method
+			// NOTE: If an API call detected, only API compatible gateway maybe fetched
+			// Check the /app/Models/Scopes/CompatibleApiScope.php file for more information
+			$paymentMethod = PaymentMethod::find($request-&gt;input(&#039;payment_method_id&#039;));
+			
+			if (!empty($paymentMethod)) {
+				// Load Payment Addon
+				$addon = load_installed_addon(strtolower($paymentMethod-&gt;name));
+				
+				// Payment using the selected Payment Method
+				if (!empty($addon)) {
+					try {
+						
+						// Send the Payment
+						// return $addon-&gt;class::{&#039;sendPayment&#039;}($request, $payable, $resData);
+						return call_user_func($addon-&gt;class . &#039;::sendPayment&#039;, $request, $payable, $resData);
+						
+					} catch (Throwable $e) {
+						$resData[&#039;extra&#039;][&#039;payment&#039;][&#039;message&#039;] = $e-&gt;getMessage();
+						$resData[&#039;extra&#039;][&#039;previousUrl&#039;] = $this-&gt;apiUri[&#039;previousUrl&#039;] . &#039;?error=addonLoading&#039;;
+						
+						return apiResponse()-&gt;json($resData, 400);
+					}
+				} else {
+					$resData[&#039;extra&#039;][&#039;payment&#039;][&#039;message&#039;] = trans(&#039;global.addon_not_found&#039;);
+					$resData[&#039;extra&#039;][&#039;previousUrl&#039;] = $this-&gt;apiUri[&#039;previousUrl&#039;] . &#039;?error=addonNotFound&#039;;
+				}
+			} else {
+				$resData[&#039;extra&#039;][&#039;payment&#039;][&#039;message&#039;] = trans(&#039;global.payment_method_not_found&#039;);
+				$resData[&#039;extra&#039;][&#039;previousUrl&#039;] = $this-&gt;apiUri[&#039;previousUrl&#039;] . &#039;?error=paymentMethodNotFound&#039;;
+			}
+		} else {
+			$resData[&#039;extra&#039;][&#039;payment&#039;][&#039;message&#039;] = trans(&#039;global.package_type_not_found&#039;);
+			$resData[&#039;extra&#039;][&#039;previousUrl&#039;] = $this-&gt;apiUri[&#039;previousUrl&#039;] . &#039;?error=packageTypeNotFound&#039;;
+		}
+		
+		if (isApiRoute()) {
+			return apiResponse()-&gt;json($resData);
+		} else {
+			$errorMessage = data_get($resData, &#039;extra.payment.message&#039;, trans(&#039;global.unknown_error&#039;));
+			$previousUrl = data_get($resData, &#039;extra.previousUrl&#039;, &#039;/&#039;);
+			
+			flash($errorMessage)-&gt;error();
+			
+			return redirect()-&gt;to($previousUrl);
+		}
+	}
+	
+	/**
+	 * Payment Confirmation
+	 * Note: Only used by Web calls
+	 *
+	 * URL: /posts/{id}/payment/success
+	 * - Success URL when Credit Card is used
+	 * - Payment Process URL when no Credit Card is used
+	 *
+	 * @param $payableId
+	 * @return \Illuminate\Http\RedirectResponse|mixed
+	 */
+	public function paymentConfirmation($payableId = null)
+	{
+		// Get session parameters
+		$params = session(&#039;params&#039;);
+		$params = is_array($params) ? $params : [];
+		
+		if (empty($params)) {
+			flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;])-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentSessionNotFound&#039;);
+		}
+		
+		// Check if the payable ID can be retrieved
+		if (!isset($params[&#039;payable&#039;][&#039;id&#039;]) || !isset($params[&#039;package&#039;][&#039;type&#039;])) {
+			flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;])-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentParametersNotFound&#039;);
+		}
+		
+		$packageType = $params[&#039;package&#039;][&#039;type&#039;];
+		$isPromoting = ($packageType == &#039;promotion&#039;);
+		$isSubscripting = ($packageType == &#039;subscription&#039;);
+		
+		// Get the entry
+		$payable = null;
+		if ($isPromoting) {
+			$payable = Post::withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+				-&gt;where(&#039;id&#039;, $params[&#039;payable&#039;][&#039;id&#039;])
+				-&gt;first();
+		}
+		if ($isSubscripting) {
+			$payable = User::withoutGlobalScopes([VerifiedScope::class])
+				-&gt;where(&#039;id&#039;, $params[&#039;payable&#039;][&#039;id&#039;])
+				-&gt;first();
+		}
+		
+		if (empty($payable)) {
+			flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;])-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentEntryNotFound&#039;);
+		}
+		
+		// GO TO PAYMENT METHODS
+		
+		// Check if the payment method ID can be retrieved
+		if (!isset($params[&#039;paymentMethod&#039;][&#039;id&#039;])) {
+			flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;])-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentMethodParameterNotFound&#039;);
+		}
+		
+		// Get Payment Method
+		$paymentMethod = PaymentMethod::find($params[&#039;paymentMethod&#039;][&#039;id&#039;]);
+		if (empty($paymentMethod)) {
+			flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;])-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentMethodEntryNotFound&#039;);
+		}
+		
+		// Load Payment Addon
+		$addon = load_installed_addon(strtolower($paymentMethod-&gt;name));
+		
+		// Check if the Payment Method exists
+		if (empty($addon)) {
+			flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;])-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentMethodAddonNotFound&#039;);
+		}
+		
+		// Payment using the selected Payment Method
+		try {
+			// return $addon-&gt;class::{&#039;paymentConfirmation&#039;}($payable, $params);
+			return call_user_func($addon-&gt;class . &#039;::paymentConfirmation&#039;, $payable, $params);
+		} catch (Throwable $e) {
+			flash($e-&gt;getMessage())-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentMethodAddonError&#039;);
+		}
+	}
+	
+	/**
+	 * Payment Cancel
+	 * Note: Only used by Web calls
+	 *
+	 * URL: /posts/{id}/payment/cancel
+	 *
+	 * @param $payableId
+	 * @return \Illuminate\Http\RedirectResponse
+	 */
+	public function paymentCancel($payableId = null)
+	{
+		// Set the error message
+		flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;cancel&#039;])-&gt;error();
+		
+		// Get session parameters
+		$params = session(&#039;params&#039;);
+		$params = is_array($params) ? $params : [];
+		
+		if (empty($params)) {
+			return redirect()-&gt;to(&#039;/?error=paymentCancelled&amp;params=empty&#039;);
+		}
+		
+		// Check if the payable ID can be retrieved
+		if (!isset($params[&#039;payable&#039;][&#039;id&#039;]) || !isset($params[&#039;package&#039;][&#039;type&#039;])) {
+			flash($this-&gt;apiMsg[&#039;checkout&#039;][&#039;error&#039;])-&gt;error();
+			
+			return redirect()-&gt;to(&#039;/?error=paymentParametersNotFound&#039;);
+		}
+		
+		$packageType = $params[&#039;package&#039;][&#039;type&#039;];
+		$isPromoting = ($packageType == &#039;promotion&#039;);
+		$isSubscripting = ($packageType == &#039;subscription&#039;);
+		
+		// Get the entry
+		$payable = null;
+		if ($isPromoting) {
+			$payable = Post::withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+				-&gt;where(&#039;id&#039;, $params[&#039;payable&#039;][&#039;id&#039;])
+				-&gt;first();
+		}
+		if ($isSubscripting) {
+			$payable = User::withoutGlobalScopes([VerifiedScope::class])
+				-&gt;where(&#039;id&#039;, $params[&#039;payable&#039;][&#039;id&#039;])
+				-&gt;first();
+		}
+		
+		if (empty($payable)) {
+			return redirect()-&gt;to(&#039;/?error=paymentCancelled&amp;post=empty&#039;);
+		}
+		
+		// Delete new entries when payment canceled (Or not)
+		if (session()-&gt;has(&#039;message&#039;)) {
+			if (config(&#039;settings.listing_form.remove_new_entries_when_payment_cancelled&#039;)) {
+				$payable-&gt;delete();
+			} else {
+				flash(session(&#039;message&#039;))-&gt;success();
+			}
+			session()-&gt;forget(&#039;message&#039;);
+		}
+		
+		// Replace patterns in URLs
+		$this-&gt;apiUri = self::replacePatternsInUrls($payable, $this-&gt;apiUri);
+		
+		return redirect()-&gt;to($this-&gt;apiUri[&#039;previousUrl&#039;] . &#039;?error=paymentCancelled&#039;)-&gt;withInput();
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/Payment/Promotion/MultiStepsPayment.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Payment/Promotion -->
+
+</body>
+</html>

@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/spatie/laravel-permission/src/PermissionRegistrar.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Spatie\Permission;
+
+use Illuminate\Cache\CacheManager;
+use Illuminate\Contracts\Auth\Access\Authorizable;
+use Illuminate\Contracts\Auth\Access\Gate;
+use Illuminate\Contracts\Cache\Repository;
+use Illuminate\Contracts\Cache\Store;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
+use Spatie\Permission\Contracts\Permission;
+use Spatie\Permission\Contracts\PermissionsTeamResolver;
+use Spatie\Permission\Contracts\Role;
+
+class PermissionRegistrar
+{
+    protected Repository $cache;
+
+    protected CacheManager $cacheManager;
+
+    protected string $permissionClass;
+
+    protected string $roleClass;
+
+    /** @var Collection|array|null */
+    protected $permissions;
+
+    public string $pivotRole;
+
+    public string $pivotPermission;
+
+    /** @var \DateInterval|int */
+    public $cacheExpirationTime;
+
+    public bool $teams;
+
+    protected PermissionsTeamResolver $teamResolver;
+
+    public string $teamsKey;
+
+    public string $cacheKey;
+
+    private array $cachedRoles = [];
+
+    private array $alias = [];
+
+    private array $except = [];
+
+    private array $wildcardPermissionsIndex = [];
+
+    private bool $isLoadingPermissions = false;
+
+    /**
+     * PermissionRegistrar constructor.
+     */
+    public function __construct(CacheManager $cacheManager)
+    {
+        $this-&gt;permissionClass = config(&#039;permission.models.permission&#039;);
+        $this-&gt;roleClass = config(&#039;permission.models.role&#039;);
+        $this-&gt;teamResolver = new (config(&#039;permission.team_resolver&#039;, DefaultTeamResolver::class));
+
+        $this-&gt;cacheManager = $cacheManager;
+        $this-&gt;initializeCache();
+    }
+
+    public function initializeCache(): void
+    {
+        $this-&gt;cacheExpirationTime = config(&#039;permission.cache.expiration_time&#039;) ?: \DateInterval::createFromDateString(&#039;24 hours&#039;);
+
+        $this-&gt;teams = config(&#039;permission.teams&#039;, false);
+        $this-&gt;teamsKey = config(&#039;permission.column_names.team_foreign_key&#039;, &#039;team_id&#039;);
+
+        $this-&gt;cacheKey = config(&#039;permission.cache.key&#039;);
+
+        $this-&gt;pivotRole = config(&#039;permission.column_names.role_pivot_key&#039;) ?: &#039;role_id&#039;;
+        $this-&gt;pivotPermission = config(&#039;permission.column_names.permission_pivot_key&#039;) ?: &#039;permission_id&#039;;
+
+        $this-&gt;cache = $this-&gt;getCacheStoreFromConfig();
+    }
+
+    protected function getCacheStoreFromConfig(): Repository
+    {
+        // the &#039;default&#039; fallback here is from the permission.php config file,
+        // where &#039;default&#039; means to use config(cache.default)
+        $cacheDriver = config(&#039;permission.cache.store&#039;, &#039;default&#039;);
+
+        // when &#039;default&#039; is specified, no action is required since we already have the default instance
+        if ($cacheDriver === &#039;default&#039;) {
+            return $this-&gt;cacheManager-&gt;store();
+        }
+
+        // if an undefined cache store is specified, fallback to &#039;array&#039; which is Laravel&#039;s closest equiv to &#039;none&#039;
+        if (! \array_key_exists($cacheDriver, config(&#039;cache.stores&#039;))) {
+            $cacheDriver = &#039;array&#039;;
+        }
+
+        return $this-&gt;cacheManager-&gt;store($cacheDriver);
+    }
+
+    /**
+     * Set the team id for teams/groups support, this id is used when querying permissions/roles
+     *
+     * @param  int|string|\Illuminate\Database\Eloquent\Model|null  $id
+     */
+    public function setPermissionsTeamId($id): void
+    {
+        $this-&gt;teamResolver-&gt;setPermissionsTeamId($id);
+    }
+
+    /**
+     * @return int|string|null
+     */
+    public function getPermissionsTeamId()
+    {
+        return $this-&gt;teamResolver-&gt;getPermissionsTeamId();
+    }
+
+    /**
+     * Register the permission check method on the gate.
+     * We resolve the Gate fresh here, for benefit of long-running instances.
+     */
+    public function registerPermissions(Gate $gate): bool
+    {
+        $gate-&gt;before(function (Authorizable $user, string $ability, array &amp;$args = []) {
+            if (is_string($args[0] ?? null) &amp;&amp; ! class_exists($args[0])) {
+                $guard = array_shift($args);
+            }
+            if (method_exists($user, &#039;checkPermissionTo&#039;)) {
+                return $user-&gt;checkPermissionTo($ability, $guard ?? null) ?: null;
+            }
+        });
+
+        return true;
+    }
+
+    /**
+     * Flush the cache.
+     */
+    public function forgetCachedPermissions()
+    {
+        $this-&gt;permissions = null;
+        $this-&gt;forgetWildcardPermissionIndex();
+
+        return $this-&gt;cache-&gt;forget($this-&gt;cacheKey);
+    }
+
+    public function forgetWildcardPermissionIndex(?Model $record = null): void
+    {
+        if ($record) {
+            unset($this-&gt;wildcardPermissionsIndex[get_class($record)][$record-&gt;getKey()]);
+
+            return;
+        }
+
+        $this-&gt;wildcardPermissionsIndex = [];
+    }
+
+    public function getWildcardPermissionIndex(Model $record): array
+    {
+        if (isset($this-&gt;wildcardPermissionsIndex[get_class($record)][$record-&gt;getKey()])) {
+            return $this-&gt;wildcardPermissionsIndex[get_class($record)][$record-&gt;getKey()];
+        }
+
+        return $this-&gt;wildcardPermissionsIndex[get_class($record)][$record-&gt;getKey()] = app($record-&gt;getWildcardClass(), [&#039;record&#039; =&gt; $record])-&gt;getIndex();
+    }
+
+    /**
+     * Clear already-loaded permissions collection.
+     * This is only intended to be called by the PermissionServiceProvider on boot,
+     * so that long-running instances like Octane or Swoole don&#039;t keep old data in memory.
+     */
+    public function clearPermissionsCollection(): void
+    {
+        $this-&gt;permissions = null;
+        $this-&gt;wildcardPermissionsIndex = [];
+        $this-&gt;isLoadingPermissions = false;
+    }
+
+    /**
+     * @deprecated
+     *
+     * @alias of clearPermissionsCollection()
+     */
+    public function clearClassPermissions()
+    {
+        $this-&gt;clearPermissionsCollection();
+    }
+
+    /**
+     * Load permissions from cache
+     * And turns permissions array into a \Illuminate\Database\Eloquent\Collection
+     *
+     * Thread-safe implementation to prevent race conditions in concurrent environments
+     * (e.g., Laravel Octane, Swoole, parallel requests)
+     */
+    private function loadPermissions(int $retries = 0): void
+    {
+        // First check (without lock) - fast path for already loaded permissions
+        if ($this-&gt;permissions) {
+            return;
+        }
+
+        // Prevent concurrent loading using a flag-based lock
+        // This protects against cache stampede and duplicate database queries
+        if ($this-&gt;isLoadingPermissions &amp;&amp; $retries &lt; 10) {
+            // Another thread is loading, wait and retry
+            usleep(10000); // Wait 10ms
+            $retries++;
+
+            // After wait, recursively check again if permissions were loaded
+            $this-&gt;loadPermissions($retries);
+
+            return;
+        }
+
+        // Set loading flag to prevent concurrent loads
+        $this-&gt;isLoadingPermissions = true;
+
+        try {
+            $this-&gt;permissions = $this-&gt;cache-&gt;remember(
+                $this-&gt;cacheKey, $this-&gt;cacheExpirationTime, fn () =&gt; $this-&gt;getSerializedPermissionsForCache()
+            );
+
+            $this-&gt;alias = $this-&gt;permissions[&#039;alias&#039;];
+
+            $this-&gt;hydrateRolesCache();
+
+            $this-&gt;permissions = $this-&gt;getHydratedPermissionCollection();
+
+            $this-&gt;cachedRoles = $this-&gt;alias = $this-&gt;except = [];
+        } finally {
+            // Always release the loading flag, even if an exception occurs
+            $this-&gt;isLoadingPermissions = false;
+        }
+    }
+
+    /**
+     * Get the permissions based on the passed params.
+     */
+    public function getPermissions(array $params = [], bool $onlyOne = false): Collection
+    {
+        $this-&gt;loadPermissions();
+
+        $method = $onlyOne ? &#039;first&#039; : &#039;filter&#039;;
+
+        $permissions = $this-&gt;permissions-&gt;$method(static function ($permission) use ($params) {
+            foreach ($params as $attr =&gt; $value) {
+                if ($permission-&gt;getAttribute($attr) != $value) {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        if ($onlyOne) {
+            $permissions = new Collection($permissions ? [$permissions] : []);
+        }
+
+        return $permissions;
+    }
+
+    public function getPermissionClass(): string
+    {
+        return $this-&gt;permissionClass;
+    }
+
+    public function setPermissionClass($permissionClass)
+    {
+        $this-&gt;permissionClass = $permissionClass;
+        config()-&gt;set(&#039;permission.models.permission&#039;, $permissionClass);
+        app()-&gt;bind(Permission::class, $permissionClass);
+
+        return $this;
+    }
+
+    public function getRoleClass(): string
+    {
+        return $this-&gt;roleClass;
+    }
+
+    public function setRoleClass($roleClass)
+    {
+        $this-&gt;roleClass = $roleClass;
+        config()-&gt;set(&#039;permission.models.role&#039;, $roleClass);
+        app()-&gt;bind(Role::class, $roleClass);
+
+        return $this;
+    }
+
+    public function getCacheRepository(): Repository
+    {
+        return $this-&gt;cache;
+    }
+
+    public function getCacheStore(): Store
+    {
+        return $this-&gt;cache-&gt;getStore();
+    }
+
+    protected function getPermissionsWithRoles(): Collection
+    {
+        return $this-&gt;permissionClass::select()-&gt;with(&#039;roles&#039;)-&gt;get();
+    }
+
+    /**
+     * Changes array keys with alias
+     */
+    private function aliasedArray($model): array
+    {
+        return collect(is_array($model) ? $model : $model-&gt;getAttributes())-&gt;except($this-&gt;except)
+            -&gt;keyBy(fn ($value, $key) =&gt; $this-&gt;alias[$key] ?? $key)
+            -&gt;all();
+    }
+
+    /**
+     * Array for cache alias
+     */
+    private function aliasModelFields($newKeys = []): void
+    {
+        $i = 0;
+        $alphas = ! count($this-&gt;alias) ? range(&#039;a&#039;, &#039;h&#039;) : range(&#039;j&#039;, &#039;p&#039;);
+
+        foreach (array_keys($newKeys-&gt;getAttributes()) as $value) {
+            if (! isset($this-&gt;alias[$value])) {
+                $this-&gt;alias[$value] = $alphas[$i++] ?? $value;
+            }
+        }
+
+        $this-&gt;alias = array_diff_key($this-&gt;alias, array_flip($this-&gt;except));
+    }
+
+    /*
+     * Make the cache smaller using an array with only required fields
+     */
+    private function getSerializedPermissionsForCache(): array
+    {
+        $this-&gt;except = config(&#039;permission.cache.column_names_except&#039;, [&#039;created_at&#039;, &#039;updated_at&#039;, &#039;deleted_at&#039;]);
+
+        $permissions = $this-&gt;getPermissionsWithRoles()
+            -&gt;map(function ($permission) {
+                if (! $this-&gt;alias) {
+                    $this-&gt;aliasModelFields($permission);
+                }
+
+                return $this-&gt;aliasedArray($permission) + $this-&gt;getSerializedRoleRelation($permission);
+            })-&gt;all();
+        $roles = array_values($this-&gt;cachedRoles);
+        $this-&gt;cachedRoles = [];
+
+        return [&#039;alias&#039; =&gt; array_flip($this-&gt;alias)] + compact(&#039;permissions&#039;, &#039;roles&#039;);
+    }
+
+    private function getSerializedRoleRelation($permission): array
+    {
+        if (! $permission-&gt;roles-&gt;count()) {
+            return [];
+        }
+
+        if (! isset($this-&gt;alias[&#039;roles&#039;])) {
+            $this-&gt;alias[&#039;roles&#039;] = &#039;r&#039;;
+            $this-&gt;aliasModelFields($permission-&gt;roles[0]);
+        }
+
+        return [
+            &#039;r&#039; =&gt; $permission-&gt;roles-&gt;map(function ($role) {
+                if (! isset($this-&gt;cachedRoles[$role-&gt;getKey()])) {
+                    $this-&gt;cachedRoles[$role-&gt;getKey()] = $this-&gt;aliasedArray($role);
+                }
+
+                return $role-&gt;getKey();
+            })-&gt;all(),
+        ];
+    }
+
+    private function getHydratedPermissionCollection(): Collection
+    {
+        $permissionInstance = (new ($this-&gt;getPermissionClass())())-&gt;newInstance([], true);
+
+        return Collection::make(array_map(
+            fn ($item) =&gt; (clone $permissionInstance)
+                -&gt;setRawAttributes($this-&gt;aliasedArray(array_diff_key($item, [&#039;r&#039; =&gt; 0])), true)
+                -&gt;setRelation(&#039;roles&#039;, $this-&gt;getHydratedRoleCollection($item[&#039;r&#039;] ?? [])),
+            $this-&gt;permissions[&#039;permissions&#039;]
+        ));
+    }
+
+    private function getHydratedRoleCollection(array $roles): Collection
+    {
+        return Collection::make(array_values(
+            array_intersect_key($this-&gt;cachedRoles, array_flip($roles))
+        ));
+    }
+
+    private function hydrateRolesCache(): void
+    {
+        $roleInstance = (new ($this-&gt;getRoleClass())())-&gt;newInstance([], true);
+
+        array_map(function ($item) use ($roleInstance) {
+            $role = (clone $roleInstance)
+                -&gt;setRawAttributes($this-&gt;aliasedArray($item), true);
+            $this-&gt;cachedRoles[$role-&gt;getKey()] = $role;
+        }, $this-&gt;permissions[&#039;roles&#039;]);
+
+        $this-&gt;permissions[&#039;roles&#039;] = [];
+    }
+
+    public static function isUid($value): bool
+    {
+        if (! is_string($value) || empty(trim($value))) {
+            return false;
+        }
+
+        // check if is UUID/GUID
+        $uid = preg_match(&#039;/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iD&#039;, $value) &gt; 0;
+        if ($uid) {
+            return true;
+        }
+
+        // check if is ULID
+        $ulid = strlen($value) == 26 &amp;&amp; strspn($value, &#039;0123456789ABCDEFGHJKMNPQRSTVWXYZabcdefghjkmnpqrstvwxyz&#039;) == 26 &amp;&amp; $value[0] &lt;= &#039;7&#039;;
+        if ($ulid) {
+            return true;
+        }
+
+        return false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/spatie/laravel-permission/src/PermissionServiceProvider.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/spatie/laravel-permission/src/Commands -->
+
+</body>
+</html>

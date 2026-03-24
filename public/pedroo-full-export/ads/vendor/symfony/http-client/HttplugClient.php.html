@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/HttplugClient.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient;
+
+use GuzzleHttp\Promise\Promise as GuzzlePromise;
+use GuzzleHttp\Promise\RejectedPromise;
+use GuzzleHttp\Promise\Utils;
+use Http\Client\Exception\NetworkException;
+use Http\Client\Exception\RequestException;
+use Http\Client\HttpAsyncClient;
+use Http\Discovery\Psr17Factory;
+use Http\Discovery\Psr17FactoryDiscovery;
+use Nyholm\Psr7\Factory\Psr17Factory as NyholmPsr17Factory;
+use Nyholm\Psr7\Request;
+use Nyholm\Psr7\Uri;
+use Psr\Http\Client\ClientInterface;
+use Psr\Http\Message\RequestFactoryInterface;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseFactoryInterface;
+use Psr\Http\Message\ResponseInterface as Psr7ResponseInterface;
+use Psr\Http\Message\StreamFactoryInterface;
+use Psr\Http\Message\StreamInterface;
+use Psr\Http\Message\UriFactoryInterface;
+use Psr\Http\Message\UriInterface;
+use Symfony\Component\HttpClient\Internal\HttplugWaitLoop;
+use Symfony\Component\HttpClient\Response\HttplugPromise;
+use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+use Symfony\Contracts\Service\ResetInterface;
+
+if (!interface_exists(HttpAsyncClient::class)) {
+    throw new \LogicException(&#039;You cannot use &quot;Symfony\Component\HttpClient\HttplugClient&quot; as the &quot;php-http/httplug&quot; package is not installed. Try running &quot;composer require php-http/discovery php-http/async-client-implementation:*&quot;.&#039;);
+}
+
+if (!interface_exists(RequestFactoryInterface::class)) {
+    throw new \LogicException(&#039;You cannot use the &quot;Symfony\Component\HttpClient\HttplugClient&quot; as the &quot;psr/http-factory&quot; package is not installed. Try running &quot;composer require php-http/discovery psr/http-factory-implementation:*&quot;.&#039;);
+}
+
+/**
+ * An adapter to turn a Symfony HttpClientInterface into an Httplug client.
+ *
+ * In comparison to Psr18Client, this client supports asynchronous requests.
+ *
+ * Run &quot;composer require php-http/discovery php-http/async-client-implementation:*&quot;
+ * to get the required dependencies.
+ *
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ */
+final class HttplugClient implements ClientInterface, HttpAsyncClient, RequestFactoryInterface, StreamFactoryInterface, UriFactoryInterface, ResetInterface
+{
+    private HttpClientInterface $client;
+    private ResponseFactoryInterface $responseFactory;
+    private StreamFactoryInterface $streamFactory;
+    private bool $autoUpgradeHttpVersion = true;
+
+    /**
+     * @var \SplObjectStorage&lt;ResponseInterface, array{RequestInterface, Promise}&gt;|null
+     */
+    private ?\SplObjectStorage $promisePool;
+
+    private HttplugWaitLoop $waitLoop;
+
+    public function __construct(?HttpClientInterface $client = null, ?ResponseFactoryInterface $responseFactory = null, ?StreamFactoryInterface $streamFactory = null)
+    {
+        $this-&gt;client = $client ?? HttpClient::create();
+        $streamFactory ??= $responseFactory instanceof StreamFactoryInterface ? $responseFactory : null;
+        $this-&gt;promisePool = class_exists(Utils::class) ? new \SplObjectStorage() : null;
+
+        if (null === $responseFactory || null === $streamFactory) {
+            if (class_exists(Psr17Factory::class)) {
+                $psr17Factory = new Psr17Factory();
+            } elseif (class_exists(NyholmPsr17Factory::class)) {
+                $psr17Factory = new NyholmPsr17Factory();
+            } else {
+                throw new \LogicException(&#039;You cannot use the &quot;Symfony\Component\HttpClient\HttplugClient&quot; as no PSR-17 factories have been provided. Try running &quot;composer require php-http/discovery psr/http-factory-implementation:*&quot;.&#039;);
+            }
+
+            $responseFactory ??= $psr17Factory;
+            $streamFactory ??= $psr17Factory;
+        }
+
+        $this-&gt;responseFactory = $responseFactory;
+        $this-&gt;streamFactory = $streamFactory;
+        $this-&gt;waitLoop = new HttplugWaitLoop($this-&gt;client, $this-&gt;promisePool, $this-&gt;responseFactory, $this-&gt;streamFactory);
+    }
+
+    public function withOptions(array $options): static
+    {
+        $clone = clone $this;
+        if (\array_key_exists(&#039;auto_upgrade_http_version&#039;, $options)) {
+            $clone-&gt;autoUpgradeHttpVersion = $options[&#039;auto_upgrade_http_version&#039;];
+            unset($options[&#039;auto_upgrade_http_version&#039;]);
+        }
+        $clone-&gt;client = $clone-&gt;client-&gt;withOptions($options);
+
+        return $clone;
+    }
+
+    public function sendRequest(RequestInterface $request): Psr7ResponseInterface
+    {
+        try {
+            return HttplugWaitLoop::createPsr7Response($this-&gt;responseFactory, $this-&gt;streamFactory, $this-&gt;client, $this-&gt;sendPsr7Request($request), true);
+        } catch (TransportExceptionInterface $e) {
+            throw new NetworkException($e-&gt;getMessage(), $request, $e);
+        }
+    }
+
+    public function sendAsyncRequest(RequestInterface $request): HttplugPromise
+    {
+        if (!$promisePool = $this-&gt;promisePool) {
+            throw new \LogicException(\sprintf(&#039;You cannot use &quot;%s()&quot; as the &quot;guzzlehttp/promises&quot; package is not installed. Try running &quot;composer require guzzlehttp/promises&quot;.&#039;, __METHOD__));
+        }
+
+        try {
+            $response = $this-&gt;sendPsr7Request($request, true);
+        } catch (NetworkException $e) {
+            return new HttplugPromise(new RejectedPromise($e));
+        }
+
+        $waitLoop = $this-&gt;waitLoop;
+
+        $promise = new GuzzlePromise(static function () use ($response, $waitLoop) {
+            $waitLoop-&gt;wait($response);
+        }, static function () use ($response, $promisePool) {
+            $response-&gt;cancel();
+            unset($promisePool[$response]);
+        });
+
+        $promisePool[$response] = [$request, $promise];
+
+        return new HttplugPromise($promise);
+    }
+
+    /**
+     * Resolves pending promises that complete before the timeouts are reached.
+     *
+     * When $maxDuration is null and $idleTimeout is reached, promises are rejected.
+     *
+     * @return int The number of remaining pending promises
+     */
+    public function wait(?float $maxDuration = null, ?float $idleTimeout = null): int
+    {
+        return $this-&gt;waitLoop-&gt;wait(null, $maxDuration, $idleTimeout);
+    }
+
+    /**
+     * @param UriInterface|string $uri
+     */
+    public function createRequest(string $method, $uri = &#039;&#039;): RequestInterface
+    {
+        if ($this-&gt;responseFactory instanceof RequestFactoryInterface) {
+            $request = $this-&gt;responseFactory-&gt;createRequest($method, $uri);
+        } elseif (class_exists(Psr17FactoryDiscovery::class)) {
+            $request = Psr17FactoryDiscovery::findRequestFactory()-&gt;createRequest($method, $uri);
+        } elseif (class_exists(Request::class)) {
+            $request = new Request($method, $uri);
+        } else {
+            throw new \LogicException(\sprintf(&#039;You cannot use &quot;%s()&quot; as no PSR-17 factories have been found. Try running &quot;composer require php-http/discovery psr/http-factory-implementation:*&quot;.&#039;, __METHOD__));
+        }
+
+        return $request;
+    }
+
+    public function createStream(string $content = &#039;&#039;): StreamInterface
+    {
+        return $this-&gt;streamFactory-&gt;createStream($content);
+    }
+
+    public function createStreamFromFile(string $filename, string $mode = &#039;r&#039;): StreamInterface
+    {
+        return $this-&gt;streamFactory-&gt;createStreamFromFile($filename, $mode);
+    }
+
+    public function createStreamFromResource($resource): StreamInterface
+    {
+        return $this-&gt;streamFactory-&gt;createStreamFromResource($resource);
+    }
+
+    public function createUri(string $uri = &#039;&#039;): UriInterface
+    {
+        if ($this-&gt;responseFactory instanceof UriFactoryInterface) {
+            return $this-&gt;responseFactory-&gt;createUri($uri);
+        }
+
+        if (class_exists(Psr17FactoryDiscovery::class)) {
+            return Psr17FactoryDiscovery::findUriFactory()-&gt;createUri($uri);
+        }
+
+        if (class_exists(Uri::class)) {
+            return new Uri($uri);
+        }
+
+        throw new \LogicException(\sprintf(&#039;You cannot use &quot;%s()&quot; as no PSR-17 factories have been found. Try running &quot;composer require php-http/discovery psr/http-factory-implementation:*&quot;.&#039;, __METHOD__));
+    }
+
+    public function __serialize(): array
+    {
+        throw new \BadMethodCallException(&#039;Cannot serialize &#039;.__CLASS__);
+    }
+
+    public function __unserialize(array $data): void
+    {
+        throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+    }
+
+    public function __destruct()
+    {
+        $this-&gt;wait();
+    }
+
+    public function reset(): void
+    {
+        if ($this-&gt;client instanceof ResetInterface) {
+            $this-&gt;client-&gt;reset();
+        }
+    }
+
+    private function sendPsr7Request(RequestInterface $request, ?bool $buffer = null): ResponseInterface
+    {
+        try {
+            $body = $request-&gt;getBody();
+            $headers = $request-&gt;getHeaders();
+
+            $size = $request-&gt;getHeader(&#039;content-length&#039;)[0] ?? -1;
+            if (0 &gt; $size &amp;&amp; 0 &lt; $size = $body-&gt;getSize() ?? -1) {
+                $headers[&#039;Content-Length&#039;] = [$size];
+            }
+
+            if (0 === $size) {
+                $body = &#039;&#039;;
+            } elseif (0 &lt; $size &amp;&amp; $size &lt; 1 &lt;&lt; 21) {
+                if ($body-&gt;isSeekable()) {
+                    try {
+                        $body-&gt;seek(0);
+                    } catch (\RuntimeException) {
+                        // ignore
+                    }
+                }
+
+                $body = $body-&gt;getContents();
+            } else {
+                $body = static function (int $size) use ($body) {
+                    if ($body-&gt;isSeekable()) {
+                        try {
+                            $body-&gt;seek(0);
+                        } catch (\RuntimeException) {
+                            // ignore
+                        }
+                    }
+
+                    while (!$body-&gt;eof()) {
+                        yield $body-&gt;read($size);
+                    }
+                };
+            }
+
+            $options = [
+                &#039;headers&#039; =&gt; $headers,
+                &#039;body&#039; =&gt; $body,
+                &#039;buffer&#039; =&gt; $buffer,
+            ];
+
+            if (!$this-&gt;autoUpgradeHttpVersion || &#039;1.0&#039; === $request-&gt;getProtocolVersion()) {
+                $options[&#039;http_version&#039;] = $request-&gt;getProtocolVersion();
+            }
+
+            return $this-&gt;client-&gt;request($request-&gt;getMethod(), (string) $request-&gt;getUri(), $options);
+        } catch (\InvalidArgumentException $e) {
+            throw new RequestException($e-&gt;getMessage(), $request, $e);
+        } catch (TransportExceptionInterface $e) {
+            throw new NetworkException($e-&gt;getMessage(), $request, $e);
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Internal/AmpBodyV4.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Caching -->
+
+</body>
+</html>

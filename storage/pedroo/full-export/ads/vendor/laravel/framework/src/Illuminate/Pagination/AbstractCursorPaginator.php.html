@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Pagination/AbstractCursorPaginator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Pagination;
+
+use ArrayAccess;
+use Closure;
+use Exception;
+use Illuminate\Contracts\Support\Htmlable;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Http\Resources\Json\JsonResource;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
+use Illuminate\Support\Traits\ForwardsCalls;
+use Illuminate\Support\Traits\Tappable;
+use Illuminate\Support\Traits\TransformsToResourceCollection;
+use Stringable;
+use Traversable;
+
+/**
+ * @template TKey of array-key
+ *
+ * @template-covariant TValue
+ *
+ * @mixin \Illuminate\Support\Collection&lt;TKey, TValue&gt;
+ */
+abstract class AbstractCursorPaginator implements Htmlable, Stringable
+{
+    use ForwardsCalls, Tappable, TransformsToResourceCollection;
+
+    /**
+     * All of the items being paginated.
+     *
+     * @var \Illuminate\Support\Collection&lt;TKey, TValue&gt;
+     */
+    protected $items;
+
+    /**
+     * The number of items to be shown per page.
+     *
+     * @var int
+     */
+    protected $perPage;
+
+    /**
+     * The base path to assign to all URLs.
+     *
+     * @var string
+     */
+    protected $path = &#039;/&#039;;
+
+    /**
+     * The query parameters to add to all URLs.
+     *
+     * @var array
+     */
+    protected $query = [];
+
+    /**
+     * The URL fragment to add to all URLs.
+     *
+     * @var string|null
+     */
+    protected $fragment;
+
+    /**
+     * The cursor string variable used to store the page.
+     *
+     * @var string
+     */
+    protected $cursorName = &#039;cursor&#039;;
+
+    /**
+     * The current cursor.
+     *
+     * @var \Illuminate\Pagination\Cursor|null
+     */
+    protected $cursor;
+
+    /**
+     * The paginator parameters for the cursor.
+     *
+     * @var array
+     */
+    protected $parameters;
+
+    /**
+     * The paginator options.
+     *
+     * @var array
+     */
+    protected $options;
+
+    /**
+     * The current cursor resolver callback.
+     *
+     * @var \Closure
+     */
+    protected static $currentCursorResolver;
+
+    /**
+     * Get the URL for a given cursor.
+     *
+     * @param  \Illuminate\Pagination\Cursor|null  $cursor
+     * @return string
+     */
+    public function url($cursor)
+    {
+        // If we have any extra query string key / value pairs that need to be added
+        // onto the URL, we will put them in query string form and then attach it
+        // to the URL. This allows for extra information like sortings storage.
+        $parameters = is_null($cursor) ? [] : [$this-&gt;cursorName =&gt; $cursor-&gt;encode()];
+
+        if (count($this-&gt;query) &gt; 0) {
+            $parameters = array_merge($this-&gt;query, $parameters);
+        }
+
+        return $this-&gt;path()
+            .(str_contains($this-&gt;path(), &#039;?&#039;) ? &#039;&amp;&#039; : &#039;?&#039;)
+            .Arr::query($parameters)
+            .$this-&gt;buildFragment();
+    }
+
+    /**
+     * Get the URL for the previous page.
+     *
+     * @return string|null
+     */
+    public function previousPageUrl()
+    {
+        if (is_null($previousCursor = $this-&gt;previousCursor())) {
+            return null;
+        }
+
+        return $this-&gt;url($previousCursor);
+    }
+
+    /**
+     * The URL for the next page, or null.
+     *
+     * @return string|null
+     */
+    public function nextPageUrl()
+    {
+        if (is_null($nextCursor = $this-&gt;nextCursor())) {
+            return null;
+        }
+
+        return $this-&gt;url($nextCursor);
+    }
+
+    /**
+     * Get the &quot;cursor&quot; that points to the previous set of items.
+     *
+     * @return \Illuminate\Pagination\Cursor|null
+     */
+    public function previousCursor()
+    {
+        if (is_null($this-&gt;cursor) ||
+            ($this-&gt;cursor-&gt;pointsToPreviousItems() &amp;&amp; ! $this-&gt;hasMore)) {
+            return null;
+        }
+
+        if ($this-&gt;items-&gt;isEmpty()) {
+            return null;
+        }
+
+        return $this-&gt;getCursorForItem($this-&gt;items-&gt;first(), false);
+    }
+
+    /**
+     * Get the &quot;cursor&quot; that points to the next set of items.
+     *
+     * @return \Illuminate\Pagination\Cursor|null
+     */
+    public function nextCursor()
+    {
+        if ((is_null($this-&gt;cursor) &amp;&amp; ! $this-&gt;hasMore) ||
+            (! is_null($this-&gt;cursor) &amp;&amp; $this-&gt;cursor-&gt;pointsToNextItems() &amp;&amp; ! $this-&gt;hasMore)) {
+            return null;
+        }
+
+        if ($this-&gt;items-&gt;isEmpty()) {
+            return null;
+        }
+
+        return $this-&gt;getCursorForItem($this-&gt;items-&gt;last(), true);
+    }
+
+    /**
+     * Get a cursor instance for the given item.
+     *
+     * @param  \ArrayAccess|\stdClass  $item
+     * @param  bool  $isNext
+     * @return \Illuminate\Pagination\Cursor
+     */
+    public function getCursorForItem($item, $isNext = true)
+    {
+        return new Cursor($this-&gt;getParametersForItem($item), $isNext);
+    }
+
+    /**
+     * Get the cursor parameters for a given object.
+     *
+     * @param  \ArrayAccess|\stdClass  $item
+     * @return array
+     *
+     * @throws \Exception
+     */
+    public function getParametersForItem($item)
+    {
+        return (new Collection($this-&gt;parameters))
+            -&gt;filter()
+            -&gt;flip()
+            -&gt;map(function ($_, $parameterName) use ($item) {
+                if ($item instanceof JsonResource) {
+                    $item = $item-&gt;resource;
+                }
+
+                if ($item instanceof Model &amp;&amp;
+                    ! is_null($parameter = $this-&gt;getPivotParameterForItem($item, $parameterName))) {
+                    return $parameter;
+                } elseif ($item instanceof ArrayAccess || is_array($item)) {
+                    return $this-&gt;ensureParameterIsPrimitive(
+                        $item[$parameterName] ?? $item[Str::afterLast($parameterName, &#039;.&#039;)]
+                    );
+                } elseif (is_object($item)) {
+                    return $this-&gt;ensureParameterIsPrimitive(
+                        $item-&gt;{$parameterName} ?? $item-&gt;{Str::afterLast($parameterName, &#039;.&#039;)}
+                    );
+                }
+
+                throw new Exception(&#039;Only arrays and objects are supported when cursor paginating items.&#039;);
+            })-&gt;toArray();
+    }
+
+    /**
+     * Get the cursor parameter value from a pivot model if applicable.
+     *
+     * @param  \ArrayAccess|\stdClass  $item
+     * @param  string  $parameterName
+     * @return string|null
+     */
+    protected function getPivotParameterForItem($item, $parameterName)
+    {
+        $table = Str::beforeLast($parameterName, &#039;.&#039;);
+
+        foreach ($item-&gt;getRelations() as $relation) {
+            if ($relation instanceof Pivot &amp;&amp; $relation-&gt;getTable() === $table) {
+                return $this-&gt;ensureParameterIsPrimitive(
+                    $relation-&gt;getAttribute(Str::afterLast($parameterName, &#039;.&#039;))
+                );
+            }
+        }
+    }
+
+    /**
+     * Ensure the parameter is a primitive type.
+     *
+     * This can resolve issues that arise the developer uses a value object for an attribute.
+     *
+     * @param  mixed  $parameter
+     * @return mixed
+     */
+    protected function ensureParameterIsPrimitive($parameter)
+    {
+        return is_object($parameter) &amp;&amp; method_exists($parameter, &#039;__toString&#039;)
+            ? (string) $parameter
+            : $parameter;
+    }
+
+    /**
+     * Get / set the URL fragment to be appended to URLs.
+     *
+     * @param  string|null  $fragment
+     * @return $this|string|null
+     */
+    public function fragment($fragment = null)
+    {
+        if (is_null($fragment)) {
+            return $this-&gt;fragment;
+        }
+
+        $this-&gt;fragment = $fragment;
+
+        return $this;
+    }
+
+    /**
+     * Add a set of query string values to the paginator.
+     *
+     * @param  array|string|null  $key
+     * @param  string|null  $value
+     * @return $this
+     */
+    public function appends($key, $value = null)
+    {
+        if (is_null($key)) {
+            return $this;
+        }
+
+        if (is_array($key)) {
+            return $this-&gt;appendArray($key);
+        }
+
+        return $this-&gt;addQuery($key, $value);
+    }
+
+    /**
+     * Add an array of query string values.
+     *
+     * @param  array  $keys
+     * @return $this
+     */
+    protected function appendArray(array $keys)
+    {
+        foreach ($keys as $key =&gt; $value) {
+            $this-&gt;addQuery($key, $value);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Add all current query string values to the paginator.
+     *
+     * @return $this
+     */
+    public function withQueryString()
+    {
+        if (! is_null($query = Paginator::resolveQueryString())) {
+            return $this-&gt;appends($query);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Add a query string value to the paginator.
+     *
+     * @param  string  $key
+     * @param  string  $value
+     * @return $this
+     */
+    protected function addQuery($key, $value)
+    {
+        if ($key !== $this-&gt;cursorName) {
+            $this-&gt;query[$key] = $value;
+        }
+
+        return $this;
+    }
+
+    /**
+     * Build the full fragment portion of a URL.
+     *
+     * @return string
+     */
+    protected function buildFragment()
+    {
+        return $this-&gt;fragment ? &#039;#&#039;.$this-&gt;fragment : &#039;&#039;;
+    }
+
+    /**
+     * Load a set of relationships onto the mixed relationship collection.
+     *
+     * @param  string  $relation
+     * @param  array  $relations
+     * @return $this
+     */
+    public function loadMorph($relation, $relations)
+    {
+        $this-&gt;getCollection()-&gt;loadMorph($relation, $relations);
+
+        return $this;
+    }
+
+    /**
+     * Load a set of relationship counts onto the mixed relationship collection.
+     *
+     * @param  string  $relation
+     * @param  array  $relations
+     * @return $this
+     */
+    public function loadMorphCount($relation, $relations)
+    {
+        $this-&gt;getCollection()-&gt;loadMorphCount($relation, $relations);
+
+        return $this;
+    }
+
+    /**
+     * Get the slice of items being paginated.
+     *
+     * @return array&lt;TKey, TValue&gt;
+     */
+    public function items()
+    {
+        return $this-&gt;items-&gt;all();
+    }
+
+    /**
+     * Transform each item in the slice of items using a callback.
+     *
+     * @template TThroughValue
+     *
+     * @param  callable(TValue, TKey): TThroughValue  $callback
+     * @return $this
+     *
+     * @phpstan-this-out static&lt;TKey, TThroughValue&gt;
+     */
+    public function through(callable $callback)
+    {
+        $this-&gt;items-&gt;transform($callback);
+
+        return $this;
+    }
+
+    /**
+     * Get the number of items shown per page.
+     *
+     * @return int
+     */
+    public function perPage()
+    {
+        return $this-&gt;perPage;
+    }
+
+    /**
+     * Get the current cursor being paginated.
+     *
+     * @return \Illuminate\Pagination\Cursor|null
+     */
+    public function cursor()
+    {
+        return $this-&gt;cursor;
+    }
+
+    /**
+     * Get the query string variable used to store the cursor.
+     *
+     * @return string
+     */
+    public function getCursorName()
+    {
+        return $this-&gt;cursorName;
+    }
+
+    /**
+     * Set the query string variable used to store the cursor.
+     *
+     * @param  string  $name
+     * @return $this
+     */
+    public function setCursorName($name)
+    {
+        $this-&gt;cursorName = $name;
+
+        return $this;
+    }
+
+    /**
+     * Set the base path to assign to all URLs.
+     *
+     * @param  string  $path
+     * @return $this
+     */
+    public function withPath($path)
+    {
+        return $this-&gt;setPath($path);
+    }
+
+    /**
+     * Set the base path to assign to all URLs.
+     *
+     * @param  string  $path
+     * @return $this
+     */
+    public function setPath($path)
+    {
+        $this-&gt;path = $path;
+
+        return $this;
+    }
+
+    /**
+     * Get the base path for paginator generated URLs.
+     *
+     * @return string|null
+     */
+    public function path()
+    {
+        return $this-&gt;path;
+    }
+
+    /**
+     * Resolve the current cursor or return the default value.
+     *
+     * @param  string  $cursorName
+     * @return \Illuminate\Pagination\Cursor|null
+     */
+    public static function resolveCurrentCursor($cursorName = &#039;cursor&#039;, $default = null)
+    {
+        if (isset(static::$currentCursorResolver)) {
+            return call_user_func(static::$currentCursorResolver, $cursorName);
+        }
+
+        return $default;
+    }
+
+    /**
+     * Set the current cursor resolver callback.
+     *
+     * @param  \Closure  $resolver
+     * @return void
+     */
+    public static function currentCursorResolver(Closure $resolver)
+    {
+        static::$currentCursorResolver = $resolver;
+    }
+
+    /**
+     * Get an instance of the view factory from the resolver.
+     *
+     * @return \Illuminate\Contracts\View\Factory
+     */
+    public static function viewFactory()
+    {
+        return Paginator::viewFactory();
+    }
+
+    /**
+     * Get an iterator for the items.
+     *
+     * @return \ArrayIterator&lt;TKey, TValue&gt;
+     */
+    public function getIterator(): Traversable
+    {
+        return $this-&gt;items-&gt;getIterator();
+    }
+
+    /**
+     * Determine if the list of items is empty.
+     *
+     * @return bool
+     */
+    public function isEmpty()
+    {
+        return $this-&gt;items-&gt;isEmpty();
+    }
+
+    /**
+     * Determine if the list of items is not empty.
+     *
+     * @return bool
+     */
+    public function isNotEmpty()
+    {
+        return $this-&gt;items-&gt;isNotEmpty();
+    }
+
+    /**
+     * Get the number of items for the current page.
+     *
+     * @return int
+     */
+    public function count(): int
+    {
+        return $this-&gt;items-&gt;count();
+    }
+
+    /**
+     * Get the paginator&#039;s underlying collection.
+     *
+     * @return \Illuminate\Support\Collection&lt;TKey, TValue&gt;
+     */
+    public function getCollection()
+    {
+        return $this-&gt;items;
+    }
+
+    /**
+     * Set the paginator&#039;s underlying collection.
+     *
+     * @template TSetKey of array-key
+     * @template TSetValue
+     *
+     * @param  \Illuminate\Support\Collection&lt;TSetKey, TSetValue&gt;  $collection
+     * @return $this
+     *
+     * @phpstan-this-out static&lt;TSetKey, TSetValue&gt;
+     */
+    public function setCollection(Collection $collection)
+    {
+        $this-&gt;items = $collection;
+
+        return $this;
+    }
+
+    /**
+     * Get the paginator options.
+     *
+     * @return array
+     */
+    public function getOptions()
+    {
+        return $this-&gt;options;
+    }
+
+    /**
+     * Determine if the given item exists.
+     *
+     * @param  TKey  $key
+     * @return bool
+     */
+    public function offsetExists($key): bool
+    {
+        return $this-&gt;items-&gt;has($key);
+    }
+
+    /**
+     * Get the item at the given offset.
+     *
+     * @param  TKey  $key
+     * @return TValue|null
+     */
+    public function offsetGet($key): mixed
+    {
+        return $this-&gt;items-&gt;get($key);
+    }
+
+    /**
+     * Set the item at the given offset.
+     *
+     * @param  TKey|null  $key
+     * @param  TValue  $value
+     * @return void
+     */
+    public function offsetSet($key, $value): void
+    {
+        $this-&gt;items-&gt;put($key, $value);
+    }
+
+    /**
+     * Unset the item at the given key.
+     *
+     * @param  TKey  $key
+     * @return void
+     */
+    public function offsetUnset($key): void
+    {
+        $this-&gt;items-&gt;forget($key);
+    }
+
+    /**
+     * Render the contents of the paginator to HTML.
+     *
+     * @return string
+     */
+    public function toHtml()
+    {
+        return (string) $this-&gt;render();
+    }
+
+    /**
+     * Make dynamic calls into the collection.
+     *
+     * @param  string  $method
+     * @param  array  $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        return $this-&gt;forwardCallTo($this-&gt;getCollection(), $method, $parameters);
+    }
+
+    /**
+     * Render the contents of the paginator when casting to a string.
+     *
+     * @return string
+     */
+    public function __toString()
+    {
+        return (string) $this-&gt;render();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Pagination/AbstractPaginator.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Pagination/resources -->
+
+</body>
+</html>

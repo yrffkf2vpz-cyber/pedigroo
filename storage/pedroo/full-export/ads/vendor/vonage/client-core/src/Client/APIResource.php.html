@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/vonage/client-core/src/Client/APIResource.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Vonage\Client;
+
+use Laminas\Diactoros\Request;
+use Psr\Log\LogLevel;
+use Vonage\Client\Credentials\Handler\BasicHandler;
+use Vonage\Entity\Filter\EmptyFilter;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Vonage\Entity\IterableAPICollection;
+use Vonage\Entity\Filter\FilterInterface;
+use Psr\Http\Client\ClientExceptionInterface;
+use Vonage\Client\Credentials\Handler\HandlerInterface;
+use Vonage\Logger\LoggerTrait;
+
+use function is_null;
+use function json_decode;
+use function json_encode;
+use function http_build_query;
+
+class APIResource implements ClientAwareInterface
+{
+    use ClientAwareTrait;
+    use LoggerTrait;
+
+    /**
+     * @var HandlerInterface[]
+     */
+    protected array $authHandlers = [];
+
+    /**
+     * Base URL that we will hit. This can be overridden from the underlying
+     * client or directly on this class.
+     */
+    protected string $baseUrl = &#039;&#039;;
+
+    protected string $baseUri = &#039;&#039;;
+
+    protected string $collectionName = &#039;&#039;;
+
+    protected ?IterableAPICollection $collectionPrototype = null;
+
+    /**
+     * Sets flag that says to check for errors even on 200 Success
+     */
+    protected bool $errorsOn200 = false;
+
+    /**
+     * Error handler to use when reviewing API responses
+     *
+     * @var callable
+     */
+    protected $exceptionErrorHandler;
+
+    protected bool $isHAL = true;
+
+    protected ?RequestInterface $lastRequest = null;
+
+    protected ?ResponseInterface $lastResponse = null;
+
+    /**
+     * Adds authentication to a request
+     *
+     */
+    public function addAuth(RequestInterface $request): RequestInterface
+    {
+        $credentials = $this-&gt;getClient()-&gt;getCredentials();
+
+        if (is_array($this-&gt;getAuthHandlers())) {
+            foreach ($this-&gt;getAuthHandlers() as $handler) {
+                try {
+                    $request = $handler($request, $credentials);
+                    break;
+                } catch (\RuntimeException) {
+                    continue; // We are OK if multiple are sent but only one match
+                    // This has a really nasty side effect for complex handlers where we never see the error
+                }
+                throw new \RuntimeException(
+                    &#039;Unable to set credentials, please check configuration and 
+                    supplied authentication&#039;
+                );
+            }
+            return $request;
+        }
+
+        return $this-&gt;getAuthHandlers()($request, $credentials);
+    }
+
+    /**
+     * @throws ClientExceptionInterface
+     * @throws Exception\Exception
+     */
+    public function create(array $body, string $uri = &#039;&#039;, array $headers = []): ?array
+    {
+        if (empty($headers)) {
+            $headers = [&#039;content-type&#039; =&gt; &#039;application/json&#039;];
+        }
+
+        $request = new Request(
+            $this-&gt;getBaseUrl() . $this-&gt;getBaseUri() . $uri,
+            &#039;POST&#039;,
+            &#039;php://temp&#039;,
+            $headers
+        );
+
+        $request-&gt;getBody()-&gt;write(json_encode($body));
+
+        if ($this-&gt;getAuthHandlers()) {
+            $request = $this-&gt;addAuth($request);
+        }
+
+        $this-&gt;lastRequest = $request;
+
+        $response = $this-&gt;getClient()-&gt;send($request);
+        $status = (int)$response-&gt;getStatusCode();
+
+        $this-&gt;setLastResponse($response);
+
+        if (($status &lt; 200 || $status &gt; 299) || $this-&gt;errorsOn200()) {
+            $e = $this-&gt;getException($response, $request);
+
+            if ($e) {
+                $e-&gt;setEntity($body);
+
+                throw $e;
+            }
+        }
+
+        $response-&gt;getBody()-&gt;rewind();
+
+        return json_decode($response-&gt;getBody()-&gt;getContents(), true);
+    }
+
+    /**
+     * @throws ClientExceptionInterface
+     * @throws Exception\Exception
+     */
+    public function delete(string $id, array $headers = []): ?array
+    {
+        $uri = $this-&gt;getBaseUrl() . $this-&gt;baseUri . &#039;/&#039; . $id;
+
+        if (empty($headers)) {
+            $headers = [
+                &#039;accept&#039; =&gt; &#039;application/json&#039;,
+                &#039;content-type&#039; =&gt; &#039;application/json&#039;
+            ];
+        }
+
+        $request = new Request(
+            $uri,
+            &#039;DELETE&#039;,
+            &#039;php://temp&#039;,
+            $headers
+        );
+
+        if ($this-&gt;getAuthHandlers()) {
+            $request = $this-&gt;addAuth($request);
+        }
+
+        $response = $this-&gt;getClient()-&gt;send($request);
+        $status = (int)$response-&gt;getStatusCode();
+
+        $this-&gt;lastRequest = $request;
+        $this-&gt;setLastResponse($response);
+
+        if ($status &lt; 200 || $status &gt; 299) {
+            $e = $this-&gt;getException($response, $request);
+            $e-&gt;setEntity($id);
+
+            throw $e;
+        }
+
+        $response-&gt;getBody()-&gt;rewind();
+
+        return json_decode($response-&gt;getBody()-&gt;getContents(), true);
+    }
+
+    /**
+     * @throws ClientExceptionInterface
+     * @throws Exception\Exception
+     */
+    public function get(
+        $id,
+        array $query = [],
+        array $headers = [],
+        bool $jsonResponse = true,
+        bool $uriOverride = false
+    ) {
+        $uri = $this-&gt;getBaseUrl() . $this-&gt;baseUri . &#039;/&#039; . $id;
+
+        // This is a necessary hack if you want to fetch a totally different URL but use Vonage Auth
+        if ($uriOverride) {
+            $uri = $id;
+        }
+
+        if (!empty($query)) {
+            $uri .= &#039;?&#039; . http_build_query($query);
+        }
+
+        if (empty($headers)) {
+            $headers = [
+                &#039;accept&#039; =&gt; &#039;application/json&#039;,
+                &#039;content-type&#039; =&gt; &#039;application/json&#039;
+            ];
+        }
+
+        $request = new Request(
+            $uri,
+            &#039;GET&#039;,
+            &#039;php://temp&#039;,
+            $headers
+        );
+
+        if ($this-&gt;getAuthHandlers()) {
+            $request = $this-&gt;addAuth($request);
+        }
+
+        $response = $this-&gt;getClient()-&gt;send($request);
+        $status = (int)$response-&gt;getStatusCode();
+
+        $this-&gt;lastRequest = $request;
+        $this-&gt;setLastResponse($response);
+
+        if ($status &lt; 200 || $status &gt; 299) {
+            $e = $this-&gt;getException($response, $request);
+            $e-&gt;setEntity($id);
+
+            throw $e;
+        }
+
+        if (!$jsonResponse) {
+            return $response-&gt;getBody();
+        }
+
+        return json_decode($response-&gt;getBody()-&gt;getContents(), true);
+    }
+
+    public function getAuthHandlers()
+    {
+        // If we have not set a handler, default to Basic and issue warning.
+        if (!$this-&gt;authHandlers) {
+            $this-&gt;log(
+                LogLevel::WARNING,
+                &#039;Warning: no authorisation handler set for this Client. Defaulting to Basic which might not be
+                the correct authorisation for this API call&#039;
+            );
+
+            return new BasicHandler();
+        }
+
+        return $this-&gt;authHandlers;
+    }
+
+    public function getBaseUrl(): ?string
+    {
+        if (!$this-&gt;baseUrl &amp;&amp; $this-&gt;client) {
+            $this-&gt;baseUrl = $this-&gt;client-&gt;getApiUrl();
+        }
+
+        return $this-&gt;baseUrl;
+    }
+
+    public function getBaseUri(): ?string
+    {
+        return $this-&gt;baseUri;
+    }
+
+    public function getCollectionName(): string
+    {
+        return $this-&gt;collectionName;
+    }
+
+    public function getCollectionPrototype(): IterableAPICollection
+    {
+        if (is_null($this-&gt;collectionPrototype)) {
+            $this-&gt;collectionPrototype = new IterableAPICollection();
+        }
+
+        return clone $this-&gt;collectionPrototype;
+    }
+
+    public function getExceptionErrorHandler(): callable
+    {
+        if (is_null($this-&gt;exceptionErrorHandler)) {
+            return new APIExceptionHandler();
+        }
+
+        return $this-&gt;exceptionErrorHandler;
+    }
+
+    /**
+     * Sets the error handler to use when reviewing API responses.
+     */
+    public function setExceptionErrorHandler(callable $handler): self
+    {
+        $this-&gt;exceptionErrorHandler = $handler;
+
+        return $this;
+    }
+
+    protected function getException(ResponseInterface $response, RequestInterface $request)
+    {
+        return $this-&gt;getExceptionErrorHandler()($response, $request);
+    }
+
+    public function getLastRequest(): ?RequestInterface
+    {
+        $this-&gt;lastRequest-&gt;getBody()-&gt;rewind();
+
+        return $this-&gt;lastRequest;
+    }
+
+    public function getLastResponse(): ?ResponseInterface
+    {
+        $this-&gt;lastResponse-&gt;getBody()-&gt;rewind();
+
+        return $this-&gt;lastResponse;
+    }
+
+    public function isHAL(): bool
+    {
+        return $this-&gt;isHAL;
+    }
+
+    public function partiallyUpdate(string $id, array $body, array $headers = []): ?array
+    {
+        return $this-&gt;updateEntity(&#039;PATCH&#039;, $id, $body, $headers);
+    }
+
+    public function search(?FilterInterface $filter = null, string $uri = &#039;&#039;): IterableAPICollection
+    {
+        if (is_null($filter)) {
+            $filter = new EmptyFilter();
+        }
+
+        $api = clone $this;
+
+        if ($uri) {
+            $api-&gt;setBaseUri($uri);
+        }
+
+        $collection = $this-&gt;getCollectionPrototype();
+        $collection
+            -&gt;setApiResource($api)
+            -&gt;setFilter($filter);
+        $collection-&gt;setClient($this-&gt;client);
+
+        return $collection;
+    }
+
+    /**
+     * Set the auth handler(s). This can be a handler that extends off AbstractHandler,
+     * or an array of handlers that will attempt to resolve at runtime
+     *
+     * @param HandlerInterface|array $handler
+     *
+     * @return $this
+     */
+    public function setAuthHandlers($handler): self
+    {
+        if (!is_array($handler)) {
+            $handler = [$handler];
+        }
+        $this-&gt;authHandlers = $handler;
+
+        return $this;
+    }
+
+    public function setBaseUrl(string $url): self
+    {
+        $this-&gt;baseUrl = $url;
+
+        return $this;
+    }
+
+    public function setBaseUri(string $uri): self
+    {
+        $this-&gt;baseUri = $uri;
+
+        return $this;
+    }
+
+    public function setCollectionName(string $name): self
+    {
+        $this-&gt;collectionName = $name;
+
+        return $this;
+    }
+
+    public function setCollectionPrototype(IterableAPICollection $prototype): self
+    {
+        $this-&gt;collectionPrototype = $prototype;
+
+        return $this;
+    }
+
+    public function setIsHAL(bool $state): self
+    {
+        $this-&gt;isHAL = $state;
+
+        return $this;
+    }
+
+    public function setLastResponse(ResponseInterface $response): self
+    {
+        $this-&gt;lastResponse = $response;
+
+        return $this;
+    }
+
+    public function setLastRequest(RequestInterface $request): self
+    {
+        $this-&gt;lastRequest = $request;
+
+        return $this;
+    }
+
+    /**
+     * Allows form URL-encoded POST requests.
+     *
+     * @throws ClientExceptionInterface
+     * @throws Exception\Exception
+     */
+    public function submit(array $formData = [], string $uri = &#039;&#039;, array $headers = []): string
+    {
+        if (empty($headers)) {
+            $headers = [&#039;content-type&#039; =&gt; &#039;application/x-www-form-urlencoded&#039;];
+        }
+
+        $request = new Request(
+            $this-&gt;baseUrl . $this-&gt;baseUri . $uri,
+            &#039;POST&#039;,
+            &#039;php://temp&#039;,
+            $headers
+        );
+
+        if ($this-&gt;getAuthHandlers()) {
+            $request = $this-&gt;addAuth($request);
+        }
+
+        $request-&gt;getBody()-&gt;write(http_build_query($formData));
+        $response = $this-&gt;getClient()-&gt;send($request);
+        $status = $response-&gt;getStatusCode();
+
+        $this-&gt;lastRequest = $request;
+        $this-&gt;setLastResponse($response);
+
+        if ($status &lt; 200 || $status &gt; 299) {
+            $e = $this-&gt;getException($response, $request);
+            $e-&gt;setEntity($formData);
+
+            throw $e;
+        }
+
+        return $response-&gt;getBody()-&gt;getContents();
+    }
+
+    public function update(string $id, array $body, array $headers = []): ?array
+    {
+        return $this-&gt;updateEntity(&#039;PUT&#039;, $id, $body, $headers);
+    }
+
+    /**
+     * @throws ClientExceptionInterface
+     * @throws Exception\Exception
+     */
+    protected function updateEntity(string $method, string $id, array $body, array $headers = []): ?array
+    {
+        if (empty($headers)) {
+            $headers = [&#039;content-type&#039; =&gt; &#039;application/json&#039;];
+        }
+
+        $request = new Request(
+            $this-&gt;getBaseUrl() . $this-&gt;baseUri . &#039;/&#039; . $id,
+            $method,
+            &#039;php://temp&#039;,
+            $headers
+        );
+
+        if ($this-&gt;getAuthHandlers()) {
+            $request = $this-&gt;addAuth($request);
+        }
+
+        $request-&gt;getBody()-&gt;write(json_encode($body));
+        $response = $this-&gt;getClient()-&gt;send($request);
+
+        $this-&gt;lastRequest = $request;
+        $this-&gt;setLastResponse($response);
+        $status = $response-&gt;getStatusCode();
+
+        if (($status &lt; 200 || $status &gt; 299) || $this-&gt;errorsOn200()) {
+            $e = $this-&gt;getException($response, $request);
+            $e-&gt;setEntity([&#039;id&#039; =&gt; $id, &#039;body&#039; =&gt; $body]);
+
+            throw $e;
+        }
+
+        return json_decode($response-&gt;getBody()-&gt;getContents(), true);
+    }
+
+    public function errorsOn200(): bool
+    {
+        return $this-&gt;errorsOn200;
+    }
+
+    public function setErrorsOn200(bool $value): self
+    {
+        $this-&gt;errorsOn200 = $value;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/vonage/client-core/src/Client/Callback/Callback.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/vonage/client-core/src/Client/Callback -->
+
+</body>
+</html>

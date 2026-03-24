@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Crypto/DecryptionTraitV2.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Crypto;
+
+use Aws\Exception\CryptoException;
+use GuzzleHttp\Psr7;
+use GuzzleHttp\Psr7\LimitStream;
+use Psr\Http\Message\StreamInterface;
+
+trait DecryptionTraitV2
+{
+    /**
+     * Dependency to reverse lookup the openssl_* cipher name from the AESName
+     * in the MetadataEnvelope.
+     *
+     * @param $aesName
+     *
+     * @return string
+     *
+     * @internal
+     */
+    abstract protected function getCipherFromAesName($aesName);
+
+    /**
+     * Dependency to generate a CipherMethod from a set of inputs for loading
+     * in to an AesDecryptingStream.
+     *
+     * @param string $cipherName Name of the cipher to generate for decrypting.
+     * @param string $iv Base Initialization Vector for the cipher.
+     * @param int $keySize Size of the encryption key, in bits, that will be
+     *                     used.
+     *
+     * @return Cipher\CipherMethod
+     *
+     * @internal
+     */
+    abstract protected function buildCipherMethod($cipherName, $iv, $keySize);
+
+    /**
+     * Builds an AesStreamInterface using cipher options loaded from the
+     * MetadataEnvelope and MaterialsProvider. Can decrypt data from both the
+     * legacy and V2 encryption client workflows.
+     *
+     * @param string $cipherText Plain-text data to be encrypted using the
+     *                           materials, algorithm, and data provided.
+     * @param MaterialsProviderInterfaceV2 $provider A provider to supply and encrypt
+     *                                             materials used in encryption.
+     * @param MetadataEnvelope $envelope A storage envelope for encryption
+     *                                   metadata to be read from.
+     * @param array $options Options used for decryption.
+     *
+     * @return AesStreamInterface
+     *
+     * @throws \InvalidArgumentException Thrown when a value in $cipherOptions
+     *                                   is not valid.
+     *
+     * @internal
+     */
+    public function decrypt(
+        $cipherText,
+        MaterialsProviderInterfaceV2 $provider,
+        MetadataEnvelope $envelope,
+        array $options = []
+    ) 
+    {
+        $commitmentPolicy = $this-&gt;getKeyCommitmentPolicy($options);
+        unset($options[&#039;@CommitmentPolicy&#039;]);
+        if (isset($envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_V3])) {
+            if ($commitmentPolicy !== &quot;FORBID_ENCRYPT_ALLOW_DECRYPT&quot;) {
+                throw new CryptoException(
+                    &quot;The requested item is encrypted&quot;
+                    . &quot; with Key Commitment. The current policy {$commitmentPolicy}&quot;
+                    . &quot; conflicts with the object metadata. Select an appropriate&quot;
+                    . &quot; &#039;@CommitmentPolicy&#039; to decrypt this item.&quot;
+                );
+            }
+            $algorithmSuite = AlgorithmSuite::ALG_AES_256_GCM_HKDF_SHA512_COMMIT_KEY;
+            $options[&#039;@CipherOptions&#039;] = $options[&#039;@CipherOptions&#039;] ?? [];
+            $options[&#039;@CipherOptions&#039;][&#039;Iv&#039;] = str_repeat(&quot;\1&quot;, 12);
+            $options[&#039;@CipherOptions&#039;][&#039;TagLength&#039;] = $algorithmSuite-&gt;getCipherTagLengthInBytes();
+            $materialDescription = json_decode(
+                $envelope[MetadataEnvelope::ENCRYPTION_CONTEXT_V3],
+                true
+            );
+
+
+            $cek = $provider-&gt;decryptCek(
+                base64_decode($envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_V3]),
+                $materialDescription,
+                $options
+            );
+
+            $options[&#039;@CipherOptions&#039;][&#039;KeySize&#039;] = strlen($cek) * 8;
+            $options[&#039;@CipherOptions&#039;][&#039;Cipher&#039;] = $this-&gt;getCipherFromAesName(
+                $this-&gt;numericalContenCipherToAesName($envelope)
+            );
+            $this-&gt;validateOptionsAndEnvelope($options, $envelope);
+
+            $messageId = base64_decode($envelope[MetadataEnvelope::MESSAGE_ID_V3]);
+            $commitmentKey = base64_decode($envelope[MetadataEnvelope::KEY_COMMITMENT_V3]);
+
+            if (strlen($messageId) !== ($algorithmSuite-&gt;getKeyCommitmentSaltLengthBits()) / 8) {
+                throw new CryptoException(&quot;Invalid MessageId length found in object envelope.&quot;);
+            }
+
+            if (strlen($commitmentKey) !== $algorithmSuite-&gt;getCommitmentOutputKeyLengthBytes()) {
+                throw new CryptoException(&quot;Invalid Commitment Key length found in object envelope.&quot;);
+            }
+
+            $decryptionStream = $this-&gt;getCommitingDecryptingStream(
+                $cipherText,
+                $cek,
+                $options[&#039;@CipherOptions&#039;],
+                $messageId,
+                $commitmentKey,
+                $algorithmSuite
+            );
+            unset($cek);
+
+            return $decryptionStream;
+        } else {
+            $options[&#039;@CipherOptions&#039;] = $options[&#039;@CipherOptions&#039;] ?? [];
+            $options[&#039;@CipherOptions&#039;][&#039;Iv&#039;] = base64_decode(
+                $envelope[MetadataEnvelope::IV_HEADER]
+            );
+
+            $options[&#039;@CipherOptions&#039;][&#039;TagLength&#039;] =
+                $envelope[MetadataEnvelope::CRYPTO_TAG_LENGTH_HEADER] / 8;
+
+            $cek = $provider-&gt;decryptCek(
+                base64_decode(
+                    $envelope[MetadataEnvelope::CONTENT_KEY_V2_HEADER]
+                ),
+                json_decode(
+                    $envelope[MetadataEnvelope::MATERIALS_DESCRIPTION_HEADER],
+                    true
+                ),
+                $options
+            );
+            $options[&#039;@CipherOptions&#039;][&#039;KeySize&#039;] = strlen($cek) * 8;
+            $options[&#039;@CipherOptions&#039;][&#039;Cipher&#039;] = $this-&gt;getCipherFromAesName(
+                $envelope[MetadataEnvelope::CONTENT_CRYPTO_SCHEME_HEADER]
+            );
+
+            $this-&gt;validateOptionsAndEnvelope($options, $envelope);
+
+            $decryptionStream = $this-&gt;getDecryptingStream(
+                $cipherText,
+                $cek,
+                $options[&#039;@CipherOptions&#039;]
+            );
+            unset($cek);
+
+            return $decryptionStream;
+        }
+    }
+
+    private function buildMaterialDescription(
+        MetadataEnvelope $envelope
+    ): array 
+    {
+        switch ($envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_ALGORITHM_V3]) {
+            case 12:
+                return [&#039;aws:x-amz-cek-alg&#039; =&gt; &#039;115&#039;];
+            default:
+                throw new CryptoException(
+                    &quot;Unknown Encrypted Data Key &quot;
+                    . &quot;wrapping algorithm found: &quot;
+                    . &quot;{$envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_ALGORITHM_V3]}&quot;
+                );
+        }
+    }
+
+    private function numericalContenCipherToAesName(
+        MetadataEnvelope $envelope
+    ): string
+    {
+        switch ($envelope[MetadataEnvelope::CONTENT_CIPHER_V3]) {
+            case 115:
+                return &#039;AES/GCM/NoPadding&#039;;
+            default:
+                throw new CryptoException(
+                    &quot;Unknown Encrypted Data Key &quot;
+                    . &quot;wrapping algorithm found: &quot;
+                    . &quot;{$envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_ALGORITHM_V3]}&quot;
+                );
+        }
+
+    }
+
+    private function getTagFromCiphertextStream(
+        StreamInterface $cipherText,
+        $tagLength
+    ) 
+    {
+        $cipherTextSize = $cipherText-&gt;getSize();
+        if ($cipherTextSize == null || $cipherTextSize &lt;= 0) {
+            throw new \RuntimeException(&#039;Cannot decrypt a stream of unknown&#039;
+                . &#039; size.&#039;);
+        }
+        return (string) new LimitStream(
+            $cipherText,
+            $tagLength,
+            $cipherTextSize - $tagLength
+        );
+    }
+
+    private function getStrippedCiphertextStream(
+        StreamInterface $cipherText,
+        $tagLength
+    ) 
+    {
+        $cipherTextSize = $cipherText-&gt;getSize();
+        if ($cipherTextSize == null || $cipherTextSize &lt;= 0) {
+            throw new \RuntimeException(&#039;Cannot decrypt a stream of unknown&#039;
+                . &#039; size.&#039;);
+        }
+        return new LimitStream(
+            $cipherText,
+            $cipherTextSize - $tagLength,
+            0
+        );
+    }
+
+    private function validateOptionsAndEnvelope($options, $envelope): void
+    {
+        $allowedCiphers = AbstractCryptoClientV2::$supportedCiphers;
+        $allowedKeywraps = AbstractCryptoClientV2::$supportedKeyWraps;
+        if ($options[&#039;@SecurityProfile&#039;] == &#039;V2_AND_LEGACY&#039;) {
+            $allowedCiphers = array_unique(array_merge(
+                $allowedCiphers,
+                AbstractCryptoClient::$supportedCiphers
+            ));
+            $allowedKeywraps = array_unique(array_merge(
+                $allowedKeywraps,
+                AbstractCryptoClient::$supportedKeyWraps
+            ));
+        }
+
+        $v1SchemaException = new CryptoException(&quot;The requested object is encrypted&quot;
+            . &quot; with V1 encryption schemas that have been disabled by&quot;
+            . &quot; client configuration @SecurityProfile=V2. Retry with&quot;
+            . &quot; V2_AND_LEGACY enabled or reencrypt the object.&quot;);
+
+        if (!in_array($options[&#039;@CipherOptions&#039;][&#039;Cipher&#039;], $allowedCiphers)) {
+            if (in_array($options[&#039;@CipherOptions&#039;][&#039;Cipher&#039;], AbstractCryptoClient::$supportedCiphers)) {
+                throw $v1SchemaException;
+            }
+            throw new CryptoException(&quot;The requested object is encrypted with&quot;
+                . &quot; the cipher &#039;{$options[&#039;@CipherOptions&#039;][&#039;Cipher&#039;]}&#039;, which is not&quot;
+                . &quot; supported for decryption with the selected security profile.&quot;
+                . &quot; This profile allows decryption with: &quot;
+                . implode(&quot;, &quot;, $allowedCiphers));
+        }
+
+        if (isset($envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_V3])) {
+            if ($envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_ALGORITHM_V3] !== &#039;12&#039;) {
+                throw new CryptoException(&quot;The requested object is encrypted with&quot;
+                    . &quot; the keywrap schema &#039;{$envelope[MetadataEnvelope::ENCRYPTED_DATA_KEY_ALGORITHM_V3]}&#039;,&quot;
+                    . &quot; which is not supported for decryption with the current security&quot;
+                    . &quot; profile.&quot;);
+            }
+        } else {
+            if (!in_array($envelope[MetadataEnvelope::KEY_WRAP_ALGORITHM_HEADER], $allowedKeywraps)) {
+                if (in_array($envelope[MetadataEnvelope::KEY_WRAP_ALGORITHM_HEADER], AbstractCryptoClient::$supportedKeyWraps)) {
+                    throw $v1SchemaException;
+                }
+
+                throw new CryptoException(&quot;The requested object is encrypted with&quot;
+                    . &quot; the keywrap schema &#039;{$envelope[MetadataEnvelope::KEY_WRAP_ALGORITHM_HEADER]}&#039;,&quot;
+                    . &quot; which is not supported for decryption with the current security&quot;
+                    . &quot; profile.&quot;);
+            }
+            $matdesc = json_decode(
+                $envelope[MetadataEnvelope::MATERIALS_DESCRIPTION_HEADER],
+                true
+            );
+            if (isset($matdesc[&#039;aws:x-amz-cek-alg&#039;])
+                &amp;&amp; ($envelope[MetadataEnvelope::CONTENT_CRYPTO_SCHEME_HEADER]
+                    !== $matdesc[&#039;aws:x-amz-cek-alg&#039;])
+            ) {
+                throw new CryptoException(&quot;There is a mismatch in specified content&quot;
+                    . &quot; encryption algrithm between the materials description value&quot;
+                    . &quot; and the metadata envelope value: {$matdesc[&#039;aws:x-amz-cek-alg&#039;]}&quot;
+                    . &quot; vs. {$envelope[MetadataEnvelope::CONTENT_CRYPTO_SCHEME_HEADER]}.&quot;);
+            }
+        }
+    }
+
+    /**
+     * Generates a stream that wraps the cipher text with the proper cipher and
+     * uses the content encryption key (CEK) to decrypt the data when read.
+     *
+     * @param string $cipherText Plain-text data to be encrypted using the
+     *                           materials, algorithm, and data provided.
+     * @param string $cek A content encryption key for use by the stream for
+     *                    encrypting the plaintext data.
+     * @param array $cipherOptions Options for use in determining the cipher to
+     *                             be used for encrypting data.
+     *
+     * @return AesStreamInterface
+     *
+     * @internal
+     */
+    protected function getDecryptingStream(
+        $cipherText,
+        $cek,
+        $cipherOptions
+    ) 
+    {
+        $cipherTextStream = Psr7\Utils::streamFor($cipherText);
+        switch ($cipherOptions[&#039;Cipher&#039;]) {
+            case &#039;gcm&#039;:
+                $cipherOptions[&#039;Tag&#039;] = $this-&gt;getTagFromCiphertextStream(
+                    $cipherTextStream,
+                    $cipherOptions[&#039;TagLength&#039;]
+                );
+
+                return new AesGcmDecryptingStream(
+                    $this-&gt;getStrippedCiphertextStream(
+                        $cipherTextStream,
+                        $cipherOptions[&#039;TagLength&#039;]
+                    ),
+                    $cek,
+                    $cipherOptions[&#039;Iv&#039;],
+                    $cipherOptions[&#039;Tag&#039;],
+                    $cipherOptions[&#039;Aad&#039;] = $cipherOptions[&#039;Aad&#039;] ?? &#039;&#039;,
+                    $cipherOptions[&#039;TagLength&#039;] ?: null,
+                    $cipherOptions[&#039;KeySize&#039;]
+                );
+            default:
+                $cipherMethod = $this-&gt;buildCipherMethod(
+                    $cipherOptions[&#039;Cipher&#039;],
+                    $cipherOptions[&#039;Iv&#039;],
+                    $cipherOptions[&#039;KeySize&#039;]
+                );
+                return new AesDecryptingStream(
+                    $cipherTextStream,
+                    $cek,
+                    $cipherMethod
+                );
+        }
+    }
+
+    /**
+     * Generates a stream that wraps the cipher text with the proper cipher and
+     * uses the content encryption key (CEK) to derive both a derived content encryption key
+     * and a commitment key to decrypt the data when read.
+     *
+     * @param string $cipherText Plain-text data to be encrypted using the
+     *                           materials, algorithm, and data provided.
+     * @param string $cek A content encryption key for use by the stream for
+     *                    encrypting the plaintext data.
+     * @param array $cipherOptions Options for use in determining the cipher to
+     *                             be used for encrypting data.
+     * @param string $messageId a string value used to calculate both a commitment
+     *                          key and derived content encryption key
+     * @param string $commitmentKey a string value to compare with the calculated commitment
+     *                              key value, if the values don&#039;t match an exception is raised.
+     *
+     * @return AesStreamInterface | CryptoException
+     *
+     * @internal
+     */
+    protected function getCommitingDecryptingStream(
+        string $cipherText,
+        string $cek,
+        array $cipherOptions,
+        string $messageId,
+        string $commitmentKey,
+        AlgorithmSuite $algorithmSuite
+    ): AesStreamInterface|CryptoException
+    {
+        $algorithmSuiteIdAsBytes = pack(&#039;n&#039;, $algorithmSuite-&gt;getId());
+        $derivedEncryptionKeyInfo = $algorithmSuiteIdAsBytes . &quot;DERIVEKEY&quot;;
+        $commitmentKeyInfo = $algorithmSuiteIdAsBytes . &quot;COMMITKEY&quot;;
+        $derivedEncryptionKey = hash_hkdf(
+            $algorithmSuite-&gt;getHashingAlgorithm(),
+            $cek,
+            $algorithmSuite-&gt;getDerivationOutputKeyLengthBytes(),
+            $derivedEncryptionKeyInfo,
+            $messageId
+        );
+        $calculatedCommitmentKey = hash_hkdf(
+            $algorithmSuite-&gt;getHashingAlgorithm(),
+            $cek,
+            $algorithmSuite-&gt;getCommitmentOutputKeyLengthBytes(),
+            $commitmentKeyInfo,
+            $messageId
+        );
+
+        if ($commitmentKey != $calculatedCommitmentKey) {
+            throw new CryptoException(&quot;Calculated commitment key does &quot;
+                . &quot;not match expected commitment key value &quot;);
+        }
+
+        $cipherTextStream = Psr7\Utils::streamFor($cipherText);
+        switch ($cipherOptions[&#039;Cipher&#039;]) {
+            case &#039;gcm&#039;:
+                $cipherOptions[&#039;Tag&#039;] = $this-&gt;getTagFromCiphertextStream(
+                    $cipherTextStream,
+                    $cipherOptions[&#039;TagLength&#039;]
+                );
+                $cipherOptions[&#039;Aad&#039;] = isset($cipherOptions[&#039;Aad&#039;])
+                    ? $cipherOptions[&#039;Aad&#039;] + $algorithmSuiteIdAsBytes
+                    : $algorithmSuiteIdAsBytes;
+
+                return new AesGcmDecryptingStream(
+                    $this-&gt;getStrippedCiphertextStream(
+                        $cipherTextStream,
+                        $cipherOptions[&#039;TagLength&#039;]
+                    ),
+                    $derivedEncryptionKey,
+                    $cipherOptions[&#039;Iv&#039;],
+                    $cipherOptions[&#039;Tag&#039;],
+                    $cipherOptions[&#039;Aad&#039;],
+                    $cipherOptions[&#039;TagLength&#039;] ?: null,
+                    $cipherOptions[&#039;KeySize&#039;]
+                );
+            default: 
+                throw new CryptoException(&quot;Unsupported Cipher used for key commitment messages.&quot;
+                    . &quot; Found {$cipherOptions[&quot;Cipher&quot;]}. Only &#039;gcm&#039; is supported.&quot;);
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Crypto/DecryptionTraitV3.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Crypto/Cipher -->
+
+</body>
+</html>

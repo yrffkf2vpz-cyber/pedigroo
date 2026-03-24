@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/psy/psysh/src/VersionUpdater/SelfUpdate.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\VersionUpdater;
+
+use Psy\Exception\ErrorException;
+use Psy\Shell;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * Self update command.
+ *
+ * If a new version is available, this command will download it and replace the currently installed version
+ */
+class SelfUpdate
+{
+    const URL_PREFIX = &#039;https://github.com/bobthecow/psysh/releases/download&#039;;
+    const SUCCESS = 0;
+    const FAILURE = 1;
+
+    private Checker $checker;
+    private Installer $installer;
+    private ?Downloader $downloader = null;
+
+    public function __construct(Checker $checker, Installer $installer)
+    {
+        $this-&gt;checker = $checker;
+        $this-&gt;installer = $installer;
+    }
+
+    /**
+     * Allow the downloader to be injected for testing.
+     *
+     * @return void
+     */
+    public function setDownloader(Downloader $downloader)
+    {
+        $this-&gt;downloader = $downloader;
+    }
+
+    /**
+     * Get the currently set Downloader or create one based on the capabilities of the php environment.
+     *
+     * @throws ErrorException if a downloader cannot be created for the php environment
+     */
+    private function getDownloader(): Downloader
+    {
+        if (!isset($this-&gt;downloader)) {
+            return Downloader\Factory::getDownloader();
+        }
+
+        return $this-&gt;downloader;
+    }
+
+    /**
+     * Build the download URL for the latest release.
+     *
+     * The file name used in the URL will include the flavour postfix extracted from the current version
+     * if it&#039;s present
+     */
+    private function getAssetUrl(string $latestVersion): string
+    {
+        $versionPostfix = &#039;&#039;;
+        if (\strpos(Shell::VERSION, &#039;+&#039;)) {
+            $versionPostfix = &#039;-&#039;.\substr(Shell::VERSION, \strpos(Shell::VERSION, &#039;+&#039;) + 1);
+        }
+        $downloadFilename = \sprintf(&#039;psysh-%s%s.tar.gz&#039;, $latestVersion, $versionPostfix);
+
+        // check if latest release data contains an asset matching the filename?
+
+        return \sprintf(&#039;%s/%s/%s&#039;, self::URL_PREFIX, $latestVersion, $downloadFilename);
+    }
+
+    /**
+     * Execute the self-update process.
+     *
+     * @throws ErrorException if the current version is not restored when installation fails
+     */
+    public function run(InputInterface $input, OutputInterface $output): int
+    {
+        $currentVersion = Shell::VERSION;
+
+        // already have the latest version?
+        if ($this-&gt;checker-&gt;isLatest()) {
+            // current version is latest version...
+            $output-&gt;writeln(&#039;&lt;info&gt;Current version is up-to-date.&lt;/info&gt;&#039;);
+
+            return self::SUCCESS;
+        }
+
+        // can overwrite current version?
+        if (!$this-&gt;installer-&gt;isInstallLocationWritable()) {
+            $output-&gt;writeln(&#039;&lt;error&gt;Installed version is not writable.&lt;/error&gt;&#039;);
+
+            return self::FAILURE;
+        }
+        // can download to, and create a backup in the temp directory?
+        if (!$this-&gt;installer-&gt;isTempDirectoryWritable()) {
+            $output-&gt;writeln(&#039;&lt;error&gt;Temporary directory is not writable.&lt;/error&gt;&#039;);
+
+            return self::FAILURE;
+        }
+
+        $latestVersion = $this-&gt;checker-&gt;getLatest();
+        $downloadUrl = $this-&gt;getAssetUrl($latestVersion);
+
+        $output-&gt;write(&quot;Downloading PsySH $latestVersion ...&quot;);
+
+        try {
+            $downloader = $this-&gt;getDownloader();
+            $downloader-&gt;setTempDir($this-&gt;installer-&gt;getTempDirectory());
+            $downloaded = $downloader-&gt;download($downloadUrl);
+        } catch (ErrorException $e) {
+            $output-&gt;write(&#039; &lt;error&gt;Failed.&lt;/error&gt;&#039;);
+            $output-&gt;writeln(\sprintf(&#039;&lt;error&gt;%s&lt;/error&gt;&#039;, $e-&gt;getMessage()));
+
+            return self::FAILURE;
+        }
+
+        if (!$downloaded) {
+            $output-&gt;writeln(&#039;&lt;error&gt;Download failed.&lt;/error&gt;&#039;);
+            $downloader-&gt;cleanup();
+
+            return self::FAILURE;
+        } else {
+            $output-&gt;write(&#039; &lt;info&gt;OK&lt;/info&gt;&#039;.\PHP_EOL);
+        }
+
+        $downloadedFile = $downloader-&gt;getFilename();
+
+        if (!$this-&gt;installer-&gt;isValidSource($downloadedFile)) {
+            $downloader-&gt;cleanup();
+            $output-&gt;writeln(&#039;&lt;error&gt;Downloaded file is not a valid archive.&lt;/error&gt;&#039;);
+
+            return self::FAILURE;
+        }
+
+        // create backup as bin.old-version in the temporary directory
+        $backupCreated = $this-&gt;installer-&gt;createBackup($currentVersion);
+        if (!$backupCreated) {
+            $downloader-&gt;cleanup();
+            $output-&gt;writeln(&#039;&lt;error&gt;Failed to create a backup of the current version.&lt;/error&gt;&#039;);
+
+            return self::FAILURE;
+        } elseif ($input-&gt;getOption(&#039;verbose&#039;)) {
+            $backupFilename = $this-&gt;installer-&gt;getBackupFilename($currentVersion);
+            $output-&gt;writeln(&#039;Created backup of current version: &#039;.$backupFilename);
+        }
+
+        if (!$this-&gt;installer-&gt;install($downloadedFile)) {
+            $this-&gt;installer-&gt;restoreFromBackup($currentVersion);
+            $downloader-&gt;cleanup();
+            $output-&gt;writeln(&quot;&lt;error&gt;Failed to install new PsySH version $latestVersion.&lt;/error&gt;&quot;);
+
+            return self::FAILURE;
+        }
+
+        // Remove the downloaded archive file from the temporary directory
+        $downloader-&gt;cleanup();
+
+        $output-&gt;writeln(&quot;Updated PsySH from $currentVersion to &lt;info&gt;$latestVersion&lt;/info&gt;&quot;);
+
+        return self::SUCCESS;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/psy/psysh/src/functions.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/psy/psysh/src/VersionUpdater/Downloader -->
+
+</body>
+</html>

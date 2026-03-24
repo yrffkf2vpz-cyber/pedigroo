@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/sail/src/Console/Concerns/InteractsWithDockerComposeServices.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Laravel\Sail\Console\Concerns;
+
+use Symfony\Component\Process\Process;
+use Symfony\Component\Yaml\Yaml;
+
+trait InteractsWithDockerComposeServices
+{
+    /**
+     * Possible names for the compose file according to the spec.
+     *
+     * @var array&lt;string&gt;
+     */
+    protected $composePaths = [
+        &#039;compose.yaml&#039;,
+        &#039;compose.yml&#039;,
+        &#039;docker-compose.yaml&#039;,
+        &#039;docker-compose.yml&#039;,
+    ];
+
+    /**
+     * The available services that may be installed.
+     *
+     * @var array&lt;string&gt;
+     */
+    protected $services = [
+        &#039;mysql&#039;,
+        &#039;pgsql&#039;,
+        &#039;mariadb&#039;,
+        &#039;mongodb&#039;,
+        &#039;redis&#039;,
+        &#039;valkey&#039;,
+        &#039;memcached&#039;,
+        &#039;meilisearch&#039;,
+        &#039;typesense&#039;,
+        &#039;minio&#039;,
+        &#039;rustfs&#039;,
+        &#039;mailpit&#039;,
+        &#039;rabbitmq&#039;,
+        &#039;selenium&#039;,
+        &#039;soketi&#039;,
+    ];
+
+    /**
+     * The default services used when the user chooses non-interactive mode.
+     *
+     * @var string[]
+     */
+    protected $defaultServices = [&#039;mysql&#039;, &#039;redis&#039;, &#039;selenium&#039;, &#039;mailpit&#039;];
+
+    /**
+     * Gather the desired Sail services using an interactive prompt.
+     *
+     * @return array
+     */
+    protected function gatherServicesInteractively()
+    {
+        if (function_exists(&#039;\Laravel\Prompts\multiselect&#039;)) {
+            return \Laravel\Prompts\multiselect(
+                label: &#039;Which services would you like to install?&#039;,
+                options: $this-&gt;services,
+                default: [&#039;mysql&#039;],
+            );
+        }
+
+        return $this-&gt;choice(&#039;Which services would you like to install?&#039;, $this-&gt;services, 0, null, true);
+    }
+
+    /**
+     * Build the Docker Compose file.
+     *
+     * @param  array  $services
+     * @return void
+     */
+    protected function buildDockerCompose(array $services)
+    {
+        $composePath = $this-&gt;composePath();
+
+        $compose = file_exists($composePath)
+            ? Yaml::parseFile($composePath)
+            : Yaml::parse(file_get_contents(__DIR__ . &#039;/../../../stubs/compose.stub&#039;));
+
+        // Prepare the installation of the &quot;mariadb-client&quot; package if the MariaDB service is used...
+        if (in_array(&#039;mariadb&#039;, $services)) {
+            $compose[&#039;services&#039;][&#039;laravel.test&#039;][&#039;build&#039;][&#039;args&#039;][&#039;MYSQL_CLIENT&#039;] = &#039;mariadb-client&#039;;
+        }
+
+        // Adds the new services as dependencies of the laravel.test service...
+        if (! array_key_exists(&#039;laravel.test&#039;, $compose[&#039;services&#039;])) {
+            $this-&gt;warn(&#039;Couldn\&#039;t find the laravel.test service. Make sure you add [&#039;.implode(&#039;,&#039;, $services).&#039;] to the depends_on config.&#039;);
+        } else {
+            $compose[&#039;services&#039;][&#039;laravel.test&#039;][&#039;depends_on&#039;] = collect($compose[&#039;services&#039;][&#039;laravel.test&#039;][&#039;depends_on&#039;] ?? [])
+                -&gt;merge($services)
+                -&gt;unique()
+                -&gt;values()
+                -&gt;all();
+        }
+
+        // Add the services to the compose.yaml...
+        collect($services)
+            -&gt;filter(function ($service) use ($compose) {
+                return ! array_key_exists($service, $compose[&#039;services&#039;] ?? []);
+            })-&gt;each(function ($service) use (&amp;$compose) {
+                $compose[&#039;services&#039;][$service] = Yaml::parseFile(__DIR__ . &quot;/../../../stubs/{$service}.stub&quot;)[$service];
+            });
+
+        // Merge volumes...
+        collect($services)
+            -&gt;filter(function ($service) {
+                return in_array($service, [&#039;mysql&#039;, &#039;pgsql&#039;, &#039;mariadb&#039;, &#039;mongodb&#039;, &#039;redis&#039;, &#039;valkey&#039;, &#039;meilisearch&#039;, &#039;typesense&#039;, &#039;minio&#039;, &#039;rustfs&#039;, &#039;rabbitmq&#039;]);
+            })-&gt;filter(function ($service) use ($compose) {
+                return ! array_key_exists($service, $compose[&#039;volumes&#039;] ?? []);
+            })-&gt;each(function ($service) use (&amp;$compose) {
+                $compose[&#039;volumes&#039;][&quot;sail-{$service}&quot;] = [&#039;driver&#039; =&gt; &#039;local&#039;];
+            });
+
+        // If the list of volumes is empty, we can remove it...
+        if (empty($compose[&#039;volumes&#039;])) {
+            unset($compose[&#039;volumes&#039;]);
+        }
+
+        $yaml = Yaml::dump($compose, Yaml::DUMP_OBJECT_AS_MAP);
+
+        $yaml = str_replace(&#039;{{PHP_VERSION}}&#039;, $this-&gt;hasOption(&#039;php&#039;) ? $this-&gt;option(&#039;php&#039;) : &#039;8.5&#039;, $yaml);
+
+        file_put_contents($composePath, $yaml);
+    }
+
+    /**
+     * Replace the Host environment variables in the app&#039;s .env file.
+     *
+     * @param  array  $services
+     * @return void
+     */
+    protected function replaceEnvVariables(array $services)
+    {
+        $environment = file_get_contents($this-&gt;laravel-&gt;basePath(&#039;.env&#039;));
+
+        if (in_array(&#039;mysql&#039;, $services) ||
+            in_array(&#039;mariadb&#039;, $services) ||
+            in_array(&#039;pgsql&#039;, $services)) {
+            $defaults = [
+                &#039;# DB_HOST=127.0.0.1&#039;,
+                &#039;# DB_PORT=3306&#039;,
+                &#039;# DB_DATABASE=laravel&#039;,
+                &#039;# DB_USERNAME=root&#039;,
+                &#039;# DB_PASSWORD=&#039;,
+            ];
+
+            foreach ($defaults as $default) {
+                $environment = str_replace($default, substr($default, 2), $environment);
+            }
+        }
+
+        if (in_array(&#039;mysql&#039;, $services)) {
+            $environment = preg_replace(&#039;/DB_CONNECTION=.*/&#039;, &#039;DB_CONNECTION=mysql&#039;, $environment);
+            $environment = str_replace(&#039;DB_HOST=127.0.0.1&#039;, &quot;DB_HOST=mysql&quot;, $environment);
+        }elseif (in_array(&#039;pgsql&#039;, $services)) {
+            $environment = preg_replace(&#039;/DB_CONNECTION=.*/&#039;, &#039;DB_CONNECTION=pgsql&#039;, $environment);
+            $environment = str_replace(&#039;DB_HOST=127.0.0.1&#039;, &quot;DB_HOST=pgsql&quot;, $environment);
+            $environment = str_replace(&#039;DB_PORT=3306&#039;, &quot;DB_PORT=5432&quot;, $environment);
+        } elseif (in_array(&#039;mariadb&#039;, $services)) {
+            if ($this-&gt;laravel-&gt;config-&gt;has(&#039;database.connections.mariadb&#039;)) {
+                $environment = preg_replace(&#039;/DB_CONNECTION=.*/&#039;, &#039;DB_CONNECTION=mariadb&#039;, $environment);
+            }
+
+            $environment = str_replace(&#039;DB_HOST=127.0.0.1&#039;, &quot;DB_HOST=mariadb&quot;, $environment);
+        }
+
+        $environment = str_replace(&#039;DB_USERNAME=root&#039;, &quot;DB_USERNAME=sail&quot;, $environment);
+        $environment = preg_replace(&quot;/DB_PASSWORD=(.*)/&quot;, &quot;DB_PASSWORD=password&quot;, $environment);
+
+        if (in_array(&#039;memcached&#039;, $services)) {
+            $environment = str_replace(&#039;MEMCACHED_HOST=127.0.0.1&#039;, &#039;MEMCACHED_HOST=memcached&#039;, $environment);
+        }
+
+        if (in_array(&#039;redis&#039;, $services)) {
+            $environment = str_replace(&#039;REDIS_HOST=127.0.0.1&#039;, &#039;REDIS_HOST=redis&#039;, $environment);
+        }
+
+        if (in_array(&#039;valkey&#039;,$services)){
+            $environment = str_replace(&#039;REDIS_HOST=127.0.0.1&#039;, &#039;REDIS_HOST=valkey&#039;, $environment);
+        }
+
+        if (in_array(&#039;mongodb&#039;, $services)) {
+            $environment .= &quot;\nMONGODB_URI=mongodb://mongodb:27017&quot;;
+            $environment .= &quot;\nMONGODB_DATABASE=laravel&quot;;
+        }
+
+        if (in_array(&#039;meilisearch&#039;, $services)) {
+            $environment .= &quot;\nSCOUT_DRIVER=meilisearch&quot;;
+            $environment .= &quot;\nMEILISEARCH_HOST=http://meilisearch:7700\n&quot;;
+            $environment .= &quot;\nMEILISEARCH_NO_ANALYTICS=false\n&quot;;
+        }
+
+        if (in_array(&#039;typesense&#039;, $services)) {
+            $environment .= &quot;\nSCOUT_DRIVER=typesense&quot;;
+            $environment .= &quot;\nTYPESENSE_HOST=typesense&quot;;
+            $environment .= &quot;\nTYPESENSE_PORT=8108&quot;;
+            $environment .= &quot;\nTYPESENSE_PROTOCOL=http&quot;;
+            $environment .= &quot;\nTYPESENSE_API_KEY=xyz\n&quot;;
+        }
+
+        if (in_array(&#039;soketi&#039;, $services)) {
+            $environment = preg_replace(&quot;/^BROADCAST_DRIVER=(.*)/m&quot;, &quot;BROADCAST_DRIVER=pusher&quot;, $environment);
+            $environment = preg_replace(&quot;/^PUSHER_APP_ID=(.*)/m&quot;, &quot;PUSHER_APP_ID=app-id&quot;, $environment);
+            $environment = preg_replace(&quot;/^PUSHER_APP_KEY=(.*)/m&quot;, &quot;PUSHER_APP_KEY=app-key&quot;, $environment);
+            $environment = preg_replace(&quot;/^PUSHER_APP_SECRET=(.*)/m&quot;, &quot;PUSHER_APP_SECRET=app-secret&quot;, $environment);
+            $environment = preg_replace(&quot;/^PUSHER_HOST=(.*)/m&quot;, &quot;PUSHER_HOST=soketi&quot;, $environment);
+            $environment = preg_replace(&quot;/^PUSHER_PORT=(.*)/m&quot;, &quot;PUSHER_PORT=6001&quot;, $environment);
+            $environment = preg_replace(&quot;/^PUSHER_SCHEME=(.*)/m&quot;, &quot;PUSHER_SCHEME=http&quot;, $environment);
+            $environment = preg_replace(&quot;/^VITE_PUSHER_HOST=(.*)/m&quot;, &quot;VITE_PUSHER_HOST=localhost&quot;, $environment);
+        }
+
+        if (in_array(&#039;mailpit&#039;, $services)) {
+            $environment = preg_replace(&quot;/^MAIL_MAILER=(.*)/m&quot;, &quot;MAIL_MAILER=smtp&quot;, $environment);
+            $environment = preg_replace(&quot;/^MAIL_HOST=(.*)/m&quot;, &quot;MAIL_HOST=mailpit&quot;, $environment);
+            $environment = preg_replace(&quot;/^MAIL_PORT=(.*)/m&quot;, &quot;MAIL_PORT=1025&quot;, $environment);
+        }
+
+        if (in_array(&#039;rabbitmq&#039;, $services)) {
+            $environment = str_replace(&#039;RABBITMQ_HOST=127.0.0.1&#039;, &#039;RABBITMQ_HOST=rabbitmq&#039;, $environment);
+        }
+
+        $environment = str_replace(&#039;# PHP_CLI_SERVER_WORKERS=4&#039;, &#039;PHP_CLI_SERVER_WORKERS=4&#039;, $environment);
+
+        file_put_contents($this-&gt;laravel-&gt;basePath(&#039;.env&#039;), $environment);
+    }
+
+    /**
+     * Configure PHPUnit to use the dedicated testing database.
+     *
+     * @return void
+     */
+    protected function configurePhpUnit()
+    {
+        if (! file_exists($path = $this-&gt;laravel-&gt;basePath(&#039;phpunit.xml&#039;))) {
+            $path = $this-&gt;laravel-&gt;basePath(&#039;phpunit.xml.dist&#039;);
+
+            if (! file_exists($path)) {
+                return;
+            }
+        }
+
+        $phpunit = file_get_contents($path);
+
+        $phpunit = preg_replace(&#039;/^.*DB_CONNECTION.*\n/m&#039;, &#039;&#039;, $phpunit);
+        $phpunit = str_replace(
+            [
+                &#039;&lt;!-- &lt;env name=&quot;DB_DATABASE&quot; value=&quot;:memory:&quot;/&gt; --&gt;&#039;,
+                &#039;&lt;env name=&quot;DB_DATABASE&quot; value=&quot;:memory:&quot;/&gt;&#039;,
+            ],
+            &#039;&lt;env name=&quot;DB_DATABASE&quot; value=&quot;testing&quot;/&gt;&#039;,
+            $phpunit
+        );
+
+        file_put_contents($this-&gt;laravel-&gt;basePath(&#039;phpunit.xml&#039;), $phpunit);
+    }
+
+    /**
+     * Install the devcontainer.json configuration file.
+     *
+     * @return void
+     */
+    protected function installDevContainer()
+    {
+        if (! is_dir($this-&gt;laravel-&gt;basePath(&#039;.devcontainer&#039;))) {
+            mkdir($this-&gt;laravel-&gt;basePath(&#039;.devcontainer&#039;), 0755, true);
+        }
+
+        file_put_contents(
+            $this-&gt;laravel-&gt;basePath(&#039;.devcontainer/devcontainer.json&#039;),
+            file_get_contents(__DIR__.&#039;/../../../stubs/devcontainer.stub&#039;)
+        );
+
+        $environment = file_get_contents($this-&gt;laravel-&gt;basePath(&#039;.env&#039;));
+
+        $environment .= &quot;\nWWWGROUP=1000&quot;;
+        $environment .= &quot;\nWWWUSER=1000\n&quot;;
+
+        file_put_contents($this-&gt;laravel-&gt;basePath(&#039;.env&#039;), $environment);
+    }
+
+    /**
+     * Prepare the installation by pulling and building any necessary images.
+     *
+     * @param  array  $services
+     * @return void
+     */
+    protected function prepareInstallation($services)
+    {
+        // Ensure docker is installed...
+        if ($this-&gt;runCommands([&#039;docker info &gt; /dev/null 2&gt;&amp;1&#039;]) !== 0) {
+            return;
+        }
+
+        if (count($services) &gt; 0) {
+            $this-&gt;runCommands([
+                &#039;./vendor/bin/sail pull &#039;.implode(&#039; &#039;, $services),
+            ]);
+        }
+
+        $this-&gt;runCommands([
+            &#039;./vendor/bin/sail build&#039;,
+        ]);
+    }
+
+    /**
+     * Run the given commands.
+     *
+     * @param  array  $commands
+     * @return int
+     */
+    protected function runCommands($commands)
+    {
+        $process = Process::fromShellCommandline(implode(&#039; &amp;&amp; &#039;, $commands), null, null, null, null);
+
+        if (&#039;\\&#039; !== DIRECTORY_SEPARATOR &amp;&amp; file_exists(&#039;/dev/tty&#039;) &amp;&amp; is_readable(&#039;/dev/tty&#039;)) {
+            try {
+                $process-&gt;setTty(true);
+            } catch (\RuntimeException $e) {
+                $this-&gt;output-&gt;writeln(&#039;  &lt;bg=yellow;fg=black&gt; WARN &lt;/&gt; &#039;.$e-&gt;getMessage().PHP_EOL);
+            }
+        }
+
+        return $process-&gt;run(function ($type, $line) {
+            $this-&gt;output-&gt;write(&#039;    &#039;.$line);
+        });
+    }
+
+    /**
+     * Get the path to an existing Compose file or fall back to a default of `compose.yaml`.
+     *
+     * @return string
+     */
+    protected function composePath()
+    {
+        return collect($this-&gt;composePaths)
+            -&gt;map(fn ($path) =&gt; $this-&gt;laravel-&gt;basePath($path))
+            -&gt;first(fn ($path) =&gt; file_exists($path), $this-&gt;laravel-&gt;basePath(&#039;compose.yaml&#039;));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/sail/src/Console/InstallCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/sail/stubs -->
+
+</body>
+</html>

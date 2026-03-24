@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/Parser/S3Parser.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Aws\S3\Parser;
+
+use Aws\Api\ErrorParser\XmlErrorParser;
+use Aws\Api\Parser\AbstractParser;
+use Aws\Api\Parser\Exception\ParserException;
+use Aws\Api\Service;
+use Aws\Api\StructureShape;
+use Aws\CommandInterface;
+use Aws\Exception\AwsException;
+use Aws\ResultInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Custom S3 parser on top of the S3 protocol parser
+ * for handling specific S3 parsing scenarios.
+ *
+ * @internal
+ */
+final class S3Parser extends AbstractParser
+{
+     /** @var AbstractParser */
+    private $protocolParser;
+    /**  @var XmlErrorParser */
+    private $errorParser;
+    /** @var string */
+    private $exceptionClass;
+    /** @var array */
+    private $s3ResultMutators;
+
+    /**
+     * @param AbstractParser $protocolParser
+     * @param XmlErrorParser $errorParser
+     * @param Service $api
+     * @param string $exceptionClass
+     */
+    public function __construct(
+        AbstractParser $protocolParser,
+        XmlErrorParser $errorParser,
+        Service $api,
+        string $exceptionClass = AwsException::class
+    )
+    {
+        parent::__construct($api);
+        $this-&gt;protocolParser = $protocolParser;
+        $this-&gt;errorParser = $errorParser;
+        $this-&gt;exceptionClass = $exceptionClass;
+        $this-&gt;s3ResultMutators = [];
+    }
+
+    /**
+     * Parses a S3 response.
+     *
+     * @param CommandInterface $command The command that originated the request.
+     * @param ResponseInterface $response The response received from the service.
+     *
+     * @return ResultInterface|null
+     */
+    public function __invoke(
+        CommandInterface $command,
+        ResponseInterface $response
+    ):? ResultInterface
+    {
+        // Check first if the response is an error
+        $this-&gt;parse200Error($command, $response);
+
+        try {
+            $parseFn = $this-&gt;protocolParser;
+            $result = $parseFn($command, $response);
+        } catch (ParserException $e) {
+            // Parsing errors will be considered retryable.
+            throw new $this-&gt;exceptionClass(
+                &quot;Error parsing response for {$command-&gt;getName()}:&quot;
+                . &quot; AWS parsing error: {$e-&gt;getMessage()}&quot;,
+                $command,
+                [&#039;connection_error&#039; =&gt; true, &#039;exception&#039; =&gt; $e],
+                $e
+            );
+        }
+
+        return $this-&gt;executeS3ResultMutators($result, $command, $response);
+    }
+
+    /**
+     * Tries to parse a 200 response as an error from S3.
+     * If the parsed result contains a code and message then that means an error
+     * was found, and hence an exception is thrown with that error.
+     *
+     * @param CommandInterface $command
+     * @param ResponseInterface $response
+     *
+     * @return void
+     */
+    private function parse200Error(
+        CommandInterface $command,
+        ResponseInterface $response
+    ): void
+    {
+        // This error parsing should be just for 200 error responses
+        // and operations where its output shape does not have a streaming
+        // member and the body of the response is seekable.
+        if (200 !== $response-&gt;getStatusCode()
+            || !$this-&gt;shouldBeConsidered200Error($command-&gt;getName())
+            || !$response-&gt;getBody()-&gt;isSeekable()) {
+            return;
+        }
+
+        // To guarantee we try the error parsing just for an Error xml response.
+        if (!$this-&gt;isFirstRootElementError($response-&gt;getBody())) {
+            return;
+        }
+
+        try {
+            $errorParserFn = $this-&gt;errorParser;
+            $parsedError = $errorParserFn($response, $command);
+        } catch (ParserException $e) {
+            // Parsing errors will be considered retryable.
+            $parsedError = [
+                &#039;code&#039; =&gt; &#039;ConnectionError&#039;,
+                &#039;message&#039; =&gt; &quot;An error connecting to the service occurred&quot;
+                    . &quot; while performing the &quot; . $command-&gt;getName()
+                    . &quot; operation.&quot;
+            ];
+        }
+
+        if (isset($parsedError[&#039;code&#039;]) &amp;&amp; isset($parsedError[&#039;message&#039;])) {
+            throw new $this-&gt;exceptionClass(
+                $parsedError[&#039;message&#039;],
+                $command,
+                [
+                    &#039;connection_error&#039; =&gt; true,
+                    &#039;code&#039; =&gt; $parsedError[&#039;code&#039;],
+                    &#039;message&#039; =&gt; $parsedError[&#039;message&#039;]
+                ]
+            );
+        }
+    }
+
+    /**
+     * Checks if a specific operation should be considered
+     * a s3 200 error. Operations where any of its output members
+     * has a streaming or httpPayload trait should be not considered.
+     *
+     * @param $commandName
+     *
+     * @return bool
+     */
+    private function shouldBeConsidered200Error($commandName): bool
+    {
+        $operation = $this-&gt;api-&gt;getOperation($commandName);
+        $output = $operation-&gt;getOutput();
+        foreach ($output-&gt;getMembers() as $_ =&gt; $memberProps) {
+            if (!empty($memberProps[&#039;eventstream&#039;]) || !empty($memberProps[&#039;streaming&#039;])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Checks if the root element of the response body is &quot;Error&quot;, which is
+     * when we should try to parse an error from a 200 response from s3.
+     * It is recommended to make sure the stream given is seekable, otherwise
+     * the rewind call will cause a user warning.
+     *
+     * @param StreamInterface $responseBody
+     *
+     * @return bool
+     */
+    private function isFirstRootElementError(StreamInterface $responseBody): bool
+    {
+        static $pattern = &#039;/&lt;\?xml version=&quot;1\.0&quot; encoding=&quot;UTF-8&quot;\?&gt;\s*&lt;Error&gt;/&#039;;
+        // To avoid performance overhead in large streams
+        $reducedBodyContent = $responseBody-&gt;read(64);
+        $foundErrorElement = preg_match($pattern, $reducedBodyContent);
+        // A rewind is needed because the stream is partially or entirely consumed
+        // in the previous read operation.
+        $responseBody-&gt;rewind();
+
+        return $foundErrorElement;
+    }
+
+    /**
+     * Execute mutator implementations over a result.
+     * Mutators are logics that modifies a result.
+     *
+     * @param ResultInterface $result
+     * @param CommandInterface $command
+     * @param ResponseInterface $response
+     *
+     * @return ResultInterface
+     */
+    private function executeS3ResultMutators(
+        ResultInterface $result,
+        CommandInterface $command,
+        ResponseInterface $response
+    ): ResultInterface
+    {
+        foreach ($this-&gt;s3ResultMutators as $mutator) {
+            $result = $mutator($result, $command, $response);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Adds a mutator into the list of mutators.
+     *
+     * @param string $mutatorName
+     * @param S3ResultMutator $s3ResultMutator
+     * @return void
+     */
+    public function addS3ResultMutator(
+        string $mutatorName,
+        S3ResultMutator $s3ResultMutator
+    ): void
+    {
+        if (isset($this-&gt;s3ResultMutators[$mutatorName])) {
+            trigger_error(
+                &quot;The S3 Result Mutator {$mutatorName} already exists!&quot;,
+                E_USER_WARNING
+            );
+
+            return;
+        }
+
+        $this-&gt;s3ResultMutators[$mutatorName] = $s3ResultMutator;
+    }
+
+    /**
+     * Removes a mutator from the mutator list.
+     *
+     * @param string $mutatorName
+     * @return void
+     */
+    public function removeS3ResultMutator(string $mutatorName): void
+    {
+        if (!isset($this-&gt;s3ResultMutators[$mutatorName])) {
+            trigger_error(
+                &quot;The S3 Result Mutator {$mutatorName} does not exist!&quot;,
+                E_USER_WARNING
+            );
+
+            return;
+        }
+
+        unset($this-&gt;s3ResultMutators[$mutatorName]);
+    }
+
+    /**
+     * Returns the list of result mutators available.
+     *
+     * @return array
+     */
+    public function getS3ResultMutators(): array
+    {
+        return $this-&gt;s3ResultMutators;
+    }
+
+    public function parseMemberFromStream(
+        StreamInterface $stream,
+        StructureShape $member,
+        $response
+    )
+    {
+        return $this-&gt;protocolParser-&gt;parseMemberFromStream(
+            $stream,
+            $member,
+            $response
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/Parser/S3ResultMutator.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/RegionalEndpoint -->
+
+</body>
+</html>

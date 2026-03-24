@@ -1,0 +1,1106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/View/Compilers/BladeCompiler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\View\Compilers;
+
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Support\Htmlable;
+use Illuminate\Contracts\View\Factory as ViewFactory;
+use Illuminate\Contracts\View\View;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
+use Illuminate\Support\Stringable;
+use Illuminate\Support\Traits\ReflectsClosures;
+use Illuminate\View\Component;
+use InvalidArgumentException;
+use ParseError;
+
+class BladeCompiler extends Compiler implements CompilerInterface
+{
+    use Concerns\CompilesAuthorizations,
+        Concerns\CompilesClasses,
+        Concerns\CompilesComments,
+        Concerns\CompilesComponents,
+        Concerns\CompilesConditionals,
+        Concerns\CompilesContexts,
+        Concerns\CompilesEchos,
+        Concerns\CompilesErrors,
+        Concerns\CompilesFragments,
+        Concerns\CompilesHelpers,
+        Concerns\CompilesIncludes,
+        Concerns\CompilesInjections,
+        Concerns\CompilesJson,
+        Concerns\CompilesJs,
+        Concerns\CompilesLayouts,
+        Concerns\CompilesLoops,
+        Concerns\CompilesRawPhp,
+        Concerns\CompilesSessions,
+        Concerns\CompilesStacks,
+        Concerns\CompilesStyles,
+        Concerns\CompilesTranslations,
+        Concerns\CompilesUseStatements,
+        ReflectsClosures;
+
+    /**
+     * All of the registered extensions.
+     *
+     * @var array
+     */
+    protected $extensions = [];
+
+    /**
+     * All custom &quot;directive&quot; handlers.
+     *
+     * @var array
+     */
+    protected $customDirectives = [];
+
+    /**
+     * All custom &quot;condition&quot; handlers.
+     *
+     * @var array
+     */
+    protected $conditions = [];
+
+    /**
+     * The registered string preparation callbacks.
+     *
+     * @var array
+     */
+    protected $prepareStringsForCompilationUsing = [];
+
+    /**
+     * All of the registered precompilers.
+     *
+     * @var array
+     */
+    protected $precompilers = [];
+
+    /**
+     * The file currently being compiled.
+     *
+     * @var string
+     */
+    protected $path;
+
+    /**
+     * All of the available compiler functions.
+     *
+     * @var string[]
+     */
+    protected $compilers = [
+        // &#039;Comments&#039;,
+        &#039;Extensions&#039;,
+        &#039;Statements&#039;,
+        &#039;Echos&#039;,
+    ];
+
+    /**
+     * Array of opening and closing tags for raw echos.
+     *
+     * @var string[]
+     */
+    protected $rawTags = [&#039;{!!&#039;, &#039;!!}&#039;];
+
+    /**
+     * Array of opening and closing tags for regular echos.
+     *
+     * @var string[]
+     */
+    protected $contentTags = [&#039;{{&#039;, &#039;}}&#039;];
+
+    /**
+     * Array of opening and closing tags for escaped echos.
+     *
+     * @var string[]
+     */
+    protected $escapedTags = [&#039;{{{&#039;, &#039;}}}&#039;];
+
+    /**
+     * The &quot;regular&quot; / legacy echo string format.
+     *
+     * @var string
+     */
+    protected $echoFormat = &#039;e(%s)&#039;;
+
+    /**
+     * Array of footer lines to be added to the template.
+     *
+     * @var array
+     */
+    protected $footer = [];
+
+    /**
+     * Array to temporarily store the raw blocks found in the template.
+     *
+     * @var array
+     */
+    protected $rawBlocks = [];
+
+    /**
+     * The array of anonymous component paths to search for components in.
+     *
+     * @var array
+     */
+    protected $anonymousComponentPaths = [];
+
+    /**
+     * The array of anonymous component namespaces to autoload from.
+     *
+     * @var array
+     */
+    protected $anonymousComponentNamespaces = [];
+
+    /**
+     * The array of class component aliases and their class names.
+     *
+     * @var array
+     */
+    protected $classComponentAliases = [];
+
+    /**
+     * The array of class component namespaces to autoload from.
+     *
+     * @var array
+     */
+    protected $classComponentNamespaces = [];
+
+    /**
+     * Indicates if component tags should be compiled.
+     *
+     * @var bool
+     */
+    protected $compilesComponentTags = true;
+
+    /**
+     * Compile the view at the given path.
+     *
+     * @param  string|null  $path
+     * @return void
+     */
+    public function compile($path = null)
+    {
+        if ($path) {
+            $this-&gt;setPath($path);
+        }
+
+        if (! is_null($this-&gt;cachePath)) {
+            $contents = $this-&gt;compileString($this-&gt;files-&gt;get($this-&gt;getPath()));
+
+            if (! empty($this-&gt;getPath())) {
+                $contents = $this-&gt;appendFilePath($contents);
+            }
+
+            $this-&gt;ensureCompiledDirectoryExists(
+                $compiledPath = $this-&gt;getCompiledPath($this-&gt;getPath())
+            );
+
+            if (! $this-&gt;files-&gt;exists($compiledPath)) {
+                $this-&gt;files-&gt;replace($compiledPath, $contents);
+
+                return;
+            }
+
+            $compiledHash = $this-&gt;files-&gt;hash($compiledPath, &#039;xxh128&#039;);
+
+            if ($compiledHash !== hash(&#039;xxh128&#039;, $contents)) {
+                $this-&gt;files-&gt;replace($compiledPath, $contents);
+            }
+        }
+    }
+
+    /**
+     * Append the file path to the compiled string.
+     *
+     * @param  string  $contents
+     * @return string
+     */
+    protected function appendFilePath($contents)
+    {
+        $tokens = $this-&gt;getOpenAndClosingPhpTokens($contents);
+
+        if ($tokens-&gt;isNotEmpty() &amp;&amp; $tokens-&gt;last() !== T_CLOSE_TAG) {
+            $contents .= &#039; ?&gt;&#039;;
+        }
+
+        return $contents.&quot;&lt;?php /**PATH {$this-&gt;getPath()} ENDPATH**/ ?&gt;&quot;;
+    }
+
+    /**
+     * Get the open and closing PHP tag tokens from the given string.
+     *
+     * @param  string  $contents
+     * @return \Illuminate\Support\Collection
+     */
+    protected function getOpenAndClosingPhpTokens($contents)
+    {
+        $tokens = [];
+
+        foreach (token_get_all($contents) as $token) {
+            if ($token[0] === T_OPEN_TAG || $token[0] === T_OPEN_TAG_WITH_ECHO || $token[0] === T_CLOSE_TAG) {
+                $tokens[] = $token[0];
+            }
+        }
+
+        return new Collection($tokens);
+    }
+
+    /**
+     * Get the path currently being compiled.
+     *
+     * @return string
+     */
+    public function getPath()
+    {
+        return $this-&gt;path;
+    }
+
+    /**
+     * Set the path currently being compiled.
+     *
+     * @param  string  $path
+     * @return void
+     */
+    public function setPath($path)
+    {
+        $this-&gt;path = $path;
+    }
+
+    /**
+     * Compile the given Blade template contents.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    public function compileString($value)
+    {
+        [$this-&gt;footer, $result] = [[], &#039;&#039;];
+
+        foreach ($this-&gt;prepareStringsForCompilationUsing as $callback) {
+            $value = $callback($value);
+        }
+
+        $value = $this-&gt;storeUncompiledBlocks($value);
+
+        // First we will compile the Blade component tags. This is a precompile style
+        // step which compiles the component Blade tags into @component directives
+        // that may be used by Blade. Then we should call any other precompilers.
+        $value = $this-&gt;compileComponentTags(
+            $this-&gt;compileComments($value)
+        );
+
+        foreach ($this-&gt;precompilers as $precompiler) {
+            $value = $precompiler($value);
+        }
+
+        // Here we will loop through all of the tokens returned by the Zend lexer and
+        // parse each one into the corresponding valid PHP. We will then have this
+        // template as the correctly rendered PHP that can be rendered natively.
+        foreach (token_get_all($value) as $token) {
+            $result .= is_array($token) ? $this-&gt;parseToken($token) : $token;
+        }
+
+        if (! empty($this-&gt;rawBlocks)) {
+            $result = $this-&gt;restoreRawContent($result);
+        }
+
+        // If there are any footer lines that need to get added to a template we will
+        // add them here at the end of the template. This gets used mainly for the
+        // template inheritance via the extends keyword that should be appended.
+        if (count($this-&gt;footer) &gt; 0) {
+            $result = $this-&gt;addFooters($result);
+        }
+
+        if (! empty($this-&gt;echoHandlers)) {
+            $result = $this-&gt;addBladeCompilerVariable($result);
+        }
+
+        return str_replace(
+            [&#039;##BEGIN-COMPONENT-CLASS##&#039;, &#039;##END-COMPONENT-CLASS##&#039;],
+            &#039;&#039;,
+            $result);
+    }
+
+    /**
+     * Evaluate and render a Blade string to HTML.
+     *
+     * @param  string  $string
+     * @param  array  $data
+     * @param  bool  $deleteCachedView
+     * @return string
+     */
+    public static function render($string, $data = [], $deleteCachedView = false)
+    {
+        $component = new class($string) extends Component
+        {
+            protected $template;
+
+            public function __construct($template)
+            {
+                $this-&gt;template = $template;
+            }
+
+            public function render()
+            {
+                return $this-&gt;template;
+            }
+        };
+
+        $view = Container::getInstance()
+            -&gt;make(ViewFactory::class)
+            -&gt;make($component-&gt;resolveView(), $data);
+
+        return tap($view-&gt;render(), function () use ($view, $deleteCachedView) {
+            if ($deleteCachedView) {
+                @unlink($view-&gt;getPath());
+            }
+        });
+    }
+
+    /**
+     * Render a component instance to HTML.
+     *
+     * @param  \Illuminate\View\Component  $component
+     * @return string
+     */
+    public static function renderComponent(Component $component)
+    {
+        $data = $component-&gt;data();
+
+        $view = value($component-&gt;resolveView(), $data);
+
+        if ($view instanceof View) {
+            return $view-&gt;with($data)-&gt;render();
+        } elseif ($view instanceof Htmlable) {
+            return $view-&gt;toHtml();
+        } else {
+            return Container::getInstance()
+                -&gt;make(ViewFactory::class)
+                -&gt;make($view, $data)
+                -&gt;render();
+        }
+    }
+
+    /**
+     * Store the blocks that do not receive compilation.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function storeUncompiledBlocks($value)
+    {
+        if (str_contains($value, &#039;@verbatim&#039;)) {
+            $value = $this-&gt;storeVerbatimBlocks($value);
+        }
+
+        if (str_contains($value, &#039;@php&#039;)) {
+            $value = $this-&gt;storePhpBlocks($value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Store the verbatim blocks and replace them with a temporary placeholder.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function storeVerbatimBlocks($value)
+    {
+        return preg_replace_callback(&#039;/(?&lt;!@)@verbatim(\s*)(.*?)@endverbatim/s&#039;, function ($matches) {
+            return $matches[1].$this-&gt;storeRawBlock($matches[2]);
+        }, $value);
+    }
+
+    /**
+     * Store the PHP blocks and replace them with a temporary placeholder.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function storePhpBlocks($value)
+    {
+        return preg_replace_callback(&#039;/(?&lt;!@)@php(.*?)@endphp/s&#039;, function ($matches) {
+            return $this-&gt;storeRawBlock(&quot;&lt;?php{$matches[1]}?&gt;&quot;);
+        }, $value);
+    }
+
+    /**
+     * Store a raw block and return a unique raw placeholder.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function storeRawBlock($value)
+    {
+        return $this-&gt;getRawPlaceholder(
+            array_push($this-&gt;rawBlocks, $value) - 1
+        );
+    }
+
+    /**
+     * Compile the component tags.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function compileComponentTags($value)
+    {
+        if (! $this-&gt;compilesComponentTags) {
+            return $value;
+        }
+
+        return (new ComponentTagCompiler(
+            $this-&gt;classComponentAliases, $this-&gt;classComponentNamespaces, $this
+        ))-&gt;compile($value);
+    }
+
+    /**
+     * Replace the raw placeholders with the original code stored in the raw blocks.
+     *
+     * @param  string  $result
+     * @return string
+     */
+    protected function restoreRawContent($result)
+    {
+        $result = preg_replace_callback(&#039;/&#039;.$this-&gt;getRawPlaceholder(&#039;(\d+)&#039;).&#039;/&#039;, function ($matches) {
+            return $this-&gt;rawBlocks[$matches[1]];
+        }, $result);
+
+        $this-&gt;rawBlocks = [];
+
+        return $result;
+    }
+
+    /**
+     * Get a placeholder to temporarily mark the position of raw blocks.
+     *
+     * @param  int|string  $replace
+     * @return string
+     */
+    protected function getRawPlaceholder($replace)
+    {
+        return str_replace(&#039;#&#039;, $replace, &#039;@__raw_block_#__@&#039;);
+    }
+
+    /**
+     * Add the stored footers onto the given content.
+     *
+     * @param  string  $result
+     * @return string
+     */
+    protected function addFooters($result)
+    {
+        return ltrim($result, &quot;\n&quot;)
+                .&quot;\n&quot;.implode(&quot;\n&quot;, array_reverse($this-&gt;footer));
+    }
+
+    /**
+     * Parse the tokens from the template.
+     *
+     * @param  array  $token
+     * @return string
+     */
+    protected function parseToken($token)
+    {
+        [$id, $content] = $token;
+
+        if ($id == T_INLINE_HTML) {
+            foreach ($this-&gt;compilers as $type) {
+                $content = $this-&gt;{&quot;compile{$type}&quot;}($content);
+            }
+        }
+
+        return $content;
+    }
+
+    /**
+     * Execute the user defined extensions.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function compileExtensions($value)
+    {
+        foreach ($this-&gt;extensions as $compiler) {
+            $value = $compiler($value, $this);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Compile Blade statements that start with &quot;@&quot;.
+     *
+     * @param  string  $template
+     * @return string
+     */
+    protected function compileStatements($template)
+    {
+        preg_match_all(&#039;/\B@(@?\w+(?:::\w+)?)([ \t]*)(\( ( [\S\s]*? ) \))?/x&#039;, $template, $matches);
+
+        $offset = 0;
+
+        for ($i = 0; isset($matches[0][$i]); $i++) {
+            $match = [
+                $matches[0][$i],
+                $matches[1][$i],
+                $matches[2][$i],
+                $matches[3][$i] ?: null,
+                $matches[4][$i] ?: null,
+            ];
+
+            // Here we check to see if we have properly found the closing parenthesis by
+            // regex pattern or not, and will recursively continue on to the next &quot;)&quot;
+            // then check again until the tokenizer confirms we find the right one.
+            while (isset($match[4]) &amp;&amp;
+                   Str::endsWith($match[0], &#039;)&#039;) &amp;&amp;
+                   ! $this-&gt;hasEvenNumberOfParentheses($match[0])) {
+                if (($after = Str::after($template, $match[0])) === $template) {
+                    break;
+                }
+
+                $rest = Str::before($after, &#039;)&#039;);
+
+                if (isset($matches[0][$i + 1]) &amp;&amp; Str::contains($rest.&#039;)&#039;, $matches[0][$i + 1])) {
+                    unset($matches[0][$i + 1]);
+                    $i++;
+                }
+
+                $match[0] = $match[0].$rest.&#039;)&#039;;
+                $match[3] = $match[3].$rest.&#039;)&#039;;
+                $match[4] = $match[4].$rest;
+            }
+
+            [$template, $offset] = $this-&gt;replaceFirstStatement(
+                $match[0],
+                $this-&gt;compileStatement($match),
+                $template,
+                $offset
+            );
+        }
+
+        return $template;
+    }
+
+    /**
+     * Replace the first match for a statement compilation operation.
+     *
+     * @param  string  $search
+     * @param  string  $replace
+     * @param  string  $subject
+     * @param  int  $offset
+     * @return array
+     */
+    protected function replaceFirstStatement($search, $replace, $subject, $offset)
+    {
+        $search = (string) $search;
+
+        if ($search === &#039;&#039;) {
+            return $subject;
+        }
+
+        $position = strpos($subject, $search, $offset);
+
+        if ($position !== false) {
+            return [
+                substr_replace($subject, $replace, $position, strlen($search)),
+                $position + strlen($replace),
+            ];
+        }
+
+        return [$subject, 0];
+    }
+
+    /**
+     * Determine if the given expression has the same number of opening and closing parentheses.
+     *
+     * @param  string  $expression
+     * @return bool
+     */
+    protected function hasEvenNumberOfParentheses(string $expression)
+    {
+        try {
+            $tokens = token_get_all(&#039;&lt;?php &#039;.$expression);
+        } catch (ParseError) {
+            return false;
+        }
+
+        if (Arr::last($tokens) !== &#039;)&#039;) {
+            return false;
+        }
+
+        $opening = 0;
+        $closing = 0;
+
+        foreach ($tokens as $token) {
+            if ($token == &#039;)&#039;) {
+                $closing++;
+            } elseif ($token == &#039;(&#039;) {
+                $opening++;
+            }
+        }
+
+        return $opening === $closing;
+    }
+
+    /**
+     * Compile a single Blade @ statement.
+     *
+     * @param  array  $match
+     * @return string
+     */
+    protected function compileStatement($match)
+    {
+        if (str_contains($match[1], &#039;@&#039;)) {
+            $match[0] = isset($match[3]) ? $match[1].$match[3] : $match[1];
+        } elseif (isset($this-&gt;customDirectives[$match[1]])) {
+            $match[0] = $this-&gt;callCustomDirective($match[1], Arr::get($match, 3));
+        } elseif (method_exists($this, $method = &#039;compile&#039;.ucfirst($match[1]))) {
+            $match[0] = $this-&gt;$method(Arr::get($match, 3));
+        } else {
+            return $match[0];
+        }
+
+        return isset($match[3]) ? $match[0] : $match[0].$match[2];
+    }
+
+    /**
+     * Call the given directive with the given value.
+     *
+     * @param  string  $name
+     * @param  string|null  $value
+     * @return string
+     */
+    protected function callCustomDirective($name, $value)
+    {
+        $value ??= &#039;&#039;;
+
+        if (str_starts_with($value, &#039;(&#039;) &amp;&amp; str_ends_with($value, &#039;)&#039;)) {
+            $value = Str::substr($value, 1, -1);
+        }
+
+        return call_user_func($this-&gt;customDirectives[$name], trim($value));
+    }
+
+    /**
+     * Strip the parentheses from the given expression.
+     *
+     * @param  string  $expression
+     * @return string
+     */
+    public function stripParentheses($expression)
+    {
+        if (Str::startsWith($expression, &#039;(&#039;)) {
+            $expression = substr($expression, 1, -1);
+        }
+
+        return $expression;
+    }
+
+    /**
+     * Register a custom Blade compiler.
+     *
+     * @param  callable  $compiler
+     * @return void
+     */
+    public function extend(callable $compiler)
+    {
+        $this-&gt;extensions[] = $compiler;
+    }
+
+    /**
+     * Get the extensions used by the compiler.
+     *
+     * @return array
+     */
+    public function getExtensions()
+    {
+        return $this-&gt;extensions;
+    }
+
+    /**
+     * Register an &quot;if&quot; statement directive.
+     *
+     * @param  string  $name
+     * @param  callable  $callback
+     * @return void
+     */
+    public function if($name, callable $callback)
+    {
+        $this-&gt;conditions[$name] = $callback;
+
+        $this-&gt;directive($name, function ($expression) use ($name) {
+            return $expression !== &#039;&#039;
+                ? &quot;&lt;?php if (\Illuminate\Support\Facades\Blade::check(&#039;{$name}&#039;, {$expression})): ?&gt;&quot;
+                : &quot;&lt;?php if (\Illuminate\Support\Facades\Blade::check(&#039;{$name}&#039;)): ?&gt;&quot;;
+        });
+
+        $this-&gt;directive(&#039;unless&#039;.$name, function ($expression) use ($name) {
+            return $expression !== &#039;&#039;
+                ? &quot;&lt;?php if (! \Illuminate\Support\Facades\Blade::check(&#039;{$name}&#039;, {$expression})): ?&gt;&quot;
+                : &quot;&lt;?php if (! \Illuminate\Support\Facades\Blade::check(&#039;{$name}&#039;)): ?&gt;&quot;;
+        });
+
+        $this-&gt;directive(&#039;else&#039;.$name, function ($expression) use ($name) {
+            return $expression !== &#039;&#039;
+                ? &quot;&lt;?php elseif (\Illuminate\Support\Facades\Blade::check(&#039;{$name}&#039;, {$expression})): ?&gt;&quot;
+                : &quot;&lt;?php elseif (\Illuminate\Support\Facades\Blade::check(&#039;{$name}&#039;)): ?&gt;&quot;;
+        });
+
+        $this-&gt;directive(&#039;end&#039;.$name, function () {
+            return &#039;&lt;?php endif; ?&gt;&#039;;
+        });
+    }
+
+    /**
+     * Check the result of a condition.
+     *
+     * @param  string  $name
+     * @param  mixed  ...$parameters
+     * @return bool
+     */
+    public function check($name, ...$parameters)
+    {
+        return call_user_func($this-&gt;conditions[$name], ...$parameters);
+    }
+
+    /**
+     * Register a class-based component alias directive.
+     *
+     * @param  string  $class
+     * @param  string|null  $alias
+     * @param  string  $prefix
+     * @return void
+     */
+    public function component($class, $alias = null, $prefix = &#039;&#039;)
+    {
+        if (! is_null($alias) &amp;&amp; str_contains($alias, &#039;\\&#039;)) {
+            [$class, $alias] = [$alias, $class];
+        }
+
+        if (is_null($alias)) {
+            $alias = str_contains($class, &#039;\\View\\Components\\&#039;)
+                ? (new Collection(explode(&#039;\\&#039;, Str::after($class, &#039;\\View\\Components\\&#039;))))
+                    -&gt;map(fn ($segment) =&gt; Str::kebab($segment))
+                    -&gt;implode(&#039;:&#039;)
+                : Str::kebab(class_basename($class));
+        }
+
+        if (! empty($prefix)) {
+            $alias = $prefix.&#039;-&#039;.$alias;
+        }
+
+        $this-&gt;classComponentAliases[$alias] = $class;
+    }
+
+    /**
+     * Register an array of class-based components.
+     *
+     * @param  array  $components
+     * @param  string  $prefix
+     * @return void
+     */
+    public function components(array $components, $prefix = &#039;&#039;)
+    {
+        foreach ($components as $key =&gt; $value) {
+            if (is_numeric($key)) {
+                $this-&gt;component($value, null, $prefix);
+            } else {
+                $this-&gt;component($key, $value, $prefix);
+            }
+        }
+    }
+
+    /**
+     * Get the registered class component aliases.
+     *
+     * @return array
+     */
+    public function getClassComponentAliases()
+    {
+        return $this-&gt;classComponentAliases;
+    }
+
+    /**
+     * Register a new anonymous component path.
+     *
+     * @param  string  $path
+     * @param  string|null  $prefix
+     * @return void
+     */
+    public function anonymousComponentPath(string $path, ?string $prefix = null)
+    {
+        $prefixHash = hash(&#039;xxh128&#039;, $prefix ?: $path);
+
+        $this-&gt;anonymousComponentPaths[] = [
+            &#039;path&#039; =&gt; $path,
+            &#039;prefix&#039; =&gt; $prefix,
+            &#039;prefixHash&#039; =&gt; $prefixHash,
+        ];
+
+        Container::getInstance()
+            -&gt;make(ViewFactory::class)
+            -&gt;addNamespace($prefixHash, $path);
+    }
+
+    /**
+     * Register an anonymous component namespace.
+     *
+     * @param  string  $directory
+     * @param  string|null  $prefix
+     * @return void
+     */
+    public function anonymousComponentNamespace(string $directory, ?string $prefix = null)
+    {
+        $prefix ??= $directory;
+
+        $this-&gt;anonymousComponentNamespaces[$prefix] = (new Stringable($directory))
+            -&gt;replace(&#039;/&#039;, &#039;.&#039;)
+            -&gt;trim(&#039;. &#039;)
+            -&gt;toString();
+    }
+
+    /**
+     * Register a class-based component namespace.
+     *
+     * @param  string  $namespace
+     * @param  string  $prefix
+     * @return void
+     */
+    public function componentNamespace($namespace, $prefix)
+    {
+        $this-&gt;classComponentNamespaces[$prefix] = $namespace;
+    }
+
+    /**
+     * Get the registered anonymous component paths.
+     *
+     * @return array
+     */
+    public function getAnonymousComponentPaths()
+    {
+        return $this-&gt;anonymousComponentPaths;
+    }
+
+    /**
+     * Get the registered anonymous component namespaces.
+     *
+     * @return array
+     */
+    public function getAnonymousComponentNamespaces()
+    {
+        return $this-&gt;anonymousComponentNamespaces;
+    }
+
+    /**
+     * Get the registered class component namespaces.
+     *
+     * @return array
+     */
+    public function getClassComponentNamespaces()
+    {
+        return $this-&gt;classComponentNamespaces;
+    }
+
+    /**
+     * Register a component alias directive.
+     *
+     * @param  string  $path
+     * @param  string|null  $alias
+     * @return void
+     */
+    public function aliasComponent($path, $alias = null)
+    {
+        $alias = $alias ?: Arr::last(explode(&#039;.&#039;, $path));
+
+        $this-&gt;directive($alias, function ($expression) use ($path) {
+            return $expression
+                ? &quot;&lt;?php \$__env-&gt;startComponent(&#039;{$path}&#039;, {$expression}); ?&gt;&quot;
+                : &quot;&lt;?php \$__env-&gt;startComponent(&#039;{$path}&#039;); ?&gt;&quot;;
+        });
+
+        $this-&gt;directive(&#039;end&#039;.$alias, function ($expression) {
+            return &#039;&lt;?php echo $__env-&gt;renderComponent(); ?&gt;&#039;;
+        });
+    }
+
+    /**
+     * Register an include alias directive.
+     *
+     * @param  string  $path
+     * @param  string|null  $alias
+     * @return void
+     */
+    public function include($path, $alias = null)
+    {
+        $this-&gt;aliasInclude($path, $alias);
+    }
+
+    /**
+     * Register an include alias directive.
+     *
+     * @param  string  $path
+     * @param  string|null  $alias
+     * @return void
+     */
+    public function aliasInclude($path, $alias = null)
+    {
+        $alias = $alias ?: Arr::last(explode(&#039;.&#039;, $path));
+
+        $this-&gt;directive($alias, function ($expression) use ($path) {
+            $expression = $this-&gt;stripParentheses($expression) ?: &#039;[]&#039;;
+
+            return &quot;&lt;?php echo \$__env-&gt;make(&#039;{$path}&#039;, {$expression}, array_diff_key(get_defined_vars(), [&#039;__data&#039; =&gt; 1, &#039;__path&#039; =&gt; 1]))-&gt;render(); ?&gt;&quot;;
+        });
+    }
+
+    /**
+     * Register a handler for custom directives, binding the handler to the compiler.
+     *
+     * @param  string  $name
+     * @param  callable  $handler
+     * @return void
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function bindDirective($name, callable $handler)
+    {
+        $this-&gt;directive($name, $handler, bind: true);
+    }
+
+    /**
+     * Register a handler for custom directives.
+     *
+     * @param  string  $name
+     * @param  ($bind is true ? \Closure : callable)  $handler
+     * @param  bool  $bind
+     * @return void
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function directive($name, callable $handler, bool $bind = false)
+    {
+        if (! preg_match(&#039;/^\w+(?:::\w+)?$/x&#039;, $name)) {
+            throw new InvalidArgumentException(&quot;The directive name [{$name}] is not valid. Directive names must only contain alphanumeric characters and underscores.&quot;);
+        }
+
+        $this-&gt;customDirectives[$name] = $bind ? $handler-&gt;bindTo($this, BladeCompiler::class) : $handler;
+    }
+
+    /**
+     * Get the list of custom directives.
+     *
+     * @return array
+     */
+    public function getCustomDirectives()
+    {
+        return $this-&gt;customDirectives;
+    }
+
+    /**
+     * Indicate that the following callable should be used to prepare strings for compilation.
+     *
+     * @param  callable  $callback
+     * @return $this
+     */
+    public function prepareStringsForCompilationUsing(callable $callback)
+    {
+        $this-&gt;prepareStringsForCompilationUsing[] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Register a new precompiler.
+     *
+     * @param  callable  $precompiler
+     * @return void
+     */
+    public function precompiler(callable $precompiler)
+    {
+        $this-&gt;precompilers[] = $precompiler;
+    }
+
+    /**
+     * Execute the given callback using a custom echo format.
+     *
+     * @param  string  $format
+     * @param  callable  $callback
+     * @return string
+     */
+    public function usingEchoFormat($format, callable $callback)
+    {
+        $originalEchoFormat = $this-&gt;echoFormat;
+
+        $this-&gt;setEchoFormat($format);
+
+        try {
+            $output = call_user_func($callback);
+        } finally {
+            $this-&gt;setEchoFormat($originalEchoFormat);
+        }
+
+        return $output;
+    }
+
+    /**
+     * Set the echo format to be used by the compiler.
+     *
+     * @param  string  $format
+     * @return void
+     */
+    public function setEchoFormat($format)
+    {
+        $this-&gt;echoFormat = $format;
+    }
+
+    /**
+     * Set the &quot;echo&quot; format to double encode entities.
+     *
+     * @return void
+     */
+    public function withDoubleEncoding()
+    {
+        $this-&gt;setEchoFormat(&#039;e(%s, true)&#039;);
+    }
+
+    /**
+     * Set the &quot;echo&quot; format to not double encode entities.
+     *
+     * @return void
+     */
+    public function withoutDoubleEncoding()
+    {
+        $this-&gt;setEchoFormat(&#039;e(%s, false)&#039;);
+    }
+
+    /**
+     * Indicate that component tags should not be compiled.
+     *
+     * @return void
+     */
+    public function withoutComponentTags()
+    {
+        $this-&gt;compilesComponentTags = false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/View/Compilers/Compiler.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/View/Compilers/Concerns -->
+
+</body>
+</html>

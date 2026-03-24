@@ -1,0 +1,1324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/error-handler/DebugClassLoader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\ErrorHandler;
+
+use Composer\InstalledVersions;
+use Doctrine\Common\Persistence\Proxy as LegacyProxy;
+use Doctrine\Persistence\Proxy;
+use Mockery\MockInterface;
+use Phake\IMock;
+use PHPUnit\Framework\MockObject\Matcher\StatelessInvocation;
+use PHPUnit\Framework\MockObject\MockObject;
+use PHPUnit\Framework\MockObject\Stub;
+use Prophecy\Prophecy\ProphecySubjectInterface;
+use ProxyManager\Proxy\ProxyInterface;
+use Psr\Log\LogLevel;
+use Symfony\Component\DependencyInjection\Argument\LazyClosure;
+use Symfony\Component\ErrorHandler\Internal\TentativeTypes;
+use Symfony\Component\VarExporter\LazyObjectInterface;
+
+/**
+ * Autoloader checking if the class is really defined in the file found.
+ *
+ * The ClassLoader will wrap all registered autoloaders
+ * and will throw an exception if a file is found but does
+ * not declare the class.
+ *
+ * It can also patch classes to turn docblocks into actual return types.
+ * This behavior is controlled by the SYMFONY_PATCH_TYPE_DECLARATIONS env var,
+ * which is a url-encoded array with the follow parameters:
+ *  - &quot;force&quot;: any value enables deprecation notices - can be any of:
+ *      - &quot;phpdoc&quot; to patch only docblock annotations
+ *      - &quot;2&quot; to add all possible return types
+ *      - &quot;1&quot; to add return types but only to tests/final/internal/private methods
+ *  - &quot;php&quot;: the target version of PHP - e.g. &quot;7.1&quot; doesn&#039;t generate &quot;object&quot; types
+ *  - &quot;deprecations&quot;: &quot;1&quot; to trigger a deprecation notice when a child class misses a
+ *                    return type while the parent declares an &quot;@return&quot; annotation
+ *
+ * Note that patching doesn&#039;t care about any coding style so you&#039;d better to run
+ * php-cs-fixer after, with rules &quot;phpdoc_trim_consecutive_blank_line_separation&quot;
+ * and &quot;no_superfluous_phpdoc_tags&quot; enabled typically.
+ *
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ * @author Christophe Coevoet &lt;stof@notk.org&gt;
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ * @author Guilhem Niot &lt;guilhem.niot@gmail.com&gt;
+ */
+class DebugClassLoader
+{
+    private const SPECIAL_RETURN_TYPES = [
+        &#039;void&#039; =&gt; &#039;void&#039;,
+        &#039;null&#039; =&gt; &#039;null&#039;,
+        &#039;resource&#039; =&gt; &#039;resource&#039;,
+        &#039;boolean&#039; =&gt; &#039;bool&#039;,
+        &#039;true&#039; =&gt; &#039;true&#039;,
+        &#039;false&#039; =&gt; &#039;false&#039;,
+        &#039;integer&#039; =&gt; &#039;int&#039;,
+        &#039;array&#039; =&gt; &#039;array&#039;,
+        &#039;bool&#039; =&gt; &#039;bool&#039;,
+        &#039;callable&#039; =&gt; &#039;callable&#039;,
+        &#039;float&#039; =&gt; &#039;float&#039;,
+        &#039;int&#039; =&gt; &#039;int&#039;,
+        &#039;iterable&#039; =&gt; &#039;iterable&#039;,
+        &#039;object&#039; =&gt; &#039;object&#039;,
+        &#039;string&#039; =&gt; &#039;string&#039;,
+        &#039;non-empty-string&#039; =&gt; &#039;string&#039;,
+        &#039;self&#039; =&gt; &#039;self&#039;,
+        &#039;parent&#039; =&gt; &#039;parent&#039;,
+        &#039;mixed&#039; =&gt; &#039;mixed&#039;,
+        &#039;static&#039; =&gt; &#039;static&#039;,
+        &#039;$this&#039; =&gt; &#039;static&#039;,
+        &#039;list&#039; =&gt; &#039;array&#039;,
+        &#039;non-empty-list&#039; =&gt; &#039;array&#039;,
+        &#039;class-string&#039; =&gt; &#039;string&#039;,
+        &#039;never&#039; =&gt; &#039;never&#039;,
+    ];
+
+    private const BUILTIN_RETURN_TYPES = [
+        &#039;void&#039; =&gt; true,
+        &#039;array&#039; =&gt; true,
+        &#039;false&#039; =&gt; true,
+        &#039;bool&#039; =&gt; true,
+        &#039;callable&#039; =&gt; true,
+        &#039;float&#039; =&gt; true,
+        &#039;int&#039; =&gt; true,
+        &#039;iterable&#039; =&gt; true,
+        &#039;object&#039; =&gt; true,
+        &#039;string&#039; =&gt; true,
+        &#039;self&#039; =&gt; true,
+        &#039;parent&#039; =&gt; true,
+        &#039;mixed&#039; =&gt; true,
+        &#039;static&#039; =&gt; true,
+        &#039;null&#039; =&gt; true,
+        &#039;true&#039; =&gt; true,
+        &#039;never&#039; =&gt; true,
+    ];
+
+    private const MAGIC_METHODS = [
+        &#039;__isset&#039; =&gt; &#039;bool&#039;,
+        &#039;__sleep&#039; =&gt; &#039;array&#039;,
+        &#039;__toString&#039; =&gt; &#039;string&#039;,
+        &#039;__debugInfo&#039; =&gt; &#039;array&#039;,
+        &#039;__serialize&#039; =&gt; &#039;array&#039;,
+        &#039;__set&#039; =&gt; &#039;void&#039;,
+        &#039;__unset&#039; =&gt; &#039;void&#039;,
+        &#039;__unserialize&#039; =&gt; &#039;void&#039;,
+        &#039;__wakeup&#039; =&gt; &#039;void&#039;,
+    ];
+
+    /**
+     * @var callable
+     */
+    private $classLoader;
+    private bool $isFinder;
+    private array $loaded = [];
+    private array $patchTypes = [];
+
+    private static int $caseCheck;
+    private static array $checkedClasses = [];
+    private static array $final = [];
+    private static array $finalMethods = [];
+    private static array $finalProperties = [];
+    private static array $finalConstants = [];
+    private static array $deprecated = [];
+    private static array $internal = [];
+    private static array $internalMethods = [];
+    private static array $annotatedParameters = [];
+    private static array $darwinCache = [&#039;/&#039; =&gt; [&#039;/&#039;, []]];
+    private static array $method = [];
+    private static array $returnTypes = [];
+    private static array $methodTraits = [];
+    private static array $fileOffsets = [];
+
+    public function __construct(callable $classLoader)
+    {
+        $this-&gt;classLoader = $classLoader;
+        $this-&gt;isFinder = \is_array($classLoader) &amp;&amp; method_exists($classLoader[0], &#039;findFile&#039;);
+        parse_str($_ENV[&#039;SYMFONY_PATCH_TYPE_DECLARATIONS&#039;] ?? $_SERVER[&#039;SYMFONY_PATCH_TYPE_DECLARATIONS&#039;] ?? getenv(&#039;SYMFONY_PATCH_TYPE_DECLARATIONS&#039;) ?: &#039;&#039;, $this-&gt;patchTypes);
+        $this-&gt;patchTypes += [
+            &#039;force&#039; =&gt; null,
+            &#039;php&#039; =&gt; \PHP_MAJOR_VERSION.&#039;.&#039;.\PHP_MINOR_VERSION,
+            &#039;deprecations&#039; =&gt; true,
+        ];
+
+        if (&#039;phpdoc&#039; === $this-&gt;patchTypes[&#039;force&#039;]) {
+            $this-&gt;patchTypes[&#039;force&#039;] = &#039;docblock&#039;;
+        }
+
+        if (!isset(self::$caseCheck)) {
+            $file = is_file(__FILE__) ? __FILE__ : rtrim(realpath(&#039;.&#039;), \DIRECTORY_SEPARATOR);
+            $i = strrpos($file, \DIRECTORY_SEPARATOR);
+            $dir = substr($file, 0, 1 + $i);
+            $file = substr($file, 1 + $i);
+            $test = strtoupper($file) === $file ? strtolower($file) : strtoupper($file);
+            $test = realpath($dir.$test);
+
+            if (false === $test || false === $i) {
+                // filesystem is case-sensitive
+                self::$caseCheck = 0;
+            } elseif (str_ends_with($test, $file)) {
+                // filesystem is case-insensitive and realpath() normalizes the case of characters
+                self::$caseCheck = 1;
+            } elseif (&#039;Darwin&#039; === \PHP_OS_FAMILY) {
+                // on MacOSX, HFS+ is case-insensitive but realpath() doesn&#039;t normalize the case of characters
+                self::$caseCheck = 2;
+            } else {
+                // filesystem case checks failed, fallback to disabling them
+                self::$caseCheck = 0;
+            }
+        }
+    }
+
+    public function getClassLoader(): callable
+    {
+        return $this-&gt;classLoader;
+    }
+
+    /**
+     * Wraps all autoloaders.
+     */
+    public static function enable(): void
+    {
+        // Ensures we don&#039;t hit https://bugs.php.net/42098
+        class_exists(ErrorHandler::class);
+        class_exists(LogLevel::class);
+
+        if (!\is_array($functions = spl_autoload_functions())) {
+            return;
+        }
+
+        foreach ($functions as $function) {
+            spl_autoload_unregister($function);
+        }
+
+        foreach ($functions as $function) {
+            if (!\is_array($function) || !$function[0] instanceof self) {
+                $function = [new static($function), &#039;loadClass&#039;];
+            }
+
+            spl_autoload_register($function);
+        }
+    }
+
+    /**
+     * Disables the wrapping.
+     */
+    public static function disable(): void
+    {
+        if (!\is_array($functions = spl_autoload_functions())) {
+            return;
+        }
+
+        foreach ($functions as $function) {
+            spl_autoload_unregister($function);
+        }
+
+        foreach ($functions as $function) {
+            if (\is_array($function) &amp;&amp; $function[0] instanceof self) {
+                $function = $function[0]-&gt;getClassLoader();
+            }
+
+            spl_autoload_register($function);
+        }
+    }
+
+    public static function checkClasses(): bool
+    {
+        if (!\is_array($functions = spl_autoload_functions())) {
+            return false;
+        }
+
+        $loader = null;
+
+        foreach ($functions as $function) {
+            if (\is_array($function) &amp;&amp; $function[0] instanceof self) {
+                $loader = $function[0];
+                break;
+            }
+        }
+
+        if (null === $loader) {
+            return false;
+        }
+
+        static $offsets = [
+            &#039;get_declared_interfaces&#039; =&gt; 0,
+            &#039;get_declared_traits&#039; =&gt; 0,
+            &#039;get_declared_classes&#039; =&gt; 0,
+        ];
+
+        foreach ($offsets as $getSymbols =&gt; $i) {
+            $symbols = $getSymbols();
+
+            for (; $i &lt; \count($symbols); ++$i) {
+                if (!is_subclass_of($symbols[$i], MockObject::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], Stub::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], ProphecySubjectInterface::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], Proxy::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], ProxyInterface::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], LazyObjectInterface::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], LegacyProxy::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], MockInterface::class)
+                    &amp;&amp; !is_subclass_of($symbols[$i], IMock::class)
+                    &amp;&amp; !(is_subclass_of($symbols[$i], LazyClosure::class) &amp;&amp; str_contains($symbols[$i], &quot;@anonymous\0&quot;))
+                ) {
+                    $loader-&gt;checkClass($symbols[$i]);
+                }
+            }
+
+            $offsets[$getSymbols] = $i;
+        }
+
+        return true;
+    }
+
+    public function findFile(string $class): ?string
+    {
+        return $this-&gt;isFinder ? ($this-&gt;classLoader[0]-&gt;findFile($class) ?: null) : null;
+    }
+
+    /**
+     * Loads the given class or interface.
+     *
+     * @throws \RuntimeException
+     */
+    public function loadClass(string $class): void
+    {
+        $e = error_reporting(error_reporting() | \E_PARSE | \E_ERROR | \E_CORE_ERROR | \E_COMPILE_ERROR);
+
+        try {
+            if ($this-&gt;isFinder &amp;&amp; !isset($this-&gt;loaded[$class])) {
+                $this-&gt;loaded[$class] = true;
+                if (!$file = $this-&gt;classLoader[0]-&gt;findFile($class) ?: &#039;&#039;) {
+                    // no-op
+                } elseif (\function_exists(&#039;opcache_is_script_cached&#039;) &amp;&amp; @opcache_is_script_cached($file)) {
+                    include $file;
+
+                    return;
+                } elseif (false === include $file) {
+                    return;
+                }
+            } else {
+                ($this-&gt;classLoader)($class);
+                $file = &#039;&#039;;
+            }
+        } finally {
+            error_reporting($e);
+        }
+
+        $this-&gt;checkClass($class, $file);
+    }
+
+    private function checkClass(string $class, ?string $file = null): void
+    {
+        $exists = null === $file || class_exists($class, false) || interface_exists($class, false) || trait_exists($class, false);
+
+        if (null !== $file &amp;&amp; $class &amp;&amp; &#039;\\&#039; === $class[0]) {
+            $class = substr($class, 1);
+        }
+
+        if ($exists) {
+            if (isset(self::$checkedClasses[$class])) {
+                return;
+            }
+            self::$checkedClasses[$class] = true;
+
+            $refl = new \ReflectionClass($class);
+            if (null === $file &amp;&amp; $refl-&gt;isInternal()) {
+                return;
+            }
+            $name = $refl-&gt;getName();
+
+            if ($name !== $class &amp;&amp; 0 === strcasecmp($name, $class)) {
+                throw new \RuntimeException(\sprintf(&#039;Case mismatch between loaded and declared class names: &quot;%s&quot; vs &quot;%s&quot;.&#039;, $class, $name));
+            }
+
+            $deprecations = $this-&gt;checkAnnotations($refl, $name);
+
+            foreach ($deprecations as $message) {
+                @trigger_error($message, \E_USER_DEPRECATED);
+            }
+        }
+
+        if (!$file) {
+            return;
+        }
+
+        if (!$exists) {
+            if (str_contains($class, &#039;/&#039;)) {
+                throw new \RuntimeException(\sprintf(&#039;Trying to autoload a class with an invalid name &quot;%s&quot;. Be careful that the namespace separator is &quot;\&quot; in PHP, not &quot;/&quot;.&#039;, $class));
+            }
+
+            throw new \RuntimeException(\sprintf(&#039;The autoloader expected class &quot;%s&quot; to be defined in file &quot;%s&quot;. The file was found but the class was not in it, the class name or namespace probably has a typo.&#039;, $class, $file));
+        }
+
+        if (self::$caseCheck &amp;&amp; $message = $this-&gt;checkCase($refl, $file, $class)) {
+            throw new \RuntimeException(\sprintf(&#039;Case mismatch between class and real file names: &quot;%s&quot; vs &quot;%s&quot; in &quot;%s&quot;.&#039;, $message[0], $message[1], $message[2]));
+        }
+    }
+
+    public function checkAnnotations(\ReflectionClass $refl, string $class): array
+    {
+        if (
+            &#039;Symfony\Bridge\PhpUnit\Legacy\SymfonyTestsListenerForV7&#039; === $class
+            || &#039;Symfony\Bridge\PhpUnit\Legacy\SymfonyTestsListenerForV6&#039; === $class
+        ) {
+            return [];
+        }
+        $deprecations = [];
+
+        $className = str_contains($class, &quot;@anonymous\0&quot;) ? (get_parent_class($class) ?: key(class_implements($class)) ?: &#039;class&#039;).&#039;@anonymous&#039; : $class;
+
+        // Don&#039;t trigger deprecations for classes in the same vendor
+        if ($class !== $className) {
+            $vendor = $refl-&gt;getFileName() &amp;&amp; preg_match(&#039;/^namespace ([^;\\\\\s]++)[;\\\\]/m&#039;, @file_get_contents($refl-&gt;getFileName()) ?: &#039;&#039;, $vendor) ? $vendor[1].&#039;\\&#039; : &#039;&#039;;
+            $vendorLen = \strlen($vendor);
+        } elseif (2 &gt; $vendorLen = 1 + (strpos($class, &#039;\\&#039;) ?: strpos($class, &#039;_&#039;))) {
+            $vendorLen = 0;
+            $vendor = &#039;&#039;;
+        } else {
+            $vendor = str_replace(&#039;_&#039;, &#039;\\&#039;, substr($class, 0, $vendorLen));
+        }
+
+        $parent = get_parent_class($class) ?: null;
+        self::$returnTypes[$class] = [];
+        $classIsTemplate = false;
+
+        // Detect annotations on the class
+        if ($doc = $this-&gt;parsePhpDoc($refl)) {
+            $classIsTemplate = isset($doc[&#039;template&#039;]) || isset($doc[&#039;template-covariant&#039;]);
+
+            foreach ([&#039;final&#039;, &#039;deprecated&#039;, &#039;internal&#039;] as $annotation) {
+                if (null !== $description = $doc[$annotation][0] ?? null) {
+                    self::${$annotation}[$class] = &#039;&#039; !== $description ? &#039; &#039;.$description.(preg_match(&#039;/[.!]$/&#039;, $description) ? &#039;&#039; : &#039;.&#039;) : &#039;.&#039;;
+                }
+            }
+
+            if ($refl-&gt;isInterface() &amp;&amp; isset($doc[&#039;method&#039;])) {
+                foreach ($doc[&#039;method&#039;] as $name =&gt; [$static, $returnType, $signature, $description]) {
+                    self::$method[$class][] = [$class, $static, $returnType, $name.$signature, $description];
+
+                    if (&#039;&#039; !== $returnType) {
+                        $this-&gt;setReturnType($returnType, $refl-&gt;name, $name, $refl-&gt;getFileName(), $parent);
+                    }
+                }
+            }
+        }
+
+        $parentAndOwnInterfaces = $this-&gt;getOwnInterfaces($class, $parent);
+        if ($parent) {
+            $parentAndOwnInterfaces[$parent] = $parent;
+
+            if (!isset(self::$checkedClasses[$parent])) {
+                $this-&gt;checkClass($parent);
+            }
+
+            if (isset(self::$final[$parent])) {
+                $deprecations[] = \sprintf(&#039;The &quot;%s&quot; class is considered final%s It may change without further notice as of its next major version. You should not extend it from &quot;%s&quot;.&#039;, $parent, self::$final[$parent], $className);
+            }
+        }
+
+        // Detect if the parent is annotated
+        foreach ($parentAndOwnInterfaces + class_uses($class, false) as $use) {
+            if (!isset(self::$checkedClasses[$use])) {
+                $this-&gt;checkClass($use);
+            }
+            if (isset(self::$deprecated[$use]) &amp;&amp; strncmp($vendor, str_replace(&#039;_&#039;, &#039;\\&#039;, $use), $vendorLen) &amp;&amp; !isset(self::$deprecated[$class])) {
+                $type = class_exists($class, false) ? &#039;class&#039; : (interface_exists($class, false) ? &#039;interface&#039; : &#039;trait&#039;);
+                $verb = class_exists($use, false) || interface_exists($class, false) ? &#039;extends&#039; : (interface_exists($use, false) ? &#039;implements&#039; : &#039;uses&#039;);
+
+                $deprecations[] = \sprintf(&#039;The &quot;%s&quot; %s %s &quot;%s&quot; that is deprecated%s&#039;, $className, $type, $verb, $use, self::$deprecated[$use]);
+            }
+            if (isset(self::$internal[$use]) &amp;&amp; strncmp($vendor, str_replace(&#039;_&#039;, &#039;\\&#039;, $use), $vendorLen)) {
+                $deprecations[] = \sprintf(&#039;The &quot;%s&quot; %s is considered internal%s It may change without further notice. You should not use it from &quot;%s&quot;.&#039;, $use, class_exists($use, false) ? &#039;class&#039; : (interface_exists($use, false) ? &#039;interface&#039; : &#039;trait&#039;), self::$internal[$use], $className);
+            }
+            if (isset(self::$method[$use])) {
+                if ($refl-&gt;isAbstract()) {
+                    if (isset(self::$method[$class])) {
+                        self::$method[$class] = array_merge(self::$method[$class], self::$method[$use]);
+                    } else {
+                        self::$method[$class] = self::$method[$use];
+                    }
+                } elseif (!$refl-&gt;isInterface()) {
+                    if (!strncmp($vendor, str_replace(&#039;_&#039;, &#039;\\&#039;, $use), $vendorLen)
+                        &amp;&amp; str_starts_with($className, &#039;Symfony\\&#039;)
+                        &amp;&amp; (!class_exists(InstalledVersions::class)
+                            || &#039;symfony/symfony&#039; !== InstalledVersions::getRootPackage()[&#039;name&#039;])
+                    ) {
+                        // skip &quot;same vendor&quot; @method deprecations for Symfony\* classes unless symfony/symfony is being tested
+                        continue;
+                    }
+                    $hasCall = $refl-&gt;hasMethod(&#039;__call&#039;);
+                    $hasStaticCall = $refl-&gt;hasMethod(&#039;__callStatic&#039;);
+                    foreach (self::$method[$use] as [$interface, $static, $returnType, $name, $description]) {
+                        if ($static ? $hasStaticCall : $hasCall) {
+                            continue;
+                        }
+                        $realName = substr($name, 0, strpos($name, &#039;(&#039;));
+                        if (!$refl-&gt;hasMethod($realName) || !($methodRefl = $refl-&gt;getMethod($realName))-&gt;isPublic() || ($static &amp;&amp; !$methodRefl-&gt;isStatic()) || (!$static &amp;&amp; $methodRefl-&gt;isStatic())) {
+                            $deprecations[] = \sprintf(&#039;Class &quot;%s&quot; should implement method &quot;%s::%s%s&quot;%s&#039;, $className, ($static ? &#039;static &#039; : &#039;&#039;).$interface, $name, $returnType ? &#039;: &#039;.$returnType : &#039;&#039;, null === $description ? &#039;.&#039; : &#039;: &#039;.$description);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (trait_exists($class)) {
+            $file = $refl-&gt;getFileName();
+
+            foreach ($refl-&gt;getMethods() as $method) {
+                if ($method-&gt;getFileName() === $file) {
+                    self::$methodTraits[$file][$method-&gt;getStartLine()] = $class;
+                }
+            }
+
+            return $deprecations;
+        }
+
+        // Inherit @final, @internal, @param and @return annotations for methods
+        self::$finalMethods[$class] = [];
+        self::$internalMethods[$class] = [];
+        self::$annotatedParameters[$class] = [];
+        self::$finalProperties[$class] = [];
+        self::$finalConstants[$class] = [];
+        foreach ($parentAndOwnInterfaces as $use) {
+            foreach ([&#039;finalMethods&#039;, &#039;internalMethods&#039;, &#039;annotatedParameters&#039;, &#039;returnTypes&#039;, &#039;finalProperties&#039;, &#039;finalConstants&#039;] as $property) {
+                if (isset(self::${$property}[$use])) {
+                    self::${$property}[$class] = self::${$property}[$class] ? self::${$property}[$use] + self::${$property}[$class] : self::${$property}[$use];
+                }
+            }
+
+            if (null !== (TentativeTypes::RETURN_TYPES[$use] ?? null)) {
+                foreach (TentativeTypes::RETURN_TYPES[$use] as $method =&gt; $returnType) {
+                    $returnType = explode(&#039;|&#039;, $returnType);
+                    foreach ($returnType as $i =&gt; $t) {
+                        if (&#039;?&#039; !== $t &amp;&amp; !isset(self::BUILTIN_RETURN_TYPES[$t])) {
+                            $returnType[$i] = &#039;\\&#039;.$t;
+                        }
+                    }
+                    $returnType = implode(&#039;|&#039;, $returnType);
+
+                    self::$returnTypes[$class] += [$method =&gt; [$returnType, str_starts_with($returnType, &#039;?&#039;) ? substr($returnType, 1).&#039;|null&#039; : $returnType, $use, &#039;&#039;]];
+                }
+            }
+        }
+
+        foreach ($refl-&gt;getMethods() as $method) {
+            if ($method-&gt;class !== $class) {
+                continue;
+            }
+
+            if (null === $ns = self::$methodTraits[$method-&gt;getFileName()][$method-&gt;getStartLine()] ?? null) {
+                $ns = $vendor;
+                $len = $vendorLen;
+            } elseif (2 &gt; $len = 1 + (strpos($ns, &#039;\\&#039;) ?: strpos($ns, &#039;_&#039;))) {
+                $len = 0;
+                $ns = &#039;&#039;;
+            } else {
+                $ns = str_replace(&#039;_&#039;, &#039;\\&#039;, substr($ns, 0, $len));
+            }
+
+            if ($parent &amp;&amp; isset(self::$finalMethods[$parent][$method-&gt;name])) {
+                [$declaringClass, $message] = self::$finalMethods[$parent][$method-&gt;name];
+                $deprecations[] = \sprintf(&#039;The &quot;%s::%s()&quot; method is considered final%s It may change without further notice as of its next major version. You should not extend it from &quot;%s&quot;.&#039;, $declaringClass, $method-&gt;name, $message, $className);
+            }
+
+            if (isset(self::$internalMethods[$class][$method-&gt;name])) {
+                [$declaringClass, $message] = self::$internalMethods[$class][$method-&gt;name];
+                if (strncmp($ns, $declaringClass, $len)) {
+                    $deprecations[] = \sprintf(&#039;The &quot;%s::%s()&quot; method is considered internal%s It may change without further notice. You should not extend it from &quot;%s&quot;.&#039;, $declaringClass, $method-&gt;name, $message, $className);
+                }
+            }
+
+            // To read method annotations
+            $doc = $this-&gt;parsePhpDoc($method);
+
+            if (($classIsTemplate || isset($doc[&#039;template&#039;]) || isset($doc[&#039;template-covariant&#039;])) &amp;&amp; $method-&gt;hasReturnType()) {
+                unset($doc[&#039;return&#039;]);
+            }
+
+            if (isset(self::$annotatedParameters[$class][$method-&gt;name])) {
+                $definedParameters = [];
+                foreach ($method-&gt;getParameters() as $parameter) {
+                    $definedParameters[$parameter-&gt;name] = true;
+                }
+
+                foreach (self::$annotatedParameters[$class][$method-&gt;name] as $parameterName =&gt; $deprecation) {
+                    if (!isset($definedParameters[$parameterName]) &amp;&amp; !isset($doc[&#039;param&#039;][$parameterName])) {
+                        $deprecations[] = \sprintf($deprecation, $className);
+                    }
+                }
+            }
+
+            $forcePatchTypes = $this-&gt;patchTypes[&#039;force&#039;];
+
+            if ($canAddReturnType = null !== $forcePatchTypes &amp;&amp; !str_contains($method-&gt;getFileName(), \DIRECTORY_SEPARATOR.&#039;vendor&#039;.\DIRECTORY_SEPARATOR)) {
+                $this-&gt;patchTypes[&#039;force&#039;] = $forcePatchTypes ?: &#039;docblock&#039;;
+
+                $canAddReturnType = 2 === (int) $forcePatchTypes
+                    || false !== stripos($method-&gt;getFileName(), \DIRECTORY_SEPARATOR.&#039;Tests&#039;.\DIRECTORY_SEPARATOR)
+                    || $refl-&gt;isFinal()
+                    || $method-&gt;isFinal()
+                    || $method-&gt;isPrivate()
+                    || (&#039;.&#039; === (self::$internal[$class] ?? null) &amp;&amp; !$refl-&gt;isAbstract())
+                    || &#039;.&#039; === (self::$final[$class] ?? null)
+                    || &#039;&#039; === ($doc[&#039;final&#039;][0] ?? null)
+                    || &#039;&#039; === ($doc[&#039;internal&#039;][0] ?? null)
+                ;
+            }
+
+            if (null !== ($returnType = self::$returnTypes[$class][$method-&gt;name] ?? null) &amp;&amp; &#039;docblock&#039; === $this-&gt;patchTypes[&#039;force&#039;] &amp;&amp; !$method-&gt;hasReturnType() &amp;&amp; isset(TentativeTypes::RETURN_TYPES[$returnType[2]][$method-&gt;name])) {
+                $this-&gt;patchReturnTypeWillChange($method);
+            }
+
+            if (null !== ($returnType ??= self::MAGIC_METHODS[$method-&gt;name] ?? null) &amp;&amp; !$method-&gt;hasReturnType() &amp;&amp; !isset($doc[&#039;return&#039;])) {
+                [$normalizedType, $returnType, $declaringClass, $declaringFile] = \is_string($returnType) ? [$returnType, $returnType, &#039;&#039;, &#039;&#039;] : $returnType;
+
+                if ($canAddReturnType &amp;&amp; &#039;docblock&#039; !== $this-&gt;patchTypes[&#039;force&#039;]) {
+                    $this-&gt;patchMethod($method, $returnType, $declaringFile, $normalizedType);
+                }
+                if (!isset($doc[&#039;deprecated&#039;]) &amp;&amp; strncmp($ns, $declaringClass, $len)) {
+                    if (&#039;docblock&#039; === $this-&gt;patchTypes[&#039;force&#039;]) {
+                        $this-&gt;patchMethod($method, $returnType, $declaringFile, $normalizedType);
+                    } elseif (&#039;&#039; !== $declaringClass &amp;&amp; $this-&gt;patchTypes[&#039;deprecations&#039;]) {
+                        $deprecations[] = \sprintf(&#039;Method &quot;%s::%s()&quot; might add &quot;%s&quot; as a native return type declaration in the future. Do the same in %s &quot;%s&quot; now to avoid errors or add an explicit @return annotation to suppress this message.&#039;, $declaringClass, $method-&gt;name, $normalizedType, interface_exists($declaringClass) ? &#039;implementation&#039; : &#039;child class&#039;, $className);
+                    }
+                }
+            }
+
+            if (!$doc) {
+                $this-&gt;patchTypes[&#039;force&#039;] = $forcePatchTypes;
+
+                continue;
+            }
+
+            if (isset($doc[&#039;return&#039;])) {
+                $this-&gt;setReturnType($doc[&#039;return&#039;] ?? self::MAGIC_METHODS[$method-&gt;name], $method-&gt;class, $method-&gt;name, $method-&gt;getFileName(), $parent, $method-&gt;getReturnType());
+
+                if (isset(self::$returnTypes[$class][$method-&gt;name][0]) &amp;&amp; $canAddReturnType) {
+                    $this-&gt;fixReturnStatements($method, self::$returnTypes[$class][$method-&gt;name][0]);
+                }
+
+                if ($method-&gt;isPrivate()) {
+                    unset(self::$returnTypes[$class][$method-&gt;name]);
+                }
+            }
+
+            $this-&gt;patchTypes[&#039;force&#039;] = $forcePatchTypes;
+
+            if ($method-&gt;isPrivate()) {
+                continue;
+            }
+
+            $finalOrInternal = false;
+
+            foreach ([&#039;final&#039;, &#039;internal&#039;] as $annotation) {
+                if (null !== $description = $doc[$annotation][0] ?? null) {
+                    self::${$annotation.&#039;Methods&#039;}[$class][$method-&gt;name] = [$class, &#039;&#039; !== $description ? &#039; &#039;.$description.(preg_match(&#039;/[[:punct:]]$/&#039;, $description) ? &#039;&#039; : &#039;.&#039;) : &#039;.&#039;];
+                    $finalOrInternal = true;
+                }
+            }
+
+            if ($finalOrInternal || $method-&gt;isConstructor() || !isset($doc[&#039;param&#039;]) || StatelessInvocation::class === $class) {
+                continue;
+            }
+            if (!isset(self::$annotatedParameters[$class][$method-&gt;name])) {
+                $definedParameters = [];
+                foreach ($method-&gt;getParameters() as $parameter) {
+                    $definedParameters[$parameter-&gt;name] = true;
+                }
+            }
+            foreach ($doc[&#039;param&#039;] as $parameterName =&gt; $parameterType) {
+                if (!isset($definedParameters[$parameterName])) {
+                    self::$annotatedParameters[$class][$method-&gt;name][$parameterName] = \sprintf(&#039;The &quot;%%s::%s()&quot; method will require a new &quot;%s$%s&quot; argument in the next major version of its %s &quot;%s&quot;, not defining it is deprecated.&#039;, $method-&gt;name, $parameterType ? $parameterType.&#039; &#039; : &#039;&#039;, $parameterName, interface_exists($className) ? &#039;interface&#039; : &#039;parent class&#039;, $className);
+                }
+            }
+        }
+
+        $finals = isset(self::$final[$class]) || $refl-&gt;isFinal() ? [] : [
+            &#039;finalConstants&#039; =&gt; $refl-&gt;getReflectionConstants(\ReflectionClassConstant::IS_PUBLIC | \ReflectionClassConstant::IS_PROTECTED),
+            &#039;finalProperties&#039; =&gt; $refl-&gt;getProperties(\ReflectionProperty::IS_PUBLIC | \ReflectionProperty::IS_PROTECTED),
+        ];
+        foreach ($finals as $type =&gt; $reflectors) {
+            foreach ($reflectors as $r) {
+                if ($r-&gt;class !== $class) {
+                    continue;
+                }
+
+                $doc = $this-&gt;parsePhpDoc($r);
+
+                foreach ($parentAndOwnInterfaces as $use) {
+                    if (isset(self::${$type}[$use][$r-&gt;name]) &amp;&amp; !isset($doc[&#039;deprecated&#039;]) &amp;&amp; (&#039;finalConstants&#039; === $type || substr($use, 0, strrpos($use, &#039;\\&#039;)) !== substr($use, 0, strrpos($class, &#039;\\&#039;)))) {
+                        $msg = &#039;finalConstants&#039; === $type ? &#039;%s&quot; constant&#039; : &#039;$%s&quot; property&#039;;
+                        $deprecations[] = \sprintf(&#039;The &quot;%s::&#039;.$msg.&#039; is considered final. You should not override it in &quot;%s&quot;.&#039;, self::${$type}[$use][$r-&gt;name], $r-&gt;name, $class);
+                    }
+                }
+
+                if (isset($doc[&#039;final&#039;]) || (&#039;finalProperties&#039; === $type &amp;&amp; str_starts_with($class, &#039;Symfony\\&#039;) &amp;&amp; !$r-&gt;hasType())) {
+                    self::${$type}[$class][$r-&gt;name] = $class;
+                }
+            }
+        }
+
+        return $deprecations;
+    }
+
+    public function checkCase(\ReflectionClass $refl, string $file, string $class): ?array
+    {
+        $real = explode(&#039;\\&#039;, $class.strrchr($file, &#039;.&#039;));
+        $tail = explode(\DIRECTORY_SEPARATOR, str_replace(&#039;/&#039;, \DIRECTORY_SEPARATOR, $file));
+
+        $i = \count($tail) - 1;
+        $j = \count($real) - 1;
+
+        while (isset($tail[$i], $real[$j]) &amp;&amp; $tail[$i] === $real[$j]) {
+            --$i;
+            --$j;
+        }
+
+        array_splice($tail, 0, $i + 1);
+
+        if (!$tail) {
+            return null;
+        }
+
+        $tail = \DIRECTORY_SEPARATOR.implode(\DIRECTORY_SEPARATOR, $tail);
+        $tailLen = \strlen($tail);
+        $real = $refl-&gt;getFileName();
+
+        if (2 === self::$caseCheck) {
+            $real = $this-&gt;darwinRealpath($real);
+        }
+
+        if (0 === substr_compare($real, $tail, -$tailLen, $tailLen, true)
+            &amp;&amp; 0 !== substr_compare($real, $tail, -$tailLen, $tailLen, false)
+        ) {
+            return [substr($tail, -$tailLen + 1), substr($real, -$tailLen + 1), substr($real, 0, -$tailLen + 1)];
+        }
+
+        return null;
+    }
+
+    /**
+     * `realpath` on MacOSX doesn&#039;t normalize the case of characters.
+     */
+    private function darwinRealpath(string $real): string
+    {
+        $i = 1 + strrpos($real, &#039;/&#039;);
+        $file = substr($real, $i);
+        $real = substr($real, 0, $i);
+
+        if (isset(self::$darwinCache[$real])) {
+            $kDir = $real;
+        } else {
+            $kDir = strtolower($real);
+
+            if (isset(self::$darwinCache[$kDir])) {
+                $real = self::$darwinCache[$kDir][0];
+            } else {
+                $dir = getcwd();
+
+                if (!@chdir($real)) {
+                    return $real.$file;
+                }
+
+                $real = getcwd().&#039;/&#039;;
+                chdir($dir);
+
+                $dir = $real;
+                $k = $kDir;
+                $i = \strlen($dir) - 1;
+                while (!isset(self::$darwinCache[$k])) {
+                    self::$darwinCache[$k] = [$dir, []];
+                    self::$darwinCache[$dir] = &amp;self::$darwinCache[$k];
+
+                    while (&#039;/&#039; !== $dir[--$i]) {
+                    }
+                    $k = substr($k, 0, ++$i);
+                    $dir = substr($dir, 0, $i--);
+                }
+            }
+        }
+
+        $dirFiles = self::$darwinCache[$kDir][1];
+
+        if (!isset($dirFiles[$file]) &amp;&amp; str_ends_with($file, &#039;) : eval()\&#039;d code&#039;)) {
+            // Get the file name from &quot;file_name.php(123) : eval()&#039;d code&quot;
+            $file = substr($file, 0, strrpos($file, &#039;(&#039;, -17));
+        }
+
+        if (isset($dirFiles[$file])) {
+            return $real.$dirFiles[$file];
+        }
+
+        $kFile = strtolower($file);
+
+        if (!isset($dirFiles[$kFile])) {
+            foreach (scandir($real, 2) as $f) {
+                if (&#039;.&#039; !== $f[0]) {
+                    $dirFiles[$f] = $f;
+                    if ($f === $file) {
+                        $kFile = $file;
+                    } elseif ($f !== $k = strtolower($f)) {
+                        $dirFiles[$k] = $f;
+                    }
+                }
+            }
+            self::$darwinCache[$kDir][1] = $dirFiles;
+        }
+
+        return $real.$dirFiles[$kFile];
+    }
+
+    /**
+     * `class_implements` includes interfaces from the parents so we have to manually exclude them.
+     *
+     * @return string[]
+     */
+    private function getOwnInterfaces(string $class, ?string $parent): array
+    {
+        $ownInterfaces = class_implements($class, false);
+
+        if ($parent) {
+            foreach (class_implements($parent, false) as $interface) {
+                unset($ownInterfaces[$interface]);
+            }
+        }
+
+        foreach ($ownInterfaces as $interface) {
+            foreach (class_implements($interface) as $interface) {
+                unset($ownInterfaces[$interface]);
+            }
+        }
+
+        return $ownInterfaces;
+    }
+
+    private function setReturnType(string $types, string $class, string $method, string $filename, ?string $parent, ?\ReflectionType $returnType = null): void
+    {
+        if (&#039;__construct&#039; === $method) {
+            return;
+        }
+
+        if (&#039;null&#039; === $types) {
+            self::$returnTypes[$class][$method] = [&#039;null&#039;, &#039;null&#039;, $class, $filename];
+
+            return;
+        }
+
+        if ($nullable = str_starts_with($types, &#039;null|&#039;)) {
+            $types = substr($types, 5);
+        } elseif ($nullable = str_ends_with($types, &#039;|null&#039;)) {
+            $types = substr($types, 0, -5);
+        }
+        $arrayType = [&#039;array&#039; =&gt; &#039;array&#039;];
+        $typesMap = [];
+        $glue = str_contains($types, &#039;&amp;&#039;) ? &#039;&amp;&#039; : &#039;|&#039;;
+        foreach (explode($glue, $types) as $t) {
+            $t = self::SPECIAL_RETURN_TYPES[strtolower($t)] ?? $t;
+            $typesMap[$this-&gt;normalizeType($t, $class, $parent, $returnType)][$t] = $t;
+        }
+
+        if (isset($typesMap[&#039;array&#039;])) {
+            if (isset($typesMap[&#039;Traversable&#039;]) || isset($typesMap[&#039;\Traversable&#039;])) {
+                $typesMap[&#039;iterable&#039;] = $arrayType !== $typesMap[&#039;array&#039;] ? $typesMap[&#039;array&#039;] : [&#039;iterable&#039;];
+                unset($typesMap[&#039;array&#039;], $typesMap[&#039;Traversable&#039;], $typesMap[&#039;\Traversable&#039;]);
+            } elseif ($arrayType !== $typesMap[&#039;array&#039;] &amp;&amp; isset(self::$returnTypes[$class][$method]) &amp;&amp; !$returnType) {
+                return;
+            }
+        }
+
+        if (isset($typesMap[&#039;array&#039;]) &amp;&amp; isset($typesMap[&#039;iterable&#039;])) {
+            if ($arrayType !== $typesMap[&#039;array&#039;]) {
+                $typesMap[&#039;iterable&#039;] = $typesMap[&#039;array&#039;];
+            }
+            unset($typesMap[&#039;array&#039;]);
+        }
+
+        $iterable = $object = true;
+        foreach ($typesMap as $n =&gt; $t) {
+            if (&#039;null&#039; !== $n) {
+                $iterable = $iterable &amp;&amp; (\in_array($n, [&#039;array&#039;, &#039;iterable&#039;], true) || str_contains($n, &#039;Iterator&#039;));
+                $object = $object &amp;&amp; (\in_array($n, [&#039;callable&#039;, &#039;object&#039;, &#039;$this&#039;, &#039;static&#039;], true) || !isset(self::SPECIAL_RETURN_TYPES[$n]));
+            }
+        }
+
+        $phpTypes = [];
+        $docTypes = [];
+
+        foreach ($typesMap as $n =&gt; $t) {
+            if (str_contains($n, &#039;::&#039;)) {
+                [$definingClass, $constantName] = explode(&#039;::&#039;, $n, 2);
+                $definingClass = match ($definingClass) {
+                    &#039;self&#039;, &#039;static&#039;, &#039;parent&#039; =&gt; $class,
+                    default =&gt; $definingClass,
+                };
+
+                if (!\defined($definingClass.&#039;::&#039;.$constantName)) {
+                    return;
+                }
+
+                $constant = new \ReflectionClassConstant($definingClass, $constantName);
+
+                if (\PHP_VERSION_ID &gt;= 80300 &amp;&amp; $constantType = $constant-&gt;getType()) {
+                    if ($constantType instanceof \ReflectionNamedType) {
+                        $n = $constantType-&gt;getName();
+                    } else {
+                        return;
+                    }
+                } else {
+                    $n = \gettype($constant-&gt;getValue());
+                }
+            }
+
+            if (&#039;null&#039; === $n) {
+                $nullable = true;
+                continue;
+            }
+
+            $docTypes[] = $t;
+
+            if (&#039;mixed&#039; === $n || &#039;void&#039; === $n) {
+                $nullable = false;
+                $phpTypes = [&#039;&#039; =&gt; $n];
+                continue;
+            }
+
+            if (&#039;resource&#039; === $n) {
+                // there is no native type for &quot;resource&quot;
+                return;
+            }
+
+            if (!preg_match(&#039;/^(?:\\\\?[a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]*)+$/&#039;, $n)) {
+                // exclude any invalid PHP class name (e.g. `Cookie::SAMESITE_*`)
+                continue;
+            }
+
+            if (!isset($phpTypes[&#039;&#039;]) &amp;&amp; !\in_array($n, $phpTypes, true)) {
+                $phpTypes[] = $n;
+            }
+        }
+        $docTypes = array_merge([], ...$docTypes);
+
+        if (!$phpTypes) {
+            return;
+        }
+
+        if (1 &lt; \count($phpTypes)) {
+            if ($iterable &amp;&amp; &#039;8.0&#039; &gt; $this-&gt;patchTypes[&#039;php&#039;]) {
+                $phpTypes = $docTypes = [&#039;iterable&#039;];
+            } elseif ($object &amp;&amp; &#039;object&#039; === $this-&gt;patchTypes[&#039;force&#039;]) {
+                $phpTypes = $docTypes = [&#039;object&#039;];
+            } elseif (&#039;8.0&#039; &gt; $this-&gt;patchTypes[&#039;php&#039;]) {
+                // ignore multi-types return declarations
+                return;
+            }
+        }
+
+        $phpType = \sprintf($nullable ? (1 &lt; \count($phpTypes) ? &#039;%s|null&#039; : &#039;?%s&#039;) : &#039;%s&#039;, implode($glue, $phpTypes));
+        $docType = \sprintf($nullable ? &#039;%s|null&#039; : &#039;%s&#039;, implode($glue, $docTypes));
+
+        self::$returnTypes[$class][$method] = [$phpType, $docType, $class, $filename];
+    }
+
+    private function normalizeType(string $type, string $class, ?string $parent, ?\ReflectionType $returnType): string
+    {
+        if (isset(self::SPECIAL_RETURN_TYPES[$lcType = strtolower($type)])) {
+            if (&#039;parent&#039; === $lcType = self::SPECIAL_RETURN_TYPES[$lcType]) {
+                $lcType = null !== $parent ? &#039;\\&#039;.$parent : &#039;parent&#039;;
+            } elseif (&#039;self&#039; === $lcType) {
+                $lcType = &#039;\\&#039;.$class;
+            }
+
+            return $lcType;
+        }
+
+        // We could resolve &quot;use&quot; statements to return the FQDN
+        // but this would be too expensive for a runtime checker
+
+        if (!str_ends_with($type, &#039;[]&#039;)) {
+            return $type;
+        }
+
+        if ($returnType instanceof \ReflectionNamedType) {
+            $type = $returnType-&gt;getName();
+
+            if (&#039;mixed&#039; !== $type) {
+                return isset(self::SPECIAL_RETURN_TYPES[$type]) ? $type : &#039;\\&#039;.$type;
+            }
+        }
+
+        return &#039;array&#039;;
+    }
+
+    /**
+     * Utility method to add #[ReturnTypeWillChange] where php triggers deprecations.
+     */
+    private function patchReturnTypeWillChange(\ReflectionMethod $method): void
+    {
+        if (\count($method-&gt;getAttributes(\ReturnTypeWillChange::class))) {
+            return;
+        }
+
+        if (!is_file($file = $method-&gt;getFileName())) {
+            return;
+        }
+
+        $fileOffset = self::$fileOffsets[$file] ?? 0;
+
+        $code = file($file);
+
+        $startLine = $method-&gt;getStartLine() + $fileOffset - 2;
+
+        if (false !== stripos($code[$startLine], &#039;ReturnTypeWillChange&#039;)) {
+            return;
+        }
+
+        $code[$startLine] .= &quot;    #[\\ReturnTypeWillChange]\n&quot;;
+        self::$fileOffsets[$file] = 1 + $fileOffset;
+        file_put_contents($file, $code);
+    }
+
+    /**
+     * Utility method to add @return annotations to the Symfony code-base where it triggers self-deprecations.
+     */
+    private function patchMethod(\ReflectionMethod $method, string $returnType, string $declaringFile, string $normalizedType): void
+    {
+        static $patchedMethods = [];
+        static $useStatements = [];
+
+        if (!is_file($file = $method-&gt;getFileName()) || isset($patchedMethods[$file][$startLine = $method-&gt;getStartLine()])) {
+            return;
+        }
+
+        $patchedMethods[$file][$startLine] = true;
+        $fileOffset = self::$fileOffsets[$file] ?? 0;
+        $startLine += $fileOffset - 2;
+        if ($nullable = str_ends_with($returnType, &#039;|null&#039;)) {
+            $returnType = substr($returnType, 0, -5);
+        }
+        $glue = str_contains($returnType, &#039;&amp;&#039;) ? &#039;&amp;&#039; : &#039;|&#039;;
+        $returnType = explode($glue, $returnType);
+        $code = file($file);
+
+        foreach ($returnType as $i =&gt; $type) {
+            if (preg_match(&#039;/((?:\[\])+)$/&#039;, $type, $m)) {
+                $type = substr($type, 0, -\strlen($m[1]));
+                $format = &#039;%s&#039;.$m[1];
+            } else {
+                $format = null;
+            }
+
+            if (isset(self::SPECIAL_RETURN_TYPES[$type]) || (&#039;\\&#039; === $type[0] &amp;&amp; !$p = strrpos($type, &#039;\\&#039;, 1))) {
+                continue;
+            }
+
+            [$namespace, $useOffset, $useMap] = $useStatements[$file] ??= self::getUseStatements($file);
+
+            if (&#039;\\&#039; !== $type[0]) {
+                [$declaringNamespace, , $declaringUseMap] = $useStatements[$declaringFile] ??= self::getUseStatements($declaringFile);
+
+                $p = strpos($type, &#039;\\&#039;, 1);
+                $alias = $p ? substr($type, 0, $p) : $type;
+
+                if (isset($declaringUseMap[$alias])) {
+                    $type = &#039;\\&#039;.$declaringUseMap[$alias].($p ? substr($type, $p) : &#039;&#039;);
+                } else {
+                    $type = &#039;\\&#039;.$declaringNamespace.$type;
+                }
+
+                $p = strrpos($type, &#039;\\&#039;, 1);
+            }
+
+            $alias = substr($type, 1 + $p);
+            $type = substr($type, 1);
+
+            if (!isset($useMap[$alias]) &amp;&amp; (class_exists($c = $namespace.$alias) || interface_exists($c) || trait_exists($c))) {
+                $useMap[$alias] = $c;
+            }
+
+            if (!isset($useMap[$alias])) {
+                $useStatements[$file][2][$alias] = $type;
+                $code[$useOffset] = &quot;use $type;\n&quot;.$code[$useOffset];
+                ++$fileOffset;
+            } elseif ($useMap[$alias] !== $type) {
+                $alias .= &#039;FIXME&#039;;
+                $useStatements[$file][2][$alias] = $type;
+                $code[$useOffset] = &quot;use $type as $alias;\n&quot;.$code[$useOffset];
+                ++$fileOffset;
+            }
+
+            $returnType[$i] = null !== $format ? \sprintf($format, $alias) : $alias;
+        }
+
+        if (&#039;docblock&#039; === $this-&gt;patchTypes[&#039;force&#039;] || (&#039;object&#039; === $normalizedType &amp;&amp; &#039;7.1&#039; === $this-&gt;patchTypes[&#039;php&#039;])) {
+            $returnType = implode($glue, $returnType).($nullable ? &#039;|null&#039; : &#039;&#039;);
+
+            if (str_contains($code[$startLine], &#039;#[&#039;)) {
+                --$startLine;
+            }
+
+            if ($method-&gt;getDocComment()) {
+                $code[$startLine] = &quot;     * @return $returnType\n&quot;.$code[$startLine];
+            } else {
+                $code[$startLine] .= &lt;&lt;&lt;EOTXT
+                        /**
+                         * @return $returnType
+                         */
+
+                    EOTXT;
+            }
+
+            $fileOffset += substr_count($code[$startLine], &quot;\n&quot;) - 1;
+        }
+
+        self::$fileOffsets[$file] = $fileOffset;
+        file_put_contents($file, $code);
+
+        $this-&gt;fixReturnStatements($method, $normalizedType);
+    }
+
+    private static function getUseStatements(string $file): array
+    {
+        $namespace = &#039;&#039;;
+        $useMap = [];
+        $useOffset = 0;
+
+        if (!is_file($file)) {
+            return [$namespace, $useOffset, $useMap];
+        }
+
+        $file = file($file);
+
+        for ($i = 0; $i &lt; \count($file); ++$i) {
+            if (preg_match(&#039;/^(class|interface|trait|abstract) /&#039;, $file[$i])) {
+                break;
+            }
+
+            if (str_starts_with($file[$i], &#039;namespace &#039;)) {
+                $namespace = substr($file[$i], \strlen(&#039;namespace &#039;), -2).&#039;\\&#039;;
+                $useOffset = $i + 2;
+            }
+
+            if (str_starts_with($file[$i], &#039;use &#039;)) {
+                $useOffset = $i;
+
+                for (; str_starts_with($file[$i], &#039;use &#039;); ++$i) {
+                    $u = explode(&#039; as &#039;, substr($file[$i], 4, -2), 2);
+
+                    if (1 === \count($u)) {
+                        $p = strrpos($u[0], &#039;\\&#039;);
+                        $useMap[substr($u[0], false !== $p ? 1 + $p : 0)] = $u[0];
+                    } else {
+                        $useMap[$u[1]] = $u[0];
+                    }
+                }
+
+                break;
+            }
+        }
+
+        return [$namespace, $useOffset, $useMap];
+    }
+
+    private function fixReturnStatements(\ReflectionMethod $method, string $returnType): void
+    {
+        if (&#039;docblock&#039; !== $this-&gt;patchTypes[&#039;force&#039;]) {
+            if (&#039;7.1&#039; === $this-&gt;patchTypes[&#039;php&#039;] &amp;&amp; &#039;object&#039; === ltrim($returnType, &#039;?&#039;)) {
+                return;
+            }
+
+            if (&#039;7.4&#039; &gt; $this-&gt;patchTypes[&#039;php&#039;] &amp;&amp; $method-&gt;hasReturnType()) {
+                return;
+            }
+
+            if (&#039;8.0&#039; &gt; $this-&gt;patchTypes[&#039;php&#039;] &amp;&amp; (str_contains($returnType, &#039;|&#039;) || \in_array($returnType, [&#039;mixed&#039;, &#039;static&#039;], true))) {
+                return;
+            }
+
+            if (&#039;8.1&#039; &gt; $this-&gt;patchTypes[&#039;php&#039;] &amp;&amp; str_contains($returnType, &#039;&amp;&#039;)) {
+                return;
+            }
+        }
+
+        if (!is_file($file = $method-&gt;getFileName())) {
+            return;
+        }
+
+        $fixedCode = $code = file($file);
+        $i = (self::$fileOffsets[$file] ?? 0) + $method-&gt;getStartLine();
+
+        if (&#039;?&#039; !== $returnType &amp;&amp; &#039;docblock&#039; !== $this-&gt;patchTypes[&#039;force&#039;]) {
+            $fixedCode[$i - 1] = preg_replace(&#039;/\)(?::[^;\n]++)?(;?\n)/&#039;, &quot;): $returnType\\1&quot;, $code[$i - 1]);
+        }
+
+        $end = $method-&gt;isGenerator() ? $i : $method-&gt;getEndLine();
+        $inClosure = false;
+        $braces = 0;
+        for (; $i &lt; $end; ++$i) {
+            if (!$inClosure) {
+                $inClosure = str_contains($code[$i], &#039;function (&#039;);
+            }
+
+            if ($inClosure) {
+                $braces += substr_count($code[$i], &#039;{&#039;) - substr_count($code[$i], &#039;}&#039;);
+                $inClosure = $braces &gt; 0;
+
+                continue;
+            }
+
+            if (&#039;void&#039; === $returnType) {
+                $fixedCode[$i] = str_replace(&#039;    return null;&#039;, &#039;    return;&#039;, $code[$i]);
+            } elseif (&#039;mixed&#039; === $returnType || &#039;?&#039; === $returnType[0]) {
+                $fixedCode[$i] = str_replace(&#039;    return;&#039;, &#039;    return null;&#039;, $code[$i]);
+            } else {
+                $fixedCode[$i] = str_replace(&#039;    return;&#039;, &quot;    return $returnType!?;&quot;, $code[$i]);
+            }
+        }
+
+        if ($fixedCode !== $code) {
+            file_put_contents($file, $fixedCode);
+        }
+    }
+
+    /**
+     * @param \ReflectionClass|\ReflectionMethod|\ReflectionProperty $reflector
+     */
+    private function parsePhpDoc(\Reflector $reflector): array
+    {
+        if (!$doc = $reflector-&gt;getDocComment()) {
+            return [];
+        }
+
+        $tagName = &#039;&#039;;
+        $tagContent = &#039;&#039;;
+
+        $tags = [];
+
+        foreach (explode(&quot;\n&quot;, substr($doc, 3, -2)) as $line) {
+            $line = ltrim($line);
+            $line = ltrim($line, &#039;*&#039;);
+
+            if (&#039;&#039; === $line = trim($line)) {
+                if (&#039;&#039; !== $tagName) {
+                    $tags[$tagName][] = $tagContent;
+                }
+                $tagName = $tagContent = &#039;&#039;;
+                continue;
+            }
+
+            if (&#039;@&#039; === $line[0]) {
+                if (&#039;&#039; !== $tagName) {
+                    $tags[$tagName][] = $tagContent;
+                    $tagContent = &#039;&#039;;
+                }
+
+                if (preg_match(&#039;{^@([-a-zA-Z0-9_:]++)(\s|$)}&#039;, $line, $m)) {
+                    $tagName = $m[1];
+                    $tagContent = str_replace(&quot;\t&quot;, &#039; &#039;, ltrim(substr($line, 2 + \strlen($tagName))));
+                } else {
+                    $tagName = &#039;&#039;;
+                }
+            } elseif (&#039;&#039; !== $tagName) {
+                $tagContent .= &#039; &#039;.str_replace(&quot;\t&quot;, &#039; &#039;, $line);
+            }
+        }
+
+        if (&#039;&#039; !== $tagName) {
+            $tags[$tagName][] = $tagContent;
+        }
+
+        foreach ($tags[&#039;method&#039;] ?? [] as $i =&gt; $method) {
+            unset($tags[&#039;method&#039;][$i]);
+
+            $parts = preg_split(&#039;{(\s++|\((?:[^()]*+|(?R))*\)(?: *: *[^ ]++)?|&lt;(?:[^&lt;&gt;]*+|(?R))*&gt;|\{(?:[^{}]*+|(?R))*\})}&#039;, $method, -1, \PREG_SPLIT_DELIM_CAPTURE);
+            $returnType = &#039;&#039;;
+            $static = &#039;static&#039; === $parts[0];
+
+            for ($i = $static ? 2 : 0; null !== $p = $parts[$i] ?? null; $i += 2) {
+                if (\in_array($p, [&#039;&#039;, &#039;callable&#039;], true) || \in_array(substr($returnType, -1), [&#039;|&#039;, &#039;&amp;&#039;], true) || \in_array($p[0], [&#039;|&#039;, &#039;&amp;&#039;], true)) {
+                    $returnType .= trim($parts[$i - 1] ?? &#039;&#039;).$p;
+                    continue;
+                }
+
+                $signature = &#039;(&#039; === ($parts[$i + 1][0] ?? &#039;(&#039;) ? $parts[$i + 1] ?? &#039;()&#039; : null;
+
+                if (null === $signature &amp;&amp; &#039;&#039; === $returnType) {
+                    $returnType = $p;
+                    continue;
+                }
+
+                if ($static &amp;&amp; 2 === $i) {
+                    $static = false;
+                    $returnType = &#039;static&#039;;
+                }
+
+                if (\in_array($description = trim(implode(&#039;&#039;, \array_slice($parts, 2 + $i))), [&#039;&#039;, &#039;.&#039;], true)) {
+                    $description = null;
+                } elseif (!preg_match(&#039;/[.!]$/&#039;, $description)) {
+                    $description .= &#039;.&#039;;
+                }
+
+                $tags[&#039;method&#039;][$p] = [$static, $returnType, $signature ?? &#039;()&#039;, $description];
+                break;
+            }
+        }
+
+        foreach ($tags[&#039;param&#039;] ?? [] as $i =&gt; $param) {
+            unset($tags[&#039;param&#039;][$i]);
+
+            if (\strlen($param) !== strcspn($param, &#039;&lt;{(&#039;)) {
+                $param = preg_replace(&#039;{\(([^()]*+|(?R))*\)(?: *: *[^ ]++)?|&lt;([^&lt;&gt;]*+|(?R))*&gt;|\{([^{}]*+|(?R))*\}}&#039;, &#039;&#039;, $param);
+            }
+
+            if (false === $i = strpos($param, &#039;$&#039;)) {
+                continue;
+            }
+
+            $type = 0 === $i ? &#039;&#039; : rtrim(substr($param, 0, $i), &#039; &amp;&#039;);
+            $param = substr($param, 1 + $i, (strpos($param, &#039; &#039;, $i) ?: (1 + $i + \strlen($param))) - $i - 1);
+
+            $tags[&#039;param&#039;][$param] = $type;
+        }
+
+        foreach ([&#039;var&#039;, &#039;return&#039;] as $k) {
+            if (null === $v = $tags[$k][0] ?? null) {
+                continue;
+            }
+            if (\strlen($v) !== strcspn($v, &#039;&lt;{(&#039;)) {
+                $v = preg_replace(&#039;{\(([^()]*+|(?R))*\)(?: *: *[^ ]++)?|&lt;([^&lt;&gt;]*+|(?R))*&gt;|\{([^{}]*+|(?R))*\}}&#039;, &#039;&#039;, $v);
+            }
+
+            $tags[$k] = substr($v, 0, strpos($v, &#039; &#039;) ?: \strlen($v)) ?: null;
+        }
+
+        return $tags;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/error-handler/Error/ClassNotFoundError.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/error-handler/Command -->
+
+</body>
+</html>

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/monolog/monolog/src/Monolog/ErrorHandler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+
+/*
+ * This file is part of the Monolog package.
+ *
+ * (c) Jordi Boggiano &lt;j.boggiano@seld.be&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Monolog;
+
+use Closure;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
+
+/**
+ * Monolog error handler
+ *
+ * A facility to enable logging of runtime errors, exceptions and fatal errors.
+ *
+ * Quick setup: &lt;code&gt;ErrorHandler::register($logger);&lt;/code&gt;
+ *
+ * @author Jordi Boggiano &lt;j.boggiano@seld.be&gt;
+ */
+class ErrorHandler
+{
+    private Closure|null $previousExceptionHandler = null;
+
+    /** @var array&lt;class-string, LogLevel::*&gt; an array of class name to LogLevel::* constant mapping */
+    private array $uncaughtExceptionLevelMap = [];
+
+    /** @var Closure|true|null */
+    private Closure|bool|null $previousErrorHandler = null;
+
+    /** @var array&lt;int, LogLevel::*&gt; an array of E_* constant to LogLevel::* constant mapping */
+    private array $errorLevelMap = [];
+
+    private bool $handleOnlyReportedErrors = true;
+
+    private bool $hasFatalErrorHandler = false;
+
+    private string $fatalLevel = LogLevel::ALERT;
+
+    private string|null $reservedMemory = null;
+
+    /** @var ?array{type: int, message: string, file: string, line: int, trace: mixed} */
+    private array|null $lastFatalData = null;
+
+    private const FATAL_ERRORS = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR];
+
+    public function __construct(
+        private LoggerInterface $logger
+    ) {
+    }
+
+    /**
+     * Registers a new ErrorHandler for a given Logger
+     *
+     * By default it will handle errors, exceptions and fatal errors
+     *
+     * @param  array&lt;int, LogLevel::*&gt;|false          $errorLevelMap     an array of E_* constant to LogLevel::* constant mapping, or false to disable error handling
+     * @param  array&lt;class-string, LogLevel::*&gt;|false $exceptionLevelMap an array of class name to LogLevel::* constant mapping, or false to disable exception handling
+     * @param  LogLevel::*|null|false                 $fatalLevel        a LogLevel::* constant, null to use the default LogLevel::ALERT or false to disable fatal error handling
+     * @return static
+     */
+    public static function register(LoggerInterface $logger, $errorLevelMap = [], $exceptionLevelMap = [], $fatalLevel = null): self
+    {
+        /** @phpstan-ignore-next-line */
+        $handler = new static($logger);
+        if ($errorLevelMap !== false) {
+            $handler-&gt;registerErrorHandler($errorLevelMap);
+        }
+        if ($exceptionLevelMap !== false) {
+            $handler-&gt;registerExceptionHandler($exceptionLevelMap);
+        }
+        if ($fatalLevel !== false) {
+            $handler-&gt;registerFatalHandler($fatalLevel);
+        }
+
+        return $handler;
+    }
+
+    /**
+     * @param  array&lt;class-string, LogLevel::*&gt; $levelMap an array of class name to LogLevel::* constant mapping
+     * @return $this
+     */
+    public function registerExceptionHandler(array $levelMap = [], bool $callPrevious = true): self
+    {
+        $prev = set_exception_handler(function (\Throwable $e): void {
+            $this-&gt;handleException($e);
+        });
+        $this-&gt;uncaughtExceptionLevelMap = $levelMap;
+        foreach ($this-&gt;defaultExceptionLevelMap() as $class =&gt; $level) {
+            if (!isset($this-&gt;uncaughtExceptionLevelMap[$class])) {
+                $this-&gt;uncaughtExceptionLevelMap[$class] = $level;
+            }
+        }
+        if ($callPrevious &amp;&amp; null !== $prev) {
+            $this-&gt;previousExceptionHandler = $prev(...);
+        }
+
+        return $this;
+    }
+
+    /**
+     * @param  array&lt;int, LogLevel::*&gt; $levelMap an array of E_* constant to LogLevel::* constant mapping
+     * @return $this
+     */
+    public function registerErrorHandler(array $levelMap = [], bool $callPrevious = true, int $errorTypes = -1, bool $handleOnlyReportedErrors = true): self
+    {
+        $prev = set_error_handler($this-&gt;handleError(...), $errorTypes);
+        $this-&gt;errorLevelMap = array_replace($this-&gt;defaultErrorLevelMap(), $levelMap);
+        if ($callPrevious) {
+            $this-&gt;previousErrorHandler = $prev !== null ? $prev(...) : true;
+        } else {
+            $this-&gt;previousErrorHandler = null;
+        }
+
+        $this-&gt;handleOnlyReportedErrors = $handleOnlyReportedErrors;
+
+        return $this;
+    }
+
+    /**
+     * @param  LogLevel::*|null $level              a LogLevel::* constant, null to use the default LogLevel::ALERT
+     * @param  int              $reservedMemorySize Amount of KBs to reserve in memory so that it can be freed when handling fatal errors giving Monolog some room in memory to get its job done
+     * @return $this
+     */
+    public function registerFatalHandler($level = null, int $reservedMemorySize = 20): self
+    {
+        register_shutdown_function($this-&gt;handleFatalError(...));
+
+        $this-&gt;reservedMemory = str_repeat(&#039; &#039;, 1024 * $reservedMemorySize);
+        $this-&gt;fatalLevel = null === $level ? LogLevel::ALERT : $level;
+        $this-&gt;hasFatalErrorHandler = true;
+
+        return $this;
+    }
+
+    /**
+     * @return array&lt;class-string, LogLevel::*&gt;
+     */
+    protected function defaultExceptionLevelMap(): array
+    {
+        return [
+            &#039;ParseError&#039; =&gt; LogLevel::CRITICAL,
+            &#039;Throwable&#039; =&gt; LogLevel::ERROR,
+        ];
+    }
+
+    /**
+     * @return array&lt;int, LogLevel::*&gt;
+     */
+    protected function defaultErrorLevelMap(): array
+    {
+        return [
+            E_ERROR             =&gt; LogLevel::CRITICAL,
+            E_WARNING           =&gt; LogLevel::WARNING,
+            E_PARSE             =&gt; LogLevel::ALERT,
+            E_NOTICE            =&gt; LogLevel::NOTICE,
+            E_CORE_ERROR        =&gt; LogLevel::CRITICAL,
+            E_CORE_WARNING      =&gt; LogLevel::WARNING,
+            E_COMPILE_ERROR     =&gt; LogLevel::ALERT,
+            E_COMPILE_WARNING   =&gt; LogLevel::WARNING,
+            E_USER_ERROR        =&gt; LogLevel::ERROR,
+            E_USER_WARNING      =&gt; LogLevel::WARNING,
+            E_USER_NOTICE       =&gt; LogLevel::NOTICE,
+            2048                =&gt; LogLevel::NOTICE, // E_STRICT
+            E_RECOVERABLE_ERROR =&gt; LogLevel::ERROR,
+            E_DEPRECATED        =&gt; LogLevel::NOTICE,
+            E_USER_DEPRECATED   =&gt; LogLevel::NOTICE,
+        ];
+    }
+
+    private function handleException(\Throwable $e): never
+    {
+        $level = LogLevel::ERROR;
+        foreach ($this-&gt;uncaughtExceptionLevelMap as $class =&gt; $candidate) {
+            if ($e instanceof $class) {
+                $level = $candidate;
+                break;
+            }
+        }
+
+        $this-&gt;logger-&gt;log(
+            $level,
+            sprintf(&#039;Uncaught Exception %s: &quot;%s&quot; at %s line %s&#039;, Utils::getClass($e), $e-&gt;getMessage(), $e-&gt;getFile(), $e-&gt;getLine()),
+            [&#039;exception&#039; =&gt; $e]
+        );
+
+        if (null !== $this-&gt;previousExceptionHandler) {
+            ($this-&gt;previousExceptionHandler)($e);
+        }
+
+        if (!headers_sent() &amp;&amp; \in_array(strtolower((string) \ini_get(&#039;display_errors&#039;)), [&#039;0&#039;, &#039;&#039;, &#039;false&#039;, &#039;off&#039;, &#039;none&#039;, &#039;no&#039;], true)) {
+            http_response_code(500);
+        }
+
+        exit(255);
+    }
+
+    private function handleError(int $code, string $message, string $file = &#039;&#039;, int $line = 0): bool
+    {
+        if ($this-&gt;handleOnlyReportedErrors &amp;&amp; 0 === (error_reporting() &amp; $code)) {
+            return false;
+        }
+
+        // fatal error codes are ignored if a fatal error handler is present as well to avoid duplicate log entries
+        if (!$this-&gt;hasFatalErrorHandler || !\in_array($code, self::FATAL_ERRORS, true)) {
+            $level = $this-&gt;errorLevelMap[$code] ?? LogLevel::CRITICAL;
+            $this-&gt;logger-&gt;log($level, self::codeToString($code).&#039;: &#039;.$message, [&#039;code&#039; =&gt; $code, &#039;message&#039; =&gt; $message, &#039;file&#039; =&gt; $file, &#039;line&#039; =&gt; $line]);
+        } else {
+            $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+            array_shift($trace); // Exclude handleError from trace
+            $this-&gt;lastFatalData = [&#039;type&#039; =&gt; $code, &#039;message&#039; =&gt; $message, &#039;file&#039; =&gt; $file, &#039;line&#039; =&gt; $line, &#039;trace&#039; =&gt; $trace];
+        }
+
+        if ($this-&gt;previousErrorHandler === true) {
+            return false;
+        }
+        if ($this-&gt;previousErrorHandler instanceof Closure) {
+            return (bool) ($this-&gt;previousErrorHandler)($code, $message, $file, $line);
+        }
+
+        return true;
+    }
+
+    /**
+     * @private
+     */
+    public function handleFatalError(): void
+    {
+        $this-&gt;reservedMemory = &#039;&#039;;
+
+        if (\is_array($this-&gt;lastFatalData)) {
+            $lastError = $this-&gt;lastFatalData;
+        } else {
+            $lastError = error_get_last();
+        }
+        if (\is_array($lastError) &amp;&amp; \in_array($lastError[&#039;type&#039;], self::FATAL_ERRORS, true)) {
+            $trace = $lastError[&#039;trace&#039;] ?? null;
+            $this-&gt;logger-&gt;log(
+                $this-&gt;fatalLevel,
+                &#039;Fatal Error (&#039;.self::codeToString($lastError[&#039;type&#039;]).&#039;): &#039;.$lastError[&#039;message&#039;],
+                [&#039;code&#039; =&gt; $lastError[&#039;type&#039;], &#039;message&#039; =&gt; $lastError[&#039;message&#039;], &#039;file&#039; =&gt; $lastError[&#039;file&#039;], &#039;line&#039; =&gt; $lastError[&#039;line&#039;], &#039;trace&#039; =&gt; $trace]
+            );
+
+            if ($this-&gt;logger instanceof Logger) {
+                foreach ($this-&gt;logger-&gt;getHandlers() as $handler) {
+                    $handler-&gt;close();
+                }
+            }
+        }
+    }
+
+    private static function codeToString(int $code): string
+    {
+        return match ($code) {
+            E_ERROR =&gt; &#039;E_ERROR&#039;,
+            E_WARNING =&gt; &#039;E_WARNING&#039;,
+            E_PARSE =&gt; &#039;E_PARSE&#039;,
+            E_NOTICE =&gt; &#039;E_NOTICE&#039;,
+            E_CORE_ERROR =&gt; &#039;E_CORE_ERROR&#039;,
+            E_CORE_WARNING =&gt; &#039;E_CORE_WARNING&#039;,
+            E_COMPILE_ERROR =&gt; &#039;E_COMPILE_ERROR&#039;,
+            E_COMPILE_WARNING =&gt; &#039;E_COMPILE_WARNING&#039;,
+            E_USER_ERROR =&gt; &#039;E_USER_ERROR&#039;,
+            E_USER_WARNING =&gt; &#039;E_USER_WARNING&#039;,
+            E_USER_NOTICE =&gt; &#039;E_USER_NOTICE&#039;,
+            2048 =&gt; &#039;E_STRICT&#039;,
+            E_RECOVERABLE_ERROR =&gt; &#039;E_RECOVERABLE_ERROR&#039;,
+            E_DEPRECATED =&gt; &#039;E_DEPRECATED&#039;,
+            E_USER_DEPRECATED =&gt; &#039;E_USER_DEPRECATED&#039;,
+            default =&gt; &#039;Unknown PHP error&#039;,
+        };
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/monolog/monolog/src/Monolog/Formatter/ChromePHPFormatter.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/monolog/monolog/src/Monolog/Attribute -->
+
+</body>
+</html>

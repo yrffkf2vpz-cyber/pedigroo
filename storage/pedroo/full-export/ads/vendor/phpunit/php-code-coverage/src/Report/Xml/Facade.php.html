@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpunit/php-code-coverage/src/Report/Xml/Facade.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of phpunit/php-code-coverage.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace SebastianBergmann\CodeCoverage\Report\Xml;
+
+use const DIRECTORY_SEPARATOR;
+use function count;
+use function dirname;
+use function file_get_contents;
+use function is_array;
+use function is_dir;
+use function is_file;
+use function is_writable;
+use function sprintf;
+use function strlen;
+use function substr;
+use DateTimeImmutable;
+use DOMDocument;
+use SebastianBergmann\CodeCoverage\CodeCoverage;
+use SebastianBergmann\CodeCoverage\Driver\PathExistsButIsNotDirectoryException;
+use SebastianBergmann\CodeCoverage\Driver\WriteOperationFailedException;
+use SebastianBergmann\CodeCoverage\Node\AbstractNode;
+use SebastianBergmann\CodeCoverage\Node\Directory as DirectoryNode;
+use SebastianBergmann\CodeCoverage\Node\File as FileNode;
+use SebastianBergmann\CodeCoverage\Util\Filesystem;
+use SebastianBergmann\CodeCoverage\Util\Filesystem as DirectoryUtil;
+use SebastianBergmann\CodeCoverage\Util\Xml;
+use SebastianBergmann\CodeCoverage\Version;
+use SebastianBergmann\CodeCoverage\XmlException;
+use SebastianBergmann\Environment\Runtime;
+
+final class Facade
+{
+    private string $target;
+    private Project $project;
+    private readonly string $phpUnitVersion;
+
+    public function __construct(string $version)
+    {
+        $this-&gt;phpUnitVersion = $version;
+    }
+
+    /**
+     * @throws XmlException
+     */
+    public function process(CodeCoverage $coverage, string $target): void
+    {
+        if (substr($target, -1, 1) !== DIRECTORY_SEPARATOR) {
+            $target .= DIRECTORY_SEPARATOR;
+        }
+
+        $this-&gt;target = $target;
+        $this-&gt;initTargetDirectory($target);
+
+        $report = $coverage-&gt;getReport();
+
+        $this-&gt;project = new Project(
+            $coverage-&gt;getReport()-&gt;name(),
+        );
+
+        $this-&gt;setBuildInformation($coverage);
+        $this-&gt;processTests($coverage-&gt;getTests());
+        $this-&gt;processDirectory($report, $this-&gt;project);
+
+        $this-&gt;saveDocument($this-&gt;project-&gt;asDom(), &#039;index&#039;);
+    }
+
+    private function setBuildInformation(CodeCoverage $coverage): void
+    {
+        $buildNode = $this-&gt;project-&gt;buildInformation();
+        $buildNode-&gt;setRuntimeInformation(new Runtime, $coverage);
+        $buildNode-&gt;setBuildTime(new DateTimeImmutable);
+        $buildNode-&gt;setGeneratorVersions($this-&gt;phpUnitVersion, Version::id());
+    }
+
+    /**
+     * @throws PathExistsButIsNotDirectoryException
+     * @throws WriteOperationFailedException
+     */
+    private function initTargetDirectory(string $directory): void
+    {
+        if (is_file($directory)) {
+            if (!is_dir($directory)) {
+                throw new PathExistsButIsNotDirectoryException($directory);
+            }
+
+            if (!is_writable($directory)) {
+                throw new WriteOperationFailedException($directory);
+            }
+        }
+
+        DirectoryUtil::createDirectory($directory);
+    }
+
+    /**
+     * @throws XmlException
+     */
+    private function processDirectory(DirectoryNode $directory, Node $context): void
+    {
+        $directoryName = $directory-&gt;name();
+
+        if ($this-&gt;project-&gt;projectSourceDirectory() === $directoryName) {
+            $directoryName = &#039;/&#039;;
+        }
+
+        $directoryObject = $context-&gt;addDirectory($directoryName);
+
+        $this-&gt;setTotals($directory, $directoryObject-&gt;totals());
+
+        foreach ($directory-&gt;directories() as $node) {
+            $this-&gt;processDirectory($node, $directoryObject);
+        }
+
+        foreach ($directory-&gt;files() as $node) {
+            $this-&gt;processFile($node, $directoryObject);
+        }
+    }
+
+    /**
+     * @throws XmlException
+     */
+    private function processFile(FileNode $file, Directory $context): void
+    {
+        $fileObject = $context-&gt;addFile(
+            $file-&gt;name(),
+            $file-&gt;id() . &#039;.xml&#039;,
+        );
+
+        $this-&gt;setTotals($file, $fileObject-&gt;totals());
+
+        $path = substr(
+            $file-&gt;pathAsString(),
+            strlen($this-&gt;project-&gt;projectSourceDirectory()),
+        );
+
+        $fileReport = new Report($path);
+
+        $this-&gt;setTotals($file, $fileReport-&gt;totals());
+
+        foreach ($file-&gt;classesAndTraits() as $unit) {
+            $this-&gt;processUnit($unit, $fileReport);
+        }
+
+        foreach ($file-&gt;functions() as $function) {
+            $this-&gt;processFunction($function, $fileReport);
+        }
+
+        foreach ($file-&gt;lineCoverageData() as $line =&gt; $tests) {
+            if (!is_array($tests) || count($tests) === 0) {
+                continue;
+            }
+
+            $coverage = $fileReport-&gt;lineCoverage((string) $line);
+
+            foreach ($tests as $test) {
+                $coverage-&gt;addTest($test);
+            }
+
+            $coverage-&gt;finalize();
+        }
+
+        $fileReport-&gt;source()-&gt;setSourceCode(
+            file_get_contents($file-&gt;pathAsString()),
+        );
+
+        $this-&gt;saveDocument($fileReport-&gt;asDom(), $file-&gt;id());
+    }
+
+    private function processUnit(array $unit, Report $report): void
+    {
+        if (isset($unit[&#039;className&#039;])) {
+            $unitObject = $report-&gt;classObject($unit[&#039;className&#039;]);
+        } else {
+            $unitObject = $report-&gt;traitObject($unit[&#039;traitName&#039;]);
+        }
+
+        $unitObject-&gt;setLines(
+            $unit[&#039;startLine&#039;],
+            $unit[&#039;executableLines&#039;],
+            $unit[&#039;executedLines&#039;],
+        );
+
+        $unitObject-&gt;setCrap((float) $unit[&#039;crap&#039;]);
+        $unitObject-&gt;setNamespace($unit[&#039;namespace&#039;]);
+
+        foreach ($unit[&#039;methods&#039;] as $method) {
+            $methodObject = $unitObject-&gt;addMethod($method[&#039;methodName&#039;]);
+            $methodObject-&gt;setSignature($method[&#039;signature&#039;]);
+            $methodObject-&gt;setLines((string) $method[&#039;startLine&#039;], (string) $method[&#039;endLine&#039;]);
+            $methodObject-&gt;setCrap($method[&#039;crap&#039;]);
+            $methodObject-&gt;setTotals(
+                (string) $method[&#039;executableLines&#039;],
+                (string) $method[&#039;executedLines&#039;],
+                (string) $method[&#039;coverage&#039;],
+            );
+        }
+    }
+
+    private function processFunction(array $function, Report $report): void
+    {
+        $functionObject = $report-&gt;functionObject($function[&#039;functionName&#039;]);
+
+        $functionObject-&gt;setSignature($function[&#039;signature&#039;]);
+        $functionObject-&gt;setLines((string) $function[&#039;startLine&#039;]);
+        $functionObject-&gt;setCrap($function[&#039;crap&#039;]);
+        $functionObject-&gt;setTotals((string) $function[&#039;executableLines&#039;], (string) $function[&#039;executedLines&#039;], (string) $function[&#039;coverage&#039;]);
+    }
+
+    private function processTests(array $tests): void
+    {
+        $testsObject = $this-&gt;project-&gt;tests();
+
+        foreach ($tests as $test =&gt; $result) {
+            $testsObject-&gt;addTest($test, $result);
+        }
+    }
+
+    private function setTotals(AbstractNode $node, Totals $totals): void
+    {
+        $loc = $node-&gt;linesOfCode();
+
+        $totals-&gt;setNumLines(
+            $loc[&#039;linesOfCode&#039;],
+            $loc[&#039;commentLinesOfCode&#039;],
+            $loc[&#039;nonCommentLinesOfCode&#039;],
+            $node-&gt;numberOfExecutableLines(),
+            $node-&gt;numberOfExecutedLines(),
+        );
+
+        $totals-&gt;setNumClasses(
+            $node-&gt;numberOfClasses(),
+            $node-&gt;numberOfTestedClasses(),
+        );
+
+        $totals-&gt;setNumTraits(
+            $node-&gt;numberOfTraits(),
+            $node-&gt;numberOfTestedTraits(),
+        );
+
+        $totals-&gt;setNumMethods(
+            $node-&gt;numberOfMethods(),
+            $node-&gt;numberOfTestedMethods(),
+        );
+
+        $totals-&gt;setNumFunctions(
+            $node-&gt;numberOfFunctions(),
+            $node-&gt;numberOfTestedFunctions(),
+        );
+    }
+
+    private function targetDirectory(): string
+    {
+        return $this-&gt;target;
+    }
+
+    /**
+     * @throws XmlException
+     */
+    private function saveDocument(DOMDocument $document, string $name): void
+    {
+        $filename = sprintf(&#039;%s/%s.xml&#039;, $this-&gt;targetDirectory(), $name);
+
+        $this-&gt;initTargetDirectory(dirname($filename));
+
+        Filesystem::write($filename, Xml::asString($document));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpunit/php-code-coverage/src/Report/Xml/File.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpunit/php-code-coverage/src/StaticAnalysis -->
+
+</body>
+</html>

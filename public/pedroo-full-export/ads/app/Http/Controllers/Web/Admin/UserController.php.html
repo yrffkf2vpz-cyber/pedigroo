@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Http/Controllers/Web/Admin/UserController.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Http\Controllers\Web\Admin;
+
+use App\Enums\Gender;
+use App\Helpers\Common\Date\TimeZoneManager;
+use App\Helpers\Common\Files\Upload;
+use App\Http\Controllers\Web\Admin\Panel\PanelController;
+use App\Http\Controllers\Web\Admin\Traits\UserTrait;
+use App\Http\Requests\Admin\Request;
+use App\Http\Requests\Admin\UserRequest as StoreRequest;
+use App\Http\Requests\Admin\UserRequest as UpdateRequest;
+use App\Models\Country;
+use App\Models\Permission;
+use App\Models\Role;
+use App\Models\Scopes\VerifiedScope;
+use App\Models\User;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Response;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Storage;
+use Throwable;
+
+class UserController extends PanelController
+{
+	use UserTrait;
+	
+	public function setup()
+	{
+		$onAccountPage = routeActionHas(&#039;@account&#039;);
+		$this-&gt;onEditPage = (routeActionHas(&#039;@edit&#039;) || $onAccountPage);
+		
+		$authUser = auth()-&gt;user();
+		if (empty($authUser)) {
+			abort(Response::HTTP_FORBIDDEN, &#039;Not allowed.&#039;);
+		}
+		
+		/*
+		|--------------------------------------------------------------------------
+		| BASIC CRUD INFORMATION
+		|--------------------------------------------------------------------------
+		*/
+		$this-&gt;xPanel-&gt;setModel(User::class);
+		$this-&gt;xPanel-&gt;with([
+			&#039;permissions&#039;,
+			&#039;roles&#039;,
+			&#039;country:code,name&#039;,
+			// IMPORTANT:
+			// Payable can have multiple on-hold, pending, expired, canceled or refunded payments
+			// Payable can have only one valid payment, so we have to add that as filter for the Eager Loading.
+			// This allows displaying the right payment status (So only when payment is valid).
+			&#039;payment&#039; =&gt; fn ($query) =&gt; $query-&gt;valid(),
+			&#039;payment.package:id,type,name,short_name&#039;,
+		]);
+		$this-&gt;xPanel-&gt;withoutAppends();
+		
+		// If the logged admin user has permissions to manage users and has not &#039;super-admin&#039; role,
+		// don&#039;t allow him to manage &#039;super-admin&#039; role&#039;s users.
+		if (!doesUserHaveSuperAdminPermission($authUser)) {
+			// Get &#039;super-admin&#039; role&#039;s users IDs
+			$usersIds = [];
+			try {
+				$users = User::query()
+					-&gt;withoutGlobalScopes([VerifiedScope::class])
+					-&gt;role(Role::getSuperAdminRole())
+					-&gt;get([&#039;id&#039;, &#039;created_at&#039;]);
+				if ($users-&gt;count() &gt; 0) {
+					$usersIds = $users-&gt;keyBy(&#039;id&#039;)-&gt;keys()-&gt;toArray();
+				}
+			} catch (Throwable $e) {
+			}
+			
+			// Exclude &#039;super-admin&#039; role&#039;s users from list
+			if (!empty($usersIds)) {
+				$this-&gt;xPanel-&gt;addClause(&#039;whereNotIn&#039;, &#039;id&#039;, $usersIds);
+			}
+		}
+		
+		$this-&gt;xPanel-&gt;setRoute(urlGen()-&gt;adminUri(&#039;users&#039;));
+		$this-&gt;xPanel-&gt;setEntityNameStrings(trans(&#039;admin.user&#039;), trans(&#039;admin.users&#039;));
+		if (!request()-&gt;input(&#039;order&#039;)) {
+			$this-&gt;xPanel-&gt;orderByDesc(&#039;created_at&#039;);
+		}
+		$this-&gt;xPanel-&gt;enableDetailsRow();
+		$this-&gt;xPanel-&gt;setDetailsRowView(&#039;admin.panel.details_row.users&#039;);
+		$this-&gt;xPanel-&gt;allowAccess([&#039;details_row&#039;]);
+		
+		$this-&gt;xPanel-&gt;addButtonFromModelFunction(&#039;top&#039;, &#039;bulk_deletion_button&#039;, &#039;bulkDeletionTopButton&#039;, &#039;end&#039;);
+		
+		$this-&gt;xPanel-&gt;addButtonFromModelFunction(&#039;line&#039;, &#039;impersonate&#039;, &#039;impersonateInLineButton&#039;, &#039;beginning&#039;);
+		$this-&gt;xPanel-&gt;removeButton(&#039;delete&#039;);
+		$this-&gt;xPanel-&gt;addButtonFromModelFunction(&#039;line&#039;, &#039;delete&#039;, &#039;deleteInLineButton&#039;, &#039;end&#039;);
+		
+		/*
+		|--------------------------------------------------------------------------
+		| COLUMNS
+		|--------------------------------------------------------------------------
+		*/
+		if ($this-&gt;onIndexPage) {
+			// FILTERS
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;id&#039;,
+					&#039;type&#039;  =&gt; &#039;text&#039;,
+					&#039;label&#039; =&gt; &#039;ID&#039;,
+				],
+				filterLogic: function ($value) {
+					$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, &#039;id&#039;, &#039;=&#039;, $value);
+				}
+			);
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;from_to&#039;,
+					&#039;type&#039;  =&gt; &#039;date_range&#039;,
+					&#039;label&#039; =&gt; trans(&#039;admin.Date range&#039;),
+				],
+				filterLogic: function ($value) {
+					$dates = json_decode($value);
+					$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, &#039;created_at&#039;, &#039;&gt;=&#039;, $dates-&gt;from);
+					$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, &#039;created_at&#039;, &#039;&lt;=&#039;, $dates-&gt;to);
+				}
+			);
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;name&#039;,
+					&#039;type&#039;  =&gt; &#039;text&#039;,
+					&#039;label&#039; =&gt; trans(&#039;admin.Name&#039;),
+				],
+				filterLogic: function ($value) {
+					$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, function ($query) use ($value) {
+						$query-&gt;where(&#039;name&#039;, &#039;LIKE&#039;, &quot;%$value%&quot;);
+					});
+				}
+			);
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;username&#039;,
+					&#039;type&#039;  =&gt; &#039;text&#039;,
+					&#039;label&#039; =&gt; trans(&#039;auth.username&#039;),
+				],
+				filterLogic: function ($value) {
+					$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, function ($query) use ($value) {
+						$query-&gt;where(&#039;username&#039;, &#039;LIKE&#039;, &quot;%$value%&quot;);
+					});
+				}
+			);
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;email&#039;,
+					&#039;type&#039;  =&gt; &#039;text&#039;,
+					&#039;label&#039; =&gt; trans(&#039;auth.email&#039;),
+				],
+				filterLogic: function ($value) {
+					$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, function ($query) use ($value) {
+						$query-&gt;where(&#039;email&#039;, &#039;LIKE&#039;, &quot;%$value%&quot;);
+					});
+				}
+			);
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;country&#039;,
+					&#039;type&#039;  =&gt; &#039;select2&#039;,
+					&#039;label&#039; =&gt; mb_ucfirst(trans(&#039;admin.country&#039;)),
+				],
+				values: getCountries(),
+				filterLogic: function ($value) {
+					$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, &#039;country_code&#039;, &#039;=&#039;, $value);
+				}
+			);
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;has_subscription&#039;,
+					&#039;type&#039;  =&gt; &#039;dropdown&#039;,
+					&#039;label&#039; =&gt; trans(&#039;admin.has_subscription&#039;),
+				],
+				values: [
+					&#039;pending&#039; =&gt; trans(&#039;global.pending&#039;),
+					&#039;onHold&#039;  =&gt; trans(&#039;global.onHold&#039;),
+					&#039;valid&#039;   =&gt; trans(&#039;global.valid&#039;),
+					&#039;expired&#039; =&gt; trans(&#039;global.expired&#039;),
+					// &#039;canceled&#039; =&gt; trans(&#039;global.canceled&#039;),
+					// &#039;refunded&#039; =&gt; trans(&#039;global.refunded&#039;),
+				],
+				filterLogic: function ($value) {
+					if ($value == &#039;pending&#039;) {
+						$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, function ($query) {
+							$query-&gt;where(function ($query) {
+								$query-&gt;valid()-&gt;orWhere(fn ($query) =&gt; $query-&gt;onHold());
+							})-&gt;columnIsEmpty(&#039;active&#039;);
+						});
+					}
+					if ($value == &#039;onHold&#039;) {
+						$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, function ($query) {
+							$query-&gt;onHold()-&gt;isActive();
+						});
+					}
+					if ($value == &#039;valid&#039;) {
+						$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, function ($query) {
+							$query-&gt;valid()-&gt;isActive();
+						});
+					}
+					if ($value == &#039;expired&#039;) {
+						$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, function ($query) {
+							$query-&gt;where(function ($query) {
+								$query-&gt;notValid()-&gt;where(fn ($query) =&gt; $query-&gt;columnIsEmpty(&#039;active&#039;));
+							})-&gt;orWhere(fn ($query) =&gt; $query-&gt;notValid());
+						});
+					}
+					if ($value == &#039;canceled&#039;) {
+						$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, fn ($query) =&gt; $query-&gt;canceled());
+					}
+					if ($value == &#039;refunded&#039;) {
+						$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, fn ($query) =&gt; $query-&gt;refunded());
+					}
+				}
+			);
+			
+			if (config(&#039;addons.offlinepayment.installed&#039;)) {
+				$this-&gt;xPanel-&gt;addFilter(
+					options: [
+						&#039;name&#039;  =&gt; &#039;has_valid_subscription&#039;,
+						&#039;type&#039;  =&gt; &#039;dropdown&#039;,
+						&#039;label&#039; =&gt; trans(&#039;admin.has_valid_subscription&#039;),
+					],
+					values: [
+						&#039;real&#039; =&gt; trans(&#039;admin.with_real_payment&#039;),
+						&#039;fake&#039; =&gt; trans(&#039;admin.with_fake_payment&#039;),
+					],
+					filterLogic: function ($value) {
+						if ($value == &#039;real&#039;) {
+							$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, function ($query) {
+								$query-&gt;valid()-&gt;isActive()-&gt;notManuallyCreated();
+							});
+						}
+						if ($value == &#039;fake&#039;) {
+							$this-&gt;xPanel-&gt;addClause(&#039;whereHas&#039;, &#039;payment&#039;, function ($query) {
+								$query-&gt;valid()-&gt;isActive()-&gt;manuallyCreated();
+							});
+						}
+					}
+				);
+			}
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;status&#039;,
+					&#039;type&#039;  =&gt; &#039;dropdown&#039;,
+					&#039;label&#039; =&gt; trans(&#039;admin.Status&#039;),
+				],
+				values: [
+					1 =&gt; trans(&#039;admin.Unactivated&#039;),
+					2 =&gt; trans(&#039;admin.Activated&#039;),
+					3 =&gt; trans(&#039;admin.locked&#039;),
+					4 =&gt; trans(&#039;admin.suspended&#039;),
+				],
+				filterLogic: function ($value) {
+					if ($value == 1) {
+						$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, fn (Builder $query) =&gt; $query-&gt;unverified());
+					}
+					if ($value == 2) {
+						$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, fn (Builder $query) =&gt; $query-&gt;verified());
+					}
+					if ($value == 3) {
+						$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, fn (Builder $query) =&gt; $query-&gt;whereNotNull(&#039;locked_at&#039;));
+					}
+					if ($value == 4) {
+						$this-&gt;xPanel-&gt;addClause(&#039;where&#039;, fn (Builder $query) =&gt; $query-&gt;whereNotNull(&#039;suspended_at&#039;));
+					}
+				}
+			);
+			
+			$this-&gt;xPanel-&gt;addFilter(
+				options: [
+					&#039;name&#039;  =&gt; &#039;type&#039;,
+					&#039;type&#039;  =&gt; &#039;dropdown&#039;,
+					&#039;label&#039; =&gt; trans(&#039;admin.permissions_roles&#039;),
+				],
+				values: [
+					1 =&gt; trans(&#039;admin.has_admins_permissions&#039;),
+					2 =&gt; trans(&#039;admin.has_super_admins_permissions&#039;),
+					3 =&gt; trans(&#039;admin.has_super_admins_role&#039;),
+				],
+				filterLogic: function ($value) {
+					if ($value == 1) {
+						$this-&gt;xPanel-&gt;addClause(&#039;permission&#039;, Permission::getStaffPermissions());
+					}
+					if ($value == 2) {
+						$this-&gt;xPanel-&gt;addClause(&#039;permission&#039;, Permission::getSuperAdminPermissions());
+					}
+					if ($value == 3) {
+						$this-&gt;xPanel-&gt;addClause(&#039;role&#039;, Role::getSuperAdminRole());
+					}
+				}
+			);
+			
+			$isPhoneVerificationEnabled = (config(&#039;settings.sms.phone_verification&#039;) == 1);
+			
+			// COLUMNS
+			$this-&gt;xPanel-&gt;addColumn([
+				&#039;name&#039;      =&gt; &#039;id&#039;,
+				&#039;label&#039;     =&gt; &#039;&#039;,
+				&#039;type&#039;      =&gt; &#039;checkbox&#039;,
+				&#039;orderable&#039; =&gt; false,
+			]);
+			
+			$this-&gt;xPanel-&gt;addColumn([
+				&#039;name&#039;  =&gt; &#039;created_at&#039;,
+				&#039;label&#039; =&gt; trans(&#039;admin.Date&#039;),
+				&#039;type&#039;  =&gt; &#039;datetime&#039;,
+			]);
+			
+			$this-&gt;xPanel-&gt;addColumn([
+				&#039;name&#039;          =&gt; &#039;name&#039;,
+				&#039;label&#039;         =&gt; trans(&#039;admin.Name&#039;),
+				&#039;type&#039;          =&gt; &#039;model_function&#039;,
+				&#039;function_name&#039; =&gt; &#039;crudNameColumn&#039;,
+			]);
+			
+			$emailParams = [
+				&#039;name&#039;  =&gt; &#039;email&#039;,
+				&#039;label&#039; =&gt; trans(&#039;admin.Email&#039;),
+			];
+			if ($isPhoneVerificationEnabled) {
+				$emailParams[&#039;type&#039;] = &#039;model_function&#039;;
+				$emailParams[&#039;function_name&#039;] = &#039;crudEmailColumn&#039;;
+			}
+			$this-&gt;xPanel-&gt;addColumn($emailParams);
+			
+			if ($isPhoneVerificationEnabled) {
+				$this-&gt;xPanel-&gt;addColumn([
+					&#039;name&#039;          =&gt; &#039;phone&#039;,
+					&#039;label&#039;         =&gt; mb_ucfirst(trans(&#039;global.phone&#039;)),
+					&#039;type&#039;          =&gt; &#039;model_function&#039;,
+					&#039;function_name&#039; =&gt; &#039;crudPhoneColumn&#039;,
+				]);
+			}
+			
+			$this-&gt;xPanel-&gt;addColumn([
+				&#039;label&#039;         =&gt; mb_ucfirst(trans(&#039;admin.country&#039;)),
+				&#039;name&#039;          =&gt; &#039;country_code&#039;,
+				&#039;type&#039;          =&gt; &#039;model_function&#039;,
+				&#039;function_name&#039; =&gt; &#039;crudCountryColumn&#039;,
+			]);
+			
+			$this-&gt;xPanel-&gt;addColumn([
+				&#039;name&#039;          =&gt; &#039;email_verified_at&#039;,
+				&#039;label&#039;         =&gt; trans(&#039;admin.Verified Email&#039;),
+				&#039;type&#039;          =&gt; &#039;model_function&#039;,
+				&#039;function_name&#039; =&gt; &#039;crudVerifiedEmailColumn&#039;,
+			]);
+			
+			if ($isPhoneVerificationEnabled) {
+				$this-&gt;xPanel-&gt;addColumn([
+					&#039;name&#039;          =&gt; &#039;phone_verified_at&#039;,
+					&#039;label&#039;         =&gt; trans(&#039;admin.Verified Phone&#039;),
+					&#039;type&#039;          =&gt; &#039;model_function&#039;,
+					&#039;function_name&#039; =&gt; &#039;crudVerifiedPhoneColumn&#039;,
+				]);
+			}
+		}
+		
+		/*
+		|--------------------------------------------------------------------------
+		| FIELDS
+		|--------------------------------------------------------------------------
+		*/
+		if ($this-&gt;onCreatePage || $this-&gt;onEditPage) {
+			$user = null;
+			
+			if ($this-&gt;onEditPage) {
+				$currentResourceId = request()-&gt;route()-&gt;parameter(&#039;user&#039;);
+				$dealingUserId = $onAccountPage ? $authUser-&gt;getAuthIdentifier() : $currentResourceId;
+				
+				$user = User::query()-&gt;with([&#039;permissions&#039;, &#039;roles&#039;])-&gt;find($dealingUserId);
+			}
+			
+			$defaultPicture = config(&#039;larapen.media.avatar&#039;);
+			$diskName = &#039;public&#039;;
+			$defaultPictureUrl = Storage::disk($diskName)-&gt;url($defaultPicture);
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;    =&gt; &#039;photo_path&#039;,
+				&#039;label&#039;   =&gt; trans(&#039;global.Photo or Avatar&#039;),
+				&#039;type&#039;    =&gt; &#039;image&#039;,
+				&#039;upload&#039;  =&gt; true,
+				&#039;default&#039; =&gt; $defaultPictureUrl,
+				&#039;disk&#039;    =&gt; $diskName,
+				&#039;width&#039;   =&gt; 300,
+				&#039;hint&#039;    =&gt; trans(&#039;global.file_types&#039;, [&#039;file_types&#039; =&gt; getAllowedFileFormatsHint(&#039;image&#039;)]),
+			]);
+			
+			$this-&gt;xPanel-&gt;addField([
+				&#039;label&#039;       =&gt; trans(&#039;admin.Gender&#039;),
+				&#039;name&#039;        =&gt; &#039;gender_id&#039;,
+				&#039;type&#039;        =&gt; &#039;select2_from_array&#039;,
+				&#039;options&#039;     =&gt; $this-&gt;genders(),
+				&#039;allows_null&#039; =&gt; false,
+				&#039;wrapper&#039;     =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;       =&gt; &#039;name&#039;,
+				&#039;label&#039;      =&gt; trans(&#039;admin.Name&#039;),
+				&#039;type&#039;       =&gt; &#039;text&#039;,
+				&#039;attributes&#039; =&gt; [
+					&#039;placeholder&#039; =&gt; trans(&#039;admin.Name&#039;),
+				],
+				&#039;wrapper&#039;    =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;        =&gt; &#039;auth_field&#039;,
+				&#039;label&#039;       =&gt; trans(&#039;auth.auth_field_label&#039;),
+				&#039;type&#039;        =&gt; &#039;select2_from_array&#039;,
+				&#039;options&#039;     =&gt; getAuthFields(),
+				&#039;allows_null&#039; =&gt; true,
+				&#039;default&#039;     =&gt; getAuthField($user),
+				&#039;hint&#039;        =&gt; trans(&#039;auth.auth_field_hint&#039;),
+				&#039;wrapper&#039;     =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;       =&gt; &#039;username&#039;,
+				&#039;label&#039;      =&gt; trans(&#039;auth.username&#039;),
+				&#039;type&#039;       =&gt; &#039;text&#039;,
+				&#039;attributes&#039; =&gt; [
+					&#039;placeholder&#039; =&gt; trans(&#039;auth.username&#039;),
+				],
+				&#039;wrapper&#039;    =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;       =&gt; &#039;email&#039;,
+				&#039;label&#039;      =&gt; trans(&#039;admin.Email&#039;),
+				&#039;type&#039;       =&gt; &#039;email&#039;,
+				&#039;attributes&#039; =&gt; [
+					&#039;placeholder&#039; =&gt; trans(&#039;admin.Email&#039;),
+				],
+				&#039;prefix&#039;     =&gt; &#039;&lt;i class=&quot;fa-regular fa-envelope&quot;&gt;&lt;/i&gt;&#039;,
+				&#039;wrapper&#039;    =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$formForPwd = $onAccountPage ? &#039;update&#039; : &#039;create&#039;;
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;       =&gt; &#039;password&#039;,
+				&#039;label&#039;      =&gt; trans(&#039;admin.Password&#039;),
+				&#039;type&#039;       =&gt; &#039;password&#039;,
+				&#039;attributes&#039; =&gt; [
+					&#039;placeholder&#039;  =&gt; trans(&#039;admin.Password&#039;),
+					&#039;autocomplete&#039; =&gt; &#039;new-password&#039;,
+				],
+				&#039;prefix&#039;     =&gt; &#039;&lt;i class=&quot;fa-solid fa-lock&quot;&gt;&lt;/i&gt;&#039;,
+				&#039;wrapper&#039;    =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			], $formForPwd);
+			
+			$phoneCountry = (!empty($user) &amp;&amp; isset($user-&gt;phone_country)) ? strtolower($user-&gt;phone_country) : &#039;us&#039;;
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;          =&gt; &#039;phone&#039;,
+				&#039;label&#039;         =&gt; trans(&#039;admin.Phone&#039;),
+				&#039;type&#039;          =&gt; &#039;intl_tel_input&#039;,
+				&#039;phone_country&#039; =&gt; $phoneCountry,
+				&#039;wrapper&#039;       =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;    =&gt; &#039;phone_hidden&#039;,
+				&#039;label&#039;   =&gt; trans(&#039;admin.Phone hidden&#039;),
+				&#039;type&#039;    =&gt; &#039;checkbox_switch&#039;,
+				&#039;wrapper&#039; =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6 mt-4&#039;,
+				],
+			]);
+			
+			$this-&gt;xPanel-&gt;addField([
+				&#039;label&#039;     =&gt; mb_ucfirst(trans(&#039;admin.country&#039;)),
+				&#039;name&#039;      =&gt; &#039;country_code&#039;,
+				&#039;model&#039;     =&gt; Country::class,
+				&#039;entity&#039;    =&gt; &#039;country&#039;,
+				&#039;attribute&#039; =&gt; &#039;name&#039;,
+				&#039;type&#039;      =&gt; &#039;select2&#039;,
+				&#039;wrapper&#039;   =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$timezoneHint = $onAccountPage
+				? trans(&#039;global.admin_preferred_time_zone_info_lite&#039;)
+				: trans(&#039;global.preferred_time_zone_info_lite&#039;);
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;        =&gt; &#039;time_zone&#039;,
+				&#039;label&#039;       =&gt; trans(&#039;global.preferred_time_zone_label&#039;),
+				&#039;type&#039;        =&gt; &#039;select2_from_array&#039;,
+				&#039;options&#039;     =&gt; TimeZoneManager::getTimeZones(),
+				&#039;allows_null&#039; =&gt; true,
+				&#039;hint&#039;        =&gt; $timezoneHint,
+				&#039;wrapper&#039;     =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			]);
+			
+			$lastLoginAtLabel = trans(&#039;admin.last_login_at_label&#039;);
+			$lastLoginAtFormatted = $user-&gt;last_login_at ?? null;
+			$this-&gt;xPanel-&gt;addField([
+				&#039;name&#039;    =&gt; &#039;last_login_at&#039;,
+				&#039;type&#039;    =&gt; &#039;custom_html&#039;,
+				&#039;value&#039;   =&gt; &#039;&lt;br&gt;&lt;h5 class=&quot;mt-3&quot;&gt;&lt;span class=&quot;fw-bold&quot;&gt;&#039; . $lastLoginAtLabel . &#039;:&lt;/span&gt; &#039; . $lastLoginAtFormatted . &#039;&lt;/h5&gt;&#039;,
+				&#039;wrapper&#039; =&gt; [
+					&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+				],
+			], &#039;update&#039;);
+			
+			if (!$onAccountPage) {
+				$this-&gt;xPanel-&gt;addField([
+					&#039;name&#039;    =&gt; &#039;email_verified_at&#039;,
+					&#039;label&#039;   =&gt; trans(&#039;admin.Verified Email&#039;),
+					&#039;type&#039;    =&gt; &#039;checkbox_switch&#039;,
+					&#039;wrapper&#039; =&gt; [
+						&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+					],
+				]);
+				
+				$this-&gt;xPanel-&gt;addField([
+					&#039;name&#039;    =&gt; &#039;phone_verified_at&#039;,
+					&#039;label&#039;   =&gt; trans(&#039;admin.Verified Phone&#039;),
+					&#039;type&#039;    =&gt; &#039;checkbox_switch&#039;,
+					&#039;wrapper&#039; =&gt; [
+						&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+					],
+				]);
+				
+				$this-&gt;xPanel-&gt;addField([
+					&#039;name&#039;    =&gt; &#039;locked_at&#039;,
+					&#039;label&#039;   =&gt; trans(&#039;admin.locked&#039;),
+					&#039;type&#039;    =&gt; &#039;checkbox_switch&#039;,
+					&#039;wrapper&#039; =&gt; [
+						&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+					],
+					&#039;hint&#039;    =&gt; trans(&#039;admin.locked_hint&#039;),
+				]);
+				
+				$this-&gt;xPanel-&gt;addField([
+					&#039;name&#039;    =&gt; &#039;suspended_at&#039;,
+					&#039;label&#039;   =&gt; trans(&#039;admin.suspended&#039;),
+					&#039;type&#039;    =&gt; &#039;checkbox_switch&#039;,
+					&#039;wrapper&#039; =&gt; [
+						&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+					],
+					&#039;hint&#039;    =&gt; trans(&#039;admin.suspended_hint&#039;),
+				]);
+				
+				if (!empty($user)) {
+					$this-&gt;xPanel-&gt;addField([
+						&#039;name&#039;  =&gt; &#039;ip_separator&#039;,
+						&#039;type&#039;  =&gt; &#039;custom_html&#039;,
+						&#039;value&#039; =&gt; &#039;&lt;hr style=&quot;opacity: 0.15&quot;&gt;&#039;,
+					], &#039;update&#039;);
+					
+					$emptyIp = &#039;N/A&#039;;
+					
+					$label = &#039;&lt;span class=&quot;fw-bold&quot;&gt;&#039; . trans(&#039;admin.create_from_ip&#039;) . &#039;:&lt;/span&gt;&#039;;
+					if (!empty($user-&gt;create_from_ip)) {
+						$ipUrl = config(&#039;larapen.core.ipLinkBase&#039;) . $user-&gt;create_from_ip;
+						$ipLink = &#039;&lt;a href=&quot;&#039; . $ipUrl . &#039;&quot; target=&quot;_blank&quot;&gt;&#039; . $user-&gt;create_from_ip . &#039;&lt;/a&gt;&#039;;
+					} else {
+						$ipLink = $emptyIp;
+					}
+					$this-&gt;xPanel-&gt;addField([
+						&#039;name&#039;    =&gt; &#039;create_from_ip&#039;,
+						&#039;type&#039;    =&gt; &#039;custom_html&#039;,
+						&#039;value&#039;   =&gt; &#039;&lt;h5&gt;&#039; . $label . &#039; &#039; . $ipLink . &#039;&lt;/h5&gt;&#039;,
+						&#039;wrapper&#039; =&gt; [
+							&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+						],
+					], &#039;update&#039;);
+					
+					$label = &#039;&lt;span class=&quot;fw-bold&quot;&gt;&#039; . trans(&#039;admin.latest_update_ip&#039;) . &#039;:&lt;/span&gt;&#039;;
+					if (!empty($user-&gt;latest_update_ip)) {
+						$ipUrl = config(&#039;larapen.core.ipLinkBase&#039;) . $user-&gt;latest_update_ip;
+						$ipLink = &#039;&lt;a href=&quot;&#039; . $ipUrl . &#039;&quot; target=&quot;_blank&quot;&gt;&#039; . $user-&gt;latest_update_ip . &#039;&lt;/a&gt;&#039;;
+					} else {
+						$ipLink = $emptyIp;
+					}
+					$this-&gt;xPanel-&gt;addField([
+						&#039;name&#039;    =&gt; &#039;latest_update_ip&#039;,
+						&#039;type&#039;    =&gt; &#039;custom_html&#039;,
+						&#039;value&#039;   =&gt; &#039;&lt;h5&gt;&#039; . $label . &#039; &#039; . $ipLink . &#039;&lt;/h5&gt;&#039;,
+						&#039;wrapper&#039; =&gt; [
+							&#039;class&#039; =&gt; &#039;col-md-6&#039;,
+						],
+						&#039;newline&#039; =&gt; true,
+					], &#039;update&#039;);
+					
+					if (!empty($user-&gt;email) || !empty($user-&gt;phone)) {
+						$this-&gt;xPanel-&gt;addField([
+							&#039;name&#039;  =&gt; &#039;ban_separator&#039;,
+							&#039;type&#039;  =&gt; &#039;custom_html&#039;,
+							&#039;value&#039; =&gt; &#039;&lt;hr style=&quot;opacity: 0.15&quot;&gt;&#039;,
+						], &#039;update&#039;);
+						
+						$btnUrl = urlGen()-&gt;adminUrl(&#039;blacklists/add&#039;);
+						$queryParams = [];
+						if (!empty($user-&gt;email)) {
+							$queryParams[&#039;email&#039;] = $user-&gt;email;
+						}
+						if (!empty($user-&gt;phone)) {
+							$queryParams[&#039;phone&#039;] = $user-&gt;phone;
+						}
+						$btnUrl = urlBuilder($btnUrl)-&gt;setParameters($queryParams)-&gt;toString();
+						
+						$btnText = trans(&#039;admin.ban_the_user&#039;);
+						$btnHint = $btnText;
+						if (!empty($user-&gt;email) &amp;&amp; !empty($user-&gt;phone)) {
+							$btnHint = trans(&#039;admin.ban_the_user_email_and_phone&#039;, [
+								&#039;email&#039; =&gt; $user-&gt;email,
+								&#039;phone&#039; =&gt; $user-&gt;phone,
+							]);
+						} else {
+							if (!empty($user-&gt;email)) {
+								$btnHint = trans(&#039;admin.ban_the_user_email&#039;, [&#039;email&#039; =&gt; $user-&gt;email]);
+							}
+							if (!empty($user-&gt;phone)) {
+								$btnHint = trans(&#039;admin.ban_the_user_phone&#039;, [&#039;phone&#039; =&gt; $user-&gt;phone]);
+							}
+						}
+						$tooltip = &#039; data-bs-toggle=&quot;tooltip&quot; title=&quot;&#039; . $btnHint . &#039;&quot;&#039;;
+						
+						$btnLink = &#039;&lt;a href=&quot;&#039; . $btnUrl . &#039;&quot; class=&quot;btn btn-danger confirm-simple-action&quot;&#039; . $tooltip . &#039;&gt;&#039; . $btnText . &#039;&lt;/a&gt;&#039;;
+						$this-&gt;xPanel-&gt;addField([
+							&#039;name&#039;    =&gt; &#039;ban_button&#039;,
+							&#039;type&#039;    =&gt; &#039;custom_html&#039;,
+							&#039;value&#039;   =&gt; $btnLink,
+							&#039;wrapper&#039; =&gt; [
+								&#039;style&#039; =&gt; &#039;text-align:center;&#039;,
+							],
+						], &#039;update&#039;);
+					}
+				}
+				
+				/*
+				 * Only &#039;super-admin&#039; can assign &#039;roles&#039; or &#039;permissions&#039; to users
+				 * Also logged-in admin user cannot manage his own &#039;role&#039; or &#039;permissions&#039;
+				 */
+				$isSuperAdmin = doesUserHaveSuperAdminPermission($authUser);
+				$isCurrentUser = (!empty($user) &amp;&amp; $user-&gt;id == $authUser-&gt;getAuthIdentifier());
+				$hasUserManagementAccess = ($isSuperAdmin &amp;&amp; ($this-&gt;onCreatePage || ($this-&gt;onEditPage &amp;&amp; !$isCurrentUser)));
+				
+				if ($hasUserManagementAccess) {
+					$this-&gt;xPanel-&gt;addField([
+						&#039;name&#039;  =&gt; &#039;acl_separator&#039;,
+						&#039;type&#039;  =&gt; &#039;custom_html&#039;,
+						&#039;value&#039; =&gt; &#039;&lt;hr style=&quot;opacity: 0.25&quot;&gt;&#039;,
+					]);
+					
+					$this-&gt;xPanel-&gt;addField([
+						// Two interconnected entities
+						&#039;label&#039;             =&gt; trans(&#039;admin.user_role_permission&#039;),
+						&#039;field_unique_name&#039; =&gt; &#039;user_role_permission&#039;,
+						&#039;type&#039;              =&gt; &#039;checklist_dependency&#039;,
+						&#039;name&#039;              =&gt; &#039;roles_and_permissions&#039;, // the methods that defines the relationship in your Model
+						&#039;subfields&#039;         =&gt; [
+							&#039;primary&#039;   =&gt; [
+								&#039;label&#039;            =&gt; trans(&#039;admin.roles&#039;),
+								&#039;name&#039;             =&gt; &#039;roles&#039;, // the method that defines the relationship in your Model
+								&#039;entity&#039;           =&gt; &#039;roles&#039;, // the method that defines the relationship in your Model
+								&#039;entity_secondary&#039; =&gt; &#039;permissions&#039;, // the method that defines the relationship in your Model
+								&#039;attribute&#039;        =&gt; &#039;name&#039;, // foreign key attribute that is shown to user
+								&#039;model&#039;            =&gt; config(&#039;permission.models.role&#039;), // foreign key model
+								&#039;pivot&#039;            =&gt; true, // on create&amp;update, do you need to add/delete pivot table entries?
+								&#039;number_columns&#039;   =&gt; 3, // can be 1,2,3,4,6
+							],
+							&#039;secondary&#039; =&gt; [
+								&#039;label&#039;          =&gt; mb_ucfirst(trans(&#039;admin.permission_singular&#039;)),
+								&#039;name&#039;           =&gt; &#039;permissions&#039;, // the method that defines the relationship in your Model
+								&#039;entity&#039;         =&gt; &#039;permissions&#039;, // the method that defines the relationship in your Model
+								&#039;entity_primary&#039; =&gt; &#039;roles&#039;, // the method that defines the relationship in your Model
+								&#039;attribute&#039;      =&gt; &#039;name&#039;, // foreign key attribute that is shown to user
+								&#039;model&#039;          =&gt; config(&#039;permission.models.permission&#039;), // foreign key model
+								&#039;pivot&#039;          =&gt; true, // on create&amp;update, do you need to add/delete pivot table entries?
+								&#039;number_columns&#039; =&gt; 3, // can be 1,2,3,4,6
+							],
+						],
+					]);
+				}
+			}
+		}
+	}
+	
+	/**
+	 * @return \Illuminate\View\View
+	 */
+	public function account()
+	{
+		$authUser = auth()-&gt;check() ? auth()-&gt;user() : null;
+		if (empty($authUser)) {
+			abort(Response::HTTP_FORBIDDEN, &#039;Not allowed.&#039;);
+		}
+		
+		return parent::edit($authUser-&gt;getAuthIdentifier());
+	}
+	
+	public function store(StoreRequest $request): RedirectResponse
+	{
+		$request = $this-&gt;handleInput($request);
+		
+		return parent::storeCrud($request);
+	}
+	
+	public function update(UpdateRequest $request): RedirectResponse
+	{
+		$currentResourceId = request()-&gt;route()-&gt;parameter(&#039;user&#039;);
+		
+		$request = $this-&gt;handleInput($request);
+		$request = $this-&gt;uploadPhoto($request);
+		
+		$authUser = auth()-&gt;user();
+		
+		// Is the admin user&#039;s own account?
+		// If from self account form?
+		$isTheAdminOwnAccount = ($authUser-&gt;getAuthIdentifier() == $currentResourceId);
+		$isFromSelfAccountForm = str_contains(url()-&gt;previous(), urlGen()-&gt;adminUri(&#039;account&#039;));
+		
+		// Prevent user&#039;s role removal
+		if ($isTheAdminOwnAccount || $isFromSelfAccountForm) {
+			$this-&gt;xPanel-&gt;disableSyncPivot();
+		}
+		
+		return parent::updateCrud($request);
+	}
+	
+	// PRIVATE METHODS
+	
+	/**
+	 * Handle Input values
+	 *
+	 * @param \App\Http\Requests\Admin\Request $request
+	 * @return \App\Http\Requests\Admin\Request
+	 */
+	private function handleInput(Request $request): Request
+	{
+		// Handle password input fields
+		// Remove &#039;password_confirmation&#039; field &amp; Encrypt password if specified
+		$request-&gt;request-&gt;remove(&#039;password_confirmation&#039;);
+		if ($request-&gt;filled(&#039;password&#039;)) {
+			$request-&gt;request-&gt;set(&#039;password&#039;, Hash::make($request-&gt;input(&#039;password&#039;)));
+		} else {
+			$request-&gt;request-&gt;remove(&#039;password&#039;);
+		}
+		
+		// Handel &#039;is_admin&#039; input
+		$request = $this-&gt;handleIsAdminFromRoles($request);
+		$request = $this-&gt;handleIsAdminFromPermissions($request);
+		
+		// Unlock lockout user
+		if (!$request-&gt;filled(&#039;locked_at&#039;)) {
+			if ($request-&gt;has(&#039;locked_at&#039;)) {
+				// Reset lockout-related counters
+				$request-&gt;request-&gt;set(&#039;total_login_attempts&#039;, 0);
+				$request-&gt;request-&gt;set(&#039;otp_resend_attempts&#039;, 0);
+				$request-&gt;request-&gt;set(&#039;otp_resend_attempts_expires_at&#039;, null);
+				$request-&gt;request-&gt;set(&#039;total_otp_resend_attempts&#039;, 0);
+				
+				// Reset the two-factor authentication code and expiration
+				$request-&gt;request-&gt;set(&#039;two_factor_otp&#039;, null);
+				$request-&gt;request-&gt;set(&#039;otp_expires_at&#039;, null);
+				$request-&gt;request-&gt;set(&#039;last_otp_sent_at&#039;, null);
+			}
+		} else {
+			// A user cannot be manually locked out,
+			// as the error message displayed is specifically related to exceeding the maximum login attempts.
+			// Instead, an admin can suspend the user to achieve a similar effect.
+			$request-&gt;request-&gt;set(&#039;locked_at&#039;, null);
+			
+			$message = trans(&#039;admin.manual_user_lockout_info&#039;);
+			notification($message, &#039;info&#039;);
+		}
+		
+		return $request;
+	}
+	
+	/**
+	 * @param \App\Http\Requests\Admin\Request $request
+	 * @return \App\Http\Requests\Admin\Request
+	 */
+	private function uploadPhoto(Request $request): Request
+	{
+		$user = null;
+		
+		// From edit page
+		$currentResourceId = request()-&gt;route()-&gt;parameter(&#039;user&#039;);
+		if (!empty($currentResourceId)) {
+			$user = User::find($currentResourceId);
+		}
+		
+		// From create page
+		if (empty($user)) {
+			$userId = $request-&gt;input(&#039;user_id&#039;);
+			if (!empty($userId)) {
+				$user = User::find($userId);
+			}
+		}
+		
+		if (!empty($user)) {
+			$attribute = &#039;photo_path&#039;;
+			$file = $request-&gt;hasFile($attribute) ? $request-&gt;file($attribute) : $request-&gt;input($attribute);
+			
+			if (!empty($file)) {
+				$param = [
+					&#039;destPath&#039; =&gt; &#039;avatars/&#039; . strtolower($user-&gt;country_code) . &#039;/&#039; . $user-&gt;id,
+					&#039;width&#039;    =&gt; (int)config(&#039;larapen.media.resize.namedOptions.avatar.width&#039;, 800),
+					&#039;height&#039;   =&gt; (int)config(&#039;larapen.media.resize.namedOptions.avatar.height&#039;, 800),
+					&#039;ratio&#039;    =&gt; config(&#039;larapen.media.resize.namedOptions.avatar.ratio&#039;, &#039;1&#039;),
+					&#039;upsize&#039;   =&gt; config(&#039;larapen.media.resize.namedOptions.avatar.upsize&#039;, &#039;0&#039;),
+				];
+				try {
+					$photoPath = Upload::image($file, $param[&#039;destPath&#039;], $param);
+					$request-&gt;request-&gt;set($attribute, $photoPath);
+				} catch (Throwable $e) {
+				}
+			}
+		}
+		
+		return $request;
+	}
+	
+	/**
+	 * @return array
+	 */
+	private function genders(): array
+	{
+		$genders = Gender::all();
+		
+		return collect($genders)-&gt;pluck(&#039;title&#039;, &#039;id&#039;)-&gt;toArray();
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Http/Controllers/Web/Auth/ForgotPasswordController.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Http/Controllers/Web/Admin/Action -->
+
+</body>
+</html>

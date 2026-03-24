@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-foundation/Session/Storage/Handler/MongoDbSessionHandler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpFoundation\Session\Storage\Handler;
+
+use MongoDB\BSON\Binary;
+use MongoDB\BSON\UTCDateTime;
+use MongoDB\Client;
+use MongoDB\Driver\BulkWrite;
+use MongoDB\Driver\Manager;
+use MongoDB\Driver\Query;
+
+/**
+ * Session handler using the MongoDB driver extension.
+ *
+ * @author Markus Bachmann &lt;markus.bachmann@bachi.biz&gt;
+ * @author Jérôme Tamarelle &lt;jerome@tamarelle.net&gt;
+ *
+ * @see https://php.net/mongodb
+ */
+class MongoDbSessionHandler extends AbstractSessionHandler
+{
+    private Manager $manager;
+    private string $namespace;
+    private array $options;
+    private int|\Closure|null $ttl;
+
+    /**
+     * Constructor.
+     *
+     * List of available options:
+     *  * database: The name of the database [required]
+     *  * collection: The name of the collection [required]
+     *  * id_field: The field name for storing the session id [default: _id]
+     *  * data_field: The field name for storing the session data [default: data]
+     *  * time_field: The field name for storing the timestamp [default: time]
+     *  * expiry_field: The field name for storing the expiry-timestamp [default: expires_at]
+     *  * ttl: The time to live in seconds.
+     *
+     * It is strongly recommended to put an index on the `expiry_field` for
+     * garbage-collection. Alternatively it&#039;s possible to automatically expire
+     * the sessions in the database as described below:
+     *
+     * A TTL collections can be used on MongoDB 2.2+ to cleanup expired sessions
+     * automatically. Such an index can for example look like this:
+     *
+     *     db.&lt;session-collection&gt;.createIndex(
+     *         { &quot;&lt;expiry-field&gt;&quot;: 1 },
+     *         { &quot;expireAfterSeconds&quot;: 0 }
+     *     )
+     *
+     * More details on: https://docs.mongodb.org/manual/tutorial/expire-data/
+     *
+     * If you use such an index, you can drop `gc_probability` to 0 since
+     * no garbage-collection is required.
+     *
+     * @throws \InvalidArgumentException When &quot;database&quot; or &quot;collection&quot; not provided
+     */
+    public function __construct(Client|Manager $mongo, array $options)
+    {
+        if (!isset($options[&#039;database&#039;]) || !isset($options[&#039;collection&#039;])) {
+            throw new \InvalidArgumentException(&#039;You must provide the &quot;database&quot; and &quot;collection&quot; option for MongoDBSessionHandler.&#039;);
+        }
+
+        if ($mongo instanceof Client) {
+            $mongo = $mongo-&gt;getManager();
+        }
+
+        $this-&gt;manager = $mongo;
+        $this-&gt;namespace = $options[&#039;database&#039;].&#039;.&#039;.$options[&#039;collection&#039;];
+
+        $this-&gt;options = array_merge([
+            &#039;id_field&#039; =&gt; &#039;_id&#039;,
+            &#039;data_field&#039; =&gt; &#039;data&#039;,
+            &#039;time_field&#039; =&gt; &#039;time&#039;,
+            &#039;expiry_field&#039; =&gt; &#039;expires_at&#039;,
+        ], $options);
+        $this-&gt;ttl = $this-&gt;options[&#039;ttl&#039;] ?? null;
+    }
+
+    public function close(): bool
+    {
+        return true;
+    }
+
+    protected function doDestroy(#[\SensitiveParameter] string $sessionId): bool
+    {
+        $write = new BulkWrite();
+        $write-&gt;delete(
+            [$this-&gt;options[&#039;id_field&#039;] =&gt; $sessionId],
+            [&#039;limit&#039; =&gt; 1]
+        );
+
+        $this-&gt;manager-&gt;executeBulkWrite($this-&gt;namespace, $write);
+
+        return true;
+    }
+
+    public function gc(int $maxlifetime): int|false
+    {
+        $write = new BulkWrite();
+        $write-&gt;delete(
+            [$this-&gt;options[&#039;expiry_field&#039;] =&gt; [&#039;$lt&#039; =&gt; $this-&gt;getUTCDateTime()]],
+        );
+        $result = $this-&gt;manager-&gt;executeBulkWrite($this-&gt;namespace, $write);
+
+        return $result-&gt;getDeletedCount() ?? false;
+    }
+
+    protected function doWrite(#[\SensitiveParameter] string $sessionId, string $data): bool
+    {
+        $ttl = ($this-&gt;ttl instanceof \Closure ? ($this-&gt;ttl)() : $this-&gt;ttl) ?? \ini_get(&#039;session.gc_maxlifetime&#039;);
+        $expiry = $this-&gt;getUTCDateTime($ttl);
+
+        $fields = [
+            $this-&gt;options[&#039;time_field&#039;] =&gt; $this-&gt;getUTCDateTime(),
+            $this-&gt;options[&#039;expiry_field&#039;] =&gt; $expiry,
+            $this-&gt;options[&#039;data_field&#039;] =&gt; new Binary($data, Binary::TYPE_GENERIC),
+        ];
+
+        $write = new BulkWrite();
+        $write-&gt;update(
+            [$this-&gt;options[&#039;id_field&#039;] =&gt; $sessionId],
+            [&#039;$set&#039; =&gt; $fields],
+            [&#039;upsert&#039; =&gt; true]
+        );
+
+        $this-&gt;manager-&gt;executeBulkWrite($this-&gt;namespace, $write);
+
+        return true;
+    }
+
+    public function updateTimestamp(#[\SensitiveParameter] string $sessionId, string $data): bool
+    {
+        $ttl = ($this-&gt;ttl instanceof \Closure ? ($this-&gt;ttl)() : $this-&gt;ttl) ?? \ini_get(&#039;session.gc_maxlifetime&#039;);
+        $expiry = $this-&gt;getUTCDateTime($ttl);
+
+        $write = new BulkWrite();
+        $write-&gt;update(
+            [$this-&gt;options[&#039;id_field&#039;] =&gt; $sessionId],
+            [&#039;$set&#039; =&gt; [
+                $this-&gt;options[&#039;time_field&#039;] =&gt; $this-&gt;getUTCDateTime(),
+                $this-&gt;options[&#039;expiry_field&#039;] =&gt; $expiry,
+            ]],
+            [&#039;multi&#039; =&gt; false],
+        );
+
+        $this-&gt;manager-&gt;executeBulkWrite($this-&gt;namespace, $write);
+
+        return true;
+    }
+
+    protected function doRead(#[\SensitiveParameter] string $sessionId): string
+    {
+        $cursor = $this-&gt;manager-&gt;executeQuery($this-&gt;namespace, new Query([
+            $this-&gt;options[&#039;id_field&#039;] =&gt; $sessionId,
+            $this-&gt;options[&#039;expiry_field&#039;] =&gt; [&#039;$gte&#039; =&gt; $this-&gt;getUTCDateTime()],
+        ], [
+            &#039;projection&#039; =&gt; [
+                &#039;_id&#039; =&gt; false,
+                $this-&gt;options[&#039;data_field&#039;] =&gt; true,
+            ],
+            &#039;limit&#039; =&gt; 1,
+        ]));
+
+        foreach ($cursor as $document) {
+            return (string) $document-&gt;{$this-&gt;options[&#039;data_field&#039;]} ?? &#039;&#039;;
+        }
+
+        // Not found
+        return &#039;&#039;;
+    }
+
+    private function getUTCDateTime(int $additionalSeconds = 0): UTCDateTime
+    {
+        return new UTCDateTime((time() + $additionalSeconds) * 1000);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-foundation/Session/Storage/Handler/NativeFileSessionHandler.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-foundation/Session/Storage/Proxy -->
+
+</body>
+</html>

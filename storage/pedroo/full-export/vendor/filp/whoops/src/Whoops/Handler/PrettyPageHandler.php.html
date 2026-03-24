@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/filp/whoops/src/Whoops/Handler/PrettyPageHandler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/**
+ * Whoops - php errors for cool kids
+ * @author Filipe Dobreira &lt;http://github.com/filp&gt;
+ */
+
+namespace Whoops\Handler;
+
+use InvalidArgumentException;
+use RuntimeException;
+use Symfony\Component\VarDumper\Cloner\AbstractCloner;
+use Symfony\Component\VarDumper\Cloner\VarCloner;
+use UnexpectedValueException;
+use Whoops\Exception\Formatter;
+use Whoops\Util\Misc;
+use Whoops\Util\TemplateHelper;
+
+class PrettyPageHandler extends Handler
+{
+    const EDITOR_SUBLIME = &quot;sublime&quot;;
+    const EDITOR_TEXTMATE = &quot;textmate&quot;;
+    const EDITOR_EMACS = &quot;emacs&quot;;
+    const EDITOR_MACVIM = &quot;macvim&quot;;
+    const EDITOR_PHPSTORM = &quot;phpstorm&quot;;
+    const EDITOR_IDEA = &quot;idea&quot;;
+    const EDITOR_VSCODE = &quot;vscode&quot;;
+    const EDITOR_ATOM = &quot;atom&quot;;
+    const EDITOR_ESPRESSO = &quot;espresso&quot;;
+    const EDITOR_XDEBUG = &quot;xdebug&quot;;
+    const EDITOR_NETBEANS = &quot;netbeans&quot;;
+    const EDITOR_CURSOR = &quot;cursor&quot;;
+
+    /**
+     * Search paths to be scanned for resources.
+     *
+     * Stored in the reverse order they&#039;re declared.
+     *
+     * @var array
+     */
+    private $searchPaths = [];
+
+    /**
+     * Fast lookup cache for known resource locations.
+     *
+     * @var array
+     */
+    private $resourceCache = [];
+
+    /**
+     * The name of the custom css file.
+     *
+     * @var string|null
+     */
+    private $customCss = null;
+
+    /**
+     * The name of the custom js file.
+     *
+     * @var string|null
+     */
+    private $customJs = null;
+
+    /**
+     * @var array[]
+     */
+    private $extraTables = [];
+
+    /**
+     * @var bool
+     */
+    private $handleUnconditionally = false;
+
+    /**
+     * @var string
+     */
+    private $pageTitle = &quot;Whoops! There was an error.&quot;;
+
+    /**
+     * @var array[]
+     */
+    private $applicationPaths;
+
+    /**
+     * @var array[]
+     */
+    private $blacklist = [
+        &#039;_GET&#039; =&gt; [],
+        &#039;_POST&#039; =&gt; [],
+        &#039;_FILES&#039; =&gt; [],
+        &#039;_COOKIE&#039; =&gt; [],
+        &#039;_SESSION&#039; =&gt; [],
+        &#039;_SERVER&#039; =&gt; [],
+        &#039;_ENV&#039; =&gt; [],
+    ];
+
+    /**
+     * An identifier for a known IDE/text editor.
+     *
+     * Either a string, or a calalble that resolves a string, that can be used
+     * to open a given file in an editor. If the string contains the special
+     * substrings %file or %line, they will be replaced with the correct data.
+     *
+     * @example
+     *   &quot;txmt://open?url=%file&amp;line=%line&quot;
+     *
+     * @var callable|string $editor
+     */
+    protected $editor;
+
+    /**
+     * A list of known editor strings.
+     *
+     * @var array
+     */
+    protected $editors = [
+        &quot;sublime&quot;  =&gt; &quot;subl://open?url=file://%file&amp;line=%line&quot;,
+        &quot;textmate&quot; =&gt; &quot;txmt://open?url=file://%file&amp;line=%line&quot;,
+        &quot;emacs&quot;    =&gt; &quot;emacs://open?url=file://%file&amp;line=%line&quot;,
+        &quot;macvim&quot;   =&gt; &quot;mvim://open/?url=file://%file&amp;line=%line&quot;,
+        &quot;phpstorm&quot; =&gt; &quot;phpstorm://open?file=%file&amp;line=%line&quot;,
+        &quot;idea&quot;     =&gt; &quot;idea://open?file=%file&amp;line=%line&quot;,
+        &quot;vscode&quot;   =&gt; &quot;vscode://file/%file:%line&quot;,
+        &quot;atom&quot;     =&gt; &quot;atom://core/open/file?filename=%file&amp;line=%line&quot;,
+        &quot;espresso&quot; =&gt; &quot;x-espresso://open?filepath=%file&amp;lines=%line&quot;,
+        &quot;netbeans&quot; =&gt; &quot;netbeans://open/?f=%file:%line&quot;,
+        &quot;cursor&quot;   =&gt; &quot;cursor://file/%file:%line&quot;,
+    ];
+
+    /**
+     * @var TemplateHelper
+     */
+    protected $templateHelper;
+
+    /**
+     * Constructor.
+     *
+     * @return void
+     */
+    public function __construct()
+    {
+        if (ini_get(&#039;xdebug.file_link_format&#039;) || get_cfg_var(&#039;xdebug.file_link_format&#039;)) {
+            // Register editor using xdebug&#039;s file_link_format option.
+            $this-&gt;editors[&#039;xdebug&#039;] = function ($file, $line) {
+                return str_replace([&#039;%f&#039;, &#039;%l&#039;], [$file, $line], ini_get(&#039;xdebug.file_link_format&#039;) ?: get_cfg_var(&#039;xdebug.file_link_format&#039;));
+            };
+
+            // If xdebug is available, use it as default editor.
+            $this-&gt;setEditor(&#039;xdebug&#039;);
+        }
+
+        // Add the default, local resource search path:
+        $this-&gt;searchPaths[] = __DIR__ . &quot;/../Resources&quot;;
+
+        // blacklist php provided auth based values
+        $this-&gt;blacklist(&#039;_SERVER&#039;, &#039;PHP_AUTH_PW&#039;);
+
+        $this-&gt;templateHelper = new TemplateHelper();
+
+        if (class_exists(&#039;Symfony\Component\VarDumper\Cloner\VarCloner&#039;)) {
+            $cloner = new VarCloner();
+            // Only dump object internals if a custom caster exists for performance reasons
+            // https://github.com/filp/whoops/pull/404
+            $cloner-&gt;addCasters([&#039;*&#039; =&gt; function ($obj, $a, $stub, $isNested, $filter = 0) {
+                $class = $stub-&gt;class;
+                $classes = [$class =&gt; $class] + class_parents($obj) + class_implements($obj);
+
+                foreach ($classes as $class) {
+                    if (isset(AbstractCloner::$defaultCasters[$class])) {
+                        return $a;
+                    }
+                }
+
+                // Remove all internals
+                return [];
+            }]);
+            $this-&gt;templateHelper-&gt;setCloner($cloner);
+        }
+    }
+
+    /**
+     * @return int|null
+     *
+     * @throws \Exception
+     */
+    public function handle()
+    {
+        if (!$this-&gt;handleUnconditionally()) {
+            // Check conditions for outputting HTML:
+            // @todo: Make this more robust
+            if (PHP_SAPI === &#039;cli&#039;) {
+                // Help users who have been relying on an internal test value
+                // fix their code to the proper method
+                if (isset($_ENV[&#039;whoops-test&#039;])) {
+                    throw new \Exception(
+                        &#039;Use handleUnconditionally instead of whoops-test&#039;
+                        .&#039; environment variable&#039;
+                    );
+                }
+
+                return Handler::DONE;
+            }
+        }
+
+        $templateFile = $this-&gt;getResource(&quot;views/layout.html.php&quot;);
+        $cssFile      = $this-&gt;getResource(&quot;css/whoops.base.css&quot;);
+        $zeptoFile    = $this-&gt;getResource(&quot;js/zepto.min.js&quot;);
+        $prismJs = $this-&gt;getResource(&quot;js/prism.js&quot;);
+        $prismCss = $this-&gt;getResource(&quot;css/prism.css&quot;);
+        $clipboard    = $this-&gt;getResource(&quot;js/clipboard.min.js&quot;);
+        $jsFile       = $this-&gt;getResource(&quot;js/whoops.base.js&quot;);
+
+        if ($this-&gt;customCss) {
+            $customCssFile = $this-&gt;getResource($this-&gt;customCss);
+        }
+
+        if ($this-&gt;customJs) {
+            $customJsFile = $this-&gt;getResource($this-&gt;customJs);
+        }
+
+        $inspector = $this-&gt;getInspector();
+        $frames = $this-&gt;getExceptionFrames();
+        $code = $this-&gt;getExceptionCode();
+
+        // List of variables that will be passed to the layout template.
+        $vars = [
+            &quot;page_title&quot; =&gt; $this-&gt;getPageTitle(),
+
+            // @todo: Asset compiler
+            &quot;stylesheet&quot; =&gt; file_get_contents($cssFile),
+            &quot;zepto&quot;      =&gt; file_get_contents($zeptoFile),
+            &quot;prismJs&quot;   =&gt; file_get_contents($prismJs),
+            &quot;prismCss&quot;   =&gt; file_get_contents($prismCss),
+            &quot;clipboard&quot;  =&gt; file_get_contents($clipboard),
+            &quot;javascript&quot; =&gt; file_get_contents($jsFile),
+
+            // Template paths:
+            &quot;header&quot;                     =&gt; $this-&gt;getResource(&quot;views/header.html.php&quot;),
+            &quot;header_outer&quot;               =&gt; $this-&gt;getResource(&quot;views/header_outer.html.php&quot;),
+            &quot;frame_list&quot;                 =&gt; $this-&gt;getResource(&quot;views/frame_list.html.php&quot;),
+            &quot;frames_description&quot;         =&gt; $this-&gt;getResource(&quot;views/frames_description.html.php&quot;),
+            &quot;frames_container&quot;           =&gt; $this-&gt;getResource(&quot;views/frames_container.html.php&quot;),
+            &quot;panel_details&quot;              =&gt; $this-&gt;getResource(&quot;views/panel_details.html.php&quot;),
+            &quot;panel_details_outer&quot;        =&gt; $this-&gt;getResource(&quot;views/panel_details_outer.html.php&quot;),
+            &quot;panel_left&quot;                 =&gt; $this-&gt;getResource(&quot;views/panel_left.html.php&quot;),
+            &quot;panel_left_outer&quot;           =&gt; $this-&gt;getResource(&quot;views/panel_left_outer.html.php&quot;),
+            &quot;frame_code&quot;                 =&gt; $this-&gt;getResource(&quot;views/frame_code.html.php&quot;),
+            &quot;env_details&quot;                =&gt; $this-&gt;getResource(&quot;views/env_details.html.php&quot;),
+
+            &quot;title&quot;            =&gt; $this-&gt;getPageTitle(),
+            &quot;name&quot;             =&gt; explode(&quot;\\&quot;, $inspector-&gt;getExceptionName()),
+            &quot;message&quot;          =&gt; $inspector-&gt;getExceptionMessage(),
+            &quot;previousMessages&quot; =&gt; $inspector-&gt;getPreviousExceptionMessages(),
+            &quot;docref_url&quot;       =&gt; $inspector-&gt;getExceptionDocrefUrl(),
+            &quot;code&quot;             =&gt; $code,
+            &quot;previousCodes&quot;    =&gt; $inspector-&gt;getPreviousExceptionCodes(),
+            &quot;plain_exception&quot;  =&gt; Formatter::formatExceptionPlain($inspector),
+            &quot;frames&quot;           =&gt; $frames,
+            &quot;has_frames&quot;       =&gt; !!count($frames),
+            &quot;handler&quot;          =&gt; $this,
+            &quot;handlers&quot;         =&gt; $this-&gt;getRun()-&gt;getHandlers(),
+
+            &quot;active_frames_tab&quot; =&gt; count($frames) &amp;&amp; $frames-&gt;offsetGet(0)-&gt;isApplication() ?  &#039;application&#039; : &#039;all&#039;,
+            &quot;has_frames_tabs&quot;   =&gt; $this-&gt;getApplicationPaths(),
+
+            &quot;tables&quot;      =&gt; [
+                &quot;GET Data&quot;              =&gt; $this-&gt;masked($_GET, &#039;_GET&#039;),
+                &quot;POST Data&quot;             =&gt; $this-&gt;masked($_POST, &#039;_POST&#039;),
+                &quot;Files&quot;                 =&gt; isset($_FILES) ? $this-&gt;masked($_FILES, &#039;_FILES&#039;) : [],
+                &quot;Cookies&quot;               =&gt; $this-&gt;masked($_COOKIE, &#039;_COOKIE&#039;),
+                &quot;Session&quot;               =&gt; isset($_SESSION) ? $this-&gt;masked($_SESSION, &#039;_SESSION&#039;) :  [],
+                &quot;Server/Request Data&quot;   =&gt; $this-&gt;masked($_SERVER, &#039;_SERVER&#039;),
+                &quot;Environment Variables&quot; =&gt; $this-&gt;masked($_ENV, &#039;_ENV&#039;),
+            ],
+        ];
+
+        if (isset($customCssFile)) {
+            $vars[&quot;stylesheet&quot;] .= file_get_contents($customCssFile);
+        }
+
+        if (isset($customJsFile)) {
+            $vars[&quot;javascript&quot;] .= file_get_contents($customJsFile);
+        }
+
+        // Add extra entries list of data tables:
+        // @todo: Consolidate addDataTable and addDataTableCallback
+        $extraTables = array_map(function ($table) use ($inspector) {
+            return $table instanceof \Closure ? $table($inspector) : $table;
+        }, $this-&gt;getDataTables());
+        $vars[&quot;tables&quot;] = array_merge($extraTables, $vars[&quot;tables&quot;]);
+
+        $plainTextHandler = new PlainTextHandler();
+        $plainTextHandler-&gt;setRun($this-&gt;getRun());
+        $plainTextHandler-&gt;setException($this-&gt;getException());
+        $plainTextHandler-&gt;setInspector($this-&gt;getInspector());
+        $vars[&quot;preface&quot;] = &quot;&lt;!--\n\n\n&quot; .  $this-&gt;templateHelper-&gt;escape($plainTextHandler-&gt;generateResponse()) . &quot;\n\n\n\n\n\n\n\n\n\n\n--&gt;&quot;;
+
+        $this-&gt;templateHelper-&gt;setVariables($vars);
+        $this-&gt;templateHelper-&gt;render($templateFile);
+
+        return Handler::QUIT;
+    }
+
+    /**
+     * Get the stack trace frames of the exception currently being handled.
+     *
+     * @return \Whoops\Exception\FrameCollection
+     */
+    protected function getExceptionFrames()
+    {
+        $frames = $this-&gt;getInspector()-&gt;getFrames($this-&gt;getRun()-&gt;getFrameFilters());
+
+        if ($this-&gt;getApplicationPaths()) {
+            foreach ($frames as $frame) {
+                foreach ($this-&gt;getApplicationPaths() as $path) {
+                    if (strpos($frame-&gt;getFile(), $path) === 0) {
+                        $frame-&gt;setApplication(true);
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $frames;
+    }
+
+    /**
+     * Get the code of the exception currently being handled.
+     *
+     * @return string
+     */
+    protected function getExceptionCode()
+    {
+        $exception = $this-&gt;getException();
+
+        $code = $exception-&gt;getCode();
+        if ($exception instanceof \ErrorException) {
+            // ErrorExceptions wrap the php-error types within the &#039;severity&#039; property
+            $code = Misc::translateErrorCode($exception-&gt;getSeverity());
+        }
+
+        return (string) $code;
+    }
+
+    /**
+     * @return string
+     */
+    public function contentType()
+    {
+        return &#039;text/html&#039;;
+    }
+
+    /**
+     * Adds an entry to the list of tables displayed in the template.
+     *
+     * The expected data is a simple associative array. Any nested arrays
+     * will be flattened with `print_r`.
+     *
+     * @param string $label
+     *
+     * @return static
+     */
+    public function addDataTable($label, array $data)
+    {
+        $this-&gt;extraTables[$label] = $data;
+        return $this;
+    }
+
+    /**
+     * Lazily adds an entry to the list of tables displayed in the table.
+     *
+     * The supplied callback argument will be called when the error is
+     * rendered, it should produce a simple associative array. Any nested
+     * arrays will be flattened with `print_r`.
+     *
+     * @param string   $label
+     * @param callable $callback Callable returning an associative array
+     *
+     * @throws InvalidArgumentException If $callback is not callable
+     *
+     * @return static
+     */
+    public function addDataTableCallback($label, /* callable */ $callback)
+    {
+        if (!is_callable($callback)) {
+            throw new InvalidArgumentException(&#039;Expecting callback argument to be callable&#039;);
+        }
+
+        $this-&gt;extraTables[$label] = function (?\Whoops\Inspector\InspectorInterface $inspector = null) use ($callback) {
+            try {
+                $result = call_user_func($callback, $inspector);
+
+                // Only return the result if it can be iterated over by foreach().
+                return is_array($result) || $result instanceof \Traversable ? $result : [];
+            } catch (\Exception $e) {
+                // Don&#039;t allow failure to break the rendering of the original exception.
+                return [];
+            }
+        };
+
+        return $this;
+    }
+
+    /**
+     * Returns all the extra data tables registered with this handler.
+     *
+     * Optionally accepts a &#039;label&#039; parameter, to only return the data table
+     * under that label.
+     *
+     * @param string|null $label
+     *
+     * @return array[]|callable
+     */
+    public function getDataTables($label = null)
+    {
+        if ($label !== null) {
+            return isset($this-&gt;extraTables[$label]) ?
+                   $this-&gt;extraTables[$label] : [];
+        }
+
+        return $this-&gt;extraTables;
+    }
+
+    /**
+     * Set whether to handle unconditionally.
+     *
+     * Allows to disable all attempts to dynamically decide whether to handle
+     * or return prematurely. Set this to ensure that the handler will perform,
+     * no matter what.
+     *
+     * @param bool|null $value
+     *
+     * @return bool|static
+     */
+    public function handleUnconditionally($value = null)
+    {
+        if (func_num_args() == 0) {
+            return $this-&gt;handleUnconditionally;
+        }
+
+        $this-&gt;handleUnconditionally = (bool) $value;
+        return $this;
+    }
+
+    /**
+     * Adds an editor resolver.
+     *
+     * Either a string, or a closure that resolves a string, that can be used
+     * to open a given file in an editor. If the string contains the special
+     * substrings %file or %line, they will be replaced with the correct data.
+     *
+     * @example
+     *  $run-&gt;addEditor(&#039;macvim&#039;, &quot;mvim://open?url=file://%file&amp;line=%line&quot;)
+     * @example
+     *   $run-&gt;addEditor(&#039;remove-it&#039;, function($file, $line) {
+     *       unlink($file);
+     *       return &quot;http://stackoverflow.com&quot;;
+     *   });
+     *
+     * @param string          $identifier
+     * @param string|callable $resolver
+     *
+     * @return static
+     */
+    public function addEditor($identifier, $resolver)
+    {
+        $this-&gt;editors[$identifier] = $resolver;
+        return $this;
+    }
+
+    /**
+     * Set the editor to use to open referenced files.
+     *
+     * Pass either the name of a configured editor, or a closure that directly
+     * resolves an editor string.
+     *
+     * @example
+     *   $run-&gt;setEditor(function($file, $line) { return &quot;file:///{$file}&quot;; });
+     * @example
+     *   $run-&gt;setEditor(&#039;sublime&#039;);
+     *
+     * @param string|callable $editor
+     *
+     * @throws InvalidArgumentException If invalid argument identifier provided
+     *
+     * @return static
+     */
+    public function setEditor($editor)
+    {
+        if (!is_callable($editor) &amp;&amp; !isset($this-&gt;editors[$editor])) {
+            throw new InvalidArgumentException(
+                &quot;Unknown editor identifier: $editor. Known editors:&quot; .
+                implode(&quot;,&quot;, array_keys($this-&gt;editors))
+            );
+        }
+
+        $this-&gt;editor = $editor;
+        return $this;
+    }
+
+    /**
+     * Get the editor href for a given file and line, if available.
+     *
+     * @param string $filePath
+     * @param int    $line
+     *
+     * @throws InvalidArgumentException If editor resolver does not return a string
+     *
+     * @return string|bool
+     */
+    public function getEditorHref($filePath, $line)
+    {
+        $editor = $this-&gt;getEditor($filePath, $line);
+
+        if (empty($editor)) {
+            return false;
+        }
+
+        // Check that the editor is a string, and replace the
+        // %line and %file placeholders:
+        if (!isset($editor[&#039;url&#039;]) || !is_string($editor[&#039;url&#039;])) {
+            throw new UnexpectedValueException(
+                __METHOD__ . &quot; should always resolve to a string or a valid editor array; got something else instead.&quot;
+            );
+        }
+
+        $editor[&#039;url&#039;] = str_replace(&quot;%line&quot;, rawurlencode($line), $editor[&#039;url&#039;]);
+        $editor[&#039;url&#039;] = str_replace(&quot;%file&quot;, rawurlencode($filePath), $editor[&#039;url&#039;]);
+
+        return $editor[&#039;url&#039;];
+    }
+
+    /**
+     * Determine if the editor link should act as an Ajax request.
+     *
+     * @param string $filePath
+     * @param int    $line
+     *
+     * @throws UnexpectedValueException If editor resolver does not return a boolean
+     *
+     * @return bool
+     */
+    public function getEditorAjax($filePath, $line)
+    {
+        $editor = $this-&gt;getEditor($filePath, $line);
+
+        // Check that the ajax is a bool
+        if (!isset($editor[&#039;ajax&#039;]) || !is_bool($editor[&#039;ajax&#039;])) {
+            throw new UnexpectedValueException(
+                __METHOD__ . &quot; should always resolve to a bool; got something else instead.&quot;
+            );
+        }
+        return $editor[&#039;ajax&#039;];
+    }
+
+    /**
+     * Determines both the editor and if ajax should be used.
+     *
+     * @param string $filePath
+     * @param int    $line
+     *
+     * @return array
+     */
+    protected function getEditor($filePath, $line)
+    {
+        if (!$this-&gt;editor || (!is_string($this-&gt;editor) &amp;&amp; !is_callable($this-&gt;editor))) {
+            return [];
+        }
+
+        if (is_string($this-&gt;editor) &amp;&amp; isset($this-&gt;editors[$this-&gt;editor]) &amp;&amp; !is_callable($this-&gt;editors[$this-&gt;editor])) {
+            return [
+                &#039;ajax&#039; =&gt; false,
+                &#039;url&#039; =&gt; $this-&gt;editors[$this-&gt;editor],
+            ];
+        }
+
+        if (is_callable($this-&gt;editor) || (isset($this-&gt;editors[$this-&gt;editor]) &amp;&amp; is_callable($this-&gt;editors[$this-&gt;editor]))) {
+            if (is_callable($this-&gt;editor)) {
+                $callback = call_user_func($this-&gt;editor, $filePath, $line);
+            } else {
+                $callback = call_user_func($this-&gt;editors[$this-&gt;editor], $filePath, $line);
+            }
+
+            if (empty($callback)) {
+                return [];
+            }
+
+            if (is_string($callback)) {
+                return [
+                    &#039;ajax&#039; =&gt; false,
+                    &#039;url&#039; =&gt; $callback,
+                ];
+            }
+
+            return [
+                &#039;ajax&#039; =&gt; isset($callback[&#039;ajax&#039;]) ? $callback[&#039;ajax&#039;] : false,
+                &#039;url&#039; =&gt; isset($callback[&#039;url&#039;]) ? $callback[&#039;url&#039;] : $callback,
+            ];
+        }
+
+        return [];
+    }
+
+    /**
+     * Set the page title.
+     *
+     * @param string $title
+     *
+     * @return static
+     */
+    public function setPageTitle($title)
+    {
+        $this-&gt;pageTitle = (string) $title;
+        return $this;
+    }
+
+    /**
+     * Get the page title.
+     *
+     * @return string
+     */
+    public function getPageTitle()
+    {
+        return $this-&gt;pageTitle;
+    }
+
+    /**
+     * Adds a path to the list of paths to be searched for resources.
+     *
+     * @param string $path
+     *
+     * @throws InvalidArgumentException If $path is not a valid directory
+     *
+     * @return static
+     */
+    public function addResourcePath($path)
+    {
+        if (!is_dir($path)) {
+            throw new InvalidArgumentException(
+                &quot;&#039;$path&#039; is not a valid directory&quot;
+            );
+        }
+
+        array_unshift($this-&gt;searchPaths, $path);
+        return $this;
+    }
+
+    /**
+     * Adds a custom css file to be loaded.
+     *
+     * @param string|null $name
+     *
+     * @return static
+     */
+    public function addCustomCss($name)
+    {
+        $this-&gt;customCss = $name;
+        return $this;
+    }
+
+    /**
+     * Adds a custom js file to be loaded.
+     *
+     * @param string|null $name
+     *
+     * @return static
+     */
+    public function addCustomJs($name)
+    {
+        $this-&gt;customJs = $name;
+        return $this;
+    }
+
+    /**
+     * @return array
+     */
+    public function getResourcePaths()
+    {
+        return $this-&gt;searchPaths;
+    }
+
+    /**
+     * Finds a resource, by its relative path, in all available search paths.
+     *
+     * The search is performed starting at the last search path, and all the
+     * way back to the first, enabling a cascading-type system of overrides for
+     * all resources.
+     *
+     * @param string $resource
+     *
+     * @throws RuntimeException If resource cannot be found in any of the available paths
+     *
+     * @return string
+     */
+    protected function getResource($resource)
+    {
+        // If the resource was found before, we can speed things up
+        // by caching its absolute, resolved path:
+        if (isset($this-&gt;resourceCache[$resource])) {
+            return $this-&gt;resourceCache[$resource];
+        }
+
+        // Search through available search paths, until we find the
+        // resource we&#039;re after:
+        foreach ($this-&gt;searchPaths as $path) {
+            $fullPath = $path . &quot;/$resource&quot;;
+
+            if (is_file($fullPath)) {
+                // Cache the result:
+                $this-&gt;resourceCache[$resource] = $fullPath;
+                return $fullPath;
+            }
+        }
+
+        // If we got this far, nothing was found.
+        throw new RuntimeException(
+            &quot;Could not find resource &#039;$resource&#039; in any resource paths.&quot;
+            . &quot;(searched: &quot; . join(&quot;, &quot;, $this-&gt;searchPaths). &quot;)&quot;
+        );
+    }
+
+    /**
+     * @deprecated
+     *
+     * @return string
+     */
+    public function getResourcesPath()
+    {
+        $allPaths = $this-&gt;getResourcePaths();
+
+        // Compat: return only the first path added
+        return end($allPaths) ?: null;
+    }
+
+    /**
+     * @deprecated
+     *
+     * @param string $resourcesPath
+     *
+     * @return static
+     */
+    public function setResourcesPath($resourcesPath)
+    {
+        $this-&gt;addResourcePath($resourcesPath);
+        return $this;
+    }
+
+    /**
+     * Return the application paths.
+     *
+     * @return array
+     */
+    public function getApplicationPaths()
+    {
+        return $this-&gt;applicationPaths;
+    }
+
+    /**
+     * Set the application paths.
+     *
+     * @return void
+     */
+    public function setApplicationPaths(array $applicationPaths)
+    {
+        $this-&gt;applicationPaths = $applicationPaths;
+    }
+
+    /**
+     * Set the application root path.
+     *
+     * @param string $applicationRootPath
+     *
+     * @return void
+     */
+    public function setApplicationRootPath($applicationRootPath)
+    {
+        $this-&gt;templateHelper-&gt;setApplicationRootPath($applicationRootPath);
+    }
+
+    /**
+     * blacklist a sensitive value within one of the superglobal arrays.
+     * Alias for the hideSuperglobalKey method.
+     *
+     * @param string $superGlobalName The name of the superglobal array, e.g. &#039;_GET&#039;
+     * @param string $key             The key within the superglobal
+     * @see hideSuperglobalKey
+     *
+     * @return static
+     */
+    public function blacklist($superGlobalName, $key)
+    {
+        $this-&gt;blacklist[$superGlobalName][] = $key;
+        return $this;
+    }
+
+    /**
+     * Hide a sensitive value within one of the superglobal arrays.
+     *
+     * @param string $superGlobalName The name of the superglobal array, e.g. &#039;_GET&#039;
+     * @param string $key             The key within the superglobal
+     * @return static
+     */
+    public function hideSuperglobalKey($superGlobalName, $key)
+    {
+        return $this-&gt;blacklist($superGlobalName, $key);
+    }
+
+    /**
+     * Checks all values within the given superGlobal array.
+     *
+     * Blacklisted values will be replaced by a equal length string containing
+     * only &#039;*&#039; characters for string values.
+     * Non-string values will be replaced with a fixed asterisk count.
+     * We intentionally dont rely on $GLOBALS as it depends on the &#039;auto_globals_jit&#039; php.ini setting.
+     *
+     * @param array|\ArrayAccess  $superGlobal     One of the superglobal arrays
+     * @param string $superGlobalName The name of the superglobal array, e.g. &#039;_GET&#039;
+     *
+     * @return array $values without sensitive data
+     */
+    private function masked($superGlobal, $superGlobalName)
+    {
+        $blacklisted = $this-&gt;blacklist[$superGlobalName];
+
+        $values = $superGlobal;
+
+        foreach ($blacklisted as $key) {
+            if (isset($superGlobal[$key])) {
+                $values[$key] = str_repeat(&#039;*&#039;, is_string($superGlobal[$key]) ? strlen($superGlobal[$key]) : 3);
+            }
+        }
+
+        return $values;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/filp/whoops/src/Whoops/Handler/XmlResponseHandler.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/filp/whoops/src/Whoops/Inspector -->
+
+</body>
+</html>

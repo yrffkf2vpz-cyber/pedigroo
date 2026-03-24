@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Connection/Replication/SentinelReplication.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Connection\Replication;
+
+use InvalidArgumentException;
+use Predis\Command\CommandInterface;
+use Predis\Command\RawCommand;
+use Predis\CommunicationException;
+use Predis\Connection\ConnectionException;
+use Predis\Connection\FactoryInterface as ConnectionFactoryInterface;
+use Predis\Connection\NodeConnectionInterface;
+use Predis\Connection\Parameters;
+use Predis\Replication\ReplicationStrategy;
+use Predis\Replication\RoleException;
+use Predis\Response\Error;
+use Predis\Response\ErrorInterface as ErrorResponseInterface;
+use Predis\Response\ServerException;
+
+/**
+ * @author Daniele Alessandri &lt;suppakilla@gmail.com&gt;
+ * @author Ville Mattila &lt;ville@eventio.fi&gt;
+ */
+class SentinelReplication implements ReplicationInterface
+{
+    /**
+     * @var NodeConnectionInterface
+     */
+    protected $master;
+
+    /**
+     * @var NodeConnectionInterface[]
+     */
+    protected $slaves = [];
+
+    /**
+     * @var NodeConnectionInterface[]
+     */
+    protected $pool = [];
+
+    /**
+     * @var NodeConnectionInterface
+     */
+    protected $current;
+
+    /**
+     * @var string
+     */
+    protected $service;
+
+    /**
+     * @var ConnectionFactoryInterface
+     */
+    protected $connectionFactory;
+
+    /**
+     * @var ReplicationStrategy
+     */
+    protected $strategy;
+
+    /**
+     * @var NodeConnectionInterface[]
+     */
+    protected $sentinels = [];
+
+    /**
+     * @var int
+     */
+    protected $sentinelIndex = 0;
+
+    /**
+     * @var NodeConnectionInterface
+     */
+    protected $sentinelConnection;
+
+    /**
+     * @var float
+     */
+    protected $sentinelTimeout = 0.100;
+
+    /**
+     * Max number of automatic retries of commands upon server failure.
+     *
+     * -1 = unlimited retry attempts
+     *  0 = no retry attempts (fails immediately)
+     *  n = fail only after n retry attempts
+     *
+     * @var int
+     */
+    protected $retryLimit = 20;
+
+    /**
+     * Time to wait in milliseconds before fetching a new configuration from one
+     * of the sentinel servers.
+     *
+     * @var int
+     */
+    protected $retryWait = 1000;
+
+    /**
+     * Flag for automatic fetching of available sentinels.
+     *
+     * @var bool
+     */
+    protected $updateSentinels = false;
+
+    /**
+     * @param string                     $service           Name of the service for autodiscovery.
+     * @param array                      $sentinels         Sentinel servers connection parameters.
+     * @param ConnectionFactoryInterface $connectionFactory Connection factory instance.
+     * @param ReplicationStrategy|null   $strategy          Replication strategy instance.
+     */
+    public function __construct(
+        $service,
+        array $sentinels,
+        ConnectionFactoryInterface $connectionFactory,
+        ?ReplicationStrategy $strategy = null
+    ) {
+        $this-&gt;sentinels = $sentinels;
+        $this-&gt;service = $service;
+        $this-&gt;connectionFactory = $connectionFactory;
+        $this-&gt;strategy = $strategy ?: new ReplicationStrategy();
+    }
+
+    /**
+     * Sets a default timeout for connections to sentinels.
+     *
+     * When &quot;timeout&quot; is present in the connection parameters of sentinels, its
+     * value overrides the default sentinel timeout.
+     *
+     * @param float $timeout Timeout value.
+     */
+    public function setSentinelTimeout($timeout)
+    {
+        $this-&gt;sentinelTimeout = (float) $timeout;
+    }
+
+    /**
+     * Sets the maximum number of retries for commands upon server failure.
+     *
+     * -1 = unlimited retry attempts
+     *  0 = no retry attempts (fails immediately)
+     *  n = fail only after n retry attempts
+     *
+     * @param int $retry Number of retry attempts.
+     */
+    public function setRetryLimit($retry)
+    {
+        $this-&gt;retryLimit = (int) $retry;
+    }
+
+    /**
+     * Sets the time to wait (in milliseconds) before fetching a new configuration
+     * from one of the sentinels.
+     *
+     * @param float $milliseconds Time to wait before the next attempt.
+     */
+    public function setRetryWait($milliseconds)
+    {
+        $this-&gt;retryWait = (float) $milliseconds;
+    }
+
+    /**
+     * Set automatic fetching of available sentinels.
+     *
+     * @param bool $update Enable or disable automatic updates.
+     */
+    public function setUpdateSentinels($update)
+    {
+        $this-&gt;updateSentinels = (bool) $update;
+    }
+
+    /**
+     * Resets the current connection.
+     */
+    protected function reset()
+    {
+        $this-&gt;current = null;
+    }
+
+    /**
+     * Wipes the current list of master and slaves nodes.
+     */
+    protected function wipeServerList()
+    {
+        $this-&gt;reset();
+
+        $this-&gt;master = null;
+        $this-&gt;slaves = [];
+        $this-&gt;pool = [];
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function add(NodeConnectionInterface $connection)
+    {
+        $parameters = $connection-&gt;getParameters();
+        $role = $parameters-&gt;role;
+
+        if (&#039;master&#039; === $role) {
+            $this-&gt;master = $connection;
+        } elseif (&#039;sentinel&#039; === $role) {
+            $this-&gt;sentinels[] = $connection;
+
+            // sentinels are not considered part of the pool.
+            return;
+        } else {
+            // everything else is considered a slave.
+            $this-&gt;slaves[] = $connection;
+        }
+
+        $this-&gt;pool[(string) $connection] = $connection;
+
+        $this-&gt;reset();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function remove(NodeConnectionInterface $connection)
+    {
+        if ($connection === $this-&gt;master) {
+            $this-&gt;master = null;
+        } elseif (false !== $id = array_search($connection, $this-&gt;slaves, true)) {
+            unset($this-&gt;slaves[$id]);
+        } elseif (false !== $id = array_search($connection, $this-&gt;sentinels, true)) {
+            unset($this-&gt;sentinels[$id]);
+
+            return true;
+        } else {
+            return false;
+        }
+
+        unset($this-&gt;pool[(string) $connection]);
+
+        $this-&gt;reset();
+
+        return true;
+    }
+
+    /**
+     * Creates a new connection to a sentinel server.
+     *
+     * @return NodeConnectionInterface
+     */
+    protected function createSentinelConnection($parameters)
+    {
+        if ($parameters instanceof NodeConnectionInterface) {
+            return $parameters;
+        }
+
+        if (is_string($parameters)) {
+            $parameters = Parameters::parse($parameters);
+        }
+
+        if (is_array($parameters)) {
+            // NOTE: sentinels do not accept AUTH and SELECT commands so we must
+            // explicitly set them to NULL to avoid problems when using default
+            // parameters set via client options. Actually AUTH is supported for
+            // sentinels starting with Redis 5 but we have to differentiate from
+            // sentinels passwords and nodes passwords, this will be implemented
+            // in a later release.
+            $parameters[&#039;database&#039;] = null;
+            $parameters[&#039;username&#039;] = null;
+
+            // don&#039;t leak password from between configurations
+            // https://github.com/predis/predis/pull/807/#discussion_r985764770
+            if (!isset($parameters[&#039;password&#039;])) {
+                $parameters[&#039;password&#039;] = null;
+            }
+
+            if (!isset($parameters[&#039;timeout&#039;])) {
+                $parameters[&#039;timeout&#039;] = $this-&gt;sentinelTimeout;
+            }
+        }
+
+        return $this-&gt;connectionFactory-&gt;create($parameters);
+    }
+
+    /**
+     * Returns the current sentinel connection.
+     *
+     * If there is no active sentinel connection, a new connection is created.
+     *
+     * @return NodeConnectionInterface
+     */
+    public function getSentinelConnection()
+    {
+        if (!$this-&gt;sentinelConnection) {
+            if ($this-&gt;sentinelIndex &gt;= count($this-&gt;sentinels)) {
+                $this-&gt;sentinelIndex = 0;
+                throw new \Predis\ClientException(&#039;No sentinel server available for autodiscovery.&#039;);
+            }
+
+            $sentinel = $this-&gt;sentinels[$this-&gt;sentinelIndex];
+            ++$this-&gt;sentinelIndex;
+            $this-&gt;sentinelConnection = $this-&gt;createSentinelConnection($sentinel);
+        }
+
+        return $this-&gt;sentinelConnection;
+    }
+
+    /**
+     * Fetches an updated list of sentinels from a sentinel.
+     */
+    public function updateSentinels()
+    {
+        SENTINEL_QUERY: {
+            $sentinel = $this-&gt;getSentinelConnection();
+
+            try {
+                $payload = $sentinel-&gt;executeCommand(
+                    RawCommand::create(&#039;SENTINEL&#039;, &#039;sentinels&#039;, $this-&gt;service)
+                );
+
+                $this-&gt;sentinels = [];
+                $this-&gt;sentinelIndex = 0;
+                // NOTE: sentinel server does not return itself, so we add it back.
+                $this-&gt;sentinels[] = $sentinel-&gt;getParameters()-&gt;toArray();
+
+                foreach ($payload as $sentinel) {
+                    $this-&gt;sentinels[] = [
+                        &#039;host&#039; =&gt; $sentinel[3],
+                        &#039;port&#039; =&gt; $sentinel[5],
+                        &#039;role&#039; =&gt; &#039;sentinel&#039;,
+                    ];
+                }
+            } catch (ConnectionException $exception) {
+                $this-&gt;sentinelConnection = null;
+
+                goto SENTINEL_QUERY;
+            }
+        }
+    }
+
+    /**
+     * Fetches the details for the master and slave servers from a sentinel.
+     */
+    public function querySentinel()
+    {
+        $this-&gt;wipeServerList();
+
+        $this-&gt;updateSentinels();
+        $this-&gt;getMaster();
+        $this-&gt;getSlaves();
+    }
+
+    /**
+     * Handles error responses returned by redis-sentinel.
+     *
+     * @param NodeConnectionInterface $sentinel Connection to a sentinel server.
+     * @param ErrorResponseInterface  $error    Error response.
+     */
+    private function handleSentinelErrorResponse(NodeConnectionInterface $sentinel, ErrorResponseInterface $error)
+    {
+        if ($error-&gt;getErrorType() === &#039;IDONTKNOW&#039;) {
+            throw new ConnectionException($sentinel, $error-&gt;getMessage());
+        } else {
+            throw new ServerException($error-&gt;getMessage());
+        }
+    }
+
+    /**
+     * Fetches the details for the master server from a sentinel.
+     *
+     * @param NodeConnectionInterface $sentinel Connection to a sentinel server.
+     * @param string                  $service  Name of the service.
+     *
+     * @return array
+     */
+    protected function querySentinelForMaster(NodeConnectionInterface $sentinel, $service)
+    {
+        $payload = $sentinel-&gt;executeCommand(
+            RawCommand::create(&#039;SENTINEL&#039;, &#039;get-master-addr-by-name&#039;, $service)
+        );
+
+        if ($payload === null) {
+            throw new ServerException(&#039;ERR No such master with that name&#039;);
+        }
+
+        if ($payload instanceof ErrorResponseInterface) {
+            $this-&gt;handleSentinelErrorResponse($sentinel, $payload);
+        }
+
+        return [
+            &#039;host&#039; =&gt; $payload[0],
+            &#039;port&#039; =&gt; $payload[1],
+            &#039;role&#039; =&gt; &#039;master&#039;,
+        ];
+    }
+
+    /**
+     * Fetches the details for the slave servers from a sentinel.
+     *
+     * @param NodeConnectionInterface $sentinel Connection to a sentinel server.
+     * @param string                  $service  Name of the service.
+     *
+     * @return array
+     */
+    protected function querySentinelForSlaves(NodeConnectionInterface $sentinel, $service)
+    {
+        $slaves = [];
+
+        $payload = $sentinel-&gt;executeCommand(
+            RawCommand::create(&#039;SENTINEL&#039;, &#039;slaves&#039;, $service)
+        );
+
+        if ($payload instanceof ErrorResponseInterface) {
+            $this-&gt;handleSentinelErrorResponse($sentinel, $payload);
+        }
+
+        foreach ($payload as $slave) {
+            $flags = explode(&#039;,&#039;, $slave[9]);
+
+            if (array_intersect($flags, [&#039;s_down&#039;, &#039;o_down&#039;, &#039;disconnected&#039;])) {
+                continue;
+            }
+
+            // ensure `master-link-status` is ok
+            if (isset($slave[31]) &amp;&amp; $slave[31] === &#039;err&#039;) {
+                continue;
+            }
+
+            $slaves[] = [
+                &#039;host&#039; =&gt; $slave[3],
+                &#039;port&#039; =&gt; $slave[5],
+                &#039;role&#039; =&gt; &#039;slave&#039;,
+            ];
+        }
+
+        return $slaves;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getCurrent()
+    {
+        return $this-&gt;current;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getMaster()
+    {
+        if ($this-&gt;master) {
+            return $this-&gt;master;
+        }
+
+        if ($this-&gt;updateSentinels) {
+            $this-&gt;updateSentinels();
+        }
+
+        SENTINEL_QUERY: {
+            $sentinel = $this-&gt;getSentinelConnection();
+
+            try {
+                $masterParameters = $this-&gt;querySentinelForMaster($sentinel, $this-&gt;service);
+                $masterConnection = $this-&gt;connectionFactory-&gt;create($masterParameters);
+
+                $this-&gt;add($masterConnection);
+            } catch (ConnectionException $exception) {
+                $this-&gt;sentinelConnection = null;
+
+                goto SENTINEL_QUERY;
+            }
+        }
+
+        return $masterConnection;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getSlaves()
+    {
+        if ($this-&gt;slaves) {
+            return array_values($this-&gt;slaves);
+        }
+
+        if ($this-&gt;updateSentinels) {
+            $this-&gt;updateSentinels();
+        }
+
+        SENTINEL_QUERY: {
+            $sentinel = $this-&gt;getSentinelConnection();
+
+            try {
+                $slavesParameters = $this-&gt;querySentinelForSlaves($sentinel, $this-&gt;service);
+
+                foreach ($slavesParameters as $slaveParameters) {
+                    $this-&gt;add($this-&gt;connectionFactory-&gt;create($slaveParameters));
+                }
+            } catch (ConnectionException $exception) {
+                $this-&gt;sentinelConnection = null;
+
+                goto SENTINEL_QUERY;
+            }
+        }
+
+        return array_values($this-&gt;slaves);
+    }
+
+    /**
+     * Returns a random slave.
+     *
+     * @return NodeConnectionInterface|null
+     */
+    protected function pickSlave()
+    {
+        $slaves = $this-&gt;getSlaves();
+
+        return $slaves
+            ? $slaves[rand(1, count($slaves)) - 1]
+            : null;
+    }
+
+    /**
+     * Returns the connection instance in charge for the given command.
+     *
+     * @param CommandInterface $command Command instance.
+     *
+     * @return NodeConnectionInterface
+     */
+    private function getConnectionInternal(CommandInterface $command)
+    {
+        if (!$this-&gt;current) {
+            if ($this-&gt;strategy-&gt;isReadOperation($command) &amp;&amp; $slave = $this-&gt;pickSlave()) {
+                $this-&gt;current = $slave;
+            } else {
+                $this-&gt;current = $this-&gt;getMaster();
+            }
+
+            return $this-&gt;current;
+        }
+
+        if ($this-&gt;current === $this-&gt;master) {
+            return $this-&gt;current;
+        }
+
+        if (!$this-&gt;strategy-&gt;isReadOperation($command)) {
+            $this-&gt;current = $this-&gt;getMaster();
+        }
+
+        return $this-&gt;current;
+    }
+
+    /**
+     * Asserts that the specified connection matches an expected role.
+     *
+     * @param NodeConnectionInterface $connection Connection to a redis server.
+     * @param string                  $role       Expected role of the server (&quot;master&quot;, &quot;slave&quot; or &quot;sentinel&quot;).
+     *
+     * @throws RoleException|ConnectionException
+     */
+    protected function assertConnectionRole(NodeConnectionInterface $connection, $role)
+    {
+        $role = strtolower($role);
+        $actualRole = $connection-&gt;executeCommand(RawCommand::create(&#039;ROLE&#039;));
+
+        if ($actualRole instanceof Error) {
+            throw new ConnectionException($connection, $actualRole-&gt;getMessage());
+        }
+
+        if ($role !== $actualRole[0]) {
+            throw new RoleException($connection, &quot;Expected $role but got $actualRole[0] [$connection]&quot;);
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getConnectionByCommand(CommandInterface $command)
+    {
+        $connection = $this-&gt;getConnectionInternal($command);
+
+        if (!$connection-&gt;isConnected()) {
+            // When we do not have any available slave in the pool we can expect
+            // read-only operations to hit the master server.
+            $expectedRole = $this-&gt;strategy-&gt;isReadOperation($command) &amp;&amp; $this-&gt;slaves ? &#039;slave&#039; : &#039;master&#039;;
+            $this-&gt;assertConnectionRole($connection, $expectedRole);
+        }
+
+        return $connection;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getConnectionById($id)
+    {
+        return $this-&gt;pool[$id] ?? null;
+    }
+
+    /**
+     * Returns a connection by its role.
+     *
+     * @param string $role Connection role (`master`, `slave` or `sentinel`)
+     *
+     * @return NodeConnectionInterface|null
+     */
+    public function getConnectionByRole($role)
+    {
+        if ($role === &#039;master&#039;) {
+            return $this-&gt;getMaster();
+        } elseif ($role === &#039;slave&#039;) {
+            return $this-&gt;pickSlave();
+        } elseif ($role === &#039;sentinel&#039;) {
+            return $this-&gt;getSentinelConnection();
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Switches the internal connection in use by the backend.
+     *
+     * Sentinel connections are not considered as part of the pool, meaning that
+     * trying to switch to a sentinel will throw an exception.
+     *
+     * @param NodeConnectionInterface $connection Connection instance in the pool.
+     */
+    public function switchTo(NodeConnectionInterface $connection)
+    {
+        if ($connection &amp;&amp; $connection === $this-&gt;current) {
+            return;
+        }
+
+        if ($connection !== $this-&gt;master &amp;&amp; !in_array($connection, $this-&gt;slaves, true)) {
+            throw new InvalidArgumentException(&#039;Invalid connection or connection not found.&#039;);
+        }
+
+        $connection-&gt;connect();
+
+        if ($this-&gt;current) {
+            $this-&gt;current-&gt;disconnect();
+        }
+
+        $this-&gt;current = $connection;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function switchToMaster()
+    {
+        $connection = $this-&gt;getConnectionByRole(&#039;master&#039;);
+        $this-&gt;switchTo($connection);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function switchToSlave()
+    {
+        $connection = $this-&gt;getConnectionByRole(&#039;slave&#039;);
+        $this-&gt;switchTo($connection);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function isConnected()
+    {
+        return $this-&gt;current ? $this-&gt;current-&gt;isConnected() : false;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function connect()
+    {
+        if (!$this-&gt;current) {
+            if (!$this-&gt;current = $this-&gt;pickSlave()) {
+                $this-&gt;current = $this-&gt;getMaster();
+            }
+        }
+
+        $this-&gt;current-&gt;connect();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function disconnect()
+    {
+        foreach ($this-&gt;pool as $connection) {
+            $connection-&gt;disconnect();
+        }
+    }
+
+    /**
+     * Retries the execution of a command upon server failure after asking a new
+     * configuration to one of the sentinels.
+     *
+     * @param CommandInterface $command Command instance.
+     * @param string           $method  Actual method.
+     *
+     * @return mixed
+     */
+    private function retryCommandOnFailure(CommandInterface $command, $method)
+    {
+        $retries = 0;
+
+        while ($retries &lt;= $this-&gt;retryLimit) {
+            try {
+                $response = $this-&gt;getConnectionByCommand($command)-&gt;$method($command);
+                break;
+            } catch (CommunicationException $exception) {
+                $this-&gt;wipeServerList();
+                $exception-&gt;getConnection()-&gt;disconnect();
+
+                if ($retries === $this-&gt;retryLimit) {
+                    throw $exception;
+                }
+
+                usleep($this-&gt;retryWait * 1000);
+
+                ++$retries;
+            }
+        }
+
+        return $response;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function writeRequest(CommandInterface $command)
+    {
+        $this-&gt;retryCommandOnFailure($command, __FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function readResponse(CommandInterface $command)
+    {
+        return $this-&gt;retryCommandOnFailure($command, __FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function executeCommand(CommandInterface $command)
+    {
+        return $this-&gt;retryCommandOnFailure($command, __FUNCTION__);
+    }
+
+    /**
+     * Returns the underlying replication strategy.
+     *
+     * @return ReplicationStrategy
+     */
+    public function getReplicationStrategy()
+    {
+        return $this-&gt;strategy;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __sleep()
+    {
+        return [
+            &#039;master&#039;, &#039;slaves&#039;, &#039;pool&#039;, &#039;service&#039;, &#039;sentinels&#039;, &#039;connectionFactory&#039;, &#039;strategy&#039;,
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Connection/StreamConnection.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Monitor -->
+
+</body>
+</html>

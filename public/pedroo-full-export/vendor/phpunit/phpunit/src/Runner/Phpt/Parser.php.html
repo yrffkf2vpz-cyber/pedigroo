@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpunit/phpunit/src/Runner/Phpt/Parser.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of PHPUnit.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace PHPUnit\Runner\Phpt;
+
+use const DIRECTORY_SEPARATOR;
+use function assert;
+use function dirname;
+use function explode;
+use function file;
+use function file_get_contents;
+use function is_file;
+use function is_readable;
+use function is_string;
+use function preg_match;
+use function rtrim;
+use function str_contains;
+use function trim;
+use PHPUnit\Runner\Exception;
+
+/**
+ * @no-named-arguments Parameter names are not covered by the backward compatibility promise for PHPUnit
+ *
+ * @internal This class is not covered by the backward compatibility promise for PHPUnit
+ *
+ * @see https://qa.php.net/phpt_details.php
+ */
+final readonly class Parser
+{
+    /**
+     * @param non-empty-string $phptFile
+     *
+     * @throws Exception
+     *
+     * @return array&lt;non-empty-string, non-empty-string&gt;
+     */
+    public function parse(string $phptFile): array
+    {
+        $sections = [];
+        $section  = &#039;&#039;;
+
+        $unsupportedSections = [
+            &#039;CGI&#039;,
+            &#039;COOKIE&#039;,
+            &#039;DEFLATE_POST&#039;,
+            &#039;EXPECTHEADERS&#039;,
+            &#039;EXTENSIONS&#039;,
+            &#039;GET&#039;,
+            &#039;GZIP_POST&#039;,
+            &#039;HEADERS&#039;,
+            &#039;PHPDBG&#039;,
+            &#039;POST&#039;,
+            &#039;POST_RAW&#039;,
+            &#039;PUT&#039;,
+            &#039;REDIRECTTEST&#039;,
+            &#039;REQUEST&#039;,
+        ];
+
+        $lineNr = 0;
+
+        foreach (file($phptFile) as $line) {
+            $lineNr++;
+
+            if (preg_match(&#039;/^--([_A-Z]+)--/&#039;, $line, $result)) {
+                $section                        = $result[1];
+                $sections[$section]             = &#039;&#039;;
+                $sections[$section . &#039;_offset&#039;] = $lineNr;
+
+                continue;
+            }
+
+            if ($section === &#039;&#039;) {
+                throw new InvalidPhptFileException;
+            }
+
+            $sections[$section] .= $line;
+        }
+
+        if (isset($sections[&#039;FILEEOF&#039;])) {
+            $sections[&#039;FILE&#039;] = rtrim($sections[&#039;FILEEOF&#039;], &quot;\r\n&quot;);
+
+            unset($sections[&#039;FILEEOF&#039;]);
+        }
+
+        $this-&gt;parseExternal($phptFile, $sections);
+        $this-&gt;validate($sections);
+
+        foreach ($unsupportedSections as $unsupportedSection) {
+            if (isset($sections[$unsupportedSection])) {
+                throw new UnsupportedPhptSectionException($unsupportedSection);
+            }
+        }
+
+        return $sections;
+    }
+
+    /**
+     * @return array&lt;non-empty-string, non-empty-string&gt;
+     */
+    public function parseEnvSection(string $content): array
+    {
+        $env = [];
+
+        foreach (explode(&quot;\n&quot;, trim($content)) as $e) {
+            $e = explode(&#039;=&#039;, trim($e), 2);
+
+            if ($e[0] !== &#039;&#039; &amp;&amp; isset($e[1])) {
+                $env[$e[0]] = $e[1];
+            }
+        }
+
+        return $env;
+    }
+
+    /**
+     * @param array&lt;string&gt;|string                                              $content
+     * @param array&lt;non-empty-string, array&lt;non-empty-string&gt;|non-empty-string&gt; $ini
+     *
+     * @return array&lt;non-empty-string, array&lt;non-empty-string&gt;|non-empty-string&gt;
+     */
+    public function parseIniSection(array|string $content, array $ini = []): array
+    {
+        if (is_string($content)) {
+            $content = explode(&quot;\n&quot;, trim($content));
+        }
+
+        foreach ($content as $setting) {
+            if (!str_contains($setting, &#039;=&#039;)) {
+                continue;
+            }
+
+            $setting = explode(&#039;=&#039;, $setting, 2);
+            $name    = trim($setting[0]);
+            $value   = trim($setting[1]);
+
+            if ($name === &#039;extension&#039; || $name === &#039;zend_extension&#039;) {
+                if (!isset($ini[$name])) {
+                    $ini[$name] = [];
+                }
+
+                $ini[$name][] = $value;
+
+                continue;
+            }
+
+            $ini[$name] = $value;
+        }
+
+        return $ini;
+    }
+
+    /**
+     * @param non-empty-string                          $phptFile
+     * @param array&lt;non-empty-string, non-empty-string&gt; $sections
+     *
+     * @throws Exception
+     */
+    private function parseExternal(string $phptFile, array &amp;$sections): void
+    {
+        $allowSections = [
+            &#039;FILE&#039;,
+            &#039;EXPECT&#039;,
+            &#039;EXPECTF&#039;,
+            &#039;EXPECTREGEX&#039;,
+        ];
+
+        $testDirectory = dirname($phptFile) . DIRECTORY_SEPARATOR;
+
+        foreach ($allowSections as $section) {
+            if (isset($sections[$section . &#039;_EXTERNAL&#039;])) {
+                $externalFilename = trim($sections[$section . &#039;_EXTERNAL&#039;]);
+
+                if (!is_file($testDirectory . $externalFilename) ||
+                    !is_readable($testDirectory . $externalFilename)) {
+                    throw new PhptExternalFileCannotBeLoadedException(
+                        $section,
+                        $testDirectory . $externalFilename,
+                    );
+                }
+
+                $contents = file_get_contents($testDirectory . $externalFilename);
+
+                assert($contents !== false &amp;&amp; $contents !== &#039;&#039;);
+
+                $sections[$section] = $contents;
+            }
+        }
+    }
+
+    /**
+     * @param array&lt;non-empty-string, non-empty-string&gt; $sections
+     *
+     * @throws InvalidPhptFileException
+     */
+    private function validate(array $sections): void
+    {
+        if (!isset($sections[&#039;FILE&#039;])) {
+            throw new InvalidPhptFileException;
+        }
+
+        if (!isset($sections[&#039;EXPECT&#039;]) &amp;&amp;
+            !isset($sections[&#039;EXPECTF&#039;]) &amp;&amp;
+            !isset($sections[&#039;EXPECTREGEX&#039;])) {
+            throw new InvalidPhptFileException;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpunit/phpunit/src/Runner/Phpt/Renderer.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpunit/phpunit/src/Runner/Phpt/Exception -->
+
+</body>
+</html>

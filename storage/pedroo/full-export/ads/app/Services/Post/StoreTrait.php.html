@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/Post/StoreTrait.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services\Post;
+
+use App\Http\Resources\PostResource;
+use App\Models\City;
+use App\Models\Post;
+use App\Services\Post\Store\AutoRegistrationTrait;
+use App\Services\Post\Store\StoreFieldValueTrait;
+use Illuminate\Http\Request;
+use Throwable;
+
+trait StoreTrait
+{
+	use AutoRegistrationTrait;
+	use StoreFieldValueTrait;
+	
+	/**
+	 * @param \Illuminate\Http\Request $request
+	 * @return \Illuminate\Http\JsonResponse|\Illuminate\Http\RedirectResponse|mixed
+	 */
+	protected function storePost(Request $request): mixed
+	{
+		// Get the Post&#039;s City
+		$city = City::find($request-&gt;input(&#039;city_id&#039;, 0));
+		if (empty($city)) {
+			return apiResponse()-&gt;error(trans(&#039;global.city_not_found&#039;));
+		}
+		
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		// Conditions to Verify User&#039;s Email or Phone
+		if (!empty($authUser)) {
+			$emailVerificationRequired = (
+				config(&#039;settings.mail.email_verification&#039;) == &#039;1&#039;
+				&amp;&amp; $request-&gt;filled(&#039;email&#039;)
+				&amp;&amp; $request-&gt;input(&#039;email&#039;) != $authUser-&gt;email
+			);
+			$phoneVerificationRequired = (
+				config(&#039;settings.sms.phone_verification&#039;) == &#039;1&#039;
+				&amp;&amp; $request-&gt;filled(&#039;phone&#039;)
+				&amp;&amp; $request-&gt;input(&#039;phone&#039;) != $authUser-&gt;phone
+			);
+		} else {
+			$emailVerificationRequired = config(&#039;settings.mail.email_verification&#039;) == &#039;1&#039; &amp;&amp; $request-&gt;filled(&#039;email&#039;);
+			$phoneVerificationRequired = config(&#039;settings.sms.phone_verification&#039;) == &#039;1&#039; &amp;&amp; $request-&gt;filled(&#039;phone&#039;);
+		}
+		
+		// New Post
+		$post = new Post();
+		$input = $request-&gt;only($post-&gt;getFillable());
+		foreach ($input as $key =&gt; $value) {
+			$post-&gt;{$key} = $value;
+		}
+		
+		if (!empty($authUser)) {
+			// Try to use the user&#039;s possible subscription
+			$authUser-&gt;loadMissing(&#039;payment&#039;);
+			if (!empty($authUser-&gt;payment)) {
+				$post-&gt;payment_id = $authUser-&gt;payment-&gt;id ?? null;
+			}
+		}
+		
+		// Checkboxes
+		$post-&gt;negotiable = (int)$request-&gt;input(&#039;negotiable&#039;);
+		$post-&gt;phone_hidden = (int)$request-&gt;input(&#039;phone_hidden&#039;);
+		
+		// Other fields
+		$post-&gt;country_code = $request-&gt;input(&#039;country_code&#039;, config(&#039;country.code&#039;));
+		$post-&gt;user_id = !empty($authUser-&gt;id) ? $authUser-&gt;id : null;
+		$post-&gt;lat = $city-&gt;latitude;
+		$post-&gt;lon = $city-&gt;longitude;
+		$post-&gt;tmp_token = generateToken(hashed: true);
+		$post-&gt;reviewed_at = null;
+		
+		if ($request-&gt;anyFilled([&#039;email&#039;, &#039;phone&#039;])) {
+			$post-&gt;email_verified_at = now();
+			$post-&gt;phone_verified_at = now();
+			
+			// Email verification key generation
+			if ($emailVerificationRequired) {
+				$post-&gt;email_token = generateToken(hashed: true);
+				$post-&gt;email_verified_at = null;
+			}
+			
+			// Mobile activation key generation
+			if ($phoneVerificationRequired) {
+				$post-&gt;phone_token = generateOtp(defaultOtpLength());
+				$post-&gt;phone_verified_at = null;
+			}
+		}
+		
+		if (
+			!listingsNeedToBeReviewed()
+			&amp;&amp; !$emailVerificationRequired
+			&amp;&amp; !$phoneVerificationRequired
+		) {
+			$post-&gt;reviewed_at = now();
+		}
+		
+		// Save
+		try {
+			
+			$post-&gt;save();
+			
+		} catch (Throwable $e) {
+			return apiResponse()-&gt;error($e-&gt;getMessage());
+		}
+		
+		// Get the API response data
+		$data = [
+			&#039;success&#039; =&gt; true,
+			&#039;message&#039; =&gt; $this-&gt;apiMsg[&#039;payable&#039;][&#039;success&#039;],
+			&#039;result&#039;  =&gt; (new PostResource($post))-&gt;toArray($request),
+		];
+		
+		$extra = [];
+		
+		// Save all pictures
+		$extra[&#039;pictures&#039;] = [];
+		try {
+			$extra[&#039;pictures&#039;] = $this-&gt;singleStepPicturesStore($post-&gt;id, $request);
+		} catch (Throwable $e) {
+			return apiResponse()-&gt;error($e-&gt;getMessage());
+		}
+		
+		// Custom Fields
+		$this-&gt;fieldsValuesStore($post, $request);
+		
+		// Auto-Register the Author
+		$extra[&#039;autoRegisteredUser&#039;] = $this-&gt;autoRegister($post, $request);
+		
+		if (!doesRequestIsFromWebClient()) {
+			// ===| Make|send payment (if needed) |==============
+			
+			$payResult = $this-&gt;isPaymentRequested($request, $post);
+			if (data_get($payResult, &#039;success&#039;)) {
+				return $this-&gt;sendPayment($request, $post);
+			}
+			if (data_get($payResult, &#039;failure&#039;)) {
+				return apiResponse()-&gt;error(data_get($payResult, &#039;message&#039;));
+			}
+			
+			// ===| If no payment is made (continue) |===========
+		}
+		
+		$data[&#039;success&#039;] = true;
+		$data[&#039;message&#039;] = $this-&gt;apiMsg[&#039;payable&#039;][&#039;success&#039;];
+		
+		// Send Verification Link or Code
+		// Email
+		if ($emailVerificationRequired) {
+			// Send Verification Link by Email
+			$extra[&#039;sendEmailVerification&#039;] = $this-&gt;sendEmailVerification(&#039;posts&#039;, $post);
+			if (
+				array_key_exists(&#039;success&#039;, $extra[&#039;sendEmailVerification&#039;])
+				&amp;&amp; array_key_exists(&#039;message&#039;, $extra[&#039;sendEmailVerification&#039;])
+			) {
+				$extra[&#039;mail&#039;][&#039;success&#039;] = $extra[&#039;sendEmailVerification&#039;][&#039;success&#039;];
+				$extra[&#039;mail&#039;][&#039;message&#039;] = $extra[&#039;sendEmailVerification&#039;][&#039;message&#039;];
+			}
+		}
+		
+		// Phone
+		if ($phoneVerificationRequired) {
+			// Send Verification Code by SMS
+			$extra[&#039;sendPhoneVerification&#039;] = $this-&gt;sendPhoneVerification(&#039;posts&#039;, $post);
+			if (
+				array_key_exists(&#039;success&#039;, $extra[&#039;sendPhoneVerification&#039;])
+				&amp;&amp; array_key_exists(&#039;message&#039;, $extra[&#039;sendPhoneVerification&#039;])
+			) {
+				$extra[&#039;mail&#039;][&#039;success&#039;] = $extra[&#039;sendPhoneVerification&#039;][&#039;success&#039;];
+				$extra[&#039;mail&#039;][&#039;message&#039;] = $extra[&#039;sendPhoneVerification&#039;][&#039;message&#039;];
+			}
+		}
+		
+		// Once Verification Notification is sent (containing Link or Code),
+		// Send Confirmation Notification, when the user clicks on the Verification Link or enters the Verification Code.
+		// Done in the &quot;app/Observers/PostObserver.php&quot; file.
+		
+		$data[&#039;extra&#039;] = $extra;
+		
+		return apiResponse()-&gt;json($data);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/Post/Update/MultiStepsForm.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Post/List -->
+
+</body>
+</html>

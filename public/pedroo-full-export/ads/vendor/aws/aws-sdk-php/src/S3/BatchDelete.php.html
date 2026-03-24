@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/BatchDelete.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\S3;
+
+use Aws\AwsClientInterface;
+use Aws\S3\Exception\DeleteMultipleObjectsException;
+use GuzzleHttp\Promise;
+use GuzzleHttp\Promise\PromisorInterface;
+use GuzzleHttp\Promise\PromiseInterface;
+
+/**
+ * Efficiently deletes many objects from a single Amazon S3 bucket using an
+ * iterator that yields keys. Deletes are made using the DeleteObjects API
+ * operation.
+ *
+ *     $s3 = new Aws\S3\Client([
+ *         &#039;region&#039; =&gt; &#039;us-west-2&#039;,
+ *         &#039;version&#039; =&gt; &#039;latest&#039;
+ *     ]);
+ *
+ *     $listObjectsParams = [&#039;Bucket&#039; =&gt; &#039;foo&#039;, &#039;Prefix&#039; =&gt; &#039;starts/with/&#039;];
+ *     $delete = Aws\S3\BatchDelete::fromListObjects($s3, $listObjectsParams);
+ *     // Asynchronously delete
+ *     $promise = $delete-&gt;promise();
+ *     // Force synchronous completion
+ *     $delete-&gt;delete();
+ *
+ * When using one of the batch delete creational static methods, you can supply
+ * an associative array of options:
+ *
+ * - before: Function invoked before executing a command. The function is
+ *   passed the command that is about to be executed. This can be useful
+ *   for logging, adding custom request headers, etc.
+ * - batch_size: The size of each delete batch. Defaults to 1000.
+ *
+ * @link http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
+ */
+class BatchDelete implements PromisorInterface
+{
+    private $bucket;
+    /** @var AwsClientInterface */
+    private $client;
+    /** @var callable */
+    private $before;
+    /** @var PromiseInterface */
+    private $cachedPromise;
+    /** @var callable */
+    private $promiseCreator;
+    private $batchSize = 1000;
+    private $queue = [];
+
+    /**
+     * Creates a BatchDelete object from all of the paginated results of a
+     * ListObjects operation. Each result that is returned by the ListObjects
+     * operation will be deleted.
+     *
+     * @param AwsClientInterface $client            AWS Client to use.
+     * @param array              $listObjectsParams ListObjects API parameters
+     * @param array              $options           BatchDelete options.
+     *
+     * @return BatchDelete
+     */
+    public static function fromListObjects(
+        AwsClientInterface $client,
+        array $listObjectsParams,
+        array $options = []
+    ) {
+        $iter = $client-&gt;getPaginator(&#039;ListObjects&#039;, $listObjectsParams);
+        $bucket = $listObjectsParams[&#039;Bucket&#039;];
+        $fn = function (BatchDelete $that) use ($iter) {
+            return $iter-&gt;each(function ($result) use ($that) {
+                $promises = [];
+                if (is_array($result[&#039;Contents&#039;])) {
+                    foreach ($result[&#039;Contents&#039;] as $object) {
+                        if ($promise = $that-&gt;enqueue($object)) {
+                            $promises[] = $promise;
+                        }
+                    }
+                }
+                return $promises ? Promise\Utils::all($promises) : null;
+            });
+        };
+
+        return new self($client, $bucket, $fn, $options);
+    }
+
+    /**
+     * Creates a BatchDelete object from an iterator that yields results.
+     *
+     * @param AwsClientInterface $client  AWS Client to use to execute commands
+     * @param string             $bucket  Bucket where the objects are stored
+     * @param \Iterator          $iter    Iterator that yields assoc arrays
+     * @param array              $options BatchDelete options
+     *
+     * @return BatchDelete
+     */
+    public static function fromIterator(
+        AwsClientInterface $client,
+        $bucket,
+        \Iterator $iter,
+        array $options = []
+    ) {
+        $fn = function (BatchDelete $that) use ($iter) {
+            return Promise\Coroutine::of(function () use ($that, $iter) {
+                foreach ($iter as $obj) {
+                    if ($promise = $that-&gt;enqueue($obj)) {
+                        yield $promise;
+                    }
+                }
+            });
+        };
+
+        return new self($client, $bucket, $fn, $options);
+    }
+
+    /**
+     * @return PromiseInterface
+     */
+    public function promise(): PromiseInterface
+    {
+        if (!$this-&gt;cachedPromise) {
+            $this-&gt;cachedPromise = $this-&gt;createPromise();
+        }
+
+        return $this-&gt;cachedPromise;
+    }
+
+    /**
+     * Synchronously deletes all of the objects.
+     *
+     * @throws DeleteMultipleObjectsException on error.
+     */
+    public function delete()
+    {
+        $this-&gt;promise()-&gt;wait();
+    }
+
+    /**
+     * @param AwsClientInterface $client    Client used to transfer the requests
+     * @param string             $bucket    Bucket to delete from.
+     * @param callable           $promiseFn Creates a promise.
+     * @param array              $options   Hash of options used with the batch
+     *
+     * @throws \InvalidArgumentException if the provided batch_size is &lt;= 0
+     */
+    private function __construct(
+        AwsClientInterface $client,
+        $bucket,
+        callable $promiseFn,
+        array $options = []
+    ) {
+        $this-&gt;client = $client;
+        $this-&gt;bucket = $bucket;
+        $this-&gt;promiseCreator = $promiseFn;
+
+        if (isset($options[&#039;before&#039;])) {
+            if (!is_callable($options[&#039;before&#039;])) {
+                throw new \InvalidArgumentException(&#039;before must be callable&#039;);
+            }
+            $this-&gt;before = $options[&#039;before&#039;];
+        }
+
+        if (isset($options[&#039;batch_size&#039;])) {
+            if ($options[&#039;batch_size&#039;] &lt;= 0) {
+                throw new \InvalidArgumentException(&#039;batch_size is not &gt; 0&#039;);
+            }
+            $this-&gt;batchSize = min($options[&#039;batch_size&#039;], 1000);
+        }
+    }
+
+    private function enqueue(array $obj)
+    {
+        $this-&gt;queue[] = $obj;
+        return count($this-&gt;queue) &gt;= $this-&gt;batchSize
+            ? $this-&gt;flushQueue()
+            : null;
+    }
+
+    private function flushQueue()
+    {
+        static $validKeys = [&#039;Key&#039; =&gt; true, &#039;VersionId&#039; =&gt; true];
+
+        if (count($this-&gt;queue) === 0) {
+            return null;
+        }
+
+        $batch = [];
+        while ($obj = array_shift($this-&gt;queue)) {
+            $batch[] = array_intersect_key($obj, $validKeys);
+        }
+
+        $command = $this-&gt;client-&gt;getCommand(&#039;DeleteObjects&#039;, [
+            &#039;Bucket&#039; =&gt; $this-&gt;bucket,
+            &#039;Delete&#039; =&gt; [&#039;Objects&#039; =&gt; $batch]
+        ]);
+
+        if ($this-&gt;before) {
+            call_user_func($this-&gt;before, $command);
+        }
+
+        return $this-&gt;client-&gt;executeAsync($command)
+            -&gt;then(function ($result) {
+                if (!empty($result[&#039;Errors&#039;])) {
+                    throw new DeleteMultipleObjectsException(
+                        $result[&#039;Deleted&#039;] ?: [],
+                        $result[&#039;Errors&#039;]
+                    );
+                }
+                return $result;
+            });
+    }
+
+    /**
+     * Returns a promise that will clean up any references when it completes.
+     *
+     * @return PromiseInterface
+     */
+    private function createPromise()
+    {
+        // Create the promise
+        $promise = call_user_func($this-&gt;promiseCreator, $this);
+        $this-&gt;promiseCreator = null;
+
+        // Cleans up the promise state and references.
+        $cleanup = function () {
+            $this-&gt;before = $this-&gt;client = $this-&gt;queue = null;
+        };
+
+        // When done, ensure cleanup and that any remaining are processed.
+        return $promise-&gt;then(
+            function () use ($cleanup)  {
+                return Promise\Create::promiseFor($this-&gt;flushQueue())
+                    -&gt;then($cleanup);
+            },
+            function ($reason) use ($cleanup)  {
+                $cleanup();
+                return Promise\Create::rejectionFor($reason);
+            }
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/BucketEndpointArnMiddleware.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/Crypto -->
+
+</body>
+</html>

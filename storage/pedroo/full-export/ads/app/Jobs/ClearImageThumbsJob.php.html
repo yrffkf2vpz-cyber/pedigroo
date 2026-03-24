@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Jobs/ClearImageThumbsJob.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Jobs;
+
+use App\Helpers\Common\Files\Storage\StorageDisk;
+use App\Helpers\Common\Files\Tools\FileStorage;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+/*
+ * Clear Image Thumbnails Background Job
+ *
+ * Purpose: Runs image thumbnails clearing operations in the background to prevent blocking user requests
+ * Queue: Runs on the &#039;maintenance&#039; queue (priority queue for maintenance operations)
+ *
+ * How it works:
+ * 1. User clicks &quot;Clear Image Thumbnails&quot; button
+ * 2. Controller dispatches this job with a unique job ID
+ * 3. Job status is tracked in cache (queued -&gt; processing -&gt; completed/failed)
+ * 4. JavaScript polls the status endpoint every 10 seconds
+ * 5. When completed, user sees PNotify notification automatically
+ *
+ * Running the Queue Worker:
+ * - Development: php artisan queue:listen --queue=maintenance,default --tries=1
+ * - Production: Configure Supervisor to run queue:work with maintenance queue
+ *
+ * IMPORTANT: Queue worker MUST listen to &#039;maintenance&#039; queue or jobs won&#039;t process!
+ *
+ * Documentation:
+ * https://laravel.com/docs/12.x/queues#running-the-queue-worker
+ *
+ * Supervisor:
+ * https://medium.com/@danielarcher/how-to-use-supervisord-for-your-laravel-application-66015f104703
+ * https://gist.github.com/deepak-cotocus/6b9865784dee18966e15c74ec6e487c4
+ * https://dev.to/edgaras/supervisor-guide-for-laravel-developers-configuration-and-use-cases-20i4
+ */
+
+class ClearImageThumbsJob implements ShouldQueue
+{
+	use Queueable;
+	
+	/**
+	 * The number of times the job may be attempted.
+	 * Set to 1 because thumbnails clearing should not be retried if it fails.
+	 *
+	 * @var int
+	 */
+	public int $tries = 1;
+	
+	/**
+	 * The number of seconds the job can run before timing out.
+	 * Thumbnails clearing can take longer on large sites, so we allow 10 minutes.
+	 *
+	 * @var int
+	 */
+	public int $timeout = 600;
+	
+	/**
+	 * Unique identifier for tracking this job&#039;s status.
+	 * Used to store and retrieve job progress in cache.
+	 *
+	 * @var string
+	 */
+	protected string $jobId;
+	
+	/**
+	 * Create a new job instance.
+	 *
+	 * @param string $jobId Unique identifier (UUID) for tracking job status
+	 */
+	public function __construct(string $jobId)
+	{
+		$this-&gt;jobId = $jobId;
+		
+		// Assign this job to the &#039;maintenance&#039; queue (priority queue)
+		$this-&gt;onQueue(&#039;maintenance&#039;);
+		
+		// Set initial status in cache so polling can immediately detect the job
+		// Cache TTL: 600 seconds (10 minutes) - enough time for job to complete and user to see result
+		Cache::put(&quot;clearImageThumbsJob:{$jobId}&quot;, [
+			&#039;status&#039;    =&gt; &#039;queued&#039;,
+			&#039;message&#039;   =&gt; trans(&#039;admin.clear_image_thumbnails_job_queued&#039;),
+			&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+		], 600);
+	}
+	
+	/**
+	 * Execute the images thumbnails clearing job.
+	 *
+	 * This method performs the following operations:
+	 * 1. Initialize storage disk
+	 * 2. Remove all thumbnails directories
+	 * 3. Remove all thumbnail files matching pattern
+	 * 4. Remove empty subdirectories
+	 * 5. Clear cache
+	 *
+	 * Status is tracked in cache throughout the process so the frontend
+	 * can poll and show real-time progress to the user.
+	 *
+	 * @return void
+	 */
+	public function handle(): void
+	{
+		// Update status to &#039;processing&#039; so user knows job started
+		Cache::put(&quot;clearImageThumbsJob:{$this-&gt;jobId}&quot;, [
+			&#039;status&#039;    =&gt; &#039;processing&#039;,
+			&#039;message&#039;   =&gt; trans(&#039;admin.clear_image_thumbnails_job_processing&#039;),
+			&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+		], 600);
+		
+		// Get the storage disk
+		$disk = StorageDisk::getDisk();
+		
+		// Track any errors that occur
+		$errorFound = false;
+		
+		// Get the upload paths to process
+		$uploadPaths = [
+			&#039;app&#039; . DIRECTORY_SEPARATOR,
+			&#039;files&#039; . DIRECTORY_SEPARATOR,    // New path
+			&#039;pictures&#039; . DIRECTORY_SEPARATOR, // Old path
+		];
+		
+		// ===================================================================
+		// Process each upload path
+		// ===================================================================
+		foreach ($uploadPaths as $uploadPath) {
+			if (!$disk-&gt;exists($uploadPath)) {
+				continue;
+			}
+			
+			if (!$disk-&gt;directoryExists($uploadPath)) {
+				continue;
+			}
+			
+			// ===============================================================
+			// Step 1: Remove thumbnails directories
+			// ===============================================================
+			try {
+				$directoryName = &#039;thumbnails&#039;;
+				FileStorage::removeSubDirRecursive($disk, $uploadPath, $directoryName);
+				Log::info(&quot;Removed thumbnails directory in {$uploadPath}&quot;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+			} catch (Throwable $e) {
+				$errorFound = true;
+				Log::error(&quot;Failed to remove thumbnails directory in {$uploadPath}&quot;, [
+					&#039;jobId&#039; =&gt; $this-&gt;jobId,
+					&#039;error&#039; =&gt; $e-&gt;getMessage(),
+				]);
+				break;
+			}
+			
+			// ===============================================================
+			// Step 2: Remove thumbnail files matching pattern
+			// ===============================================================
+			try {
+				$pattern = &#039;~thumb-.*\\.[a-z]*~ui&#039;;
+				FileStorage::removeMatchedFilesRecursive($disk, $uploadPath, $pattern);
+				Log::info(&quot;Removed thumbnail files in {$uploadPath}&quot;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+			} catch (Throwable $e) {
+				$errorFound = true;
+				Log::error(&quot;Failed to remove thumbnail files in {$uploadPath}&quot;, [
+					&#039;jobId&#039; =&gt; $this-&gt;jobId,
+					&#039;error&#039; =&gt; $e-&gt;getMessage(),
+				]);
+				break;
+			}
+			
+			// ===============================================================
+			// Step 3: Remove empty subdirectories and create .gitignore
+			// ===============================================================
+			// Don&#039;t create &#039;.gitignore&#039; file or remove empty directories in the &#039;/storage/app/public/app/&#039; dir
+			$appUploadedFilesPath = DIRECTORY_SEPARATOR
+				. &#039;app&#039; . DIRECTORY_SEPARATOR
+				. &#039;public&#039; . DIRECTORY_SEPARATOR
+				. &#039;app&#039; . DIRECTORY_SEPARATOR;
+			
+			if (!str_contains($appUploadedFilesPath, $uploadPath)) {
+				try {
+					// Check if the .gitignore file exists in the root directory to prevent its removal
+					if (!$disk-&gt;exists($uploadPath . &#039;.gitignore&#039;)) {
+						$content = &#039;*&#039; . &quot;\n&quot;
+							. &#039;!.gitignore&#039; . &quot;\n&quot;;
+						$disk-&gt;put($uploadPath . &#039;.gitignore&#039;, $content);
+					}
+					
+					// Remove all empty subdirectories
+					FileStorage::removeEmptySubDirs($disk, $uploadPath);
+					Log::info(&quot;Cleaned empty directories in {$uploadPath}&quot;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+				} catch (Throwable $e) {
+					$errorFound = true;
+					Log::error(&quot;Failed to clean empty directories in {$uploadPath}&quot;, [
+						&#039;jobId&#039; =&gt; $this-&gt;jobId,
+						&#039;error&#039; =&gt; $e-&gt;getMessage(),
+					]);
+					break;
+				}
+			}
+		}
+
+		// ===================================================================
+		// Step 4: Clear Cache (with job status preservation)
+		// ===================================================================
+		if (!$errorFound) {
+			try {
+				// IMPORTANT: Save job status before flushing cache
+				// The flush() operation will delete ALL cache including our job status
+				// We need to preserve it so JavaScript polling continues to work
+				$jobStatusKey = &quot;clearImageThumbsJob:{$this-&gt;jobId}&quot;;
+				$currentJobStatus = Cache::get($jobStatusKey);
+
+				// Flush all cache
+				cache()-&gt;flush();
+				Log::info(&#039;Cache flushed successfully&#039;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+
+				// Restore job status immediately after flush
+				if ($currentJobStatus) {
+					Cache::put($jobStatusKey, $currentJobStatus, 600);
+				}
+			} catch (Throwable $e) {
+				$errorFound = true;
+				Log::error(&#039;Cache flush error&#039;, [
+					&#039;jobId&#039; =&gt; $this-&gt;jobId,
+					&#039;error&#039; =&gt; $e-&gt;getMessage(),
+				]);
+			}
+		}
+
+		// ===================================================================
+		// Step 5: Update Final Status
+		// ===================================================================
+		if (!$errorFound) {
+			// Success! Update cache with completed status
+			Cache::put(&quot;clearImageThumbsJob:{$this-&gt;jobId}&quot;, [
+				&#039;status&#039;    =&gt; &#039;completed&#039;,
+				&#039;message&#039;   =&gt; trans(&#039;admin.clear_image_thumbnails_job_completed&#039;),
+				&#039;level&#039;     =&gt; &#039;success&#039;,
+				&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+			], 600);
+
+			Log::info(&#039;clearImageThumbsJob completed successfully&#039;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+		} else {
+			// Failure - operation had errors
+			$message = trans(&#039;admin.clear_image_thumbnails_job_failed&#039;);
+			
+			Cache::put(&quot;clearImageThumbsJob:{$this-&gt;jobId}&quot;, [
+				&#039;status&#039;    =&gt; &#039;failed&#039;,
+				&#039;message&#039;   =&gt; $message,
+				&#039;level&#039;     =&gt; &#039;error&#039;,
+				&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+			], 600);
+			
+			Log::warning(&#039;clearImageThumbsJob completed with errors&#039;, [
+				&#039;jobId&#039; =&gt; $this-&gt;jobId,
+			]);
+		}
+	}
+	
+	/**
+	 * Handle a job failure.
+	 *
+	 * Called when the job throws an exception or times out.
+	 * Updates cache status so the frontend can show an error notification.
+	 *
+	 * @param \Throwable $exception
+	 * @return void
+	 */
+	public function failed(Throwable $exception): void
+	{
+		$message = trans(&#039;admin.clear_image_thumbnails_job_failed&#039;) . &#039;: &#039; . $exception-&gt;getMessage();
+		
+		// Update cache with failed status
+		Cache::put(&quot;clearImageThumbsJob:{$this-&gt;jobId}&quot;, [
+			&#039;status&#039;    =&gt; &#039;failed&#039;,
+			&#039;message&#039;   =&gt; $message,
+			&#039;level&#039;     =&gt; &#039;error&#039;,
+			&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+		], 600);
+		
+		// Log the failure for debugging
+		Log::error(&#039;clearImageThumbsJob failed&#039;, [
+			&#039;jobId&#039;     =&gt; $this-&gt;jobId,
+			&#039;exception&#039; =&gt; $exception-&gt;getMessage(),
+			&#039;trace&#039;     =&gt; $exception-&gt;getTraceAsString(),
+		]);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Jobs/GenerateImageThumbJob.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Listeners -->
+
+</body>
+</html>

@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Response/CurlResponse.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Response;
+
+use Psr\Log\LoggerInterface;
+use Symfony\Component\HttpClient\Chunk\FirstChunk;
+use Symfony\Component\HttpClient\Chunk\InformationalChunk;
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Internal\Canary;
+use Symfony\Component\HttpClient\Internal\ClientState;
+use Symfony\Component\HttpClient\Internal\CurlClientState;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+
+/**
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+final class CurlResponse implements ResponseInterface, StreamableInterface
+{
+    use CommonResponseTrait {
+        getContent as private doGetContent;
+    }
+    use TransportResponseTrait;
+
+    /**
+     * @var resource
+     */
+    private $debugBuffer;
+
+    /**
+     * @internal
+     */
+    public function __construct(
+        private CurlClientState $multi,
+        \CurlHandle|string $ch,
+        ?array $options = null,
+        ?LoggerInterface $logger = null,
+        string $method = &#039;GET&#039;,
+        ?callable $resolveRedirect = null,
+        ?int $curlVersion = null,
+        ?string $originalUrl = null,
+    ) {
+        if ($ch instanceof \CurlHandle) {
+            $this-&gt;handle = $ch;
+            $this-&gt;debugBuffer = fopen(&#039;php://temp&#039;, &#039;w+&#039;);
+            if (0x074000 === $curlVersion) {
+                fwrite($this-&gt;debugBuffer, &#039;Due to a bug in curl 7.64.0, the debug log is disabled; use another version to work around the issue.&#039;);
+            } else {
+                curl_setopt($ch, \CURLOPT_VERBOSE, true);
+                curl_setopt($ch, \CURLOPT_STDERR, $this-&gt;debugBuffer);
+            }
+        } else {
+            $this-&gt;info[&#039;url&#039;] = $ch;
+            $ch = $this-&gt;handle;
+        }
+
+        $this-&gt;id = $id = (int) $ch;
+        $this-&gt;logger = $logger;
+        $this-&gt;shouldBuffer = $options[&#039;buffer&#039;] ?? true;
+        $this-&gt;timeout = $options[&#039;timeout&#039;] ?? null;
+        $this-&gt;info[&#039;http_method&#039;] = $method;
+        $this-&gt;info[&#039;user_data&#039;] = $options[&#039;user_data&#039;] ?? null;
+        $this-&gt;info[&#039;max_duration&#039;] = $options[&#039;max_duration&#039;] ?? null;
+        $this-&gt;info[&#039;start_time&#039;] ??= microtime(true);
+        $this-&gt;info[&#039;original_url&#039;] = $originalUrl ?? $this-&gt;info[&#039;url&#039;] ?? curl_getinfo($ch, \CURLINFO_EFFECTIVE_URL);
+        $info = &amp;$this-&gt;info;
+        $headers = &amp;$this-&gt;headers;
+        $debugBuffer = $this-&gt;debugBuffer;
+
+        if (!$info[&#039;response_headers&#039;]) {
+            // Used to keep track of what we&#039;re waiting for
+            curl_setopt($ch, \CURLOPT_PRIVATE, \in_array($method, [&#039;GET&#039;, &#039;HEAD&#039;, &#039;OPTIONS&#039;, &#039;TRACE&#039;, &#039;QUERY&#039;], true) &amp;&amp; 1.0 &lt; (float) ($options[&#039;http_version&#039;] ?? 1.1) ? &#039;H2&#039; : &#039;H0&#039;); // H = headers + retry counter
+        }
+
+        curl_setopt($ch, \CURLOPT_HEADERFUNCTION, static function ($ch, string $data) use (&amp;$info, &amp;$headers, $options, $multi, $id, &amp;$location, $resolveRedirect, $logger): int {
+            return self::parseHeaderLine($ch, $data, $info, $headers, $options, $multi, $id, $location, $resolveRedirect, $logger);
+        });
+
+        if (null === $options) {
+            // Pushed response: buffer until requested
+            curl_setopt($ch, \CURLOPT_WRITEFUNCTION, static function ($ch, string $data) use ($multi, $id): int {
+                $multi-&gt;handlesActivity[$id][] = $data;
+                curl_pause($ch, \CURLPAUSE_RECV);
+
+                return \strlen($data);
+            });
+
+            return;
+        }
+
+        $execCounter = $multi-&gt;execCounter;
+        $this-&gt;info[&#039;pause_handler&#039;] = static function (float $duration) use ($ch, $multi, $execCounter) {
+            if (0 &lt; $duration) {
+                if ($execCounter === $multi-&gt;execCounter) {
+                    curl_multi_remove_handle($multi-&gt;handle, $ch);
+                }
+
+                $lastExpiry = end($multi-&gt;pauseExpiries);
+                $multi-&gt;pauseExpiries[(int) $ch] = $duration += hrtime(true) / 1E9;
+                if (false !== $lastExpiry &amp;&amp; $lastExpiry &gt; $duration) {
+                    asort($multi-&gt;pauseExpiries);
+                }
+                curl_pause($ch, \CURLPAUSE_ALL);
+            } else {
+                unset($multi-&gt;pauseExpiries[(int) $ch]);
+                curl_pause($ch, \CURLPAUSE_CONT);
+                curl_multi_add_handle($multi-&gt;handle, $ch);
+            }
+        };
+
+        $this-&gt;inflate = !isset($options[&#039;normalized_headers&#039;][&#039;accept-encoding&#039;]);
+        curl_pause($ch, \CURLPAUSE_CONT);
+
+        if ($onProgress = $options[&#039;on_progress&#039;]) {
+            $url = isset($info[&#039;url&#039;]) ? [&#039;url&#039; =&gt; $info[&#039;url&#039;]] : [];
+            curl_setopt($ch, \CURLOPT_NOPROGRESS, false);
+            curl_setopt($ch, \CURLOPT_PROGRESSFUNCTION, static function ($ch, $dlSize, $dlNow) use ($onProgress, &amp;$info, $url, $multi, $debugBuffer) {
+                try {
+                    $info[&#039;debug&#039;] ??= &#039;&#039;;
+                    rewind($debugBuffer);
+                    if (fstat($debugBuffer)[&#039;size&#039;]) {
+                        $info[&#039;debug&#039;] .= stream_get_contents($debugBuffer);
+                        rewind($debugBuffer);
+                        ftruncate($debugBuffer, 0);
+                    }
+                    $onProgress($dlNow, $dlSize, $url + curl_getinfo($ch) + $info);
+                } catch (\Throwable $e) {
+                    $multi-&gt;handlesActivity[(int) $ch][] = null;
+                    $multi-&gt;handlesActivity[(int) $ch][] = $e;
+
+                    return 1; // Abort the request
+                }
+
+                return null;
+            });
+        }
+
+        curl_setopt($ch, \CURLOPT_WRITEFUNCTION, static function ($ch, string $data) use ($multi, $id): int {
+            if (&#039;H&#039; === (curl_getinfo($ch, \CURLINFO_PRIVATE)[0] ?? null)) {
+                $multi-&gt;handlesActivity[$id][] = null;
+                $multi-&gt;handlesActivity[$id][] = new TransportException(\sprintf(&#039;Unsupported protocol for &quot;%s&quot;&#039;, curl_getinfo($ch, \CURLINFO_EFFECTIVE_URL)));
+
+                return 0;
+            }
+
+            curl_setopt($ch, \CURLOPT_WRITEFUNCTION, static function ($ch, string $data) use ($multi, $id): int {
+                $multi-&gt;handlesActivity[$id][] = $data;
+
+                return \strlen($data);
+            });
+
+            $multi-&gt;handlesActivity[$id][] = $data;
+
+            return \strlen($data);
+        });
+
+        $this-&gt;initializer = static function (self $response) {
+            $waitFor = curl_getinfo($response-&gt;handle, \CURLINFO_PRIVATE);
+
+            return &#039;H&#039; === $waitFor[0];
+        };
+
+        // Schedule the request in a non-blocking way
+        $multi-&gt;lastTimeout = null;
+        $multi-&gt;openHandles[$id] = [$ch, $options];
+        curl_multi_add_handle($multi-&gt;handle, $ch);
+
+        $this-&gt;canary = new Canary(static function () use ($ch, $multi, $id) {
+            unset($multi-&gt;pauseExpiries[$id], $multi-&gt;openHandles[$id], $multi-&gt;handlesActivity[$id]);
+            curl_setopt($ch, \CURLOPT_PRIVATE, &#039;_0&#039;);
+
+            if ($multi-&gt;performing) {
+                return;
+            }
+
+            curl_multi_remove_handle($multi-&gt;handle, $ch);
+            curl_setopt_array($ch, [
+                \CURLOPT_NOPROGRESS =&gt; true,
+                \CURLOPT_PROGRESSFUNCTION =&gt; null,
+                \CURLOPT_HEADERFUNCTION =&gt; null,
+                \CURLOPT_WRITEFUNCTION =&gt; null,
+                \CURLOPT_READFUNCTION =&gt; null,
+                \CURLOPT_INFILE =&gt; null,
+            ]);
+
+            if (!$multi-&gt;openHandles) {
+                // Schedule DNS cache eviction for the next request
+                $multi-&gt;dnsCache-&gt;evictions = $multi-&gt;dnsCache-&gt;evictions ?: $multi-&gt;dnsCache-&gt;removals;
+                $multi-&gt;dnsCache-&gt;removals = $multi-&gt;dnsCache-&gt;hostnames = [];
+            }
+        });
+    }
+
+    public function getInfo(?string $type = null): mixed
+    {
+        if (!$info = $this-&gt;finalInfo) {
+            $info = array_merge($this-&gt;info, curl_getinfo($this-&gt;handle));
+            $info[&#039;redirect_url&#039;] = $this-&gt;info[&#039;redirect_url&#039;] ?? null;
+
+            // workaround curl not subtracting the time offset for pushed responses
+            if (isset($this-&gt;info[&#039;url&#039;]) &amp;&amp; $info[&#039;start_time&#039;] / 1000 &lt; $info[&#039;total_time&#039;]) {
+                $info[&#039;total_time&#039;] -= $info[&#039;starttransfer_time&#039;] ?: $info[&#039;total_time&#039;];
+                $info[&#039;starttransfer_time&#039;] = 0.0;
+            }
+
+            $info[&#039;debug&#039;] ??= &#039;&#039;;
+            rewind($this-&gt;debugBuffer);
+            if (fstat($this-&gt;debugBuffer)[&#039;size&#039;]) {
+                $info[&#039;debug&#039;] .= stream_get_contents($this-&gt;debugBuffer);
+                rewind($this-&gt;debugBuffer);
+                ftruncate($this-&gt;debugBuffer, 0);
+            }
+            $this-&gt;info = array_merge($this-&gt;info, $info);
+            $waitFor = curl_getinfo($this-&gt;handle, \CURLINFO_PRIVATE);
+
+            if (&#039;H&#039; !== $waitFor[0] &amp;&amp; &#039;C&#039; !== $waitFor[0]) {
+                curl_setopt($this-&gt;handle, \CURLOPT_VERBOSE, false);
+                $this-&gt;finalInfo = $info;
+            }
+        }
+
+        return null !== $type ? $info[$type] ?? null : $info;
+    }
+
+    public function getContent(bool $throw = true): string
+    {
+        $performing = $this-&gt;multi-&gt;performing;
+        $this-&gt;multi-&gt;performing = $performing || &#039;_0&#039; === curl_getinfo($this-&gt;handle, \CURLINFO_PRIVATE);
+
+        try {
+            return $this-&gt;doGetContent($throw);
+        } finally {
+            $this-&gt;multi-&gt;performing = $performing;
+        }
+    }
+
+    public function __destruct()
+    {
+        try {
+            if (null === $this-&gt;timeout) {
+                return; // Unused pushed response
+            }
+
+            $this-&gt;doDestruct();
+        } finally {
+            if ($this-&gt;handle instanceof \CurlHandle) {
+                curl_setopt($this-&gt;handle, \CURLOPT_VERBOSE, false);
+            }
+        }
+    }
+
+    private static function schedule(self $response, array &amp;$runningResponses): void
+    {
+        if (isset($runningResponses[$i = (int) $response-&gt;multi-&gt;handle])) {
+            $runningResponses[$i][1][$response-&gt;id] = $response;
+        } else {
+            $runningResponses[$i] = [$response-&gt;multi, [$response-&gt;id =&gt; $response]];
+        }
+
+        if (&#039;_0&#039; === curl_getinfo($response-&gt;handle, \CURLINFO_PRIVATE)) {
+            // Response already completed
+            $response-&gt;multi-&gt;handlesActivity[$response-&gt;id][] = null;
+            $response-&gt;multi-&gt;handlesActivity[$response-&gt;id][] = null !== $response-&gt;info[&#039;error&#039;] ? new TransportException($response-&gt;info[&#039;error&#039;]) : null;
+        }
+    }
+
+    /**
+     * @param CurlClientState $multi
+     */
+    private static function perform(ClientState $multi, ?array $responses = null): void
+    {
+        if ($multi-&gt;performing) {
+            if ($responses) {
+                $response = $responses[array_key_first($responses)];
+                $multi-&gt;handlesActivity[(int) $response-&gt;handle][] = null;
+                $multi-&gt;handlesActivity[(int) $response-&gt;handle][] = new TransportException(\sprintf(&#039;Userland callback cannot use the client nor the response while processing &quot;%s&quot;.&#039;, curl_getinfo($response-&gt;handle, \CURLINFO_EFFECTIVE_URL)));
+            }
+
+            return;
+        }
+
+        try {
+            $multi-&gt;performing = true;
+            ++$multi-&gt;execCounter;
+            $active = 0;
+            while (\CURLM_CALL_MULTI_PERFORM === ($err = curl_multi_exec($multi-&gt;handle, $active))) {
+            }
+
+            if (\CURLM_OK !== $err) {
+                throw new TransportException(curl_multi_strerror($err));
+            }
+
+            while ($info = curl_multi_info_read($multi-&gt;handle)) {
+                if (\CURLMSG_DONE !== $info[&#039;msg&#039;]) {
+                    continue;
+                }
+                $result = $info[&#039;result&#039;];
+                $id = (int) $ch = $info[&#039;handle&#039;];
+                $waitFor = @curl_getinfo($ch, \CURLINFO_PRIVATE) ?: &#039;_0&#039;;
+
+                if (\in_array($result, [\CURLE_SEND_ERROR, \CURLE_RECV_ERROR, /* CURLE_HTTP2 */ 16, /* CURLE_HTTP2_STREAM */ 92], true) &amp;&amp; $waitFor[1] &amp;&amp; &#039;C&#039; !== $waitFor[0]) {
+                    curl_multi_remove_handle($multi-&gt;handle, $ch);
+                    $waitFor[1] = (string) ((int) $waitFor[1] - 1); // decrement the retry counter
+                    curl_setopt($ch, \CURLOPT_PRIVATE, $waitFor);
+                    curl_setopt($ch, \CURLOPT_FORBID_REUSE, true);
+
+                    if (0 === curl_multi_add_handle($multi-&gt;handle, $ch)) {
+                        continue;
+                    }
+                }
+
+                if (\CURLE_RECV_ERROR === $result &amp;&amp; &#039;H&#039; === $waitFor[0] &amp;&amp; 400 &lt;= ($responses[(int) $ch]-&gt;info[&#039;http_code&#039;] ?? 0)) {
+                    $multi-&gt;handlesActivity[$id][] = new FirstChunk();
+                    curl_setopt($ch, \CURLOPT_PRIVATE, &#039;C&#039;.$waitFor[1]);
+                }
+
+                $multi-&gt;handlesActivity[$id][] = null;
+                $multi-&gt;handlesActivity[$id][] = \in_array($result, [\CURLE_OK, \CURLE_TOO_MANY_REDIRECTS], true)
+                    || &#039;_0&#039; === $waitFor
+                    || curl_getinfo($ch, \CURLINFO_SIZE_DOWNLOAD) === curl_getinfo($ch, \CURLINFO_CONTENT_LENGTH_DOWNLOAD)
+                    || (&#039;C&#039; === $waitFor[0]
+                        &amp;&amp; &#039;OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 0&#039; === curl_error($ch)
+                        &amp;&amp; -1.0 === curl_getinfo($ch, \CURLINFO_CONTENT_LENGTH_DOWNLOAD)
+                        &amp;&amp; \in_array(&#039;close&#039;, array_map(&#039;strtolower&#039;, $responses[$id]-&gt;headers[&#039;connection&#039;] ?? []), true)
+                    )
+                    ? null
+                    : new TransportException(ucfirst(curl_error($ch) ?: curl_strerror($result)).\sprintf(&#039; for &quot;%s&quot;.&#039;, curl_getinfo($ch, \CURLINFO_EFFECTIVE_URL)));
+            }
+        } finally {
+            $multi-&gt;performing = false;
+        }
+    }
+
+    /**
+     * @param CurlClientState $multi
+     */
+    private static function select(ClientState $multi, float $timeout): int
+    {
+        if ($multi-&gt;pauseExpiries) {
+            $now = hrtime(true) / 1E9;
+
+            foreach ($multi-&gt;pauseExpiries as $id =&gt; $pauseExpiry) {
+                if ($now &lt; $pauseExpiry) {
+                    $timeout = min($timeout, $pauseExpiry - $now);
+                    break;
+                }
+
+                unset($multi-&gt;pauseExpiries[$id]);
+                curl_pause($multi-&gt;openHandles[$id][0], \CURLPAUSE_CONT);
+                curl_multi_add_handle($multi-&gt;handle, $multi-&gt;openHandles[$id][0]);
+            }
+        }
+
+        if (0 !== $selected = curl_multi_select($multi-&gt;handle, $timeout)) {
+            return $selected;
+        }
+
+        if ($multi-&gt;pauseExpiries &amp;&amp; 0 &lt; $timeout -= hrtime(true) / 1E9 - $now) {
+            usleep((int) (1E6 * $timeout));
+        }
+
+        return 0;
+    }
+
+    /**
+     * Parses header lines as curl yields them to us.
+     */
+    private static function parseHeaderLine($ch, string $data, array &amp;$info, array &amp;$headers, ?array $options, CurlClientState $multi, int $id, ?string &amp;$location, ?callable $resolveRedirect, ?LoggerInterface $logger): int
+    {
+        if (!str_ends_with($data, &quot;\r\n&quot;)) {
+            return 0;
+        }
+
+        $waitFor = @curl_getinfo($ch, \CURLINFO_PRIVATE) ?: &#039;_0&#039;;
+
+        if (&#039;H&#039; !== $waitFor[0]) {
+            return \strlen($data); // Ignore HTTP trailers
+        }
+
+        $statusCode = curl_getinfo($ch, \CURLINFO_RESPONSE_CODE);
+
+        if ($statusCode !== $info[&#039;http_code&#039;] &amp;&amp; !preg_match(&quot;#^HTTP/\d+(?:\.\d+)? {$statusCode}(?: |\r\n$)#&quot;, $data)) {
+            return \strlen($data); // Ignore headers from responses to CONNECT requests
+        }
+
+        if (&quot;\r\n&quot; !== $data) {
+            // Regular header line: add it to the list
+            self::addResponseHeaders([substr($data, 0, -2)], $info, $headers);
+
+            if (!str_starts_with($data, &#039;HTTP/&#039;)) {
+                if (0 === stripos($data, &#039;Location:&#039;)) {
+                    $location = trim(substr($data, 9, -2));
+                }
+
+                return \strlen($data);
+            }
+
+            if (\function_exists(&#039;openssl_x509_read&#039;) &amp;&amp; $certinfo = curl_getinfo($ch, \CURLINFO_CERTINFO)) {
+                $info[&#039;peer_certificate_chain&#039;] = array_map(&#039;openssl_x509_read&#039;, array_column($certinfo, &#039;Cert&#039;));
+            }
+
+            if (300 &lt;= $info[&#039;http_code&#039;] &amp;&amp; $info[&#039;http_code&#039;] &lt; 400 &amp;&amp; null !== $options) {
+                if (curl_getinfo($ch, \CURLINFO_REDIRECT_COUNT) === $options[&#039;max_redirects&#039;]) {
+                    curl_setopt($ch, \CURLOPT_FOLLOWLOCATION, false);
+                } elseif (303 === $info[&#039;http_code&#039;] || (&#039;POST&#039; === $info[&#039;http_method&#039;] &amp;&amp; \in_array($info[&#039;http_code&#039;], [301, 302], true))) {
+                    curl_setopt($ch, \CURLOPT_POSTFIELDS, &#039;&#039;);
+                }
+            }
+
+            return \strlen($data);
+        }
+
+        // End of headers: handle informational responses, redirects, etc.
+
+        if (200 &gt; $statusCode) {
+            $multi-&gt;handlesActivity[$id][] = new InformationalChunk($statusCode, $headers);
+            $location = null;
+
+            return \strlen($data);
+        }
+
+        $info[&#039;redirect_url&#039;] = null;
+
+        if (300 &lt;= $statusCode &amp;&amp; $statusCode &lt; 400 &amp;&amp; null !== $location &amp;&amp; null !== $options) {
+            if ($noContent = 303 === $statusCode || (&#039;POST&#039; === $info[&#039;http_method&#039;] &amp;&amp; \in_array($statusCode, [301, 302], true))) {
+                $info[&#039;http_method&#039;] = &#039;HEAD&#039; === $info[&#039;http_method&#039;] ? &#039;HEAD&#039; : &#039;GET&#039;;
+                curl_setopt($ch, \CURLOPT_CUSTOMREQUEST, $info[&#039;http_method&#039;]);
+            }
+
+            if (null === $info[&#039;redirect_url&#039;] = $resolveRedirect($ch, $location, $noContent)) {
+                $options[&#039;max_redirects&#039;] = curl_getinfo($ch, \CURLINFO_REDIRECT_COUNT);
+                curl_setopt($ch, \CURLOPT_FOLLOWLOCATION, false);
+                curl_setopt($ch, \CURLOPT_MAXREDIRS, $options[&#039;max_redirects&#039;]);
+            }
+        }
+
+        if (401 === $statusCode &amp;&amp; isset($options[&#039;auth_ntlm&#039;]) &amp;&amp; 0 === strncasecmp($headers[&#039;www-authenticate&#039;][0] ?? &#039;&#039;, &#039;NTLM &#039;, 5)) {
+            // Continue with NTLM auth
+        } elseif ($statusCode &lt; 300 || 400 &lt;= $statusCode || null === $location || null === $options || curl_getinfo($ch, \CURLINFO_REDIRECT_COUNT) === $options[&#039;max_redirects&#039;]) {
+            // Headers and redirects completed, time to get the response&#039;s content
+            $multi-&gt;handlesActivity[$id][] = new FirstChunk();
+
+            if (&#039;HEAD&#039; === $info[&#039;http_method&#039;] || \in_array($statusCode, [204, 304], true)) {
+                $waitFor = &#039;_0&#039;; // no content expected
+                $multi-&gt;handlesActivity[$id][] = null;
+                $multi-&gt;handlesActivity[$id][] = null;
+            } else {
+                $waitFor[0] = &#039;C&#039;; // C = content
+            }
+
+            curl_setopt($ch, \CURLOPT_PRIVATE, $waitFor);
+        } elseif (null !== $info[&#039;redirect_url&#039;] &amp;&amp; $logger) {
+            $logger-&gt;info(\sprintf(&#039;Redirecting: &quot;%s %s&quot;&#039;, $info[&#039;http_code&#039;], $info[&#039;redirect_url&#039;]));
+        }
+
+        $location = null;
+
+        return \strlen($data);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Response/HttplugPromise.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Retry -->
+
+</body>
+</html>

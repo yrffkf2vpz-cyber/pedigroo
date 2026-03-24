@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/RSA/PublicKey.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * RSA Public Key
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2015 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\Crypt\RSA;
+
+use phpseclib3\Common\Functions\Strings;
+use phpseclib3\Crypt\Common;
+use phpseclib3\Crypt\Hash;
+use phpseclib3\Crypt\Random;
+use phpseclib3\Crypt\RSA;
+use phpseclib3\Crypt\RSA\Formats\Keys\PSS;
+use phpseclib3\Exception\UnsupportedAlgorithmException;
+use phpseclib3\Exception\UnsupportedFormatException;
+use phpseclib3\File\ASN1;
+use phpseclib3\File\ASN1\Maps\DigestInfo;
+use phpseclib3\Math\BigInteger;
+
+/**
+ * Raw RSA Key Handler
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+final class PublicKey extends RSA implements Common\PublicKey
+{
+    use Common\Traits\Fingerprint;
+
+    /**
+     * Exponentiate
+     *
+     * @param BigInteger $x
+     * @return BigInteger
+     */
+    private function exponentiate(BigInteger $x)
+    {
+        return $x-&gt;modPow($this-&gt;exponent, $this-&gt;modulus);
+    }
+
+    /**
+     * RSAVP1
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-5.2.2 RFC3447#section-5.2.2}.
+     *
+     * @param BigInteger $s
+     * @return bool|BigInteger
+     */
+    private function rsavp1($s)
+    {
+        if ($s-&gt;compare(self::$zero) &lt; 0 || $s-&gt;compare($this-&gt;modulus) &gt; 0) {
+            return false;
+        }
+        return $this-&gt;exponentiate($s);
+    }
+
+    /**
+     * RSASSA-PKCS1-V1_5-VERIFY
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-8.2.2 RFC3447#section-8.2.2}.
+     *
+     * @param string $m
+     * @param string $s
+     * @throws \LengthException if the RSA modulus is too short
+     * @return bool
+     */
+    private function rsassa_pkcs1_v1_5_verify($m, $s)
+    {
+        // Length checking
+
+        if (strlen($s) != $this-&gt;k) {
+            return false;
+        }
+
+        // RSA verification
+
+        $s = $this-&gt;os2ip($s);
+        $m2 = $this-&gt;rsavp1($s);
+        if ($m2 === false) {
+            return false;
+        }
+        $em = $this-&gt;i2osp($m2, $this-&gt;k);
+        if ($em === false) {
+            return false;
+        }
+
+        // EMSA-PKCS1-v1_5 encoding
+
+        $exception = false;
+
+        // If the encoding operation outputs &quot;intended encoded message length too short,&quot; output &quot;RSA modulus
+        // too short&quot; and stop.
+        try {
+            $em2 = $this-&gt;emsa_pkcs1_v1_5_encode($m, $this-&gt;k);
+            $r1 = hash_equals($em, $em2);
+        } catch (\LengthException $e) {
+            $exception = true;
+        }
+
+        try {
+            $em3 = $this-&gt;emsa_pkcs1_v1_5_encode_without_null($m, $this-&gt;k);
+            $r2 = hash_equals($em, $em3);
+        } catch (\LengthException $e) {
+            $exception = true;
+        } catch (UnsupportedAlgorithmException $e) {
+            $r2 = false;
+        }
+
+        if ($exception) {
+            throw new \LengthException(&#039;RSA modulus too short&#039;);
+        }
+
+        // Compare
+        return $r1 || $r2;
+    }
+
+    /**
+     * RSASSA-PKCS1-V1_5-VERIFY (relaxed matching)
+     *
+     * Per {@link http://tools.ietf.org/html/rfc3447#page-43 RFC3447#page-43} PKCS1 v1.5
+     * specified the use BER encoding rather than DER encoding that PKCS1 v2.0 specified.
+     * This means that under rare conditions you can have a perfectly valid v1.5 signature
+     * that fails to validate with _rsassa_pkcs1_v1_5_verify(). PKCS1 v2.1 also recommends
+     * that if you&#039;re going to validate these types of signatures you &quot;should indicate
+     * whether the underlying BER encoding is a DER encoding and hence whether the signature
+     * is valid with respect to the specification given in [PKCS1 v2.0+]&quot;. so if you do
+     * $rsa-&gt;getLastPadding() and get RSA::PADDING_RELAXED_PKCS1 back instead of
+     * RSA::PADDING_PKCS1... that means BER encoding was used.
+     *
+     * @param string $m
+     * @param string $s
+     * @return bool
+     */
+    private function rsassa_pkcs1_v1_5_relaxed_verify($m, $s)
+    {
+        // Length checking
+
+        if (strlen($s) != $this-&gt;k) {
+            return false;
+        }
+
+        // RSA verification
+
+        $s = $this-&gt;os2ip($s);
+        $m2 = $this-&gt;rsavp1($s);
+        if ($m2 === false) {
+            return false;
+        }
+        $em = $this-&gt;i2osp($m2, $this-&gt;k);
+        if ($em === false) {
+            return false;
+        }
+
+        if (Strings::shift($em, 2) != &quot;\0\1&quot;) {
+            return false;
+        }
+
+        $em = ltrim($em, &quot;\xFF&quot;);
+        if (Strings::shift($em) != &quot;\0&quot;) {
+            return false;
+        }
+
+        $decoded = ASN1::decodeBER($em);
+        if (!is_array($decoded) || empty($decoded[0]) || strlen($em) &gt; $decoded[0][&#039;length&#039;]) {
+            return false;
+        }
+
+        static $oids;
+        if (!isset($oids)) {
+            $oids = [
+                &#039;md2&#039; =&gt; &#039;1.2.840.113549.2.2&#039;,
+                &#039;md4&#039; =&gt; &#039;1.2.840.113549.2.4&#039;, // from PKCS1 v1.5
+                &#039;md5&#039; =&gt; &#039;1.2.840.113549.2.5&#039;,
+                &#039;id-sha1&#039; =&gt; &#039;1.3.14.3.2.26&#039;,
+                &#039;id-sha256&#039; =&gt; &#039;2.16.840.1.101.3.4.2.1&#039;,
+                &#039;id-sha384&#039; =&gt; &#039;2.16.840.1.101.3.4.2.2&#039;,
+                &#039;id-sha512&#039; =&gt; &#039;2.16.840.1.101.3.4.2.3&#039;,
+                // from PKCS1 v2.2
+                &#039;id-sha224&#039; =&gt; &#039;2.16.840.1.101.3.4.2.4&#039;,
+                &#039;id-sha512/224&#039; =&gt; &#039;2.16.840.1.101.3.4.2.5&#039;,
+                &#039;id-sha512/256&#039; =&gt; &#039;2.16.840.1.101.3.4.2.6&#039;,
+            ];
+            ASN1::loadOIDs($oids);
+        }
+
+        $decoded = ASN1::asn1map($decoded[0], DigestInfo::MAP);
+        if (!isset($decoded) || $decoded === false) {
+            return false;
+        }
+
+        if (!isset($oids[$decoded[&#039;digestAlgorithm&#039;][&#039;algorithm&#039;]])) {
+            return false;
+        }
+
+        if (isset($decoded[&#039;digestAlgorithm&#039;][&#039;parameters&#039;]) &amp;&amp; $decoded[&#039;digestAlgorithm&#039;][&#039;parameters&#039;] !== [&#039;null&#039; =&gt; &#039;&#039;]) {
+            return false;
+        }
+
+        $hash = $decoded[&#039;digestAlgorithm&#039;][&#039;algorithm&#039;];
+        $hash = substr($hash, 0, 3) == &#039;id-&#039; ?
+            substr($hash, 3) :
+            $hash;
+        $hash = new Hash($hash);
+        $em = $hash-&gt;hash($m);
+        $em2 = $decoded[&#039;digest&#039;];
+
+        return hash_equals($em, $em2);
+    }
+
+    /**
+     * EMSA-PSS-VERIFY
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-9.1.2 RFC3447#section-9.1.2}.
+     *
+     * @param string $m
+     * @param string $em
+     * @param int $emBits
+     * @return string
+     */
+    private function emsa_pss_verify($m, $em, $emBits)
+    {
+        // if $m is larger than two million terrabytes and you&#039;re using sha1, PKCS#1 suggests a &quot;Label too long&quot; error
+        // be output.
+
+        $emLen = ($emBits + 7) &gt;&gt; 3; // ie. ceil($emBits / 8);
+        $sLen = $this-&gt;sLen !== null ? $this-&gt;sLen : $this-&gt;hLen;
+
+        $mHash = $this-&gt;hash-&gt;hash($m);
+        if ($emLen &lt; $this-&gt;hLen + $sLen + 2) {
+            return false;
+        }
+
+        if ($em[strlen($em) - 1] != chr(0xBC)) {
+            return false;
+        }
+
+        $maskedDB = substr($em, 0, -$this-&gt;hLen - 1);
+        $h = substr($em, -$this-&gt;hLen - 1, $this-&gt;hLen);
+        $temp = chr(256 - (1 &lt;&lt; ($emBits &amp; 7)));
+        if ((~$maskedDB[0] &amp; $temp) != $temp) {
+            return false;
+        }
+        $dbMask = $this-&gt;mgf1($h, $emLen - $this-&gt;hLen - 1);
+        $db = $maskedDB ^ $dbMask;
+        $db[0] = ~chr(256 - (1 &lt;&lt; ($emBits &amp; 7))) &amp; $db[0];
+        $temp = $emLen - $this-&gt;hLen - $sLen - 2;
+        if (substr($db, 0, $temp) != str_repeat(chr(0), $temp) || ord($db[$temp]) != 1) {
+            return false;
+        }
+        $salt = substr($db, $temp + 1); // should be $sLen long
+        $m2 = &quot;\0\0\0\0\0\0\0\0&quot; . $mHash . $salt;
+        $h2 = $this-&gt;hash-&gt;hash($m2);
+        return hash_equals($h, $h2);
+    }
+
+    /**
+     * RSASSA-PSS-VERIFY
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-8.1.2 RFC3447#section-8.1.2}.
+     *
+     * @param string $m
+     * @param string $s
+     * @return bool|string
+     */
+    private function rsassa_pss_verify($m, $s)
+    {
+        // Length checking
+
+        if (strlen($s) != $this-&gt;k) {
+            return false;
+        }
+
+        // RSA verification
+
+        $modBits = strlen($this-&gt;modulus-&gt;toBits());
+
+        $s2 = $this-&gt;os2ip($s);
+        $m2 = $this-&gt;rsavp1($s2);
+        $em = $this-&gt;i2osp($m2, $this-&gt;k);
+        if ($em === false) {
+            return false;
+        }
+
+        // EMSA-PSS verification
+
+        return $this-&gt;emsa_pss_verify($m, $em, $modBits - 1);
+    }
+
+    /**
+     * Verifies a signature
+     *
+     * @see self::sign()
+     * @param string $message
+     * @param string $signature
+     * @return bool
+     */
+    public function verify($message, $signature)
+    {
+        switch ($this-&gt;signaturePadding) {
+            case self::SIGNATURE_RELAXED_PKCS1:
+                return $this-&gt;rsassa_pkcs1_v1_5_relaxed_verify($message, $signature);
+            case self::SIGNATURE_PKCS1:
+                return $this-&gt;rsassa_pkcs1_v1_5_verify($message, $signature);
+            //case self::SIGNATURE_PSS:
+            default:
+                return $this-&gt;rsassa_pss_verify($message, $signature);
+        }
+    }
+
+    /**
+     * RSAES-PKCS1-V1_5-ENCRYPT
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-7.2.1 RFC3447#section-7.2.1}.
+     *
+     * @param string $m
+     * @param bool $pkcs15_compat optional
+     * @throws \LengthException if strlen($m) &gt; $this-&gt;k - 11
+     * @return bool|string
+     */
+    private function rsaes_pkcs1_v1_5_encrypt($m, $pkcs15_compat = false)
+    {
+        $mLen = strlen($m);
+
+        // Length checking
+
+        if ($mLen &gt; $this-&gt;k - 11) {
+            throw new \LengthException(&#039;Message too long&#039;);
+        }
+
+        // EME-PKCS1-v1_5 encoding
+
+        $psLen = $this-&gt;k - $mLen - 3;
+        $ps = &#039;&#039;;
+        while (strlen($ps) != $psLen) {
+            $temp = Random::string($psLen - strlen($ps));
+            $temp = str_replace(&quot;\x00&quot;, &#039;&#039;, $temp);
+            $ps .= $temp;
+        }
+        $type = 2;
+        $em = chr(0) . chr($type) . $ps . chr(0) . $m;
+
+        // RSA encryption
+        $m = $this-&gt;os2ip($em);
+        $c = $this-&gt;rsaep($m);
+        $c = $this-&gt;i2osp($c, $this-&gt;k);
+
+        // Output the ciphertext C
+
+        return $c;
+    }
+
+    /**
+     * RSAES-OAEP-ENCRYPT
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-7.1.1 RFC3447#section-7.1.1} and
+     * {http://en.wikipedia.org/wiki/Optimal_Asymmetric_Encryption_Padding OAES}.
+     *
+     * @param string $m
+     * @throws \LengthException if strlen($m) &gt; $this-&gt;k - 2 * $this-&gt;hLen - 2
+     * @return string
+     */
+    private function rsaes_oaep_encrypt($m)
+    {
+        $mLen = strlen($m);
+
+        // Length checking
+
+        // if $l is larger than two million terrabytes and you&#039;re using sha1, PKCS#1 suggests a &quot;Label too long&quot; error
+        // be output.
+
+        if ($mLen &gt; $this-&gt;k - 2 * $this-&gt;hLen - 2) {
+            throw new \LengthException(&#039;Message too long&#039;);
+        }
+
+        // EME-OAEP encoding
+
+        $lHash = $this-&gt;hash-&gt;hash($this-&gt;label);
+        $ps = str_repeat(chr(0), $this-&gt;k - $mLen - 2 * $this-&gt;hLen - 2);
+        $db = $lHash . $ps . chr(1) . $m;
+        $seed = Random::string($this-&gt;hLen);
+        $dbMask = $this-&gt;mgf1($seed, $this-&gt;k - $this-&gt;hLen - 1);
+        $maskedDB = $db ^ $dbMask;
+        $seedMask = $this-&gt;mgf1($maskedDB, $this-&gt;hLen);
+        $maskedSeed = $seed ^ $seedMask;
+        $em = chr(0) . $maskedSeed . $maskedDB;
+
+        // RSA encryption
+
+        $m = $this-&gt;os2ip($em);
+        $c = $this-&gt;rsaep($m);
+        $c = $this-&gt;i2osp($c, $this-&gt;k);
+
+        // Output the ciphertext C
+
+        return $c;
+    }
+
+    /**
+     * RSAEP
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-5.1.1 RFC3447#section-5.1.1}.
+     *
+     * @param BigInteger $m
+     * @return bool|BigInteger
+     */
+    private function rsaep($m)
+    {
+        if ($m-&gt;compare(self::$zero) &lt; 0 || $m-&gt;compare($this-&gt;modulus) &gt; 0) {
+            throw new \OutOfRangeException(&#039;Message representative out of range&#039;);
+        }
+        return $this-&gt;exponentiate($m);
+    }
+
+    /**
+     * Raw Encryption / Decryption
+     *
+     * Doesn&#039;t use padding and is not recommended.
+     *
+     * @param string $m
+     * @return bool|string
+     * @throws \LengthException if strlen($m) &gt; $this-&gt;k
+     */
+    private function raw_encrypt($m)
+    {
+        if (strlen($m) &gt; $this-&gt;k) {
+            throw new \LengthException(&#039;Message too long&#039;);
+        }
+
+        $temp = $this-&gt;os2ip($m);
+        $temp = $this-&gt;rsaep($temp);
+        return  $this-&gt;i2osp($temp, $this-&gt;k);
+    }
+
+    /**
+     * Encryption
+     *
+     * Both self::PADDING_OAEP and self::PADDING_PKCS1 both place limits on how long $plaintext can be.
+     * If $plaintext exceeds those limits it will be broken up so that it does and the resultant ciphertext&#039;s will
+     * be concatenated together.
+     *
+     * @see self::decrypt()
+     * @param string $plaintext
+     * @return bool|string
+     * @throws \LengthException if the RSA modulus is too short
+     */
+    public function encrypt($plaintext)
+    {
+        switch ($this-&gt;encryptionPadding) {
+            case self::ENCRYPTION_NONE:
+                return $this-&gt;raw_encrypt($plaintext);
+            case self::ENCRYPTION_PKCS1:
+                return $this-&gt;rsaes_pkcs1_v1_5_encrypt($plaintext);
+            //case self::ENCRYPTION_OAEP:
+            default:
+                return $this-&gt;rsaes_oaep_encrypt($plaintext);
+        }
+    }
+
+    /**
+     * Returns the public key
+     *
+     * The public key is only returned under two circumstances - if the private key had the public key embedded within it
+     * or if the public key was set via setPublicKey().  If the currently loaded key is supposed to be the public key this
+     * function won&#039;t return it since this library, for the most part, doesn&#039;t distinguish between public and private keys.
+     *
+     * @param string $type
+     * @param array $options optional
+     * @return mixed
+     */
+    public function toString($type, array $options = [])
+    {
+        $type = self::validatePlugin(&#039;Keys&#039;, $type, &#039;savePublicKey&#039;);
+
+        if ($type == PSS::class) {
+            if ($this-&gt;signaturePadding == self::SIGNATURE_PSS) {
+                $options += [
+                    &#039;hash&#039; =&gt; $this-&gt;hash-&gt;getHash(),
+                    &#039;MGFHash&#039; =&gt; $this-&gt;mgfHash-&gt;getHash(),
+                    &#039;saltLength&#039; =&gt; $this-&gt;getSaltLength()
+                ];
+            } else {
+                throw new UnsupportedFormatException(&#039;The PSS format can only be used when the signature method has been explicitly set to PSS&#039;);
+            }
+        }
+
+        return $type::savePublicKey($this-&gt;modulus, $this-&gt;publicExponent, $options);
+    }
+
+    /**
+     * Converts a public key to a private key
+     *
+     * @return RSA
+     */
+    public function asPrivateKey()
+    {
+        $new = new PrivateKey();
+        $new-&gt;exponent = $this-&gt;exponent;
+        $new-&gt;modulus = $this-&gt;modulus;
+        $new-&gt;k = $this-&gt;k;
+        $new-&gt;format = $this-&gt;format;
+        return $new
+            -&gt;withHash($this-&gt;hash-&gt;getHash())
+            -&gt;withMGFHash($this-&gt;mgfHash-&gt;getHash())
+            -&gt;withSaltLength($this-&gt;sLen)
+            -&gt;withLabel($this-&gt;label)
+            -&gt;withPadding($this-&gt;signaturePadding | $this-&gt;encryptionPadding);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/Random.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/RSA/Formats -->
+
+</body>
+</html>

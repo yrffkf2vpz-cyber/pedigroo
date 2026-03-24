@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Math/BigInteger.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Pure-PHP arbitrary precision integer arithmetic library.
+ *
+ * Supports base-2, base-10, base-16, and base-256 numbers.  Uses the GMP or BCMath extensions, if available,
+ * and an internal implementation, otherwise.
+ *
+ * PHP version 5 and 7
+ *
+ * Here&#039;s an example of how to use this library:
+ * &lt;code&gt;
+ * &lt;?php
+ *    $a = new \phpseclib3\Math\BigInteger(2);
+ *    $b = new \phpseclib3\Math\BigInteger(3);
+ *
+ *    $c = $a-&gt;add($b);
+ *
+ *    echo $c-&gt;toString(); // outputs 5
+ * ?&gt;
+ * &lt;/code&gt;
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2017 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ */
+
+namespace phpseclib3\Math;
+
+use phpseclib3\Exception\BadConfigurationException;
+use phpseclib3\Math\BigInteger\Engines\Engine;
+
+/**
+ * Pure-PHP arbitrary precision integer arithmetic library. Supports base-2, base-10, base-16, and base-256
+ * numbers.
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+class BigInteger implements \JsonSerializable
+{
+    /**
+     * Main Engine
+     *
+     * @var class-string&lt;Engine&gt;
+     */
+    private static $mainEngine;
+
+    /**
+     * Selected Engines
+     *
+     * @var list&lt;string&gt;
+     */
+    private static $engines;
+
+    /**
+     * The actual BigInteger object
+     *
+     * @var object
+     */
+    private $value;
+
+    /**
+     * Mode independent value used for serialization.
+     *
+     * @see self::__sleep()
+     * @see self::__wakeup()
+     * @var string
+     */
+    private $hex;
+
+    /**
+     * Precision (used only for serialization)
+     *
+     * @see self::__sleep()
+     * @see self::__wakeup()
+     * @var int
+     */
+    private $precision;
+
+    /**
+     * Sets engine type.
+     *
+     * Throws an exception if the type is invalid
+     *
+     * @param string $main
+     * @param list&lt;string&gt; $modexps optional
+     * @return void
+     */
+    public static function setEngine($main, array $modexps = [&#039;DefaultEngine&#039;])
+    {
+        self::$engines = [];
+
+        $fqmain = &#039;phpseclib3\\Math\\BigInteger\\Engines\\&#039; . $main;
+        if (!class_exists($fqmain) || !method_exists($fqmain, &#039;isValidEngine&#039;)) {
+            throw new \InvalidArgumentException(&quot;$main is not a valid engine&quot;);
+        }
+        if (!$fqmain::isValidEngine()) {
+            throw new BadConfigurationException(&quot;$main is not setup correctly on this system&quot;);
+        }
+        /** @var class-string&lt;Engine&gt; $fqmain */
+        self::$mainEngine = $fqmain;
+
+        $found = false;
+        foreach ($modexps as $modexp) {
+            try {
+                $fqmain::setModExpEngine($modexp);
+                $found = true;
+                break;
+            } catch (\Exception $e) {
+            }
+        }
+
+        if (!$found) {
+            throw new BadConfigurationException(&quot;No valid modular exponentiation engine found for $main&quot;);
+        }
+
+        self::$engines = [$main, $modexp];
+    }
+
+    /**
+     * Returns the engine type
+     *
+     * @return string[]
+     */
+    public static function getEngine()
+    {
+        self::initialize_static_variables();
+
+        return self::$engines;
+    }
+
+    /**
+     * Initialize static variables
+     */
+    private static function initialize_static_variables()
+    {
+        if (!isset(self::$mainEngine)) {
+            $engines = [
+                [&#039;GMP&#039;, [&#039;DefaultEngine&#039;]],
+                [&#039;PHP64&#039;, [&#039;OpenSSL&#039;]],
+                [&#039;BCMath&#039;, [&#039;OpenSSL&#039;]],
+                [&#039;PHP32&#039;, [&#039;OpenSSL&#039;]],
+                [&#039;PHP64&#039;, [&#039;DefaultEngine&#039;]],
+                [&#039;PHP32&#039;, [&#039;DefaultEngine&#039;]]
+            ];
+            // per https://phpseclib.com/docs/speed PHP 8.4.0+ _significantly_ sped up BCMath
+            if (version_compare(PHP_VERSION, &#039;8.4.0&#039;) &gt;= 0) {
+                $engines[1][0] = &#039;BCMath&#039;;
+                $engines[2][0] = &#039;PHP64&#039;;
+            }
+
+            foreach ($engines as $engine) {
+                try {
+                    self::setEngine($engine[0], $engine[1]);
+                    return;
+                } catch (\Exception $e) {
+                }
+            }
+
+            throw new \UnexpectedValueException(&#039;No valid BigInteger found. This is only possible when JIT is enabled on Windows and neither the GMP or BCMath extensions are available so either disable JIT or install GMP / BCMath&#039;);
+        }
+    }
+
+    /**
+     * Converts base-2, base-10, base-16, and binary strings (base-256) to BigIntegers.
+     *
+     * If the second parameter - $base - is negative, then it will be assumed that the number&#039;s are encoded using
+     * two&#039;s compliment.  The sole exception to this is -10, which is treated the same as 10 is.
+     *
+     * @param string|int|Engine $x Base-10 number or base-$base number if $base set.
+     * @param int $base
+     */
+    public function __construct($x = 0, $base = 10)
+    {
+        self::initialize_static_variables();
+
+        if ($x instanceof self::$mainEngine) {
+            $this-&gt;value = clone $x;
+        } elseif ($x instanceof Engine) {
+            $this-&gt;value = new static(&quot;$x&quot;);
+            $this-&gt;value-&gt;setPrecision($x-&gt;getPrecision());
+        } else {
+            $this-&gt;value = new self::$mainEngine($x, $base);
+        }
+    }
+
+    /**
+     * Converts a BigInteger to a base-10 number.
+     *
+     * @return string
+     */
+    public function toString()
+    {
+        return $this-&gt;value-&gt;toString();
+    }
+
+    /**
+     *  __toString() magic method
+     */
+    public function __toString()
+    {
+        return (string)$this-&gt;value;
+    }
+
+    /**
+     *  __debugInfo() magic method
+     *
+     * Will be called, automatically, when print_r() or var_dump() are called
+     */
+    public function __debugInfo()
+    {
+        return $this-&gt;value-&gt;__debugInfo();
+    }
+
+    /**
+     * Converts a BigInteger to a byte string (eg. base-256).
+     *
+     * @param bool $twos_compliment
+     * @return string
+     */
+    public function toBytes($twos_compliment = false)
+    {
+        return $this-&gt;value-&gt;toBytes($twos_compliment);
+    }
+
+    /**
+     * Converts a BigInteger to a hex string (eg. base-16).
+     *
+     * @param bool $twos_compliment
+     * @return string
+     */
+    public function toHex($twos_compliment = false)
+    {
+        return $this-&gt;value-&gt;toHex($twos_compliment);
+    }
+
+    /**
+     * Converts a BigInteger to a bit string (eg. base-2).
+     *
+     * Negative numbers are saved as positive numbers, unless $twos_compliment is set to true, at which point, they&#039;re
+     * saved as two&#039;s compliment.
+     *
+     * @param bool $twos_compliment
+     * @return string
+     */
+    public function toBits($twos_compliment = false)
+    {
+        return $this-&gt;value-&gt;toBits($twos_compliment);
+    }
+
+    /**
+     * Adds two BigIntegers.
+     *
+     * @param BigInteger $y
+     * @return BigInteger
+     */
+    public function add(BigInteger $y)
+    {
+        return new static($this-&gt;value-&gt;add($y-&gt;value));
+    }
+
+    /**
+     * Subtracts two BigIntegers.
+     *
+     * @param BigInteger $y
+     * @return BigInteger
+     */
+    public function subtract(BigInteger $y)
+    {
+        return new static($this-&gt;value-&gt;subtract($y-&gt;value));
+    }
+
+    /**
+     * Multiplies two BigIntegers
+     *
+     * @param BigInteger $x
+     * @return BigInteger
+     */
+    public function multiply(BigInteger $x)
+    {
+        return new static($this-&gt;value-&gt;multiply($x-&gt;value));
+    }
+
+    /**
+     * Divides two BigIntegers.
+     *
+     * Returns an array whose first element contains the quotient and whose second element contains the
+     * &quot;common residue&quot;.  If the remainder would be positive, the &quot;common residue&quot; and the remainder are the
+     * same.  If the remainder would be negative, the &quot;common residue&quot; is equal to the sum of the remainder
+     * and the divisor (basically, the &quot;common residue&quot; is the first positive modulo).
+     *
+     * Here&#039;s an example:
+     * &lt;code&gt;
+     * &lt;?php
+     *    $a = new \phpseclib3\Math\BigInteger(&#039;10&#039;);
+     *    $b = new \phpseclib3\Math\BigInteger(&#039;20&#039;);
+     *
+     *    list($quotient, $remainder) = $a-&gt;divide($b);
+     *
+     *    echo $quotient-&gt;toString(); // outputs 0
+     *    echo &quot;\r\n&quot;;
+     *    echo $remainder-&gt;toString(); // outputs 10
+     * ?&gt;
+     * &lt;/code&gt;
+     *
+     * @param BigInteger $y
+     * @return BigInteger[]
+     */
+    public function divide(BigInteger $y)
+    {
+        list($q, $r) = $this-&gt;value-&gt;divide($y-&gt;value);
+        return [
+            new static($q),
+            new static($r)
+        ];
+    }
+
+    /**
+     * Calculates modular inverses.
+     *
+     * Say you have (30 mod 17 * x mod 17) mod 17 == 1.  x can be found using modular inverses.
+     *
+     * @param BigInteger $n
+     * @return BigInteger
+     */
+    public function modInverse(BigInteger $n)
+    {
+        return new static($this-&gt;value-&gt;modInverse($n-&gt;value));
+    }
+
+    /**
+     * Calculates modular inverses.
+     *
+     * Say you have (30 mod 17 * x mod 17) mod 17 == 1.  x can be found using modular inverses.
+     *
+     * @param BigInteger $n
+     * @return BigInteger[]
+     */
+    public function extendedGCD(BigInteger $n)
+    {
+        $extended = $this-&gt;value-&gt;extendedGCD($n-&gt;value);
+        $gcd = $extended[&#039;gcd&#039;];
+        $x = $extended[&#039;x&#039;];
+        $y = $extended[&#039;y&#039;];
+        return [
+            &#039;gcd&#039; =&gt; new static($gcd),
+            &#039;x&#039; =&gt; new static($x),
+            &#039;y&#039; =&gt; new static($y)
+        ];
+    }
+
+    /**
+     * Calculates the greatest common divisor
+     *
+     * Say you have 693 and 609.  The GCD is 21.
+     *
+     * @param BigInteger $n
+     * @return BigInteger
+     */
+    public function gcd(BigInteger $n)
+    {
+        return new static($this-&gt;value-&gt;gcd($n-&gt;value));
+    }
+
+    /**
+     * Absolute value.
+     *
+     * @return BigInteger
+     */
+    public function abs()
+    {
+        return new static($this-&gt;value-&gt;abs());
+    }
+
+    /**
+     * Set Precision
+     *
+     * Some bitwise operations give different results depending on the precision being used.  Examples include left
+     * shift, not, and rotates.
+     *
+     * @param int $bits
+     */
+    public function setPrecision($bits)
+    {
+        $this-&gt;value-&gt;setPrecision($bits);
+    }
+
+    /**
+     * Get Precision
+     *
+     * Returns the precision if it exists, false if it doesn&#039;t
+     *
+     * @return int|bool
+     */
+    public function getPrecision()
+    {
+        return $this-&gt;value-&gt;getPrecision();
+    }
+
+    /**
+     * Serialize
+     *
+     * Will be called, automatically, when serialize() is called on a BigInteger object.
+     *
+     * __sleep() / __wakeup() have been around since PHP 4.0 but were deprecated in PHP 8.5
+     *
+     * \Serializable was introduced in PHP 5.1 and deprecated in PHP 8.1:
+     * https://wiki.php.net/rfc/phase_out_serializable
+     *
+     * __serialize() / __unserialize() were introduced in PHP 7.4:
+     * https://wiki.php.net/rfc/custom_object_serialization
+     *
+     * @return array
+     */
+    public function __sleep()
+    {
+        $this-&gt;hex = $this-&gt;toHex(true);
+        $vars = [&#039;hex&#039;];
+        if ($this-&gt;getPrecision() &gt; 0) {
+            $vars[] = &#039;precision&#039;;
+        }
+        return $vars;
+    }
+
+    /**
+     * Serialize
+     *
+     * Will be called, automatically, when unserialize() is called on a BigInteger object.
+     */
+    public function __wakeup()
+    {
+        $temp = new static($this-&gt;hex, -16);
+        $this-&gt;value = $temp-&gt;value;
+        if ($this-&gt;precision &gt; 0) {
+            // recalculate $this-&gt;bitmask
+            $this-&gt;setPrecision($this-&gt;precision);
+        }
+    }
+
+    /**
+     *  __serialize() magic method
+     *
+     * @see self::__unserialize()
+     * @return array
+     * @access public
+     */
+    public function __serialize()
+    {
+        $result = [&#039;hex&#039; =&gt; $this-&gt;toHex(true)];
+        if ($this-&gt;getPrecision() &gt; 0) {
+            $result[&#039;precision&#039;] = $this-&gt;getPrecision();
+        }
+        return $result;
+    }
+
+    /**
+     *  __unserialize() magic method
+     *
+     * @see self::__serialize()
+     * @access public
+     */
+    public function __unserialize(array $data)
+    {
+        $temp = new static($data[&#039;hex&#039;], -16);
+        $this-&gt;value = $temp-&gt;value;
+        if (isset($data[&#039;precision&#039;]) &amp;&amp; $data[&#039;precision&#039;] &gt; 0) {
+            // recalculate $this-&gt;bitmask
+            $this-&gt;setPrecision($data[&#039;precision&#039;]);
+        }
+    }
+
+    /**
+     * JSON Serialize
+     *
+     * Will be called, automatically, when json_encode() is called on a BigInteger object.
+     *
+     * @return array{hex: string, precision?: int]
+     */
+    #[\ReturnTypeWillChange]
+    public function jsonSerialize()
+    {
+        $result = [&#039;hex&#039; =&gt; $this-&gt;toHex(true)];
+        if ($this-&gt;precision &gt; 0) {
+            $result[&#039;precision&#039;] = $this-&gt;getPrecision();
+        }
+        return $result;
+    }
+
+    /**
+     * Performs modular exponentiation.
+     *
+     * @param BigInteger $e
+     * @param BigInteger $n
+     * @return BigInteger
+     */
+    public function powMod(BigInteger $e, BigInteger $n)
+    {
+        return new static($this-&gt;value-&gt;powMod($e-&gt;value, $n-&gt;value));
+    }
+
+    /**
+     * Performs modular exponentiation.
+     *
+     * @param BigInteger $e
+     * @param BigInteger $n
+     * @return BigInteger
+     */
+    public function modPow(BigInteger $e, BigInteger $n)
+    {
+        return new static($this-&gt;value-&gt;modPow($e-&gt;value, $n-&gt;value));
+    }
+
+    /**
+     * Compares two numbers.
+     *
+     * Although one might think !$x-&gt;compare($y) means $x != $y, it, in fact, means the opposite.  The reason for this
+     * is demonstrated thusly:
+     *
+     * $x  &gt; $y: $x-&gt;compare($y)  &gt; 0
+     * $x  &lt; $y: $x-&gt;compare($y)  &lt; 0
+     * $x == $y: $x-&gt;compare($y) == 0
+     *
+     * Note how the same comparison operator is used.  If you want to test for equality, use $x-&gt;equals($y).
+     *
+     * {@internal Could return $this-&gt;subtract($x), but that&#039;s not as fast as what we do do.}
+     *
+     * @param BigInteger $y
+     * @return int in case &lt; 0 if $this is less than $y; &gt; 0 if $this is greater than $y, and 0 if they are equal.
+     * @see self::equals()
+     */
+    public function compare(BigInteger $y)
+    {
+        return $this-&gt;value-&gt;compare($y-&gt;value);
+    }
+
+    /**
+     * Tests the equality of two numbers.
+     *
+     * If you need to see if one number is greater than or less than another number, use BigInteger::compare()
+     *
+     * @param BigInteger $x
+     * @return bool
+     */
+    public function equals(BigInteger $x)
+    {
+        return $this-&gt;value-&gt;equals($x-&gt;value);
+    }
+
+    /**
+     * Logical Not
+     *
+     * @return BigInteger
+     */
+    public function bitwise_not()
+    {
+        return new static($this-&gt;value-&gt;bitwise_not());
+    }
+
+    /**
+     * Logical And
+     *
+     * @param BigInteger $x
+     * @return BigInteger
+     */
+    public function bitwise_and(BigInteger $x)
+    {
+        return new static($this-&gt;value-&gt;bitwise_and($x-&gt;value));
+    }
+
+    /**
+     * Logical Or
+     *
+     * @param BigInteger $x
+     * @return BigInteger
+     */
+    public function bitwise_or(BigInteger $x)
+    {
+        return new static($this-&gt;value-&gt;bitwise_or($x-&gt;value));
+    }
+
+    /**
+     * Logical Exclusive Or
+     *
+     * @param BigInteger $x
+     * @return BigInteger
+     */
+    public function bitwise_xor(BigInteger $x)
+    {
+        return new static($this-&gt;value-&gt;bitwise_xor($x-&gt;value));
+    }
+
+    /**
+     * Logical Right Shift
+     *
+     * Shifts BigInteger&#039;s by $shift bits, effectively dividing by 2**$shift.
+     *
+     * @param int $shift
+     * @return BigInteger
+     */
+    public function bitwise_rightShift($shift)
+    {
+        return new static($this-&gt;value-&gt;bitwise_rightShift($shift));
+    }
+
+    /**
+     * Logical Left Shift
+     *
+     * Shifts BigInteger&#039;s by $shift bits, effectively multiplying by 2**$shift.
+     *
+     * @param int $shift
+     * @return BigInteger
+     */
+    public function bitwise_leftShift($shift)
+    {
+        return new static($this-&gt;value-&gt;bitwise_leftShift($shift));
+    }
+
+    /**
+     * Logical Left Rotate
+     *
+     * Instead of the top x bits being dropped they&#039;re appended to the shifted bit string.
+     *
+     * @param int $shift
+     * @return BigInteger
+     */
+    public function bitwise_leftRotate($shift)
+    {
+        return new static($this-&gt;value-&gt;bitwise_leftRotate($shift));
+    }
+
+    /**
+     * Logical Right Rotate
+     *
+     * Instead of the bottom x bits being dropped they&#039;re prepended to the shifted bit string.
+     *
+     * @param int $shift
+     * @return BigInteger
+     */
+    public function bitwise_rightRotate($shift)
+    {
+        return new static($this-&gt;value-&gt;bitwise_rightRotate($shift));
+    }
+
+    /**
+     * Returns the smallest and largest n-bit number
+     *
+     * @param int $bits
+     * @return BigInteger[]
+     */
+    public static function minMaxBits($bits)
+    {
+        self::initialize_static_variables();
+
+        $class = self::$mainEngine;
+        $minMax = $class::minMaxBits($bits);
+        $min = $minMax[&#039;min&#039;];
+        $max = $minMax[&#039;max&#039;];
+        return [
+            &#039;min&#039; =&gt; new static($min),
+            &#039;max&#039; =&gt; new static($max)
+        ];
+    }
+
+    /**
+     * Return the size of a BigInteger in bits
+     *
+     * @return int
+     */
+    public function getLength()
+    {
+        return $this-&gt;value-&gt;getLength();
+    }
+
+    /**
+     * Return the size of a BigInteger in bytes
+     *
+     * @return int
+     */
+    public function getLengthInBytes()
+    {
+        return $this-&gt;value-&gt;getLengthInBytes();
+    }
+
+    /**
+     * Generates a random number of a certain size
+     *
+     * Bit length is equal to $size
+     *
+     * @param int $size
+     * @return BigInteger
+     */
+    public static function random($size)
+    {
+        self::initialize_static_variables();
+
+        $class = self::$mainEngine;
+        return new static($class::random($size));
+    }
+
+    /**
+     * Generates a random prime number of a certain size
+     *
+     * Bit length is equal to $size
+     *
+     * @param int $size
+     * @return BigInteger
+     */
+    public static function randomPrime($size)
+    {
+        self::initialize_static_variables();
+
+        $class = self::$mainEngine;
+        return new static($class::randomPrime($size));
+    }
+
+    /**
+     * Generate a random prime number between a range
+     *
+     * If there&#039;s not a prime within the given range, false will be returned.
+     *
+     * @param BigInteger $min
+     * @param BigInteger $max
+     * @return false|BigInteger
+     */
+    public static function randomRangePrime(BigInteger $min, BigInteger $max)
+    {
+        $class = self::$mainEngine;
+        return new static($class::randomRangePrime($min-&gt;value, $max-&gt;value));
+    }
+
+    /**
+     * Generate a random number between a range
+     *
+     * Returns a random number between $min and $max where $min and $max
+     * can be defined using one of the two methods:
+     *
+     * BigInteger::randomRange($min, $max)
+     * BigInteger::randomRange($max, $min)
+     *
+     * @param BigInteger $min
+     * @param BigInteger $max
+     * @return BigInteger
+     */
+    public static function randomRange(BigInteger $min, BigInteger $max)
+    {
+        $class = self::$mainEngine;
+        return new static($class::randomRange($min-&gt;value, $max-&gt;value));
+    }
+
+    /**
+     * Checks a numer to see if it&#039;s prime
+     *
+     * Assuming the $t parameter is not set, this function has an error rate of 2**-80.  The main motivation for the
+     * $t parameter is distributability.  BigInteger::randomPrime() can be distributed across multiple pageloads
+     * on a website instead of just one.
+     *
+     * @param int|bool $t
+     * @return bool
+     */
+    public function isPrime($t = false)
+    {
+        return $this-&gt;value-&gt;isPrime($t);
+    }
+
+    /**
+     * Calculates the nth root of a biginteger.
+     *
+     * Returns the nth root of a positive biginteger, where n defaults to 2
+     *
+     * @param int $n optional
+     * @return BigInteger
+     */
+    public function root($n = 2)
+    {
+        return new static($this-&gt;value-&gt;root($n));
+    }
+
+    /**
+     * Performs exponentiation.
+     *
+     * @param BigInteger $n
+     * @return BigInteger
+     */
+    public function pow(BigInteger $n)
+    {
+        return new static($this-&gt;value-&gt;pow($n-&gt;value));
+    }
+
+    /**
+     * Return the minimum BigInteger between an arbitrary number of BigIntegers.
+     *
+     * @param BigInteger ...$nums
+     * @return BigInteger
+     */
+    public static function min(BigInteger ...$nums)
+    {
+        $class = self::$mainEngine;
+        $nums = array_map(function ($num) {
+            return $num-&gt;value;
+        }, $nums);
+        return new static($class::min(...$nums));
+    }
+
+    /**
+     * Return the maximum BigInteger between an arbitrary number of BigIntegers.
+     *
+     * @param BigInteger ...$nums
+     * @return BigInteger
+     */
+    public static function max(BigInteger ...$nums)
+    {
+        $class = self::$mainEngine;
+        $nums = array_map(function ($num) {
+            return $num-&gt;value;
+        }, $nums);
+        return new static($class::max(...$nums));
+    }
+
+    /**
+     * Tests BigInteger to see if it is between two integers, inclusive
+     *
+     * @param BigInteger $min
+     * @param BigInteger $max
+     * @return bool
+     */
+    public function between(BigInteger $min, BigInteger $max)
+    {
+        return $this-&gt;value-&gt;between($min-&gt;value, $max-&gt;value);
+    }
+
+    /**
+     * Clone
+     */
+    public function __clone()
+    {
+        $this-&gt;value = clone $this-&gt;value;
+    }
+
+    /**
+     * Is Odd?
+     *
+     * @return bool
+     */
+    public function isOdd()
+    {
+        return $this-&gt;value-&gt;isOdd();
+    }
+
+    /**
+     * Tests if a bit is set
+     *
+     * @param int $x
+     * @return bool
+     */
+    public function testBit($x)
+    {
+        return $this-&gt;value-&gt;testBit($x);
+    }
+
+    /**
+     * Is Negative?
+     *
+     * @return bool
+     */
+    public function isNegative()
+    {
+        return $this-&gt;value-&gt;isNegative();
+    }
+
+    /**
+     * Negate
+     *
+     * Given $k, returns -$k
+     *
+     * @return BigInteger
+     */
+    public function negate()
+    {
+        return new static($this-&gt;value-&gt;negate());
+    }
+
+    /**
+     * Scan for 1 and right shift by that amount
+     *
+     * ie. $s = gmp_scan1($n, 0) and $r = gmp_div_q($n, gmp_pow(gmp_init(&#039;2&#039;), $s));
+     *
+     * @param BigInteger $r
+     * @return int
+     */
+    public static function scan1divide(BigInteger $r)
+    {
+        $class = self::$mainEngine;
+        return $class::scan1divide($r-&gt;value);
+    }
+
+    /**
+     * Create Recurring Modulo Function
+     *
+     * Sometimes it may be desirable to do repeated modulos with the same number outside of
+     * modular exponentiation
+     *
+     * @return callable
+     */
+    public function createRecurringModuloFunction()
+    {
+        $func = $this-&gt;value-&gt;createRecurringModuloFunction();
+        return function (BigInteger $x) use ($func) {
+            return new static($func($x-&gt;value));
+        };
+    }
+
+    /**
+     * Bitwise Split
+     *
+     * Splits BigInteger&#039;s into chunks of $split bits
+     *
+     * @param int $split
+     * @return BigInteger[]
+     */
+    public function bitwise_split($split)
+    {
+        return array_map(function ($val) {
+            return new static($val);
+        }, $this-&gt;value-&gt;bitwise_split($split));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Math/BigInteger/Engines/BCMath.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Math/BigInteger -->
+
+</body>
+</html>

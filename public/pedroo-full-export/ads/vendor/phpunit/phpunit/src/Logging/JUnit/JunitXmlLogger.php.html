@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpunit/phpunit/src/Logging/JUnit/JunitXmlLogger.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of PHPUnit.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace PHPUnit\Logging\JUnit;
+
+use const PHP_EOL;
+use function assert;
+use function basename;
+use function is_int;
+use function sprintf;
+use function str_replace;
+use function trim;
+use DOMDocument;
+use DOMElement;
+use PHPUnit\Event\Code\Test;
+use PHPUnit\Event\Code\TestMethod;
+use PHPUnit\Event\EventFacadeIsSealedException;
+use PHPUnit\Event\Facade;
+use PHPUnit\Event\InvalidArgumentException;
+use PHPUnit\Event\Telemetry\HRTime;
+use PHPUnit\Event\Telemetry\Info;
+use PHPUnit\Event\Test\Errored;
+use PHPUnit\Event\Test\Failed;
+use PHPUnit\Event\Test\Finished;
+use PHPUnit\Event\Test\MarkedIncomplete;
+use PHPUnit\Event\Test\PreparationStarted;
+use PHPUnit\Event\Test\Prepared;
+use PHPUnit\Event\Test\PrintedUnexpectedOutput;
+use PHPUnit\Event\Test\Skipped;
+use PHPUnit\Event\TestSuite\Started;
+use PHPUnit\Event\UnknownSubscriberTypeException;
+use PHPUnit\TextUI\Output\Printer;
+use PHPUnit\Util\Xml;
+
+/**
+ * @no-named-arguments Parameter names are not covered by the backward compatibility promise for PHPUnit
+ *
+ * @internal This class is not covered by the backward compatibility promise for PHPUnit
+ */
+final class JunitXmlLogger
+{
+    private readonly Printer $printer;
+    private DOMDocument $document;
+    private DOMElement $root;
+
+    /**
+     * @var array&lt;int, DOMElement&gt;
+     */
+    private array $testSuites = [];
+
+    /**
+     * @var array&lt;int, int&gt;
+     */
+    private array $testSuiteTests = [0];
+
+    /**
+     * @var array&lt;int, int&gt;
+     */
+    private array $testSuiteAssertions = [0];
+
+    /**
+     * @var array&lt;int, int&gt;
+     */
+    private array $testSuiteErrors = [0];
+
+    /**
+     * @var array&lt;int, int&gt;
+     */
+    private array $testSuiteFailures = [0];
+
+    /**
+     * @var array&lt;int, int&gt;
+     */
+    private array $testSuiteSkipped = [0];
+
+    /**
+     * @var array&lt;int, float&gt;
+     */
+    private array $testSuiteTimes        = [0.0];
+    private int $testSuiteLevel          = 0;
+    private ?DOMElement $currentTestCase = null;
+    private ?HRTime $time                = null;
+    private bool $prepared               = false;
+    private bool $preparationFailed      = false;
+    private ?string $unexpectedOutput    = null;
+
+    /**
+     * @throws EventFacadeIsSealedException
+     * @throws UnknownSubscriberTypeException
+     */
+    public function __construct(Printer $printer, Facade $facade)
+    {
+        $this-&gt;printer = $printer;
+
+        $this-&gt;registerSubscribers($facade);
+        $this-&gt;createDocument();
+    }
+
+    public function flush(): void
+    {
+        $this-&gt;printer-&gt;print($this-&gt;document-&gt;saveXML());
+
+        $this-&gt;printer-&gt;flush();
+    }
+
+    public function testSuiteStarted(Started $event): void
+    {
+        $testSuite = $this-&gt;document-&gt;createElement(&#039;testsuite&#039;);
+        $testSuite-&gt;setAttribute(&#039;name&#039;, $event-&gt;testSuite()-&gt;name());
+
+        if ($event-&gt;testSuite()-&gt;isForTestClass()) {
+            $testSuite-&gt;setAttribute(&#039;file&#039;, $event-&gt;testSuite()-&gt;file());
+        }
+
+        if ($this-&gt;testSuiteLevel &gt; 0) {
+            $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;appendChild($testSuite);
+        } else {
+            $this-&gt;root-&gt;appendChild($testSuite);
+        }
+
+        $this-&gt;testSuiteLevel++;
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]          = $testSuite;
+        $this-&gt;testSuiteTests[$this-&gt;testSuiteLevel]      = 0;
+        $this-&gt;testSuiteAssertions[$this-&gt;testSuiteLevel] = 0;
+        $this-&gt;testSuiteErrors[$this-&gt;testSuiteLevel]     = 0;
+        $this-&gt;testSuiteFailures[$this-&gt;testSuiteLevel]   = 0;
+        $this-&gt;testSuiteSkipped[$this-&gt;testSuiteLevel]    = 0;
+        $this-&gt;testSuiteTimes[$this-&gt;testSuiteLevel]      = 0.0;
+    }
+
+    public function testSuiteFinished(): void
+    {
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;setAttribute(
+            &#039;tests&#039;,
+            (string) $this-&gt;testSuiteTests[$this-&gt;testSuiteLevel],
+        );
+
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;setAttribute(
+            &#039;assertions&#039;,
+            (string) $this-&gt;testSuiteAssertions[$this-&gt;testSuiteLevel],
+        );
+
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;setAttribute(
+            &#039;errors&#039;,
+            (string) $this-&gt;testSuiteErrors[$this-&gt;testSuiteLevel],
+        );
+
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;setAttribute(
+            &#039;failures&#039;,
+            (string) $this-&gt;testSuiteFailures[$this-&gt;testSuiteLevel],
+        );
+
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;setAttribute(
+            &#039;skipped&#039;,
+            (string) $this-&gt;testSuiteSkipped[$this-&gt;testSuiteLevel],
+        );
+
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;setAttribute(
+            &#039;time&#039;,
+            sprintf(&#039;%F&#039;, $this-&gt;testSuiteTimes[$this-&gt;testSuiteLevel]),
+        );
+
+        if ($this-&gt;testSuiteLevel &gt; 1) {
+            $this-&gt;testSuiteTests[$this-&gt;testSuiteLevel - 1]      += $this-&gt;testSuiteTests[$this-&gt;testSuiteLevel];
+            $this-&gt;testSuiteAssertions[$this-&gt;testSuiteLevel - 1] += $this-&gt;testSuiteAssertions[$this-&gt;testSuiteLevel];
+            $this-&gt;testSuiteErrors[$this-&gt;testSuiteLevel - 1]     += $this-&gt;testSuiteErrors[$this-&gt;testSuiteLevel];
+            $this-&gt;testSuiteFailures[$this-&gt;testSuiteLevel - 1]   += $this-&gt;testSuiteFailures[$this-&gt;testSuiteLevel];
+            $this-&gt;testSuiteSkipped[$this-&gt;testSuiteLevel - 1]    += $this-&gt;testSuiteSkipped[$this-&gt;testSuiteLevel];
+            $this-&gt;testSuiteTimes[$this-&gt;testSuiteLevel - 1]      += $this-&gt;testSuiteTimes[$this-&gt;testSuiteLevel];
+        }
+
+        $this-&gt;testSuiteLevel--;
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testPreparationStarted(PreparationStarted $event): void
+    {
+        $this-&gt;createTestCase($event);
+
+        $this-&gt;preparationFailed = false;
+    }
+
+    public function testPreparationFailed(): void
+    {
+        $this-&gt;preparationFailed = true;
+    }
+
+    public function testPrepared(): void
+    {
+        $this-&gt;prepared = true;
+    }
+
+    public function testPrintedUnexpectedOutput(PrintedUnexpectedOutput $event): void
+    {
+        $this-&gt;unexpectedOutput = $event-&gt;output();
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testFinished(Finished $event): void
+    {
+        if (!$this-&gt;prepared || $this-&gt;preparationFailed) {
+            return;
+        }
+
+        $this-&gt;handleFinish($event-&gt;telemetryInfo(), $event-&gt;numberOfAssertionsPerformed());
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testMarkedIncomplete(MarkedIncomplete $event): void
+    {
+        $this-&gt;handleIncompleteOrSkipped($event);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testSkipped(Skipped $event): void
+    {
+        $this-&gt;handleIncompleteOrSkipped($event);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testErrored(Errored $event): void
+    {
+        $this-&gt;handleFault($event, &#039;error&#039;);
+
+        $this-&gt;testSuiteErrors[$this-&gt;testSuiteLevel]++;
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testFailed(Failed $event): void
+    {
+        $this-&gt;handleFault($event, &#039;failure&#039;);
+
+        $this-&gt;testSuiteFailures[$this-&gt;testSuiteLevel]++;
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function handleFinish(Info $telemetryInfo, int $numberOfAssertionsPerformed): void
+    {
+        assert($this-&gt;currentTestCase !== null);
+        assert($this-&gt;time !== null);
+
+        $time = $telemetryInfo-&gt;time()-&gt;duration($this-&gt;time)-&gt;asFloat();
+
+        $this-&gt;testSuiteAssertions[$this-&gt;testSuiteLevel] += $numberOfAssertionsPerformed;
+
+        $this-&gt;currentTestCase-&gt;setAttribute(
+            &#039;assertions&#039;,
+            (string) $numberOfAssertionsPerformed,
+        );
+
+        $this-&gt;currentTestCase-&gt;setAttribute(
+            &#039;time&#039;,
+            sprintf(&#039;%F&#039;, $time),
+        );
+
+        if ($this-&gt;unexpectedOutput !== null) {
+            $systemOut = $this-&gt;document-&gt;createElement(
+                &#039;system-out&#039;,
+                Xml::prepareString($this-&gt;unexpectedOutput),
+            );
+
+            $this-&gt;currentTestCase-&gt;appendChild($systemOut);
+        }
+
+        $this-&gt;testSuites[$this-&gt;testSuiteLevel]-&gt;appendChild(
+            $this-&gt;currentTestCase,
+        );
+
+        $this-&gt;testSuiteTests[$this-&gt;testSuiteLevel]++;
+        $this-&gt;testSuiteTimes[$this-&gt;testSuiteLevel] += $time;
+
+        $this-&gt;currentTestCase   = null;
+        $this-&gt;time              = null;
+        $this-&gt;preparationFailed = false;
+        $this-&gt;prepared          = false;
+        $this-&gt;unexpectedOutput  = null;
+    }
+
+    /**
+     * @throws EventFacadeIsSealedException
+     * @throws UnknownSubscriberTypeException
+     */
+    private function registerSubscribers(Facade $facade): void
+    {
+        $facade-&gt;registerSubscribers(
+            new TestSuiteStartedSubscriber($this),
+            new TestSuiteFinishedSubscriber($this),
+            new TestPreparationStartedSubscriber($this),
+            new TestPreparationFailedSubscriber($this),
+            new TestPreparedSubscriber($this),
+            new TestPrintedUnexpectedOutputSubscriber($this),
+            new TestFinishedSubscriber($this),
+            new TestErroredSubscriber($this),
+            new TestFailedSubscriber($this),
+            new TestMarkedIncompleteSubscriber($this),
+            new TestSkippedSubscriber($this),
+            new TestRunnerExecutionFinishedSubscriber($this),
+        );
+    }
+
+    private function createDocument(): void
+    {
+        $this-&gt;document               = new DOMDocument(&#039;1.0&#039;, &#039;UTF-8&#039;);
+        $this-&gt;document-&gt;formatOutput = true;
+
+        $this-&gt;root = $this-&gt;document-&gt;createElement(&#039;testsuites&#039;);
+        $this-&gt;document-&gt;appendChild($this-&gt;root);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function handleFault(Errored|Failed $event, string $type): void
+    {
+        if (!$this-&gt;prepared) {
+            $this-&gt;createTestCase($event);
+        }
+
+        assert($this-&gt;currentTestCase !== null);
+
+        $buffer = $this-&gt;testAsString($event-&gt;test());
+
+        $throwable = $event-&gt;throwable();
+        $buffer .= trim(
+            $throwable-&gt;description() . PHP_EOL .
+            $throwable-&gt;stackTrace(),
+        );
+
+        $fault = $this-&gt;document-&gt;createElement(
+            $type,
+            Xml::prepareString($buffer),
+        );
+
+        $fault-&gt;setAttribute(&#039;type&#039;, $throwable-&gt;className());
+
+        $this-&gt;currentTestCase-&gt;appendChild($fault);
+
+        if (!$this-&gt;prepared) {
+            $this-&gt;handleFinish($event-&gt;telemetryInfo(), 0);
+        }
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function handleIncompleteOrSkipped(MarkedIncomplete|Skipped $event): void
+    {
+        if (!$this-&gt;prepared) {
+            $this-&gt;createTestCase($event);
+        }
+
+        assert($this-&gt;currentTestCase !== null);
+
+        $skipped = $this-&gt;document-&gt;createElement(&#039;skipped&#039;);
+
+        $this-&gt;currentTestCase-&gt;appendChild($skipped);
+
+        $this-&gt;testSuiteSkipped[$this-&gt;testSuiteLevel]++;
+
+        if (!$this-&gt;prepared) {
+            $this-&gt;handleFinish($event-&gt;telemetryInfo(), 0);
+        }
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function testAsString(Test $test): string
+    {
+        if ($test-&gt;isPhpt()) {
+            return basename($test-&gt;file());
+        }
+
+        assert($test instanceof TestMethod);
+
+        return sprintf(
+            &#039;%s::%s%s&#039;,
+            $test-&gt;className(),
+            $this-&gt;name($test),
+            PHP_EOL,
+        );
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function name(Test $test): string
+    {
+        if ($test-&gt;isPhpt()) {
+            return basename($test-&gt;file());
+        }
+
+        assert($test instanceof TestMethod);
+
+        if (!$test-&gt;testData()-&gt;hasDataFromDataProvider()) {
+            return $test-&gt;methodName();
+        }
+
+        $dataSetName = $test-&gt;testData()-&gt;dataFromDataProvider()-&gt;dataSetName();
+
+        if (is_int($dataSetName)) {
+            return sprintf(
+                &#039;%s with data set #%d&#039;,
+                $test-&gt;methodName(),
+                $dataSetName,
+            );
+        }
+
+        return sprintf(
+            &#039;%s with data set &quot;%s&quot;&#039;,
+            $test-&gt;methodName(),
+            $dataSetName,
+        );
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     *
+     * @phpstan-assert !null $this-&gt;currentTestCase
+     */
+    private function createTestCase(Errored|Failed|MarkedIncomplete|PreparationStarted|Prepared|Skipped $event): void
+    {
+        $testCase = $this-&gt;document-&gt;createElement(&#039;testcase&#039;);
+
+        $test = $event-&gt;test();
+
+        $testCase-&gt;setAttribute(&#039;name&#039;, $this-&gt;name($test));
+        $testCase-&gt;setAttribute(&#039;file&#039;, $test-&gt;file());
+
+        if ($test-&gt;isTestMethod()) {
+            assert($test instanceof TestMethod);
+
+            $testCase-&gt;setAttribute(&#039;line&#039;, (string) $test-&gt;line());
+            $testCase-&gt;setAttribute(&#039;class&#039;, $test-&gt;className());
+            $testCase-&gt;setAttribute(&#039;classname&#039;, str_replace(&#039;\\&#039;, &#039;.&#039;, $test-&gt;className()));
+        }
+
+        $this-&gt;currentTestCase = $testCase;
+        $this-&gt;time            = $event-&gt;telemetryInfo()-&gt;time();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpunit/phpunit/src/Logging/JUnit/Subscriber/Subscriber.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpunit/phpunit/src/Logging/JUnit/Subscriber -->
+
+</body>
+</html>

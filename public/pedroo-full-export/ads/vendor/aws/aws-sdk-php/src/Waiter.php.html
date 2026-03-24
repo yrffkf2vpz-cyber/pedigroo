@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Waiter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws;
+
+use Aws\Exception\AwsException;
+use GuzzleHttp\Promise\Coroutine;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Promise\PromisorInterface;
+use GuzzleHttp\Promise\RejectedPromise;
+
+/**
+ * &quot;Waiters&quot; are associated with an AWS resource (e.g., EC2 instance), and poll
+ * that resource and until it is in a particular state.
+
+ * The Waiter object produces a promise that is either a.) resolved once the
+ * waiting conditions are met, or b.) rejected if the waiting conditions cannot
+ * be met or has exceeded the number of allowed attempts at meeting the
+ * conditions. You can use waiters in a blocking or non-blocking way, depending
+ * on whether you call wait() on the promise.
+
+ * The configuration for the waiter must include information about the operation
+ * and the conditions for wait completion.
+ */
+class Waiter implements PromisorInterface
+{
+    /** @var AwsClientInterface Client used to execute each attempt. */
+    private $client;
+
+    /** @var string Name of the waiter. */
+    private $name;
+
+    /** @var array Params to use with each attempt operation. */
+    private $args;
+
+    /** @var array Waiter configuration. */
+    private $config;
+
+    /** @var array Default configuration options. */
+    private static $defaults = [&#039;initDelay&#039; =&gt; 0, &#039;before&#039; =&gt; null];
+
+    /** @var array Required configuration options. */
+    private static $required = [
+        &#039;acceptors&#039;,
+        &#039;delay&#039;,
+        &#039;maxAttempts&#039;,
+        &#039;operation&#039;,
+    ];
+
+    /**
+     * The array of configuration options include:
+     *
+     * - acceptors: (array) Array of acceptor options
+     * - delay: (int) Number of seconds to delay between attempts
+     * - maxAttempts: (int) Maximum number of attempts before failing
+     * - operation: (string) Name of the API operation to use for polling
+     * - before: (callable) Invoked before attempts. Accepts command and tries.
+     *
+     * @param AwsClientInterface $client Client used to execute commands.
+     * @param string             $name   Waiter name.
+     * @param array              $args   Command arguments.
+     * @param array              $config Waiter config that overrides defaults.
+     *
+     * @throws \InvalidArgumentException if the configuration is incomplete.
+     */
+    public function __construct(
+        AwsClientInterface $client,
+        $name,
+        array $args = [],
+        array $config = []
+    ) {
+        $this-&gt;client = $client;
+        $this-&gt;name = $name;
+        $this-&gt;args = $args;
+
+        // Prepare and validate config.
+        $this-&gt;config = $config + self::$defaults;
+        foreach (self::$required as $key) {
+            if (!isset($this-&gt;config[$key])) {
+                throw new \InvalidArgumentException(
+                    &#039;The provided waiter configuration was incomplete.&#039;
+                );
+            }
+        }
+        if ($this-&gt;config[&#039;before&#039;] &amp;&amp; !is_callable($this-&gt;config[&#039;before&#039;])) {
+            throw new \InvalidArgumentException(
+                &#039;The provided &quot;before&quot; callback is not callable.&#039;
+            );
+        }
+        MetricsBuilder::appendMetricsCaptureMiddleware(
+            $this-&gt;client-&gt;getHandlerList(),
+            MetricsBuilder::WAITER
+        );
+    }
+
+    /**
+     * @return Coroutine
+     */
+    public function promise(): PromiseInterface
+    {
+        return Coroutine::of(function () {
+            $name = $this-&gt;config[&#039;operation&#039;];
+            for ($state = &#039;retry&#039;, $attempt = 1; $state === &#039;retry&#039;; $attempt++) {
+                // Execute the operation.
+                $args = $this-&gt;getArgsForAttempt($attempt);
+                $command = $this-&gt;client-&gt;getCommand($name, $args);
+                try {
+                    if ($this-&gt;config[&#039;before&#039;]) {
+                        $this-&gt;config[&#039;before&#039;]($command, $attempt);
+                    }
+                    $result = (yield $this-&gt;client-&gt;executeAsync($command));
+                } catch (AwsException $e) {
+                    $result = $e;
+                }
+
+                // Determine the waiter&#039;s state and what to do next.
+                $state = $this-&gt;determineState($result);
+                if ($state === &#039;success&#039;) {
+                    yield $command;
+                } elseif ($state === &#039;failed&#039;) {
+                    $msg = &quot;The {$this-&gt;name} waiter entered a failure state.&quot;;
+                    if ($result instanceof \Exception) {
+                        $msg .= &#039; Reason: &#039; . $result-&gt;getMessage();
+                    }
+                    yield new RejectedPromise(new \RuntimeException($msg));
+                } elseif ($state === &#039;retry&#039;
+                    &amp;&amp; $attempt &gt;= $this-&gt;config[&#039;maxAttempts&#039;]
+                ) {
+                    $state = &#039;failed&#039;;
+                    yield new RejectedPromise(new \RuntimeException(
+                        &quot;The {$this-&gt;name} waiter failed after attempt #{$attempt}.&quot;
+                    ));
+                }
+            }
+        });
+    }
+
+    /**
+     * Gets the operation arguments for the attempt, including the delay.
+     *
+     * @param $attempt Number of the current attempt.
+     *
+     * @return mixed integer
+     */
+    private function getArgsForAttempt($attempt)
+    {
+        $args = $this-&gt;args;
+
+        // Determine the delay.
+        $delay = ($attempt === 1)
+            ? $this-&gt;config[&#039;initDelay&#039;]
+            : $this-&gt;config[&#039;delay&#039;];
+        if (is_callable($delay)) {
+            $delay = $delay($attempt);
+        }
+
+        // Set the delay. (Note: handlers except delay in milliseconds.)
+        if (!isset($args[&#039;@http&#039;])) {
+            $args[&#039;@http&#039;] = [];
+        }
+        $args[&#039;@http&#039;][&#039;delay&#039;] = $delay * 1000;
+
+        return $args;
+    }
+
+    /**
+     * Determines the state of the waiter attempt, based on the result of
+     * polling the resource. A waiter can have the state of &quot;success&quot;, &quot;failed&quot;,
+     * or &quot;retry&quot;.
+     *
+     * @param mixed $result
+     *
+     * @return string Will be &quot;success&quot;, &quot;failed&quot;, or &quot;retry&quot;
+     */
+    private function determineState($result)
+    {
+        foreach ($this-&gt;config[&#039;acceptors&#039;] as $acceptor) {
+            $matcher = &#039;matches&#039; . ucfirst($acceptor[&#039;matcher&#039;]);
+            if ($this-&gt;{$matcher}($result, $acceptor)) {
+                return $acceptor[&#039;state&#039;];
+            }
+        }
+
+        return $result instanceof \Exception ? &#039;failed&#039; : &#039;retry&#039;;
+    }
+
+    /**
+     * @param Result $result   Result or exception.
+     * @param array  $acceptor Acceptor configuration being checked.
+     *
+     * @return bool
+     */
+    private function matchesPath($result, array $acceptor)
+    {
+        return $result instanceof ResultInterface
+            &amp;&amp; $acceptor[&#039;expected&#039;] === $result-&gt;search($acceptor[&#039;argument&#039;]);
+    }
+
+    /**
+     * @param Result $result   Result or exception.
+     * @param array  $acceptor Acceptor configuration being checked.
+     *
+     * @return bool
+     */
+    private function matchesPathAll($result, array $acceptor)
+    {
+        if (!($result instanceof ResultInterface)) {
+            return false;
+        }
+
+        $actuals = $result-&gt;search($acceptor[&#039;argument&#039;]) ?: [];
+        // If is empty or not evaluates to an array it must return false.
+        if (empty($actuals) || !is_array($actuals)) {
+            return false;
+        }
+
+        foreach ($actuals as $actual) {
+            if ($actual != $acceptor[&#039;expected&#039;]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param Result $result   Result or exception.
+     * @param array  $acceptor Acceptor configuration being checked.
+     *
+     * @return bool
+     */
+    private function matchesPathAny($result, array $acceptor)
+    {
+        if (!($result instanceof ResultInterface)) {
+            return false;
+        }
+
+        $actuals = $result-&gt;search($acceptor[&#039;argument&#039;]) ?: [];
+        // If is empty or not evaluates to an array it must return false.
+        if (empty($actuals) || !is_array($actuals)) {
+            return false;
+        }
+
+        return in_array($acceptor[&#039;expected&#039;], $actuals);
+    }
+
+    /**
+     * @param Result $result   Result or exception.
+     * @param array  $acceptor Acceptor configuration being checked.
+     *
+     * @return bool
+     */
+    private function matchesStatus($result, array $acceptor)
+    {
+        if ($result instanceof ResultInterface) {
+            return $acceptor[&#039;expected&#039;] == $result[&#039;@metadata&#039;][&#039;statusCode&#039;];
+        }
+
+        if ($result instanceof AwsException &amp;&amp; $response = $result-&gt;getResponse()) {
+            return $acceptor[&#039;expected&#039;] == $response-&gt;getStatusCode();
+        }
+
+        return false;
+    }
+
+    /**
+     * @param Result $result   Result or exception.
+     * @param array  $acceptor Acceptor configuration being checked.
+     *
+     * @return bool
+     */
+    private function matchesError($result, array $acceptor)
+    {
+        // If expected is true then the $result should be an instance of
+        // AwsException, otherwise it should not.
+        if (isset($acceptor[&#039;expected&#039;]) &amp;&amp; is_bool($acceptor[&#039;expected&#039;])) {
+            return $acceptor[&#039;expected&#039;] === ($result instanceof AwsException);
+        }
+
+        if ($result instanceof AwsException) {
+            return $result-&gt;isConnectionError()
+                || $result-&gt;getAwsErrorCode() == $acceptor[&#039;expected&#039;];
+        }
+
+        return false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/WellArchitected/Exception/WellArchitectedException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/ACMPCA -->
+
+</body>
+</html>

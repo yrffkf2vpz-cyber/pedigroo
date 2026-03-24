@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Response/MockResponse.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Response;
+
+use Symfony\Component\HttpClient\Chunk\ErrorChunk;
+use Symfony\Component\HttpClient\Chunk\FirstChunk;
+use Symfony\Component\HttpClient\Exception\InvalidArgumentException;
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Internal\ClientState;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+
+/**
+ * A test-friendly response.
+ *
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ */
+class MockResponse implements ResponseInterface, StreamableInterface
+{
+    use CommonResponseTrait;
+    use TransportResponseTrait;
+
+    private string|iterable|null $body;
+    private array $requestOptions = [];
+    private string $requestUrl;
+    private string $requestMethod;
+
+    private static ClientState $mainMulti;
+    private static int $idSequence = 0;
+
+    /**
+     * @param string|iterable&lt;string|\Throwable&gt; $body The response body as a string or an iterable of strings,
+     *                                                 yielding an empty string simulates an idle timeout,
+     *                                                 throwing or yielding an exception yields an ErrorChunk
+     *
+     * @see ResponseInterface::getInfo() for possible info, e.g. &quot;response_headers&quot;
+     */
+    public function __construct(string|iterable $body = &#039;&#039;, array $info = [])
+    {
+        $this-&gt;body = $body;
+        $this-&gt;info = $info + [&#039;http_code&#039; =&gt; 200] + $this-&gt;info;
+
+        if (!isset($info[&#039;response_headers&#039;])) {
+            return;
+        }
+
+        $responseHeaders = [];
+
+        foreach ($info[&#039;response_headers&#039;] as $k =&gt; $v) {
+            foreach ((array) $v as $v) {
+                $responseHeaders[] = (\is_string($k) ? $k.&#039;: &#039; : &#039;&#039;).$v;
+            }
+        }
+
+        $this-&gt;info[&#039;response_headers&#039;] = [];
+        self::addResponseHeaders($responseHeaders, $this-&gt;info, $this-&gt;headers);
+    }
+
+    public static function fromFile(string $path, array $info = []): static
+    {
+        if (!is_file($path)) {
+            throw new \InvalidArgumentException(\sprintf(&#039;File not found: &quot;%s&quot;.&#039;, $path));
+        }
+
+        return new static(file_get_contents($path), $info);
+    }
+
+    /**
+     * Returns the options used when doing the request.
+     */
+    public function getRequestOptions(): array
+    {
+        return $this-&gt;requestOptions;
+    }
+
+    /**
+     * Returns the URL used when doing the request.
+     */
+    public function getRequestUrl(): string
+    {
+        return $this-&gt;requestUrl;
+    }
+
+    /**
+     * Returns the method used when doing the request.
+     */
+    public function getRequestMethod(): string
+    {
+        return $this-&gt;requestMethod;
+    }
+
+    public function getInfo(?string $type = null): mixed
+    {
+        return null !== $type ? $this-&gt;info[$type] ?? null : $this-&gt;info;
+    }
+
+    public function cancel(): void
+    {
+        $this-&gt;info[&#039;canceled&#039;] = true;
+        $this-&gt;info[&#039;error&#039;] = &#039;Response has been canceled.&#039;;
+        try {
+            $this-&gt;body = null;
+        } catch (TransportException $e) {
+            // ignore errors when canceling
+        }
+
+        $onProgress = $this-&gt;requestOptions[&#039;on_progress&#039;] ?? static function () {};
+        $dlSize = isset($this-&gt;headers[&#039;content-encoding&#039;]) || &#039;HEAD&#039; === ($this-&gt;info[&#039;http_method&#039;] ?? null) || \in_array($this-&gt;info[&#039;http_code&#039;], [204, 304], true) ? 0 : (int) ($this-&gt;headers[&#039;content-length&#039;][0] ?? 0);
+        $onProgress($this-&gt;offset, $dlSize, $this-&gt;info);
+    }
+
+    public function __destruct()
+    {
+        $this-&gt;doDestruct();
+    }
+
+    protected function close(): void
+    {
+        $this-&gt;inflate = null;
+        $this-&gt;body = [];
+    }
+
+    /**
+     * @internal
+     */
+    public static function fromRequest(string $method, string $url, array $options, ResponseInterface $mock): self
+    {
+        $response = new self([]);
+        $response-&gt;requestOptions = $options;
+        $response-&gt;id = ++self::$idSequence;
+        $response-&gt;shouldBuffer = $options[&#039;buffer&#039;] ?? true;
+        $response-&gt;initializer = static fn (self $response) =&gt; \is_array($response-&gt;body[0] ?? null);
+
+        $response-&gt;info[&#039;redirect_count&#039;] = 0;
+        $response-&gt;info[&#039;redirect_url&#039;] = null;
+        $response-&gt;info[&#039;start_time&#039;] = microtime(true);
+        $response-&gt;info[&#039;http_method&#039;] = $method;
+        $response-&gt;info[&#039;http_code&#039;] = 0;
+        $response-&gt;info[&#039;user_data&#039;] = $options[&#039;user_data&#039;] ?? null;
+        $response-&gt;info[&#039;max_duration&#039;] = $options[&#039;max_duration&#039;] ?? null;
+        $response-&gt;info[&#039;url&#039;] = $url;
+        $response-&gt;info[&#039;original_url&#039;] = $url;
+
+        if ($mock instanceof self) {
+            $mock-&gt;requestOptions = $response-&gt;requestOptions;
+            $mock-&gt;requestMethod = $method;
+            $mock-&gt;requestUrl = $url;
+        }
+
+        self::writeRequest($response, $options, $mock);
+        $response-&gt;body[] = [$options, $mock];
+
+        return $response;
+    }
+
+    protected static function schedule(self $response, array &amp;$runningResponses): void
+    {
+        if (!isset($response-&gt;id)) {
+            throw new InvalidArgumentException(&#039;MockResponse instances must be issued by MockHttpClient before processing.&#039;);
+        }
+
+        $multi = self::$mainMulti ??= new ClientState();
+
+        if (!isset($runningResponses[0])) {
+            $runningResponses[0] = [$multi, []];
+        }
+
+        $runningResponses[0][1][$response-&gt;id] = $response;
+    }
+
+    protected static function perform(ClientState $multi, array $responses): void
+    {
+        foreach ($responses as $response) {
+            $id = $response-&gt;id;
+
+            if (null === $response-&gt;body) {
+                // Canceled response
+                $response-&gt;body = [];
+            } elseif ([] === $response-&gt;body) {
+                // Error chunk
+                $multi-&gt;handlesActivity[$id][] = null;
+                $multi-&gt;handlesActivity[$id][] = null !== $response-&gt;info[&#039;error&#039;] ? new TransportException($response-&gt;info[&#039;error&#039;]) : null;
+            } elseif (null === $chunk = array_shift($response-&gt;body)) {
+                // Last chunk
+                $multi-&gt;handlesActivity[$id][] = null;
+                $multi-&gt;handlesActivity[$id][] = array_shift($response-&gt;body);
+            } elseif (\is_array($chunk)) {
+                // First chunk
+                try {
+                    $offset = 0;
+                    $chunk[1]-&gt;getStatusCode();
+                    $chunk[1]-&gt;getHeaders(false);
+                    self::readResponse($response, $chunk[0], $chunk[1], $offset);
+                    $multi-&gt;handlesActivity[$id][] = new FirstChunk();
+                } catch (\Throwable $e) {
+                    $multi-&gt;handlesActivity[$id][] = null;
+                    $multi-&gt;handlesActivity[$id][] = $e;
+                }
+            } elseif ($chunk instanceof \Throwable) {
+                $multi-&gt;handlesActivity[$id][] = null;
+                $multi-&gt;handlesActivity[$id][] = $chunk;
+            } else {
+                // Data or timeout chunk
+                $multi-&gt;handlesActivity[$id][] = $chunk;
+            }
+        }
+    }
+
+    protected static function select(ClientState $multi, float $timeout): int
+    {
+        return 42;
+    }
+
+    /**
+     * Simulates sending the request.
+     */
+    private static function writeRequest(self $response, array $options, ResponseInterface $mock): void
+    {
+        $onProgress = $options[&#039;on_progress&#039;] ?? static function () {};
+        $response-&gt;info += $mock-&gt;getInfo() ?: [];
+        if (null !== $mock-&gt;getInfo(&#039;start_time&#039;)) {
+            $response-&gt;info[&#039;start_time&#039;] = $mock-&gt;getInfo(&#039;start_time&#039;);
+        }
+
+        // simulate &quot;size_upload&quot; if it is set
+        if (isset($response-&gt;info[&#039;size_upload&#039;])) {
+            $response-&gt;info[&#039;size_upload&#039;] = 0.0;
+        }
+
+        // simulate &quot;total_time&quot; if it is not set
+        if (!isset($response-&gt;info[&#039;total_time&#039;])) {
+            $response-&gt;info[&#039;total_time&#039;] = microtime(true) - $response-&gt;info[&#039;start_time&#039;];
+        }
+
+        // &quot;notify&quot; DNS resolution
+        $onProgress(0, 0, $response-&gt;info);
+
+        // consume the request body
+        if (\is_resource($body = $options[&#039;body&#039;] ?? &#039;&#039;)) {
+            $data = stream_get_contents($body);
+            if (isset($response-&gt;info[&#039;size_upload&#039;])) {
+                $response-&gt;info[&#039;size_upload&#039;] += \strlen($data);
+            }
+        } elseif ($body instanceof \Closure) {
+            while (&#039;&#039; !== $data = $body(16372)) {
+                if (!\is_string($data)) {
+                    throw new TransportException(\sprintf(&#039;Return value of the &quot;body&quot; option callback must be string, &quot;%s&quot; returned.&#039;, get_debug_type($data)));
+                }
+
+                // &quot;notify&quot; upload progress
+                if (isset($response-&gt;info[&#039;size_upload&#039;])) {
+                    $response-&gt;info[&#039;size_upload&#039;] += \strlen($data);
+                }
+
+                $onProgress(0, 0, $response-&gt;info);
+            }
+        }
+    }
+
+    /**
+     * Simulates reading the response.
+     */
+    private static function readResponse(self $response, array $options, ResponseInterface $mock, int &amp;$offset): void
+    {
+        $onProgress = $options[&#039;on_progress&#039;] ?? static function () {};
+
+        // populate info related to headers
+        $info = $mock-&gt;getInfo() ?: [];
+        $response-&gt;info[&#039;http_code&#039;] = ($info[&#039;http_code&#039;] ?? 0) ?: $mock-&gt;getStatusCode() ?: 200;
+        $response-&gt;addResponseHeaders($info[&#039;response_headers&#039;] ?? [], $response-&gt;info, $response-&gt;headers);
+        $dlSize = isset($response-&gt;headers[&#039;content-encoding&#039;]) || &#039;HEAD&#039; === $response-&gt;info[&#039;http_method&#039;] || \in_array($response-&gt;info[&#039;http_code&#039;], [204, 304], true) ? 0 : (int) ($response-&gt;headers[&#039;content-length&#039;][0] ?? 0);
+
+        $response-&gt;info = [
+            &#039;start_time&#039; =&gt; $response-&gt;info[&#039;start_time&#039;],
+            &#039;user_data&#039; =&gt; $response-&gt;info[&#039;user_data&#039;],
+            &#039;max_duration&#039; =&gt; $response-&gt;info[&#039;max_duration&#039;],
+            &#039;http_code&#039; =&gt; $response-&gt;info[&#039;http_code&#039;],
+        ] + $info + $response-&gt;info;
+
+        if (null !== $response-&gt;info[&#039;error&#039;]) {
+            throw new TransportException($response-&gt;info[&#039;error&#039;]);
+        }
+
+        if (!isset($response-&gt;info[&#039;total_time&#039;])) {
+            $response-&gt;info[&#039;total_time&#039;] = microtime(true) - $response-&gt;info[&#039;start_time&#039;];
+        }
+
+        // &quot;notify&quot; headers arrival
+        $onProgress(0, $dlSize, $response-&gt;info);
+
+        // cast response body to activity list
+        $body = $mock instanceof self ? $mock-&gt;body : $mock-&gt;getContent(false);
+
+        if (!\is_string($body)) {
+            try {
+                foreach ($body as $chunk) {
+                    if ($chunk instanceof \Throwable) {
+                        throw $chunk;
+                    }
+
+                    if (&#039;&#039; === $chunk = (string) $chunk) {
+                        // simulate an idle timeout
+                        $response-&gt;body[] = new ErrorChunk($offset, \sprintf(&#039;Idle timeout reached for &quot;%s&quot;.&#039;, $response-&gt;info[&#039;url&#039;]));
+                    } else {
+                        $response-&gt;body[] = $chunk;
+                        $offset += \strlen($chunk);
+                        // &quot;notify&quot; download progress
+                        $onProgress($offset, $dlSize, $response-&gt;info);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $response-&gt;body[] = $e;
+            }
+        } elseif (&#039;&#039; !== $body) {
+            $response-&gt;body[] = $body;
+            $offset = \strlen($body);
+        }
+
+        if (!isset($response-&gt;info[&#039;total_time&#039;])) {
+            $response-&gt;info[&#039;total_time&#039;] = microtime(true) - $response-&gt;info[&#039;start_time&#039;];
+        }
+
+        // &quot;notify&quot; completion
+        $onProgress($offset, $dlSize, $response-&gt;info);
+
+        if ($dlSize &amp;&amp; $offset !== $dlSize) {
+            throw new TransportException(\sprintf(&#039;Transfer closed with %d bytes remaining to read.&#039;, $dlSize - $offset));
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Response/NativeResponse.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Retry -->
+
+</body>
+</html>

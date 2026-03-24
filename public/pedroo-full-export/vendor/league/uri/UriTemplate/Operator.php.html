@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/league/uri/UriTemplate/Operator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * League.Uri (https://uri.thephpleague.com)
+ *
+ * (c) Ignace Nyamagana Butera &lt;nyamsprod@gmail.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+declare(strict_types=1);
+
+namespace League\Uri\UriTemplate;
+
+use League\Uri\Encoder;
+use League\Uri\Exceptions\SyntaxError;
+use Stringable;
+
+use function implode;
+use function is_array;
+use function preg_match;
+use function rawurlencode;
+use function str_contains;
+use function substr;
+
+/**
+ * Processing behavior according to the expression type operator.
+ *
+ * @internal The class exposes the internal representation of an Operator and its usage
+ *
+ * @link https://www.rfc-editor.org/rfc/rfc6570#section-2.2
+ * @link https://tools.ietf.org/html/rfc6570#appendix-A
+ */
+enum Operator: string
+{
+    /**
+     * Expression regular expression pattern.
+     *
+     * @link https://tools.ietf.org/html/rfc6570#section-2.2
+     */
+    private const REGEXP_EXPRESSION = &#039;/^\{(?:(?&lt;operator&gt;[\.\/;\?&amp;\=,\!@\|\+#])?(?&lt;variables&gt;[^\}]*))\}$/&#039;;
+
+    /**
+     * Reserved Operator characters.
+     *
+     * @link https://tools.ietf.org/html/rfc6570#section-2.2
+     */
+    private const RESERVED_OPERATOR = &#039;=,!@|&#039;;
+
+    case None = &#039;&#039;;
+    case ReservedChars = &#039;+&#039;;
+    case Label = &#039;.&#039;;
+    case Path = &#039;/&#039;;
+    case PathParam = &#039;;&#039;;
+    case Query = &#039;?&#039;;
+    case QueryPair = &#039;&amp;&#039;;
+    case Fragment = &#039;#&#039;;
+
+    public function first(): string
+    {
+        return match ($this) {
+            self::None, self::ReservedChars =&gt; &#039;&#039;,
+            default =&gt; $this-&gt;value,
+        };
+    }
+
+    public function separator(): string
+    {
+        return match ($this) {
+            self::None, self::ReservedChars, self::Fragment =&gt; &#039;,&#039;,
+            self::Query, self::QueryPair =&gt; &#039;&amp;&#039;,
+            default =&gt; $this-&gt;value,
+        };
+    }
+
+    public function isNamed(): bool
+    {
+        return match ($this) {
+            self::Query, self::PathParam, self::QueryPair =&gt; true,
+            default =&gt; false,
+        };
+    }
+
+    /**
+     * Removes percent encoding on reserved characters (used with + and # modifiers).
+     */
+    public function decode(string $var): string
+    {
+        return match ($this) {
+            Operator::ReservedChars, Operator::Fragment =&gt; (string) Encoder::encodeQueryOrFragment($var),
+            default =&gt; rawurlencode($var),
+        };
+    }
+
+    /**
+     * @throws SyntaxError if the expression is invalid
+     * @throws SyntaxError if the operator used in the expression is invalid
+     * @throws SyntaxError if the contained variable specifiers are invalid
+     *
+     * @return array{operator:Operator, variables:string}
+     */
+    public static function parseExpression(Stringable|string $expression): array
+    {
+        $expression = (string) $expression;
+        if (1 !== preg_match(self::REGEXP_EXPRESSION, $expression, $parts)) {
+            throw new SyntaxError(&#039;The expression &quot;&#039;.$expression.&#039;&quot; is invalid.&#039;);
+        }
+
+        /** @var array{operator:string, variables:string} $parts */
+        $parts = $parts + [&#039;operator&#039; =&gt; &#039;&#039;];
+        if (&#039;&#039; !== $parts[&#039;operator&#039;] &amp;&amp; str_contains(self::RESERVED_OPERATOR, $parts[&#039;operator&#039;])) {
+            throw new SyntaxError(&#039;The operator used in the expression &quot;&#039;.$expression.&#039;&quot; is reserved.&#039;);
+        }
+
+        return [
+            &#039;operator&#039; =&gt; self::from($parts[&#039;operator&#039;]),
+            &#039;variables&#039; =&gt; $parts[&#039;variables&#039;],
+        ];
+    }
+
+    /**
+     * Replaces an expression with the given variables.
+     *
+     * @throws TemplateCanNotBeExpanded if the variables is an array and a &quot;:&quot; modifier needs to be applied
+     * @throws TemplateCanNotBeExpanded if the variables contains nested array values
+     */
+    public function expand(VarSpecifier $varSpecifier, VariableBag $variables): string
+    {
+        $value = $variables-&gt;fetch($varSpecifier-&gt;name);
+        if (null === $value) {
+            return &#039;&#039;;
+        }
+
+        [$expanded, $actualQuery] = $this-&gt;inject($value, $varSpecifier);
+        if (!$actualQuery) {
+            return $expanded;
+        }
+
+        if (&#039;&amp;&#039; !== $this-&gt;separator() &amp;&amp; &#039;&#039; === $expanded) {
+            return $varSpecifier-&gt;name;
+        }
+
+        return $varSpecifier-&gt;name.&#039;=&#039;.$expanded;
+    }
+
+    /**
+     * @param string|array&lt;string&gt; $value
+     *
+     * @return array{0:string, 1:bool}
+     */
+    private function inject(array|string $value, VarSpecifier $varSpec): array
+    {
+        if (is_array($value)) {
+            return $this-&gt;replaceList($value, $varSpec);
+        }
+
+        if (&#039;:&#039; === $varSpec-&gt;modifier) {
+            $value = substr($value, 0, $varSpec-&gt;position);
+        }
+
+        return [$this-&gt;decode($value), $this-&gt;isNamed()];
+    }
+
+    /**
+     * Expands an expression using a list of values.
+     *
+     * @param array&lt;string&gt; $value
+     *
+     * @throws TemplateCanNotBeExpanded if the variables is an array and a &quot;:&quot; modifier needs to be applied
+     *
+     * @return array{0:string, 1:bool}
+     */
+    private function replaceList(array $value, VarSpecifier $varSpec): array
+    {
+        if (&#039;:&#039; === $varSpec-&gt;modifier) {
+            throw TemplateCanNotBeExpanded::dueToUnableToProcessValueListWithPrefix($varSpec-&gt;name);
+        }
+
+        if ([] === $value) {
+            return [&#039;&#039;, false];
+        }
+
+        $pairs = [];
+        $isList = array_is_list($value);
+        $useQuery = $this-&gt;isNamed();
+        foreach ($value as $key =&gt; $var) {
+            if (!$isList) {
+                $key = rawurlencode((string) $key);
+            }
+
+            $var = $this-&gt;decode($var);
+            if (&#039;*&#039; === $varSpec-&gt;modifier) {
+                if (!$isList) {
+                    $var = $key.&#039;=&#039;.$var;
+                } elseif ($key &gt; 0 &amp;&amp; $useQuery) {
+                    $var = $varSpec-&gt;name.&#039;=&#039;.$var;
+                }
+            }
+
+            $pairs[$key] = $var;
+        }
+
+        if (&#039;*&#039; === $varSpec-&gt;modifier) {
+            if (!$isList) {
+                // Don&#039;t prepend the value name when using the `explode` modifier with an associative array.
+                $useQuery = false;
+            }
+
+            return [implode($this-&gt;separator(), $pairs), $useQuery];
+        }
+
+        if (!$isList) {
+            // When an associative array is encountered and the `explode` modifier is not set, then
+            // the result must be a comma separated list of keys followed by their respective values.
+            $retVal = [];
+            foreach ($pairs as $offset =&gt; $data) {
+                $retVal[$offset] = $offset.&#039;,&#039;.$data;
+            }
+            $pairs = $retVal;
+        }
+
+        return [implode(&#039;,&#039;, $pairs), $useQuery];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/league/uri/UriTemplate/Template.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/league/uri-interfaces -->
+
+</body>
+</html>

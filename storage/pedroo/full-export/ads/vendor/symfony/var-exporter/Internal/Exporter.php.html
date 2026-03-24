@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/var-exporter/Internal/Exporter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\VarExporter\Internal;
+
+use Symfony\Component\VarExporter\Exception\NotInstantiableTypeException;
+
+/**
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+class Exporter
+{
+    /**
+     * Prepares an array of values for VarExporter.
+     *
+     * For performance this method is public and has no type-hints.
+     *
+     * @param array             &amp;$values
+     * @param \SplObjectStorage $objectsPool
+     * @param array             &amp;$refsPool
+     * @param int               &amp;$objectsCount
+     * @param bool              &amp;$valuesAreStatic
+     *
+     * @return array
+     *
+     * @throws NotInstantiableTypeException When a value cannot be serialized
+     */
+    public static function prepare($values, $objectsPool, &amp;$refsPool, &amp;$objectsCount, &amp;$valuesAreStatic)
+    {
+        $refs = $values;
+        foreach ($values as $k =&gt; $value) {
+            if (\is_resource($value)) {
+                throw new NotInstantiableTypeException(get_resource_type($value).&#039; resource&#039;);
+            }
+            $refs[$k] = $objectsPool;
+
+            if ($isRef = !$valueIsStatic = $values[$k] !== $objectsPool) {
+                $values[$k] = &amp;$value; // Break hard references to make $values completely
+                unset($value);         // independent from the original structure
+                $refs[$k] = $value = $values[$k];
+                if ($value instanceof Reference &amp;&amp; 0 &gt; $value-&gt;id) {
+                    $valuesAreStatic = false;
+                    ++$value-&gt;count;
+                    continue;
+                }
+                $refsPool[] = [&amp;$refs[$k], $value, &amp;$value];
+                $refs[$k] = $values[$k] = new Reference(-\count($refsPool), $value);
+            }
+
+            if (\is_array($value)) {
+                if ($value) {
+                    $value = self::prepare($value, $objectsPool, $refsPool, $objectsCount, $valueIsStatic);
+                }
+                goto handle_value;
+            } elseif (!\is_object($value) || $value instanceof \UnitEnum) {
+                goto handle_value;
+            }
+
+            $valueIsStatic = false;
+            if (isset($objectsPool[$value])) {
+                ++$objectsCount;
+                $value = new Reference($objectsPool[$value][0]);
+                goto handle_value;
+            }
+
+            if ($value instanceof \Closure &amp;&amp; !($r = new \ReflectionFunction($value))-&gt;isAnonymous()) {
+                $callable = [$r-&gt;getClosureThis() ?? $r-&gt;getClosureCalledClass()?-&gt;name, $r-&gt;name];
+                $r = $callable[0] ? new \ReflectionMethod(...$callable) : null;
+                $value = new NamedClosure(self::prepare($callable, $objectsPool, $refsPool, $objectsCount, $valueIsStatic), $r);
+
+                goto handle_value;
+            }
+
+            $class = $value::class;
+            $reflector = Registry::$reflectors[$class] ??= Registry::getClassReflector($class);
+            $properties = [];
+            $sleep = null;
+            $proto = Registry::$prototypes[$class];
+
+            if ($reflector-&gt;hasMethod(&#039;__serialize&#039;)) {
+                if (!$reflector-&gt;getMethod(&#039;__serialize&#039;)-&gt;isPublic()) {
+                    throw new \Error(\sprintf(&#039;Call to %s method &quot;%s::__serialize()&quot;.&#039;, $reflector-&gt;getMethod(&#039;__serialize&#039;)-&gt;isProtected() ? &#039;protected&#039; : &#039;private&#039;, $class));
+                }
+
+                if (!\is_array($arrayValue = $value-&gt;__serialize())) {
+                    throw new \TypeError($class.&#039;::__serialize() must return an array&#039;);
+                }
+
+                if ($reflector-&gt;hasMethod(&#039;__unserialize&#039;)) {
+                    $properties = $arrayValue;
+                    goto prepare_value;
+                }
+            } elseif (($value instanceof \ArrayIterator || $value instanceof \ArrayObject) &amp;&amp; null !== $proto) {
+                // ArrayIterator and ArrayObject need special care because their &quot;flags&quot;
+                // option changes the behavior of the (array) casting operator.
+                [$arrayValue, $properties] = self::getArrayObjectProperties($value, $proto);
+
+                // populates Registry::$prototypes[$class] with a new instance
+                Registry::getClassReflector($class, Registry::$instantiableWithoutConstructor[$class], Registry::$cloneable[$class]);
+            } elseif ($value instanceof \SplObjectStorage &amp;&amp; Registry::$cloneable[$class] &amp;&amp; null !== $proto) {
+                // By implementing Serializable, SplObjectStorage breaks
+                // internal references; let&#039;s deal with it on our own.
+                foreach (clone $value as $v) {
+                    $properties[] = $v;
+                    $properties[] = $value[$v];
+                }
+                $properties = [&#039;SplObjectStorage&#039; =&gt; [&quot;\0&quot; =&gt; $properties]];
+                $arrayValue = (array) $value;
+            } elseif ($value instanceof \Serializable || $value instanceof \__PHP_Incomplete_Class) {
+                ++$objectsCount;
+                $objectsPool[$value] = [$id = \count($objectsPool), serialize($value), [], 0];
+                $value = new Reference($id);
+                goto handle_value;
+            } else {
+                if (method_exists($class, &#039;__sleep&#039;)) {
+                    if (!\is_array($sleep = $value-&gt;__sleep())) {
+                        trigger_error(&#039;serialize(): __sleep should return an array only containing the names of instance-variables to serialize&#039;, \E_USER_NOTICE);
+                        $value = null;
+                        goto handle_value;
+                    }
+                    $sleep = array_flip($sleep);
+                }
+
+                $arrayValue = (array) $value;
+            }
+
+            $proto = (array) $proto;
+
+            foreach ($arrayValue as $name =&gt; $v) {
+                $i = 0;
+                $n = (string) $name;
+                if (&#039;&#039; === $n || &quot;\0&quot; !== $n[0]) {
+                    $parent = $reflector;
+                    do {
+                        $p = $parent-&gt;hasProperty($n) ? $parent-&gt;getProperty($n) : null;
+                    } while (!$p &amp;&amp; $parent = $parent-&gt;getParentClass());
+
+                    $c = $p &amp;&amp; (!$p-&gt;isPublic() || (\PHP_VERSION_ID &gt;= 80400 ? $p-&gt;isProtectedSet() || $p-&gt;isPrivateSet() : $p-&gt;isReadOnly())) ? $p-&gt;class : &#039;stdClass&#039;;
+                } elseif (&#039;*&#039; === $n[1]) {
+                    $n = substr($n, 3);
+                    $c = $reflector-&gt;getProperty($n)-&gt;class;
+                } else {
+                    $i = strpos($n, &quot;\0&quot;, 2);
+                    $c = substr($n, 1, $i - 1);
+                    $n = substr($n, 1 + $i);
+                }
+                if (null !== $sleep) {
+                    if (!isset($sleep[$name]) &amp;&amp; (!isset($sleep[$n]) || ($i &amp;&amp; $c !== $class))) {
+                        unset($arrayValue[$name]);
+                        continue;
+                    }
+                    unset($sleep[$name], $sleep[$n]);
+                }
+                if (&quot;\x00Error\x00trace&quot; === $name || &quot;\x00Exception\x00trace&quot; === $name) {
+                    $properties[$c][$n] = $v;
+                } elseif (!\array_key_exists($name, $proto) || $proto[$name] !== $v) {
+                    $properties[match ($c) {
+                        &#039;Error&#039; =&gt; &#039;TypeError&#039;,
+                        &#039;Exception&#039; =&gt; &#039;ErrorException&#039;,
+                        default =&gt; $c,
+                    }][$n] = $v;
+                }
+            }
+            if ($sleep) {
+                foreach ($sleep as $n =&gt; $v) {
+                    trigger_error(\sprintf(&#039;serialize(): &quot;%s&quot; returned as member variable from __sleep() but does not exist&#039;, $n), \E_USER_NOTICE);
+                }
+            }
+            if (method_exists($class, &#039;__unserialize&#039;)) {
+                $properties = $arrayValue;
+            }
+
+            prepare_value:
+            $objectsPool[$value] = [$id = \count($objectsPool)];
+            $properties = self::prepare($properties, $objectsPool, $refsPool, $objectsCount, $valueIsStatic);
+            ++$objectsCount;
+            $objectsPool[$value] = [$id, $class, $properties, method_exists($class, &#039;__unserialize&#039;) ? -$objectsCount : (method_exists($class, &#039;__wakeup&#039;) ? $objectsCount : 0)];
+
+            $value = new Reference($id);
+
+            handle_value:
+            if ($isRef) {
+                unset($value); // Break the hard reference created above
+            } elseif (!$valueIsStatic) {
+                $values[$k] = $value;
+            }
+            $valuesAreStatic = $valueIsStatic &amp;&amp; $valuesAreStatic;
+        }
+
+        return $values;
+    }
+
+    public static function export($value, $indent = &#039;&#039;)
+    {
+        switch (true) {
+            case \is_int($value) || \is_float($value): return var_export($value, true);
+            case [] === $value: return &#039;[]&#039;;
+            case false === $value: return &#039;false&#039;;
+            case true === $value: return &#039;true&#039;;
+            case null === $value: return &#039;null&#039;;
+            case &#039;&#039; === $value: return &quot;&#039;&#039;&quot;;
+            case $value instanceof \UnitEnum: return &#039;\\&#039;.ltrim(var_export($value, true), &#039;\\&#039;);
+        }
+
+        if ($value instanceof Reference) {
+            if (0 &lt;= $value-&gt;id) {
+                return &#039;$o[&#039;.$value-&gt;id.&#039;]&#039;;
+            }
+            if (!$value-&gt;count) {
+                return self::export($value-&gt;value, $indent);
+            }
+            $value = -$value-&gt;id;
+
+            return &#039;&amp;$r[&#039;.$value.&#039;]&#039;;
+        }
+        $subIndent = $indent.&#039;    &#039;;
+
+        if ($value instanceof NamedClosure) {
+            if ($value-&gt;method?-&gt;isPublic() ?? true) {
+                return match (true) {
+                    null === $value-&gt;callable[0] =&gt; &#039;\\&#039;.$value-&gt;callable[1],
+                    \is_string($value-&gt;callable[0]) =&gt; &#039;\\&#039;.$value-&gt;callable[0].&#039;::&#039;.$value-&gt;callable[1],
+                    \is_object($value-&gt;callable[0]) =&gt; self::export($value-&gt;callable[0], $subIndent).&#039;-&gt;&#039;.$value-&gt;callable[1],
+                }.&#039;(...)&#039;;
+            }
+
+            return &#039;new \ReflectionMethod(\\&#039;.$value-&gt;method-&gt;class.&#039;::class, &#039;.self::export($value-&gt;callable[1]).&#039;)&#039;
+                .&#039;-&gt;getClosure(&#039;.(\is_object($value-&gt;callable[0]) ? self::export($value-&gt;callable[0]) : &#039;&#039;).&#039;)&#039;;
+        }
+
+        if (\is_string($value)) {
+            $code = \sprintf(&quot;&#039;%s&#039;&quot;, addcslashes($value, &quot;&#039;\\&quot;));
+
+            $code = preg_replace_callback(&quot;/((?:[\\0\\r\\n]|\u{202A}|\u{202B}|\u{202D}|\u{202E}|\u{2066}|\u{2067}|\u{2068}|\u{202C}|\u{2069})++)(.)/&quot;, function ($m) use ($subIndent) {
+                $m[1] = \sprintf(&#039;\&#039;.&quot;%s&quot;.\&#039;&#039;, str_replace(
+                    [&quot;\0&quot;, &quot;\r&quot;, &quot;\n&quot;, &quot;\u{202A}&quot;, &quot;\u{202B}&quot;, &quot;\u{202D}&quot;, &quot;\u{202E}&quot;, &quot;\u{2066}&quot;, &quot;\u{2067}&quot;, &quot;\u{2068}&quot;, &quot;\u{202C}&quot;, &quot;\u{2069}&quot;, &#039;\n\\&#039;],
+                    [&#039;\0&#039;, &#039;\r&#039;, &#039;\n&#039;, &#039;\u{202A}&#039;, &#039;\u{202B}&#039;, &#039;\u{202D}&#039;, &#039;\u{202E}&#039;, &#039;\u{2066}&#039;, &#039;\u{2067}&#039;, &#039;\u{2068}&#039;, &#039;\u{202C}&#039;, &#039;\u{2069}&#039;, &#039;\n&quot;&#039;.&quot;\n&quot;.$subIndent.&#039;.&quot;\\&#039;],
+                    $m[1]
+                ));
+
+                if (&quot;&#039;&quot; === $m[2]) {
+                    return substr($m[1], 0, -2);
+                }
+
+                if (str_ends_with($m[1], &#039;n&quot;.\&#039;&#039;)) {
+                    return substr_replace($m[1], &quot;\n&quot;.$subIndent.&quot;.&#039;&quot;.$m[2], -2);
+                }
+
+                return $m[1].$m[2];
+            }, $code, -1, $count);
+
+            if ($count &amp;&amp; str_starts_with($code, &quot;&#039;&#039;.&quot;)) {
+                $code = substr($code, 3);
+            }
+
+            return $code;
+        }
+
+        if (\is_array($value)) {
+            $j = -1;
+            $code = &#039;&#039;;
+            foreach ($value as $k =&gt; $v) {
+                $code .= $subIndent;
+                if (!\is_int($k) || 1 !== $k - $j) {
+                    $code .= self::export($k, $subIndent).&#039; =&gt; &#039;;
+                }
+                if (\is_int($k) &amp;&amp; $k &gt; $j) {
+                    $j = $k;
+                }
+                $code .= self::export($v, $subIndent).&quot;,\n&quot;;
+            }
+
+            return &quot;[\n&quot;.$code.$indent.&#039;]&#039;;
+        }
+
+        if ($value instanceof Values) {
+            $code = $subIndent.&quot;\$r = [],\n&quot;;
+            foreach ($value-&gt;values as $k =&gt; $v) {
+                $code .= $subIndent.&#039;$r[&#039;.$k.&#039;] = &#039;.self::export($v, $subIndent).&quot;,\n&quot;;
+            }
+
+            return &quot;[\n&quot;.$code.$indent.&#039;]&#039;;
+        }
+
+        if ($value instanceof Registry) {
+            return self::exportRegistry($value, $indent, $subIndent);
+        }
+
+        if ($value instanceof Hydrator) {
+            return self::exportHydrator($value, $indent, $subIndent);
+        }
+
+        throw new \UnexpectedValueException(\sprintf(&#039;Cannot export value of type &quot;%s&quot;.&#039;, get_debug_type($value)));
+    }
+
+    private static function exportRegistry(Registry $value, string $indent, string $subIndent): string
+    {
+        $code = &#039;&#039;;
+        $serializables = [];
+        $seen = [];
+        $prototypesAccess = 0;
+        $factoriesAccess = 0;
+        $r = &#039;\\&#039;.Registry::class;
+        $j = -1;
+
+        foreach ($value-&gt;classes as $k =&gt; $class) {
+            if (&#039;:&#039; === ($class[1] ?? null)) {
+                $serializables[$k] = $class;
+                continue;
+            }
+            if (!Registry::$instantiableWithoutConstructor[$class]) {
+                if (is_subclass_of($class, &#039;Serializable&#039;) &amp;&amp; !method_exists($class, &#039;__unserialize&#039;)) {
+                    $serializables[$k] = &#039;C:&#039;.\strlen($class).&#039;:&quot;&#039;.$class.&#039;&quot;:0:{}&#039;;
+                } else {
+                    $serializables[$k] = &#039;O:&#039;.\strlen($class).&#039;:&quot;&#039;.$class.&#039;&quot;:0:{}&#039;;
+                }
+                if (is_subclass_of($class, &#039;Throwable&#039;)) {
+                    $eol = is_subclass_of($class, &#039;Error&#039;) ? &quot;\0Error\0&quot; : &quot;\0Exception\0&quot;;
+                    $serializables[$k] = substr_replace($serializables[$k], &#039;1:{s:&#039;.(5 + \strlen($eol)).&#039;:&quot;&#039;.$eol.&#039;trace&quot;;a:0:{}}&#039;, -4);
+                }
+                continue;
+            }
+            $code .= $subIndent.(1 !== $k - $j ? $k.&#039; =&gt; &#039; : &#039;&#039;);
+            $j = $k;
+            $eol = &quot;,\n&quot;;
+            $c = &#039;[&#039;.self::export($class).&#039;]&#039;;
+
+            if ($seen[$class] ?? false) {
+                if (Registry::$cloneable[$class]) {
+                    ++$prototypesAccess;
+                    $code .= &#039;clone $p&#039;.$c;
+                } else {
+                    ++$factoriesAccess;
+                    $code .= &#039;$f&#039;.$c.&#039;()&#039;;
+                }
+            } else {
+                $seen[$class] = true;
+                if (Registry::$cloneable[$class]) {
+                    $code .= &#039;clone (&#039;.($prototypesAccess++ ? &#039;$p&#039; : &#039;($p = &amp;&#039;.$r.&#039;::$prototypes)&#039;).$c.&#039; ?? &#039;.$r.&#039;::p&#039;;
+                } else {
+                    $code .= &#039;(&#039;.($factoriesAccess++ ? &#039;$f&#039; : &#039;($f = &amp;&#039;.$r.&#039;::$factories)&#039;).$c.&#039; ?? &#039;.$r.&#039;::f&#039;;
+                    $eol = &#039;()&#039;.$eol;
+                }
+                $code .= &#039;(&#039;.substr($c, 1, -1).&#039;))&#039;;
+            }
+            $code .= $eol;
+        }
+
+        if (1 === $prototypesAccess) {
+            $code = str_replace(&#039;($p = &amp;&#039;.$r.&#039;::$prototypes)&#039;, $r.&#039;::$prototypes&#039;, $code);
+        }
+        if (1 === $factoriesAccess) {
+            $code = str_replace(&#039;($f = &amp;&#039;.$r.&#039;::$factories)&#039;, $r.&#039;::$factories&#039;, $code);
+        }
+        if (&#039;&#039; !== $code) {
+            $code = &quot;\n&quot;.$code.$indent;
+        }
+
+        if ($serializables) {
+            $code = $r.&#039;::unserialize([&#039;.$code.&#039;], &#039;.self::export($serializables, $indent).&#039;)&#039;;
+        } else {
+            $code = &#039;[&#039;.$code.&#039;]&#039;;
+        }
+
+        return &#039;$o = &#039;.$code;
+    }
+
+    private static function exportHydrator(Hydrator $value, string $indent, string $subIndent): string
+    {
+        $code = &#039;&#039;;
+        foreach ($value-&gt;properties as $class =&gt; $properties) {
+            $code .= $subIndent.&#039;    &#039;.self::export($class).&#039; =&gt; &#039;.self::export($properties, $subIndent.&#039;    &#039;).&quot;,\n&quot;;
+        }
+
+        $code = [
+            self::export($value-&gt;registry, $subIndent),
+            self::export($value-&gt;values, $subIndent),
+            &#039;&#039; !== $code ? &quot;[\n&quot;.$code.$subIndent.&#039;]&#039; : &#039;[]&#039;,
+            self::export($value-&gt;value, $subIndent),
+            self::export($value-&gt;wakeups, $subIndent),
+        ];
+
+        return &#039;\\&#039;.$value::class.&quot;::hydrate(\n&quot;.$subIndent.implode(&quot;,\n&quot;.$subIndent, $code).&quot;\n&quot;.$indent.&#039;)&#039;;
+    }
+
+    /**
+     * @param \ArrayIterator|\ArrayObject $value
+     * @param \ArrayIterator|\ArrayObject $proto
+     */
+    private static function getArrayObjectProperties($value, $proto): array
+    {
+        $reflector = $value instanceof \ArrayIterator ? &#039;ArrayIterator&#039; : &#039;ArrayObject&#039;;
+        $reflector = Registry::$reflectors[$reflector] ??= Registry::getClassReflector($reflector);
+
+        $properties = [
+            $arrayValue = (array) $value,
+            $reflector-&gt;getMethod(&#039;getFlags&#039;)-&gt;invoke($value),
+            $value instanceof \ArrayObject ? $reflector-&gt;getMethod(&#039;getIteratorClass&#039;)-&gt;invoke($value) : &#039;ArrayIterator&#039;,
+        ];
+
+        $reflector = $reflector-&gt;getMethod(&#039;setFlags&#039;);
+        $reflector-&gt;invoke($proto, \ArrayObject::STD_PROP_LIST);
+
+        if ($properties[1] &amp; \ArrayObject::STD_PROP_LIST) {
+            $reflector-&gt;invoke($value, 0);
+            $properties[0] = (array) $value;
+        } else {
+            $reflector-&gt;invoke($value, \ArrayObject::STD_PROP_LIST);
+            $arrayValue = (array) $value;
+        }
+        $reflector-&gt;invoke($value, $properties[1]);
+
+        if ([[], 0, &#039;ArrayIterator&#039;] === $properties) {
+            $properties = [];
+        } else {
+            if (&#039;ArrayIterator&#039; === $properties[2]) {
+                unset($properties[2]);
+            }
+            $properties = [$reflector-&gt;class =&gt; [&quot;\0&quot; =&gt; $properties]];
+        }
+
+        return [$arrayValue, $properties];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/var-exporter/Internal/Hydrator.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/yaml -->
+
+</body>
+</html>

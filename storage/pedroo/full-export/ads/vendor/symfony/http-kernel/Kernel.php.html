@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-kernel/Kernel.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpKernel;
+
+use Symfony\Component\Config\Builder\ConfigBuilderGenerator;
+use Symfony\Component\Config\ConfigCache;
+use Symfony\Component\Config\Loader\DelegatingLoader;
+use Symfony\Component\Config\Loader\LoaderResolver;
+use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+use Symfony\Component\DependencyInjection\Compiler\PassConfig;
+use Symfony\Component\DependencyInjection\Compiler\RemoveBuildParametersPass;
+use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\DependencyInjection\Dumper\PhpDumper;
+use Symfony\Component\DependencyInjection\Dumper\Preloader;
+use Symfony\Component\DependencyInjection\Extension\ExtensionInterface;
+use Symfony\Component\DependencyInjection\Loader\ClosureLoader;
+use Symfony\Component\DependencyInjection\Loader\DirectoryLoader;
+use Symfony\Component\DependencyInjection\Loader\GlobFileLoader;
+use Symfony\Component\DependencyInjection\Loader\IniFileLoader;
+use Symfony\Component\DependencyInjection\Loader\PhpFileLoader;
+use Symfony\Component\DependencyInjection\Loader\XmlFileLoader;
+use Symfony\Component\DependencyInjection\Loader\YamlFileLoader;
+use Symfony\Component\ErrorHandler\DebugClassLoader;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Bundle\BundleInterface;
+use Symfony\Component\HttpKernel\CacheWarmer\WarmableInterface;
+use Symfony\Component\HttpKernel\Config\FileLocator;
+use Symfony\Component\HttpKernel\DependencyInjection\MergeExtensionConfigurationPass;
+
+// Help opcache.preload discover always-needed symbols
+class_exists(ConfigCache::class);
+
+/**
+ * The Kernel is the heart of the Symfony system.
+ *
+ * It manages an environment made of bundles.
+ *
+ * Environment names must always start with a letter and
+ * they must only contain letters and numbers.
+ *
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ */
+abstract class Kernel implements KernelInterface, RebootableInterface, TerminableInterface
+{
+    /**
+     * @var array&lt;string, BundleInterface&gt;
+     */
+    protected array $bundles = [];
+
+    protected ?ContainerInterface $container = null;
+    protected bool $booted = false;
+    protected ?float $startTime = null;
+
+    private string $projectDir;
+    private ?string $warmupDir = null;
+    private int $requestStackSize = 0;
+    private bool $resetServices = false;
+    private bool $handlingHttpCache = false;
+
+    /**
+     * @var array&lt;string, bool&gt;
+     */
+    private static array $freshCache = [];
+
+    public const VERSION = &#039;7.4.5&#039;;
+    public const VERSION_ID = 70405;
+    public const MAJOR_VERSION = 7;
+    public const MINOR_VERSION = 4;
+    public const RELEASE_VERSION = 5;
+    public const EXTRA_VERSION = &#039;&#039;;
+
+    public const END_OF_MAINTENANCE = &#039;11/2028&#039;;
+    public const END_OF_LIFE = &#039;11/2029&#039;;
+
+    public function __construct(
+        protected string $environment,
+        protected bool $debug,
+    ) {
+        if (!$environment) {
+            throw new \InvalidArgumentException(\sprintf(&#039;Invalid environment provided to &quot;%s&quot;: the environment cannot be empty.&#039;, get_debug_type($this)));
+        }
+    }
+
+    public function __clone()
+    {
+        $this-&gt;booted = false;
+        $this-&gt;container = null;
+        $this-&gt;requestStackSize = 0;
+        $this-&gt;resetServices = false;
+        $this-&gt;handlingHttpCache = false;
+    }
+
+    public function boot(): void
+    {
+        if ($this-&gt;booted) {
+            if (!$this-&gt;requestStackSize &amp;&amp; $this-&gt;resetServices) {
+                if ($this-&gt;container-&gt;has(&#039;services_resetter&#039;)) {
+                    $this-&gt;container-&gt;get(&#039;services_resetter&#039;)-&gt;reset();
+                }
+                $this-&gt;resetServices = false;
+                if ($this-&gt;debug) {
+                    $this-&gt;startTime = microtime(true);
+                }
+            }
+
+            return;
+        }
+
+        if (!$this-&gt;container) {
+            $this-&gt;preBoot();
+        }
+
+        foreach ($this-&gt;getBundles() as $bundle) {
+            $bundle-&gt;setContainer($this-&gt;container);
+            $bundle-&gt;boot();
+        }
+
+        $this-&gt;booted = true;
+    }
+
+    public function reboot(?string $warmupDir): void
+    {
+        $this-&gt;shutdown();
+        $this-&gt;warmupDir = $warmupDir;
+        $this-&gt;boot();
+    }
+
+    public function terminate(Request $request, Response $response): void
+    {
+        if (!$this-&gt;booted) {
+            return;
+        }
+
+        if ($this-&gt;getHttpKernel() instanceof TerminableInterface) {
+            $this-&gt;getHttpKernel()-&gt;terminate($request, $response);
+        }
+    }
+
+    public function shutdown(): void
+    {
+        if (!$this-&gt;booted) {
+            return;
+        }
+
+        $this-&gt;booted = false;
+
+        foreach ($this-&gt;getBundles() as $bundle) {
+            $bundle-&gt;shutdown();
+            $bundle-&gt;setContainer(null);
+        }
+
+        $this-&gt;container = null;
+        $this-&gt;requestStackSize = 0;
+        $this-&gt;resetServices = false;
+    }
+
+    public function handle(Request $request, int $type = HttpKernelInterface::MAIN_REQUEST, bool $catch = true): Response
+    {
+        if (!$this-&gt;container) {
+            $this-&gt;preBoot();
+        }
+
+        if (HttpKernelInterface::MAIN_REQUEST === $type &amp;&amp; !$this-&gt;handlingHttpCache &amp;&amp; $this-&gt;container-&gt;has(&#039;http_cache&#039;)) {
+            $this-&gt;handlingHttpCache = true;
+
+            try {
+                return $this-&gt;container-&gt;get(&#039;http_cache&#039;)-&gt;handle($request, $type, $catch);
+            } finally {
+                $this-&gt;handlingHttpCache = false;
+                $this-&gt;resetServices = true;
+            }
+        }
+
+        $this-&gt;boot();
+        ++$this-&gt;requestStackSize;
+        if (!$this-&gt;handlingHttpCache) {
+            $this-&gt;resetServices = true;
+        }
+
+        try {
+            return $this-&gt;getHttpKernel()-&gt;handle($request, $type, $catch);
+        } finally {
+            --$this-&gt;requestStackSize;
+        }
+    }
+
+    /**
+     * Gets an HTTP kernel from the container.
+     */
+    protected function getHttpKernel(): HttpKernelInterface
+    {
+        return $this-&gt;container-&gt;get(&#039;http_kernel&#039;);
+    }
+
+    public function getBundles(): array
+    {
+        return $this-&gt;bundles;
+    }
+
+    public function getBundle(string $name): BundleInterface
+    {
+        if (!isset($this-&gt;bundles[$name])) {
+            throw new \InvalidArgumentException(\sprintf(&#039;Bundle &quot;%s&quot; does not exist or it is not enabled. Maybe you forgot to add it in the &quot;registerBundles()&quot; method of your &quot;%s.php&quot; file?&#039;, $name, get_debug_type($this)));
+        }
+
+        return $this-&gt;bundles[$name];
+    }
+
+    public function locateResource(string $name): string
+    {
+        if (&#039;@&#039; !== $name[0]) {
+            throw new \InvalidArgumentException(\sprintf(&#039;A resource name must start with @ (&quot;%s&quot; given).&#039;, $name));
+        }
+
+        if (str_contains($name, &#039;..&#039;)) {
+            throw new \RuntimeException(\sprintf(&#039;File name &quot;%s&quot; contains invalid characters (..).&#039;, $name));
+        }
+
+        $bundleName = substr($name, 1);
+        $path = &#039;&#039;;
+        if (str_contains($bundleName, &#039;/&#039;)) {
+            [$bundleName, $path] = explode(&#039;/&#039;, $bundleName, 2);
+        }
+
+        $bundle = $this-&gt;getBundle($bundleName);
+        if (file_exists($file = $bundle-&gt;getPath().&#039;/&#039;.$path)) {
+            return $file;
+        }
+
+        throw new \InvalidArgumentException(\sprintf(&#039;Unable to find file &quot;%s&quot;.&#039;, $name));
+    }
+
+    public function getEnvironment(): string
+    {
+        return $this-&gt;environment;
+    }
+
+    public function isDebug(): bool
+    {
+        return $this-&gt;debug;
+    }
+
+    /**
+     * Gets the application root dir (path of the project&#039;s composer file).
+     */
+    public function getProjectDir(): string
+    {
+        if (!isset($this-&gt;projectDir)) {
+            $r = new \ReflectionObject($this);
+
+            if (!is_file($dir = $r-&gt;getFileName())) {
+                throw new \LogicException(\sprintf(&#039;Cannot auto-detect project dir for kernel of class &quot;%s&quot;.&#039;, $r-&gt;name));
+            }
+
+            $dir = $rootDir = \dirname($dir);
+            while (!is_file($dir.&#039;/composer.json&#039;)) {
+                if ($dir === \dirname($dir)) {
+                    return $this-&gt;projectDir = $rootDir;
+                }
+                $dir = \dirname($dir);
+            }
+            $this-&gt;projectDir = $dir;
+        }
+
+        return $this-&gt;projectDir;
+    }
+
+    public function getContainer(): ContainerInterface
+    {
+        if (!$this-&gt;container) {
+            throw new \LogicException(&#039;Cannot retrieve the container from a non-booted kernel.&#039;);
+        }
+
+        return $this-&gt;container;
+    }
+
+    /**
+     * @internal
+     *
+     * @deprecated since Symfony 7.1, to be removed in 8.0
+     */
+    public function setAnnotatedClassCache(array $annotatedClasses): void
+    {
+        trigger_deprecation(&#039;symfony/http-kernel&#039;, &#039;7.1&#039;, &#039;The &quot;%s()&quot; method is deprecated since Symfony 7.1 and will be removed in 8.0.&#039;, __METHOD__);
+
+        file_put_contents(($this-&gt;warmupDir ?: $this-&gt;getBuildDir()).&#039;/annotations.map&#039;, \sprintf(&#039;&lt;?php return %s;&#039;, var_export($annotatedClasses, true)));
+    }
+
+    public function getStartTime(): float
+    {
+        return $this-&gt;debug &amp;&amp; null !== $this-&gt;startTime ? $this-&gt;startTime : -\INF;
+    }
+
+    public function getCacheDir(): string
+    {
+        return $this-&gt;getProjectDir().&#039;/var/cache/&#039;.$this-&gt;environment;
+    }
+
+    public function getBuildDir(): string
+    {
+        // Returns $this-&gt;getCacheDir() for backward compatibility
+        return $this-&gt;getCacheDir();
+    }
+
+    public function getShareDir(): ?string
+    {
+        // Returns $this-&gt;getCacheDir() for backward compatibility
+        return $this-&gt;getCacheDir();
+    }
+
+    public function getLogDir(): string
+    {
+        return $this-&gt;getProjectDir().&#039;/var/log&#039;;
+    }
+
+    public function getCharset(): string
+    {
+        return &#039;UTF-8&#039;;
+    }
+
+    /**
+     * Gets the patterns defining the classes to parse and cache for annotations.
+     *
+     * @return string[]
+     *
+     * @deprecated since Symfony 7.1, to be removed in 8.0
+     */
+    public function getAnnotatedClassesToCompile(): array
+    {
+        trigger_deprecation(&#039;symfony/http-kernel&#039;, &#039;7.1&#039;, &#039;The &quot;%s()&quot; method is deprecated since Symfony 7.1 and will be removed in 8.0.&#039;, __METHOD__);
+
+        return [];
+    }
+
+    /**
+     * Initializes bundles.
+     *
+     * @throws \LogicException if two bundles share a common name
+     */
+    protected function initializeBundles(): void
+    {
+        // init bundles
+        $this-&gt;bundles = [];
+        foreach ($this-&gt;registerBundles() as $bundle) {
+            $name = $bundle-&gt;getName();
+            if (isset($this-&gt;bundles[$name])) {
+                throw new \LogicException(\sprintf(&#039;Trying to register two bundles with the same name &quot;%s&quot;.&#039;, $name));
+            }
+            $this-&gt;bundles[$name] = $bundle;
+        }
+    }
+
+    /**
+     * The extension point similar to the Bundle::build() method.
+     *
+     * Use this method to register compiler passes and manipulate the container during the building process.
+     */
+    protected function build(ContainerBuilder $container): void
+    {
+    }
+
+    /**
+     * Gets the container class.
+     *
+     * @throws \InvalidArgumentException If the generated classname is invalid
+     */
+    protected function getContainerClass(): string
+    {
+        $class = static::class;
+        $class = str_contains($class, &quot;@anonymous\0&quot;) ? get_parent_class($class).str_replace(&#039;.&#039;, &#039;_&#039;, ContainerBuilder::hash($class)) : $class;
+        $class = str_replace(&#039;\\&#039;, &#039;_&#039;, $class).ucfirst($this-&gt;environment).($this-&gt;debug ? &#039;Debug&#039; : &#039;&#039;).&#039;Container&#039;;
+
+        if (!preg_match(&#039;/^[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*$/&#039;, $class)) {
+            throw new \InvalidArgumentException(\sprintf(&#039;The environment &quot;%s&quot; contains invalid characters, it can only contain characters allowed in PHP class names.&#039;, $this-&gt;environment));
+        }
+
+        return $class;
+    }
+
+    /**
+     * Gets the container&#039;s base class.
+     *
+     * All names except Container must be fully qualified.
+     */
+    protected function getContainerBaseClass(): string
+    {
+        return &#039;Container&#039;;
+    }
+
+    /**
+     * Initializes the service container.
+     *
+     * The built version of the service container is used when fresh, otherwise the
+     * container is built.
+     */
+    protected function initializeContainer(): void
+    {
+        $class = $this-&gt;getContainerClass();
+        $buildDir = $this-&gt;warmupDir ?: $this-&gt;getBuildDir();
+        $skip = $_SERVER[&#039;SYMFONY_DISABLE_RESOURCE_TRACKING&#039;] ?? &#039;&#039;;
+        $skip = filter_var($skip, \FILTER_VALIDATE_BOOLEAN, \FILTER_NULL_ON_FAILURE) ?? explode(&#039;,&#039;, $skip);
+        $cache = new ConfigCache($buildDir.&#039;/&#039;.$class.&#039;.php&#039;, $this-&gt;debug, null, \is_array($skip) &amp;&amp; [&#039;*&#039;] !== $skip ? $skip : ($skip ? [] : null));
+
+        $cachePath = $cache-&gt;getPath();
+
+        // Silence E_WARNING to ignore &quot;include&quot; failures - don&#039;t use &quot;@&quot; to prevent silencing fatal errors
+        $errorLevel = error_reporting();
+        error_reporting($errorLevel &amp; ~\E_WARNING);
+
+        try {
+            if (is_file($cachePath) &amp;&amp; \is_object($this-&gt;container = include $cachePath)
+                &amp;&amp; (!$this-&gt;debug || (self::$freshCache[$cachePath] ?? $cache-&gt;isFresh()))
+            ) {
+                self::$freshCache[$cachePath] = true;
+                $this-&gt;container-&gt;set(&#039;kernel&#039;, $this);
+                error_reporting($errorLevel);
+
+                return;
+            }
+        } catch (\Throwable $e) {
+        }
+
+        $oldContainer = \is_object($this-&gt;container) ? new \ReflectionClass($this-&gt;container) : $this-&gt;container = null;
+
+        try {
+            is_dir($buildDir) ?: mkdir($buildDir, 0o777, true);
+
+            if ($lock = fopen($cachePath.&#039;.lock&#039;, &#039;w+&#039;)) {
+                if (!flock($lock, \LOCK_EX | \LOCK_NB, $wouldBlock) &amp;&amp; !flock($lock, $wouldBlock ? \LOCK_SH : \LOCK_EX)) {
+                    fclose($lock);
+                    $lock = null;
+                } elseif (!is_file($cachePath) || !\is_object($this-&gt;container = include $cachePath)) {
+                    $this-&gt;container = null;
+                } elseif (!$oldContainer || $this-&gt;container::class !== $oldContainer-&gt;name) {
+                    flock($lock, \LOCK_UN);
+                    fclose($lock);
+                    $this-&gt;container-&gt;set(&#039;kernel&#039;, $this);
+
+                    return;
+                }
+            }
+        } catch (\Throwable $e) {
+        } finally {
+            error_reporting($errorLevel);
+        }
+
+        if ($collectDeprecations = $this-&gt;debug &amp;&amp; !\defined(&#039;PHPUNIT_COMPOSER_INSTALL&#039;)) {
+            $collectedLogs = [];
+            $previousHandler = set_error_handler(function ($type, $message, $file, $line) use (&amp;$collectedLogs, &amp;$previousHandler) {
+                if (\E_USER_DEPRECATED !== $type &amp;&amp; \E_DEPRECATED !== $type) {
+                    return $previousHandler ? $previousHandler($type, $message, $file, $line) : false;
+                }
+
+                if (isset($collectedLogs[$message])) {
+                    ++$collectedLogs[$message][&#039;count&#039;];
+
+                    return null;
+                }
+
+                $backtrace = debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS, 5);
+                // Clean the trace by removing first frames added by the error handler itself.
+                for ($i = 0; isset($backtrace[$i]); ++$i) {
+                    if (isset($backtrace[$i][&#039;file&#039;], $backtrace[$i][&#039;line&#039;]) &amp;&amp; $backtrace[$i][&#039;line&#039;] === $line &amp;&amp; $backtrace[$i][&#039;file&#039;] === $file) {
+                        $backtrace = \array_slice($backtrace, 1 + $i);
+                        break;
+                    }
+                }
+                for ($i = 0; isset($backtrace[$i]); ++$i) {
+                    if (!isset($backtrace[$i][&#039;file&#039;], $backtrace[$i][&#039;line&#039;], $backtrace[$i][&#039;function&#039;])) {
+                        continue;
+                    }
+                    if (!isset($backtrace[$i][&#039;class&#039;]) &amp;&amp; &#039;trigger_deprecation&#039; === $backtrace[$i][&#039;function&#039;]) {
+                        $file = $backtrace[$i][&#039;file&#039;];
+                        $line = $backtrace[$i][&#039;line&#039;];
+                        $backtrace = \array_slice($backtrace, 1 + $i);
+                        break;
+                    }
+                }
+
+                // Remove frames added by DebugClassLoader.
+                for ($i = \count($backtrace) - 2; 0 &lt; $i; --$i) {
+                    if (DebugClassLoader::class === ($backtrace[$i][&#039;class&#039;] ?? null)) {
+                        $backtrace = [$backtrace[$i + 1]];
+                        break;
+                    }
+                }
+
+                $collectedLogs[$message] = [
+                    &#039;type&#039; =&gt; $type,
+                    &#039;message&#039; =&gt; $message,
+                    &#039;file&#039; =&gt; $file,
+                    &#039;line&#039; =&gt; $line,
+                    &#039;trace&#039; =&gt; [$backtrace[0]],
+                    &#039;count&#039; =&gt; 1,
+                ];
+
+                return null;
+            });
+        }
+
+        try {
+            $container = null;
+            $container = $this-&gt;buildContainer();
+            $container-&gt;compile();
+        } finally {
+            if ($collectDeprecations) {
+                restore_error_handler();
+
+                @file_put_contents($buildDir.&#039;/&#039;.$class.&#039;Deprecations.log&#039;, serialize(array_values($collectedLogs)));
+                @file_put_contents($buildDir.&#039;/&#039;.$class.&#039;Compiler.log&#039;, null !== $container ? implode(&quot;\n&quot;, $container-&gt;getCompiler()-&gt;getLog()) : &#039;&#039;);
+            }
+        }
+
+        $this-&gt;dumpContainer($cache, $container, $class, $this-&gt;getContainerBaseClass());
+
+        if ($lock) {
+            flock($lock, \LOCK_UN);
+            fclose($lock);
+        }
+
+        $this-&gt;container = require $cachePath;
+        $this-&gt;container-&gt;set(&#039;kernel&#039;, $this);
+
+        if ($oldContainer &amp;&amp; $this-&gt;container::class !== $oldContainer-&gt;name) {
+            // Because concurrent requests might still be using them,
+            // old container files are not removed immediately,
+            // but on a next dump of the container.
+            static $legacyContainers = [];
+            $oldContainerDir = \dirname($oldContainer-&gt;getFileName());
+            $legacyContainers[$oldContainerDir.&#039;.legacy&#039;] = true;
+            foreach (glob(\dirname($oldContainerDir).\DIRECTORY_SEPARATOR.&#039;*.legacy&#039;, \GLOB_NOSORT) as $legacyContainer) {
+                if (!isset($legacyContainers[$legacyContainer]) &amp;&amp; @unlink($legacyContainer)) {
+                    (new Filesystem())-&gt;remove(substr($legacyContainer, 0, -7));
+                }
+            }
+
+            touch($oldContainerDir.&#039;.legacy&#039;);
+        }
+
+        $buildDir = $this-&gt;container-&gt;getParameter(&#039;kernel.build_dir&#039;);
+        $cacheDir = $this-&gt;container-&gt;getParameter(&#039;kernel.cache_dir&#039;);
+        $preload = $this instanceof WarmableInterface ? $this-&gt;warmUp($cacheDir, $buildDir) : [];
+
+        if ($this-&gt;container-&gt;has(&#039;cache_warmer&#039;)) {
+            $cacheWarmer = $this-&gt;container-&gt;get(&#039;cache_warmer&#039;);
+
+            if ($cacheDir !== $buildDir) {
+                $cacheWarmer-&gt;enableOptionalWarmers();
+            }
+
+            $preload = array_merge($preload, $cacheWarmer-&gt;warmUp($cacheDir, $buildDir));
+        }
+
+        if ($preload &amp;&amp; file_exists($preloadFile = $buildDir.&#039;/&#039;.$class.&#039;.preload.php&#039;)) {
+            Preloader::append($preloadFile, $preload);
+        }
+    }
+
+    /**
+     * Returns the kernel parameters.
+     *
+     * @return array&lt;string, array|bool|string|int|float|\UnitEnum|null&gt;
+     */
+    protected function getKernelParameters(): array
+    {
+        $bundles = [];
+        $bundlesMetadata = [];
+
+        foreach ($this-&gt;bundles as $name =&gt; $bundle) {
+            $bundles[$name] = $bundle::class;
+            $bundlesMetadata[$name] = [
+                &#039;path&#039; =&gt; $bundle-&gt;getPath(),
+                &#039;namespace&#039; =&gt; $bundle-&gt;getNamespace(),
+            ];
+        }
+
+        return [
+            &#039;kernel.project_dir&#039; =&gt; realpath($this-&gt;getProjectDir()) ?: $this-&gt;getProjectDir(),
+            &#039;kernel.environment&#039; =&gt; $this-&gt;environment,
+            &#039;kernel.runtime_environment&#039; =&gt; &#039;%env(default:kernel.environment:APP_RUNTIME_ENV)%&#039;,
+            &#039;kernel.runtime_mode&#039; =&gt; &#039;%env(query_string:default:container.runtime_mode:APP_RUNTIME_MODE)%&#039;,
+            &#039;kernel.runtime_mode.web&#039; =&gt; &#039;%env(bool:default::key:web:default:kernel.runtime_mode:)%&#039;,
+            &#039;kernel.runtime_mode.cli&#039; =&gt; &#039;%env(not:default:kernel.runtime_mode.web:)%&#039;,
+            &#039;kernel.runtime_mode.worker&#039; =&gt; &#039;%env(bool:default::key:worker:default:kernel.runtime_mode:)%&#039;,
+            &#039;kernel.debug&#039; =&gt; $this-&gt;debug,
+            &#039;kernel.build_dir&#039; =&gt; realpath($dir = $this-&gt;warmupDir ?: $this-&gt;getBuildDir()) ?: $dir,
+            &#039;kernel.cache_dir&#039; =&gt; realpath($dir = ($this-&gt;getCacheDir() === $this-&gt;getBuildDir() ? ($this-&gt;warmupDir ?: $this-&gt;getCacheDir()) : $this-&gt;getCacheDir())) ?: $dir,
+            &#039;kernel.logs_dir&#039; =&gt; realpath($dir = $this-&gt;getLogDir()) ?: $dir,
+            &#039;kernel.bundles&#039; =&gt; $bundles,
+            &#039;kernel.bundles_metadata&#039; =&gt; $bundlesMetadata,
+            &#039;kernel.charset&#039; =&gt; $this-&gt;getCharset(),
+            &#039;kernel.container_class&#039; =&gt; $this-&gt;getContainerClass(),
+        ] + (null !== ($dir = $this-&gt;getShareDir()) ? [&#039;kernel.share_dir&#039; =&gt; realpath($dir) ?: $dir] : []);
+    }
+
+    /**
+     * Builds the service container.
+     *
+     * @throws \RuntimeException
+     */
+    protected function buildContainer(): ContainerBuilder
+    {
+        foreach ([&#039;cache&#039; =&gt; $this-&gt;getCacheDir(), &#039;build&#039; =&gt; $this-&gt;warmupDir ?: $this-&gt;getBuildDir()] as $name =&gt; $dir) {
+            if (!is_dir($dir)) {
+                if (!@mkdir($dir, 0o777, true) &amp;&amp; !is_dir($dir)) {
+                    throw new \RuntimeException(\sprintf(&#039;Unable to create the &quot;%s&quot; directory (%s).&#039;, $name, $dir));
+                }
+            } elseif (!is_writable($dir)) {
+                throw new \RuntimeException(\sprintf(&#039;Unable to write in the &quot;%s&quot; directory (%s).&#039;, $name, $dir));
+            }
+        }
+
+        $container = $this-&gt;getContainerBuilder();
+        $container-&gt;addObjectResource($this);
+        $this-&gt;prepareContainer($container);
+        $this-&gt;registerContainerConfiguration($this-&gt;getContainerLoader($container));
+
+        return $container;
+    }
+
+    /**
+     * Prepares the ContainerBuilder before it is compiled.
+     */
+    protected function prepareContainer(ContainerBuilder $container): void
+    {
+        $extensions = [];
+        foreach ($this-&gt;bundles as $bundle) {
+            if ($extension = $bundle-&gt;getContainerExtension()) {
+                $container-&gt;registerExtension($extension);
+            }
+
+            if ($this-&gt;debug) {
+                $container-&gt;addObjectResource($bundle);
+            }
+        }
+
+        foreach ($this-&gt;bundles as $bundle) {
+            $bundle-&gt;build($container);
+        }
+
+        $this-&gt;build($container);
+
+        foreach ($container-&gt;getExtensions() as $extension) {
+            $extensions[] = $extension-&gt;getAlias();
+        }
+
+        // ensure these extensions are implicitly loaded
+        $container-&gt;getCompilerPassConfig()-&gt;setMergePass(new MergeExtensionConfigurationPass($extensions));
+    }
+
+    /**
+     * Gets a new ContainerBuilder instance used to build the service container.
+     */
+    protected function getContainerBuilder(): ContainerBuilder
+    {
+        $container = new ContainerBuilder();
+        $container-&gt;getParameterBag()-&gt;add($this-&gt;getKernelParameters());
+
+        if ($this instanceof ExtensionInterface) {
+            $container-&gt;registerExtension($this);
+        }
+        if ($this instanceof CompilerPassInterface) {
+            $container-&gt;addCompilerPass($this, PassConfig::TYPE_BEFORE_OPTIMIZATION, -10000);
+        }
+
+        return $container;
+    }
+
+    /**
+     * Dumps the service container to PHP code in the cache.
+     *
+     * @param string $class     The name of the class to generate
+     * @param string $baseClass The name of the container&#039;s base class
+     */
+    protected function dumpContainer(ConfigCache $cache, ContainerBuilder $container, string $class, string $baseClass): void
+    {
+        // cache the container
+        $dumper = new PhpDumper($container);
+
+        $buildParameters = [];
+        foreach ($container-&gt;getCompilerPassConfig()-&gt;getPasses() as $pass) {
+            if ($pass instanceof RemoveBuildParametersPass) {
+                $buildParameters = array_merge($buildParameters, $pass-&gt;getRemovedParameters());
+            }
+        }
+
+        $content = $dumper-&gt;dump([
+            &#039;class&#039; =&gt; $class,
+            &#039;base_class&#039; =&gt; $baseClass,
+            &#039;file&#039; =&gt; $cache-&gt;getPath(),
+            &#039;as_files&#039; =&gt; true,
+            &#039;debug&#039; =&gt; $this-&gt;debug,
+            &#039;inline_factories&#039; =&gt; $buildParameters[&#039;.container.dumper.inline_factories&#039;] ?? false,
+            &#039;inline_class_loader&#039; =&gt; $buildParameters[&#039;.container.dumper.inline_class_loader&#039;] ?? $this-&gt;debug,
+            &#039;build_time&#039; =&gt; $container-&gt;hasParameter(&#039;kernel.container_build_time&#039;) ? $container-&gt;getParameter(&#039;kernel.container_build_time&#039;) : time(),
+            &#039;preload_classes&#039; =&gt; array_map(&#039;get_class&#039;, $this-&gt;bundles),
+        ]);
+
+        $rootCode = array_pop($content);
+        $dir = \dirname($cache-&gt;getPath()).&#039;/&#039;;
+        $fs = new Filesystem();
+
+        foreach ($content as $file =&gt; $code) {
+            $fs-&gt;dumpFile($dir.$file, $code);
+            @chmod($dir.$file, 0o666 &amp; ~umask());
+        }
+        $legacyFile = \dirname($dir.key($content)).&#039;.legacy&#039;;
+        if (is_file($legacyFile)) {
+            @unlink($legacyFile);
+        }
+
+        $cache-&gt;write($rootCode, $container-&gt;getResources());
+    }
+
+    /**
+     * Returns a loader for the container.
+     */
+    protected function getContainerLoader(ContainerInterface $container): DelegatingLoader
+    {
+        $env = $this-&gt;getEnvironment();
+        $locator = new FileLocator($this);
+        $resolver = new LoaderResolver(array_merge(class_exists(XmlFileLoader::class) ? [
+            new XmlFileLoader($container, $locator, $env),
+        ] : [], [
+            new YamlFileLoader($container, $locator, $env),
+            new IniFileLoader($container, $locator, $env),
+            class_exists(XmlFileLoader::class, false) &amp;&amp; class_exists(ConfigBuilderGenerator::class) ? new PhpFileLoader($container, $locator, $env, new ConfigBuilderGenerator($this-&gt;getBuildDir())) : new PhpFileLoader($container, $locator, $env),
+            new GlobFileLoader($container, $locator, $env),
+            new DirectoryLoader($container, $locator, $env),
+            new ClosureLoader($container, $env),
+        ]));
+
+        return new DelegatingLoader($resolver);
+    }
+
+    private function preBoot(): ContainerInterface
+    {
+        if ($this-&gt;debug) {
+            $this-&gt;startTime = microtime(true);
+        }
+        if ($this-&gt;debug &amp;&amp; !isset($_ENV[&#039;SHELL_VERBOSITY&#039;]) &amp;&amp; !isset($_SERVER[&#039;SHELL_VERBOSITY&#039;])) {
+            if (\function_exists(&#039;putenv&#039;)) {
+                putenv(&#039;SHELL_VERBOSITY=3&#039;);
+            }
+            $_ENV[&#039;SHELL_VERBOSITY&#039;] = 3;
+            $_SERVER[&#039;SHELL_VERBOSITY&#039;] = 3;
+        }
+
+        $this-&gt;initializeBundles();
+        $this-&gt;initializeContainer();
+
+        $container = $this-&gt;container;
+
+        if ($container-&gt;hasParameter(&#039;kernel.trusted_hosts&#039;) &amp;&amp; $trustedHosts = $container-&gt;getParameter(&#039;kernel.trusted_hosts&#039;)) {
+            Request::setTrustedHosts(\is_array($trustedHosts) ? $trustedHosts : preg_split(&#039;/\s*+,\s*+(?![^{]*})/&#039;, $trustedHosts));
+        }
+
+        if ($container-&gt;hasParameter(&#039;kernel.trusted_proxies&#039;) &amp;&amp; $container-&gt;hasParameter(&#039;kernel.trusted_headers&#039;) &amp;&amp; $trustedProxies = $container-&gt;getParameter(&#039;kernel.trusted_proxies&#039;)) {
+            $trustedHeaders = $container-&gt;getParameter(&#039;kernel.trusted_headers&#039;);
+
+            if (\is_string($trustedHeaders)) {
+                $trustedHeaders = array_map(&#039;trim&#039;, explode(&#039;,&#039;, $trustedHeaders));
+            }
+
+            if (\is_array($trustedHeaders)) {
+                $trustedHeaderSet = 0;
+
+                foreach ($trustedHeaders as $header) {
+                    if (!\defined($const = Request::class.&#039;::HEADER_&#039;.strtr(strtoupper($header), &#039;-&#039;, &#039;_&#039;))) {
+                        throw new \InvalidArgumentException(\sprintf(&#039;The trusted header &quot;%s&quot; is not supported.&#039;, $header));
+                    }
+                    $trustedHeaderSet |= \constant($const);
+                }
+            } else {
+                $trustedHeaderSet = $trustedHeaders ?? (Request::HEADER_X_FORWARDED_FOR | Request::HEADER_X_FORWARDED_PORT | Request::HEADER_X_FORWARDED_PROTO);
+            }
+
+            Request::setTrustedProxies(\is_array($trustedProxies) ? $trustedProxies : array_map(&#039;trim&#039;, explode(&#039;,&#039;, $trustedProxies)), $trustedHeaderSet);
+        }
+
+        return $container;
+    }
+
+    public function __serialize(): array
+    {
+        if (self::class === (new \ReflectionMethod($this, &#039;__sleep&#039;))-&gt;class || self::class !== (new \ReflectionMethod($this, &#039;__serialize&#039;))-&gt;class) {
+            return [
+                &#039;environment&#039; =&gt; $this-&gt;environment,
+                &#039;debug&#039; =&gt; $this-&gt;debug,
+            ];
+        }
+
+        trigger_deprecation(&#039;symfony/http-kernel&#039;, &#039;7.4&#039;, &#039;Implementing &quot;%s::__sleep()&quot; is deprecated, use &quot;__serialize()&quot; instead.&#039;, get_debug_type($this));
+
+        $data = [];
+        foreach ($this-&gt;__sleep() as $key) {
+            try {
+                if (($r = new \ReflectionProperty($this, $key))-&gt;isInitialized($this)) {
+                    $data[$key] = $r-&gt;getValue($this);
+                }
+            } catch (\ReflectionException) {
+                $data[$key] = $this-&gt;$key;
+            }
+        }
+
+        return $data;
+    }
+
+    public function __unserialize(array $data): void
+    {
+        if ($wakeup = self::class !== (new \ReflectionMethod($this, &#039;__wakeup&#039;))-&gt;class &amp;&amp; self::class === (new \ReflectionMethod($this, &#039;__unserialize&#039;))-&gt;class) {
+            trigger_deprecation(&#039;symfony/http-kernel&#039;, &#039;7.4&#039;, &#039;Implementing &quot;%s::__wakeup()&quot; is deprecated, use &quot;__unserialize()&quot; instead.&#039;, get_debug_type($this));
+        }
+
+        if (\in_array(array_keys($data), [[&#039;environment&#039;, &#039;debug&#039;], [&quot;\0*\0environment&quot;, &quot;\0*\0debug&quot;]], true)) {
+            $environment = $data[&#039;environment&#039;] ?? $data[&quot;\0*\0environment&quot;];
+            $debug = $data[&#039;debug&#039;] ?? $data[&quot;\0*\0debug&quot;];
+
+            if (\is_object($environment) || \is_object($debug)) {
+                throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+            }
+
+            $this-&gt;environment = $environment;
+            $this-&gt;debug = $debug;
+
+            if ($wakeup) {
+                $this-&gt;__wakeup();
+            } else {
+                $this-&gt;__construct($environment, $debug);
+            }
+
+            return;
+        }
+
+        trigger_deprecation(&#039;symfony/http-kernel&#039;, &#039;7.4&#039;, &#039;Passing more than just key &quot;environment&quot; and &quot;debug&quot; to &quot;%s::__unserialize()&quot; is deprecated, populate properties in &quot;%s::__unserialize()&quot; instead.&#039;, self::class, get_debug_type($this));
+
+        \Closure::bind(function ($data) use ($wakeup) {
+            foreach ($data as $key =&gt; $value) {
+                $this-&gt;{(&quot;\0&quot; === $key[0] ?? &#039;&#039;) ? substr($key, 1 + strrpos($key, &quot;\0&quot;)) : $key} = $value;
+            }
+
+            if ($wakeup) {
+                $this-&gt;__wakeup();
+            } else {
+                if (\is_object($this-&gt;environment) || \is_object($this-&gt;debug)) {
+                    throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+                }
+
+                $this-&gt;__construct($this-&gt;environment, $this-&gt;debug);
+            }
+        }, $this, static::class)($data);
+    }
+
+    /**
+     * @deprecated since Symfony 7.4, will be replaced by `__serialize()` in 8.0
+     */
+    public function __sleep(): array
+    {
+        trigger_deprecation(&#039;symfony/http-kernel&#039;, &#039;7.4&#039;, &#039;Calling &quot;%s::__sleep()&quot; is deprecated, use &quot;__serialize()&quot; instead.&#039;, get_debug_type($this));
+
+        return [&#039;environment&#039;, &#039;debug&#039;];
+    }
+
+    /**
+     * @deprecated since Symfony 7.4, will be replaced by `__unserialize()` in 8.0
+     */
+    public function __wakeup(): void
+    {
+        trigger_deprecation(&#039;symfony/http-kernel&#039;, &#039;7.4&#039;, &#039;Calling &quot;%s::__wakeup()&quot; is deprecated, use &quot;__unserialize()&quot; instead.&#039;, get_debug_type($this));
+
+        if (\is_object($this-&gt;environment) || \is_object($this-&gt;debug)) {
+            throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+        }
+
+        $this-&gt;__construct($this-&gt;environment, $this-&gt;debug);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-kernel/KernelEvents.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-kernel/Attribute -->
+
+</body>
+</html>

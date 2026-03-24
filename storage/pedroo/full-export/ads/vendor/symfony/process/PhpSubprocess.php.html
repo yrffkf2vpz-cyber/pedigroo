@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/process/PhpSubprocess.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Process;
+
+use Symfony\Component\Process\Exception\LogicException;
+use Symfony\Component\Process\Exception\RuntimeException;
+
+/**
+ * PhpSubprocess runs a PHP command as a subprocess while keeping the original php.ini settings.
+ *
+ * For this, it generates a temporary php.ini file taking over all the current settings and disables
+ * loading additional .ini files. Basically, your command gets prefixed using &quot;php -n -c /tmp/temp.ini&quot;.
+ *
+ * Given your php.ini contains &quot;memory_limit=-1&quot; and you have a &quot;MemoryTest.php&quot; with the following content:
+ *
+ *     &lt;?php var_dump(ini_get(&#039;memory_limit&#039;));
+ *
+ * These are the differences between the regular Process and PhpSubprocess classes:
+ *
+ *     $p = new Process([&#039;php&#039;, &#039;-d&#039;, &#039;memory_limit=256M&#039;, &#039;MemoryTest.php&#039;]);
+ *     $p-&gt;run();
+ *     print $p-&gt;getOutput().&quot;\n&quot;;
+ *
+ * This will output &quot;string(2) &quot;-1&quot;, because the process is started with the default php.ini settings.
+ *
+ *     $p = new PhpSubprocess([&#039;MemoryTest.php&#039;], null, null, 60, [&#039;php&#039;, &#039;-d&#039;, &#039;memory_limit=256M&#039;]);
+ *     $p-&gt;run();
+ *     print $p-&gt;getOutput().&quot;\n&quot;;
+ *
+ * This will output &quot;string(4) &quot;256M&quot;&quot;, because the process is started with the temporarily created php.ini settings.
+ *
+ * @author Yanick Witschi &lt;yanick.witschi@terminal42.ch&gt;
+ * @author Partially copied and heavily inspired from composer/xdebug-handler by John Stevenson &lt;john-stevenson@blueyonder.co.uk&gt;
+ */
+class PhpSubprocess extends Process
+{
+    /**
+     * @param array       $command The command to run and its arguments listed as separate entries. They will automatically
+     *                             get prefixed with the PHP binary
+     * @param string|null $cwd     The working directory or null to use the working dir of the current PHP process
+     * @param array|null  $env     The environment variables or null to use the same environment as the current PHP process
+     * @param int         $timeout The timeout in seconds
+     * @param array|null  $php     Path to the PHP binary to use with any additional arguments
+     */
+    public function __construct(array $command, ?string $cwd = null, ?array $env = null, int $timeout = 60, ?array $php = null)
+    {
+        if (null === $php) {
+            $executableFinder = new PhpExecutableFinder();
+            $php = $executableFinder-&gt;find(false);
+            $php = false === $php ? null : array_merge([$php], $executableFinder-&gt;findArguments());
+        }
+
+        if (null === $php) {
+            throw new RuntimeException(&#039;Unable to find PHP binary.&#039;);
+        }
+
+        $tmpIni = $this-&gt;writeTmpIni($this-&gt;getAllIniFiles(), sys_get_temp_dir());
+
+        $php = array_merge($php, [&#039;-n&#039;, &#039;-c&#039;, $tmpIni]);
+        register_shutdown_function(&#039;unlink&#039;, $tmpIni);
+
+        $command = array_merge($php, $command);
+
+        parent::__construct($command, $cwd, $env, null, $timeout);
+    }
+
+    public static function fromShellCommandline(string $command, ?string $cwd = null, ?array $env = null, mixed $input = null, ?float $timeout = 60): static
+    {
+        throw new LogicException(\sprintf(&#039;The &quot;%s()&quot; method cannot be called when using &quot;%s&quot;.&#039;, __METHOD__, self::class));
+    }
+
+    /**
+     * @param (callable(&#039;out&#039;|&#039;err&#039;, string):void)|null $callback
+     */
+    public function start(?callable $callback = null, array $env = []): void
+    {
+        if (null === $this-&gt;getCommandLine()) {
+            throw new RuntimeException(&#039;Unable to find the PHP executable.&#039;);
+        }
+
+        parent::start($callback, $env);
+    }
+
+    private function writeTmpIni(array $iniFiles, string $tmpDir): string
+    {
+        if (false === $tmpfile = @tempnam($tmpDir, &#039;&#039;)) {
+            throw new RuntimeException(&#039;Unable to create temporary ini file.&#039;);
+        }
+
+        // $iniFiles has at least one item and it may be empty
+        if (&#039;&#039; === $iniFiles[0]) {
+            array_shift($iniFiles);
+        }
+
+        $content = &#039;&#039;;
+
+        foreach ($iniFiles as $file) {
+            // Check for inaccessible ini files
+            if (($data = @file_get_contents($file)) === false) {
+                throw new RuntimeException(&#039;Unable to read ini: &#039;.$file);
+            }
+            // Check and remove directives after HOST and PATH sections
+            if (preg_match(&#039;/^\s*\[(?:PATH|HOST)\s*=/mi&#039;, $data, $matches, \PREG_OFFSET_CAPTURE)) {
+                $data = substr($data, 0, $matches[0][1]);
+            }
+
+            $content .= $data.&quot;\n&quot;;
+        }
+
+        // Merge loaded settings into our ini content, if it is valid
+        $config = parse_ini_string($content);
+        $loaded = ini_get_all(null, false);
+
+        if (false === $config || false === $loaded) {
+            throw new RuntimeException(&#039;Unable to parse ini data.&#039;);
+        }
+
+        $content .= $this-&gt;mergeLoadedConfig($loaded, $config);
+
+        // Work-around for https://bugs.php.net/bug.php?id=75932
+        $content .= &quot;opcache.enable_cli=0\n&quot;;
+
+        if (false === @file_put_contents($tmpfile, $content)) {
+            throw new RuntimeException(&#039;Unable to write temporary ini file.&#039;);
+        }
+
+        return $tmpfile;
+    }
+
+    private function mergeLoadedConfig(array $loadedConfig, array $iniConfig): string
+    {
+        $content = &#039;&#039;;
+
+        foreach ($loadedConfig as $name =&gt; $value) {
+            if (!\is_string($value)) {
+                continue;
+            }
+
+            if (!isset($iniConfig[$name]) || $iniConfig[$name] !== $value) {
+                // Double-quote escape each value
+                $content .= $name.&#039;=&quot;&#039;.addcslashes($value, &#039;\\&quot;&#039;).&quot;\&quot;\n&quot;;
+            }
+        }
+
+        return $content;
+    }
+
+    private function getAllIniFiles(): array
+    {
+        $paths = [(string) php_ini_loaded_file()];
+
+        if (false !== $scanned = php_ini_scanned_files()) {
+            $paths = array_merge($paths, array_map(&#039;trim&#039;, explode(&#039;,&#039;, $scanned)));
+        }
+
+        return $paths;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/process/Pipes/AbstractPipes.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/process/Exception -->
+
+</body>
+</html>

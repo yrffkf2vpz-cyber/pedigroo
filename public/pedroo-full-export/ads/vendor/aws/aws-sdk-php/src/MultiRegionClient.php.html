@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/MultiRegionClient.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws;
+
+use Aws\Endpoint\PartitionEndpointProvider;
+use Aws\Endpoint\PartitionInterface;
+use Aws\EndpointV2\EndpointProviderV2;
+use Aws\EndpointV2\EndpointDefinitionProvider;
+
+class MultiRegionClient implements AwsClientInterface
+{
+    use AwsClientTrait;
+
+    /** @var AwsClientInterface[] A pool of clients keyed by region. */
+    private $clientPool = [];
+
+    /** @var callable */
+    private $factory;
+
+    /** @var PartitionInterface */
+    private $partition;
+
+    /** @var array */
+    private $args;
+
+    /** @var array */
+    private $config;
+
+    /** @var HandlerList */
+    private $handlerList;
+
+    /** @var array */
+    private $aliases;
+
+    /** @var callable */
+    private $customHandler;
+
+    public static function getArguments()
+    {
+        $args = array_intersect_key(
+            ClientResolver::getDefaultArguments(),
+            [&#039;service&#039; =&gt; true, &#039;region&#039; =&gt; true]
+        );
+        $args[&#039;region&#039;][&#039;required&#039;] = false;
+        unset($args[&#039;region&#039;][&#039;fn&#039;]);
+        unset($args[&#039;region&#039;][&#039;default&#039;]);
+
+        return $args + [
+                &#039;client_factory&#039; =&gt; [
+                    &#039;type&#039; =&gt; &#039;config&#039;,
+                    &#039;valid&#039; =&gt; [&#039;callable&#039;],
+                    &#039;doc&#039; =&gt; &#039;A callable that takes an array of client&#039;
+                        . &#039; configuration arguments and returns a regionalized&#039;
+                        . &#039; client.&#039;,
+                    &#039;required&#039; =&gt; true,
+                    &#039;internal&#039; =&gt; true,
+                    &#039;default&#039; =&gt; function (array $args) {
+                        $namespace = manifest($args[&#039;service&#039;])[&#039;namespace&#039;];
+                        $klass = &quot;Aws\\{$namespace}\\{$namespace}Client&quot;;
+                        $region = isset($args[&#039;region&#039;]) ? $args[&#039;region&#039;] : null;
+
+                        return function (array $args) use ($klass, $region) {
+                            if ($region &amp;&amp; empty($args[&#039;region&#039;])) {
+                                $args[&#039;region&#039;] = $region;
+                            }
+
+                            return new $klass($args);
+                        };
+                    },
+                ],
+                &#039;partition&#039; =&gt; [
+                    &#039;type&#039;    =&gt; &#039;config&#039;,
+                    &#039;valid&#039;   =&gt; [&#039;string&#039;, PartitionInterface::class],
+                    &#039;doc&#039;     =&gt; &#039;AWS partition to connect to. Valid partitions&#039;
+                        . &#039; include &quot;aws,&quot; &quot;aws-cn,&quot; and &quot;aws-us-gov.&quot; Used to&#039;
+                        . &#039; restrict the scope of the mapRegions method.&#039;,
+                    &#039;default&#039; =&gt; function (array $args) {
+                        $region = isset($args[&#039;region&#039;]) ? $args[&#039;region&#039;] : &#039;&#039;;
+                        return PartitionEndpointProvider::defaultProvider()
+                            -&gt;getPartition($region, $args[&#039;service&#039;]);
+                    },
+                    &#039;fn&#039;      =&gt; function ($value, array &amp;$args) {
+                        if (is_string($value)) {
+                            $value = PartitionEndpointProvider::defaultProvider()
+                                -&gt;getPartitionByName($value);
+                        }
+
+                        if (!$value instanceof PartitionInterface) {
+                            throw new \InvalidArgumentException(&#039;No valid partition&#039;
+                                . &#039; was provided. Provide a concrete partition or&#039;
+                                . &#039; the name of a partition (e.g., &quot;aws,&quot; &quot;aws-cn,&quot;&#039;
+                                . &#039; or &quot;aws-us-gov&quot;).&#039;
+                            );
+                        }
+                        $ruleset = EndpointDefinitionProvider::getEndpointRuleset(
+                            $args[&#039;service&#039;],
+                            isset($args[&#039;version&#039;]) ? $args[&#039;version&#039;] : &#039;latest&#039;
+                        );
+                        $partitions = EndpointDefinitionProvider::getPartitions();
+                        $args[&#039;endpoint_provider&#039;] = new EndpointProviderV2($ruleset, $partitions);
+                    }
+                ],
+            ];
+    }
+
+    /**
+     * The multi-region client constructor accepts the following options:
+     *
+     * - client_factory: (callable) An optional callable that takes an array of
+     *   client configuration arguments and returns a regionalized client.
+     * - partition: (Aws\Endpoint\Partition|string) AWS partition to connect to.
+     *   Valid partitions include &quot;aws,&quot; &quot;aws-cn,&quot; and &quot;aws-us-gov.&quot; Used to
+     *   restrict the scope of the mapRegions method.
+     * - region: (string) Region to connect to when no override is provided.
+     *   Used to create the default client factory and determine the appropriate
+     *   AWS partition when present.
+     *
+     * @param array $args Client configuration arguments.
+     */
+    public function __construct(array $args = [])
+    {
+        if (!isset($args[&#039;service&#039;])) {
+            $args[&#039;service&#039;] = $this-&gt;parseClass();
+        }
+
+        $this-&gt;handlerList = new HandlerList(function (
+            CommandInterface $command
+        ) {
+            list($region, $args) = $this-&gt;getRegionFromArgs($command-&gt;toArray());
+            $command = $this-&gt;getClientFromPool($region)
+                -&gt;getCommand($command-&gt;getName(), $args);
+
+            if ($this-&gt;isUseCustomHandler()) {
+                $command-&gt;getHandlerList()-&gt;setHandler($this-&gt;customHandler);
+            }
+
+            return $this-&gt;executeAsync($command);
+        });
+
+        $argDefinitions = static::getArguments();
+        $resolver = new ClientResolver($argDefinitions);
+        $args = $resolver-&gt;resolve($args, $this-&gt;handlerList);
+        $this-&gt;config = $args[&#039;config&#039;];
+        $this-&gt;factory = $args[&#039;client_factory&#039;];
+        $this-&gt;partition = $args[&#039;partition&#039;];
+        $this-&gt;args = array_diff_key($args, $args[&#039;config&#039;]);
+    }
+
+    /**
+     * Get the region to which the client is configured to send requests by
+     * default.
+     *
+     * @return string
+     */
+    public function getRegion()
+    {
+        return $this-&gt;getClientFromPool()-&gt;getRegion();
+    }
+
+    /**
+     * Create a command for an operation name.
+     *
+     * Special keys may be set on the command to control how it behaves,
+     * including:
+     *
+     * - @http: Associative array of transfer specific options to apply to the
+     *   request that is serialized for this command. Available keys include
+     *   &quot;proxy&quot;, &quot;verify&quot;, &quot;timeout&quot;, &quot;connect_timeout&quot;, &quot;debug&quot;, &quot;delay&quot;, and
+     *   &quot;headers&quot;.
+     * - @region: The region to which the command should be sent.
+     *
+     * @param string $name Name of the operation to use in the command
+     * @param array  $args Arguments to pass to the command
+     *
+     * @return CommandInterface
+     * @throws \InvalidArgumentException if no command can be found by name
+     */
+    public function getCommand($name, array $args = [])
+    {
+        return new Command($name, $args, clone $this-&gt;getHandlerList());
+    }
+
+    public function getConfig($option = null)
+    {
+        if (null === $option) {
+            return $this-&gt;config;
+        }
+
+        if (isset($this-&gt;config[$option])) {
+            return $this-&gt;config[$option];
+        }
+
+        return $this-&gt;getClientFromPool()-&gt;getConfig($option);
+    }
+
+    public function getCredentials()
+    {
+        return $this-&gt;getClientFromPool()-&gt;getCredentials();
+    }
+
+    public function getHandlerList()
+    {
+        return $this-&gt;handlerList;
+    }
+
+    public function getApi()
+    {
+        return $this-&gt;getClientFromPool()-&gt;getApi();
+    }
+
+    public function getEndpoint()
+    {
+        return $this-&gt;getClientFromPool()-&gt;getEndpoint();
+    }
+
+    public function useCustomHandler(callable $handler)
+    {
+        $this-&gt;customHandler = $handler;
+    }
+
+    private function isUseCustomHandler()
+    {
+        return isset($this-&gt;customHandler);
+    }
+
+    /**
+     * @param string $region    Omit this argument or pass in an empty string to
+     *                          allow the configured client factory to apply the
+     *                          region.
+     *
+     * @return AwsClientInterface
+     */
+    protected function getClientFromPool($region = &#039;&#039;)
+    {
+        $region = $region ?? &#039;&#039;;
+        if (empty($this-&gt;clientPool[$region])) {
+            $factory = $this-&gt;factory;
+            $this-&gt;clientPool[$region] = $factory(
+                array_replace($this-&gt;args, array_filter([&#039;region&#039; =&gt; $region]))
+            );
+        }
+
+        return $this-&gt;clientPool[$region];
+    }
+
+    /**
+     * Parse the class name and return the &quot;service&quot; name of the client.
+     *
+     * @return string
+     */
+    private function parseClass()
+    {
+        $klass = get_class($this);
+
+        if ($klass === __CLASS__) {
+            return &#039;&#039;;
+        }
+
+        return strtolower(substr($klass, strrpos($klass, &#039;\\&#039;) + 1, -17));
+    }
+
+    private function getRegionFromArgs(array $args)
+    {
+        $region = isset($args[&#039;@region&#039;])
+            ? $args[&#039;@region&#039;]
+            : $this-&gt;getRegion();
+        unset($args[&#039;@region&#039;]);
+
+        return [$region, $args];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Multipart/AbstractUploadManager.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/ACMPCA -->
+
+</body>
+</html>

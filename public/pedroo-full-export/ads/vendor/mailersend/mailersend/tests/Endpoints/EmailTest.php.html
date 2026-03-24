@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/mailersend/mailersend/tests/Endpoints/EmailTest.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace MailerSend\Tests\Endpoints;
+
+use Http\Mock\Client;
+use MailerSend\Common\HttpLayer;
+use MailerSend\Endpoints\Email;
+use MailerSend\Exceptions\MailerSendAssertException;
+use MailerSend\Exceptions\MailerSendRateLimitException;
+use MailerSend\Exceptions\MailerSendValidationException;
+use MailerSend\Helpers\Arr;
+use MailerSend\Helpers\Builder\Attachment;
+use MailerSend\Helpers\Builder\EmailParams;
+use MailerSend\Helpers\Builder\Personalization;
+use MailerSend\Helpers\Builder\Recipient;
+use MailerSend\Tests\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
+
+class EmailTest extends TestCase
+{
+    protected Email $email;
+    protected ResponseInterface $defaultResponse;
+
+    public function setUp(): void
+    {
+        parent::setUp();
+
+        $this-&gt;client = new Client();
+
+        $this-&gt;email = new Email(new HttpLayer(self::OPTIONS, $this-&gt;client), self::OPTIONS);
+
+        $this-&gt;defaultResponse = $this-&gt;createMock(ResponseInterface::class);
+        $this-&gt;defaultResponse-&gt;method(&#039;getStatusCode&#039;)-&gt;willReturn(200);
+    }
+
+    public function test_send_request_validation_error(): void
+    {
+        $this-&gt;expectException(MailerSendValidationException::class);
+        $this-&gt;expectExceptionMessage(&#039;Validation Error&#039;);
+
+        $responseBody = $this-&gt;createMock(StreamInterface::class);
+        $responseBody-&gt;method(&#039;getContents&#039;)-&gt;willReturn(&#039;{&quot;message&quot;: &quot;Validation Error&quot;, &quot;errors&quot;: []}&#039;);
+
+        $validationErrorResponse = $this-&gt;createMock(ResponseInterface::class);
+        $validationErrorResponse-&gt;method(&#039;getStatusCode&#039;)-&gt;willReturn(422);
+        $validationErrorResponse-&gt;method(&#039;getBody&#039;)-&gt;willReturn($responseBody);
+        $validationErrorResponse-&gt;method(&#039;getHeaders&#039;)-&gt;willReturn([]);
+        $this-&gt;client-&gt;addResponse($validationErrorResponse);
+
+        $emailParams = (new EmailParams())
+            -&gt;setFrom(&#039;test@mailersend.com&#039;)
+            -&gt;setFromName(&#039;Sender&#039;)
+            -&gt;setRecipients([
+                [
+                    &#039;wrong recipient&#039;
+                ]
+            ])
+            -&gt;setSubject(&#039;Subject&#039;)
+            -&gt;setText(&#039;TEXT&#039;);
+
+        $this-&gt;email-&gt;send($emailParams);
+    }
+
+    public function test_template_id_doesnt_require_params(): void
+    {
+        $recipients = [
+            new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+        ];
+
+        $emailParams = (new EmailParams())
+            -&gt;setRecipients($recipients)
+            -&gt;setTemplateId(&#039;templateId&#039;);
+
+        $httpLayer = $this-&gt;createMock(HttpLayer::class);
+        $httpLayer-&gt;method(&#039;post&#039;)
+            -&gt;with(&#039;https://api.mailersend.com/v1/email&#039;, [
+                &#039;to&#039; =&gt; [
+                    $recipients[0]-&gt;toArray()
+                ],
+                &#039;template_id&#039; =&gt; &#039;templateId&#039;,
+            ])
+            -&gt;willReturn([]);
+
+        $response = (new Email($httpLayer, self::OPTIONS))-&gt;send($emailParams);
+
+        // It passes without assertion errors
+        self::assertEquals([], $response);
+    }
+
+    /**
+     * @dataProvider validEmailParamsProvider
+     * @param EmailParams $emailParams
+     * @throws MailerSendAssertException
+     * @throws \JsonException
+     * @throws \Psr\Http\Client\ClientExceptionInterface
+     */
+    #[DataProvider(&#039;validEmailParamsProvider&#039;)]
+    public function test_send_email(EmailParams $emailParams): void
+    {
+        $response = $this-&gt;createMock(ResponseInterface::class);
+        $response-&gt;method(&#039;getStatusCode&#039;)-&gt;willReturn(200);
+
+        $this-&gt;client-&gt;addResponse($response);
+
+        $response = $this-&gt;email-&gt;send($emailParams);
+
+        $request = $this-&gt;client-&gt;getLastRequest();
+        $request_body = json_decode((string) $request-&gt;getBody(), true);
+
+        self::assertEquals(&#039;POST&#039;, $request-&gt;getMethod());
+        self::assertEquals(&#039;/v1/email&#039;, $request-&gt;getUri()-&gt;getPath());
+        self::assertEquals(200, $response[&#039;status_code&#039;]);
+
+        self::assertEquals($emailParams-&gt;getFrom(), Arr::get($request_body, &#039;from.email&#039;));
+        self::assertEquals($emailParams-&gt;getFromName(), Arr::get($request_body, &#039;from.name&#039;));
+        self::assertEquals($emailParams-&gt;getReplyTo(), Arr::get($request_body, &#039;reply_to.email&#039;));
+        self::assertEquals($emailParams-&gt;getReplyToName(), Arr::get($request_body, &#039;reply_to.name&#039;));
+        self::assertCount(count($emailParams-&gt;getRecipients()), Arr::get($request_body, &#039;to&#039;));
+        foreach ($emailParams-&gt;getRecipients() as $key =&gt; $recipient) {
+            $recipient = !is_array($recipient) ? $recipient-&gt;toArray() : $recipient;
+            self::assertEquals($recipient[&#039;name&#039;], Arr::get($request_body, &quot;to.$key.name&quot;));
+            self::assertEquals($recipient[&#039;email&#039;], Arr::get($request_body, &quot;to.$key.email&quot;));
+        }
+        self::assertCount(count($emailParams-&gt;getCc()), Arr::get($request_body, &#039;cc&#039;) ?? []);
+        foreach ($emailParams-&gt;getCc() as $key =&gt; $cc) {
+            $cc = !is_array($cc) ? $cc-&gt;toArray() : $cc;
+            self::assertEquals($cc[&#039;name&#039;], Arr::get($request_body, &quot;cc.$key.name&quot;));
+            self::assertEquals($cc[&#039;email&#039;], Arr::get($request_body, &quot;cc.$key.email&quot;));
+        }
+        self::assertCount(count($emailParams-&gt;getBcc()), Arr::get($request_body, &#039;bcc&#039;) ?? []);
+        foreach ($emailParams-&gt;getBcc() as $key =&gt; $bcc) {
+            $bcc = !is_array($bcc) ? $bcc-&gt;toArray() : $bcc;
+            self::assertEquals($bcc[&#039;name&#039;], Arr::get($request_body, &quot;bcc.$key.name&quot;));
+            self::assertEquals($bcc[&#039;email&#039;], Arr::get($request_body, &quot;bcc.$key.email&quot;));
+        }
+        self::assertEquals($emailParams-&gt;getSubject(), Arr::get($request_body, &#039;subject&#039;));
+        self::assertEquals($emailParams-&gt;getHtml(), Arr::get($request_body, &#039;html&#039;));
+        self::assertEquals($emailParams-&gt;getText(), Arr::get($request_body, &#039;text&#039;));
+        self::assertCount(count($emailParams-&gt;getTags()), Arr::get($request_body, &#039;tags&#039;) ?? []);
+        foreach ($emailParams-&gt;getTags() as $key =&gt; $tag) {
+            self::assertEquals($tag, Arr::get($request_body, &quot;tags.$key&quot;));
+        }
+        self::assertEquals($emailParams-&gt;getTemplateId(), Arr::get($request_body, &#039;template_id&#039;));
+
+        self::assertCount(count($emailParams-&gt;getAttachments()), Arr::get($request_body, &#039;attachments&#039;) ?? []);
+        foreach ($emailParams-&gt;getAttachments() as $key =&gt; $attachment) {
+            $attachment = !is_array($attachment) ? $attachment-&gt;toArray() : $attachment;
+            self::assertEquals($attachment[&#039;content&#039;], Arr::get($request_body, &quot;attachments.$key.content&quot;));
+            self::assertEquals($attachment[&#039;filename&#039;], Arr::get($request_body, &quot;attachments.$key.filename&quot;));
+            self::assertEquals($attachment[&#039;disposition&#039;], Arr::get($request_body, &quot;attachments.$key.disposition&quot;));
+            self::assertEquals($attachment[&#039;id&#039;], Arr::get($request_body, &quot;attachments.$key.id&quot;));
+        }
+
+        self::assertCount(count($emailParams-&gt;getPersonalization()), Arr::get($request_body, &#039;personalization&#039;) ?? []);
+        foreach ($emailParams-&gt;getPersonalization() as $key =&gt; $personalization) {
+            $personalization = !is_array($personalization) ? $personalization-&gt;toArray() : $personalization;
+            self::assertEquals($personalization[&#039;email&#039;], Arr::get($request_body, &quot;personalization.$key.email&quot;));
+            foreach ($personalization[&#039;data&#039;] as $variableKey =&gt; $variableValue) {
+                self::assertEquals($personalization[&#039;data&#039;][$variableKey], Arr::get($request_body, &quot;personalization.$key.data.$variableKey&quot;));
+            }
+        }
+        self::assertCount(count($emailParams-&gt;getHeaders()), Arr::get($request_body, &#039;headers&#039;) ?? []);
+        foreach ($emailParams-&gt;getHeaders() as $key =&gt; $header) {
+            $header = !is_array($header) ? $header-&gt;toArray() : $header;
+            self::assertEquals($header[&#039;name&#039;], Arr::get($request_body, &quot;headers.$key.name&quot;));
+            self::assertEquals($header[&#039;value&#039;], Arr::get($request_body, &quot;headers.$key.value&quot;));
+        }
+        self::assertEquals($emailParams-&gt;getSendAt(), Arr::get($request_body, &#039;send_at&#039;));
+        self::assertEquals($emailParams-&gt;getPrecedenceBulkHeader(), Arr::get($request_body, &#039;precedence_bulk&#039;));
+        self::assertEquals($emailParams-&gt;getInReplyToHeader(), Arr::get($request_body, &#039;in_reply_to&#039;));
+        self::assertEquals($emailParams-&gt;trackClicks(), Arr::get($request_body, &#039;settings.track_clicks&#039;));
+        self::assertEquals($emailParams-&gt;trackOpens(), Arr::get($request_body, &#039;settings.track_opens&#039;));
+        self::assertEquals($emailParams-&gt;trackContent(), Arr::get($request_body, &#039;settings.track_content&#039;));
+    }
+
+    /**
+     * @dataProvider invalidEmailParamsProvider
+     * @param EmailParams $emailParams
+     * @throws MailerSendAssertException
+     * @throws \JsonException
+     * @throws \Psr\Http\Client\ClientExceptionInterface
+     */
+    #[DataProvider(&#039;invalidEmailParamsProvider&#039;)]
+    public function test_send_email_with_errors(EmailParams $emailParams)
+    {
+        $this-&gt;expectException(MailerSendAssertException::class);
+
+        $httpLayer = $this-&gt;createMock(HttpLayer::class);
+        $httpLayer-&gt;method(&#039;post&#039;)
+            -&gt;withAnyParameters()
+            -&gt;willReturn([]);
+
+        (new Email($httpLayer, self::OPTIONS))-&gt;send($emailParams);
+    }
+
+    public static function validEmailParamsProvider(): array
+    {
+        return [
+            &#039;simple request&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setTags([
+                        &#039;tag&#039;
+                    ]),
+            ],
+            &#039;using recipients helper&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setText(&#039;TEXT&#039;),
+            ],
+            &#039;using attachments helper&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setAttachments([
+                        new Attachment(&#039;attachment&#039;, &#039;file.jpg&#039;),
+                    ]),
+            ],
+            &#039;using personalization helper&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setPersonalization([
+                        new Personalization(&#039;recipient@mailersend.com&#039;, [
+                            &#039;var&#039; =&gt; &#039;variable&#039;,
+                            &#039;number&#039; =&gt; 123,
+                            &#039;object&#039; =&gt; [
+                                &#039;key&#039; =&gt; &#039;object-value&#039;
+                            ],
+                            &#039;objectCollection&#039; =&gt; [
+                                [
+                                    &#039;name&#039; =&gt; &#039;John&#039;
+                                ],
+                                [
+                                    &#039;name&#039; =&gt; &#039;Patrick&#039;
+                                ]
+                            ],
+                        ])
+                    ]),
+            ],
+            &#039;with cc&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        new Recipient(&#039;cc@mailersend.com&#039;, &#039;CC&#039;)
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setText(&#039;TEXT&#039;),
+            ],
+            &#039;with bcc&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setBcc([
+                        new Recipient(&#039;bcc@mailersend.com&#039;, &#039;BCC&#039;)
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setText(&#039;TEXT&#039;),
+            ],
+            &#039;without html&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setText(&#039;Text&#039;),
+            ],
+            &#039;with send at&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setTags([
+                        &#039;tag&#039;
+                    ])
+                    -&gt;setSendAt(1665626400),
+            ],
+            &#039;with precedence header&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setTags([
+                        &#039;tag&#039;
+                    ])
+                    -&gt;setPrecedenceBulkHeader(true),
+            ],
+            &#039;with in_reply_to header&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setTags([
+                        &#039;tag&#039;
+                    ])
+                    -&gt;setInReplyToHeader(&#039;test@mailersend.com&#039;),
+            ],
+            &#039;with tracking&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setTrackClicks(true)
+                    -&gt;setTrackOpens(true)
+                    -&gt;setTrackContent(true)
+            ],
+            &#039;with custom headers&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setHeaders([
+                        [
+                          &#039;name&#039; =&gt; &#039;Custom-Header-1&#039;,
+                          &#039;value&#039; =&gt; &#039;Value 1&#039;,
+                        ]
+                    ])
+            ],
+            &#039;with references header&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setTags([
+                        &#039;tag&#039;
+                    ])
+                    -&gt;setInReplyToHeader(&#039;test@mailersend.com&#039;)
+                    -&gt;setReferencesHeader([
+                        &#039;&lt;test@mailersend.com&gt;&#039;,
+                        &#039;&lt;test2@mailersend.com&gt;&#039;
+                    ]),
+            ],
+            &#039;with list unsubscribe&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;)
+                    -&gt;setListUnsubscribe(&#039;https://www.mailersend.com/unsubscribe&#039;),
+            ],
+            &#039;with unicode email&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;ügyfélszolgálat@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Ügyfélszolgálat&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+                    -&gt;setText(&#039;Text&#039;),
+            ],
+        ];
+    }
+
+    public static function invalidEmailParamsProvider(): array
+    {
+        return [
+            &#039;template id, html and text missing&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+            ],
+            &#039;from is required&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+            ],
+            &#039;from name is required&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;sender@mailersend.com&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+            ],
+            &#039;subject is required&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;sender@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setHtml(&#039;HTML&#039;)
+            ],
+            &#039;at least one recipients&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;sender@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;)
+            ],
+            &#039;wrongly formed cc&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        [
+                            &#039;wrong cc&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;too many cc recipients&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        new Recipient(&#039;cc+1@mailersend.com&#039;, &#039;CC 1&#039;),
+                        new Recipient(&#039;cc+2@mailersend.com&#039;, &#039;CC 2&#039;),
+                        new Recipient(&#039;cc+3@mailersend.com&#039;, &#039;CC 3&#039;),
+                        new Recipient(&#039;cc+4@mailersend.com&#039;, &#039;CC 4&#039;),
+                        new Recipient(&#039;cc+5@mailersend.com&#039;, &#039;CC 5&#039;),
+                        new Recipient(&#039;cc+6@mailersend.com&#039;, &#039;CC 6&#039;),
+                        new Recipient(&#039;cc+7@mailersend.com&#039;, &#039;CC 7&#039;),
+                        new Recipient(&#039;cc+8@mailersend.com&#039;, &#039;CC 8&#039;),
+                        new Recipient(&#039;cc+9@mailersend.com&#039;, &#039;CC 9&#039;),
+                        new Recipient(&#039;cc+10@mailersend.com&#039;, &#039;CC 10&#039;),
+                        new Recipient(&#039;cc+11@mailersend.com&#039;, &#039;CC 11&#039;),
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;cc recipient without email&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        [
+                            &#039;name&#039; =&gt; &#039;CC&#039;
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;cc recipient name with ,&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        new Recipient(&#039;cc@mailersend.com&#039;, &#039;CC,&#039;),
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;cc recipient name with ;&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        new Recipient(&#039;cc@mailersend.com&#039;, &#039;CC;&#039;),
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;wrongly formed bcc&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setBcc([
+                        [
+                            &#039;wrong bcc&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;too many bcc recipients&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setBcc([
+                        new Recipient(&#039;bcc+1@mailersend.com&#039;, &#039;BCC 1&#039;),
+                        new Recipient(&#039;bcc+2@mailersend.com&#039;, &#039;BCC 2&#039;),
+                        new Recipient(&#039;bcc+3@mailersend.com&#039;, &#039;BCC 3&#039;),
+                        new Recipient(&#039;bcc+4@mailersend.com&#039;, &#039;BCC 4&#039;),
+                        new Recipient(&#039;bcc+5@mailersend.com&#039;, &#039;BCC 5&#039;),
+                        new Recipient(&#039;bcc+6@mailersend.com&#039;, &#039;BCC 6&#039;),
+                        new Recipient(&#039;bcc+7@mailersend.com&#039;, &#039;BCC 7&#039;),
+                        new Recipient(&#039;bcc+8@mailersend.com&#039;, &#039;BCC 8&#039;),
+                        new Recipient(&#039;bcc+9@mailersend.com&#039;, &#039;BCC 9&#039;),
+                        new Recipient(&#039;bcc+10@mailersend.com&#039;, &#039;BCC 10&#039;),
+                        new Recipient(&#039;bcc+11@mailersend.com&#039;, &#039;BCC 11&#039;),
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;bcc recipient without email&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        [
+                            &#039;name&#039; =&gt; &#039;BCC&#039;
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;bcc recipient name with ,&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        new Recipient(&#039;bcc@mailersend.com&#039;, &#039;BCC,&#039;),
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+            &#039;bcc recipient name with ;&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setRecipients([
+                        new Recipient(&#039;recipient@mailersend.com&#039;, &#039;Recipient&#039;)
+                    ])
+                    -&gt;setCc([
+                        new Recipient(&#039;bcc@mailersend.com&#039;, &#039;BCC;&#039;),
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+                    -&gt;setHtml(&#039;HTML&#039;),
+            ],
+
+            &#039;without text param&#039; =&gt; [
+                (new EmailParams())
+                    -&gt;setFrom(&#039;test@mailersend.com&#039;)
+                    -&gt;setFromName(&#039;Sender&#039;)
+                    -&gt;setReplyTo(&#039;reply-to@mailersend.com&#039;)
+                    -&gt;setReplyToName(&#039;Reply To&#039;)
+                    -&gt;setRecipients([
+                        [
+                            &#039;name&#039; =&gt; &#039;Recipient&#039;,
+                            &#039;email&#039; =&gt; &#039;recipient@mailersend.com&#039;,
+                        ]
+                    ])
+                    -&gt;setSubject(&#039;Subject&#039;)
+            ],
+        ];
+    }
+
+    public function test_should_throw_exception_on_rate_limit(): void
+    {
+        $this-&gt;expectException(MailerSendRateLimitException::class);
+
+        $responseBody = $this-&gt;createMock(StreamInterface::class);
+        $responseBody-&gt;method(&#039;getContents&#039;)-&gt;willReturn(&#039;{&quot;message&quot;: &quot;Too Many Attempts&quot;}&#039;);
+
+        $validationErrorResponse = $this-&gt;createMock(ResponseInterface::class);
+        $validationErrorResponse-&gt;method(&#039;getStatusCode&#039;)-&gt;willReturn(429);
+        $validationErrorResponse-&gt;method(&#039;getHeaders&#039;)-&gt;willReturn([]);
+        $this-&gt;client-&gt;addResponse($validationErrorResponse);
+
+        $emailParams = (new EmailParams())
+            -&gt;setFrom(&#039;test@mailersend.com&#039;)
+            -&gt;setFromName(&#039;Sender&#039;)
+            -&gt;setRecipients([
+                [
+                    &#039;wrong recipient&#039;
+                ]
+            ])
+            -&gt;setSubject(&#039;Subject&#039;)
+            -&gt;setText(&#039;TEXT&#039;);
+
+        $this-&gt;email-&gt;send($emailParams);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/mailersend/mailersend/tests/Endpoints/EmailVerificationTest.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/mailersend/mailersend/tests/Helpers -->
+
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Internal/CurlClientState.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Internal;
+
+use Psr\Log\LoggerInterface;
+use Symfony\Component\HttpClient\Response\CurlResponse;
+
+/**
+ * Internal representation of the cURL client&#039;s state.
+ *
+ * @author Alexander M. Turek &lt;me@derrabus.de&gt;
+ *
+ * @internal
+ */
+final class CurlClientState extends ClientState
+{
+    public ?\CurlMultiHandle $handle;
+    public ?\CurlShareHandle $share;
+    public bool $performing = false;
+
+    /** @var PushedResponse[] */
+    public array $pushedResponses = [];
+    public DnsCache $dnsCache;
+    /** @var float[] */
+    public array $pauseExpiries = [];
+    public int $execCounter = \PHP_INT_MIN;
+    public ?LoggerInterface $logger = null;
+
+    public static array $curlVersion;
+
+    public function __construct(
+        private int $maxHostConnections,
+        private int $maxPendingPushes,
+    ) {
+        self::$curlVersion ??= curl_version();
+        $this-&gt;dnsCache = new DnsCache();
+
+        // handle and share are initialized lazily in __get()
+        unset($this-&gt;handle, $this-&gt;share);
+    }
+
+    public function reset(): void
+    {
+        foreach ($this-&gt;pushedResponses as $url =&gt; $response) {
+            $this-&gt;logger?-&gt;debug(\sprintf(&#039;Unused pushed response: &quot;%s&quot;&#039;, $url));
+            curl_multi_remove_handle($this-&gt;handle, $response-&gt;handle);
+        }
+
+        $this-&gt;pushedResponses = [];
+        $this-&gt;dnsCache-&gt;evictions = $this-&gt;dnsCache-&gt;evictions ?: $this-&gt;dnsCache-&gt;removals;
+        $this-&gt;dnsCache-&gt;removals = $this-&gt;dnsCache-&gt;hostnames = [];
+
+        unset($this-&gt;share);
+    }
+
+    public function __get(string $name): mixed
+    {
+        if (&#039;share&#039; === $name) {
+            $this-&gt;share = curl_share_init();
+
+            curl_share_setopt($this-&gt;share, \CURLSHOPT_SHARE, \CURL_LOCK_DATA_DNS);
+            curl_share_setopt($this-&gt;share, \CURLSHOPT_SHARE, \CURL_LOCK_DATA_SSL_SESSION);
+
+            if (\defined(&#039;CURL_LOCK_DATA_CONNECT&#039;)) {
+                curl_share_setopt($this-&gt;share, \CURLSHOPT_SHARE, \CURL_LOCK_DATA_CONNECT);
+            }
+
+            return $this-&gt;share;
+        }
+
+        if (&#039;handle&#039; === $name) {
+            $this-&gt;handle = curl_multi_init();
+
+            // Don&#039;t enable HTTP/1.1 pipelining: it forces responses to be sent in order
+            if (\defined(&#039;CURLPIPE_MULTIPLEX&#039;)) {
+                curl_multi_setopt($this-&gt;handle, \CURLMOPT_PIPELINING, \CURLPIPE_MULTIPLEX);
+            }
+            $maxHostConnections = $this-&gt;maxHostConnections;
+            if (\defined(&#039;CURLMOPT_MAX_HOST_CONNECTIONS&#039;) &amp;&amp; 0 &lt; $maxHostConnections) {
+                $maxHostConnections = curl_multi_setopt($this-&gt;handle, \CURLMOPT_MAX_HOST_CONNECTIONS, $maxHostConnections) ? min(50 * $maxHostConnections, 4294967295) : $maxHostConnections;
+            }
+            if (\defined(&#039;CURLMOPT_MAXCONNECTS&#039;) &amp;&amp; 0 &lt; $maxHostConnections) {
+                curl_multi_setopt($this-&gt;handle, \CURLMOPT_MAXCONNECTS, $maxHostConnections);
+            }
+
+            // Skip configuring HTTP/2 push when it&#039;s unsupported or buggy, see https://bugs.php.net/77535
+            if (0 &lt; $this-&gt;maxPendingPushes &amp;&amp; (\defined(&#039;CURLMOPT_PUSHFUNCTION&#039;) &amp;&amp; 0x073D00 &lt;= self::$curlVersion[&#039;version_number&#039;] &amp;&amp; (\CURL_VERSION_HTTP2 &amp; self::$curlVersion[&#039;features&#039;]))) {
+                // Clone to prevent a circular reference
+                $multi = clone $this;
+                $multi-&gt;handle = null;
+                $multi-&gt;share = null;
+                $multi-&gt;pushedResponses = &amp;$this-&gt;pushedResponses;
+                $multi-&gt;logger = &amp;$this-&gt;logger;
+                $multi-&gt;handlesActivity = &amp;$this-&gt;handlesActivity;
+                $multi-&gt;openHandles = &amp;$this-&gt;openHandles;
+
+                curl_multi_setopt($this-&gt;handle, \CURLMOPT_PUSHFUNCTION, $multi-&gt;handlePush(...));
+            }
+
+            return $this-&gt;handle;
+        }
+
+        throw new \LogicException(\sprintf(&#039;Unknown property &quot;%s&quot; on &quot;%s&quot;.&#039;, $name, self::class));
+    }
+
+    private function handlePush($parent, $pushed, array $requestHeaders): int
+    {
+        $headers = [];
+        $origin = curl_getinfo($parent, \CURLINFO_EFFECTIVE_URL);
+
+        foreach ($requestHeaders as $h) {
+            if (false !== $i = strpos($h, &#039;:&#039;, 1)) {
+                $headers[substr($h, 0, $i)][] = substr($h, 1 + $i);
+            }
+        }
+
+        if (!isset($headers[&#039;:method&#039;]) || !isset($headers[&#039;:scheme&#039;]) || !isset($headers[&#039;:authority&#039;]) || !isset($headers[&#039;:path&#039;])) {
+            $this-&gt;logger?-&gt;debug(\sprintf(&#039;Rejecting pushed response from &quot;%s&quot;: pushed headers are invalid&#039;, $origin));
+
+            return \CURL_PUSH_DENY;
+        }
+
+        $url = $headers[&#039;:scheme&#039;][0].&#039;://&#039;.$headers[&#039;:authority&#039;][0];
+
+        // curl before 7.65 doesn&#039;t validate the pushed &quot;:authority&quot; header,
+        // but this is a MUST in the HTTP/2 RFC; let&#039;s restrict pushes to the original host,
+        // ignoring domains mentioned as alt-name in the certificate for now (same as curl).
+        if (!str_starts_with($origin, $url.&#039;/&#039;)) {
+            $this-&gt;logger?-&gt;debug(\sprintf(&#039;Rejecting pushed response from &quot;%s&quot;: server is not authoritative for &quot;%s&quot;&#039;, $origin, $url));
+
+            return \CURL_PUSH_DENY;
+        }
+
+        if ($this-&gt;maxPendingPushes &lt;= \count($this-&gt;pushedResponses)) {
+            $fifoUrl = key($this-&gt;pushedResponses);
+            unset($this-&gt;pushedResponses[$fifoUrl]);
+            $this-&gt;logger?-&gt;debug(\sprintf(&#039;Evicting oldest pushed response: &quot;%s&quot;&#039;, $fifoUrl));
+        }
+
+        $url .= $headers[&#039;:path&#039;][0];
+        $this-&gt;logger?-&gt;debug(\sprintf(&#039;Queueing pushed response: &quot;%s&quot;&#039;, $url));
+
+        $this-&gt;pushedResponses[$url] = new PushedResponse(new CurlResponse($this, $pushed), $headers, $this-&gt;openHandles[(int) $parent][1] ?? [], $pushed);
+
+        return \CURL_PUSH_OK;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Internal/DnsCache.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Messenger -->
+
+</body>
+</html>

@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/RSA.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Pure-PHP PKCS#1 (v2.1) compliant implementation of RSA.
+ *
+ * PHP version 5
+ *
+ * Here&#039;s an example of how to encrypt and decrypt text with this library:
+ * &lt;code&gt;
+ * &lt;?php
+ * include &#039;vendor/autoload.php&#039;;
+ *
+ * $private = Crypt\RSA::createKey();
+ * $public = $private-&gt;getPublicKey();
+ *
+ * $plaintext = &#039;terrafrost&#039;;
+ *
+ * $ciphertext = $public-&gt;encrypt($plaintext);
+ *
+ * echo $private-&gt;decrypt($ciphertext);
+ * ?&gt;
+ * &lt;/code&gt;
+ *
+ * Here&#039;s an example of how to create signatures and verify signatures with this library:
+ * &lt;code&gt;
+ * &lt;?php
+ * include &#039;vendor/autoload.php&#039;;
+ *
+ * $private = Crypt\RSA::createKey();
+ * $public = $private-&gt;getPublicKey();
+ *
+ * $plaintext = &#039;terrafrost&#039;;
+ *
+ * $signature = $private-&gt;sign($plaintext);
+ *
+ * echo $public-&gt;verify($plaintext, $signature) ? &#039;verified&#039; : &#039;unverified&#039;;
+ * ?&gt;
+ * &lt;/code&gt;
+ *
+ * One thing to consider when using this: so phpseclib uses PSS mode by default.
+ * Technically, id-RSASSA-PSS has a different key format than rsaEncryption. So
+ * should phpseclib save to the id-RSASSA-PSS format by default or the
+ * rsaEncryption format? For stand-alone keys I figure rsaEncryption is better
+ * because SSH doesn&#039;t use PSS and idk how many SSH servers would be able to
+ * decode an id-RSASSA-PSS key. For X.509 certificates the id-RSASSA-PSS
+ * format is used by default (unless you change it up to use PKCS1 instead)
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2009 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\Crypt;
+
+use phpseclib3\Crypt\Common\AsymmetricKey;
+use phpseclib3\Crypt\RSA\Formats\Keys\PSS;
+use phpseclib3\Crypt\RSA\PrivateKey;
+use phpseclib3\Crypt\RSA\PublicKey;
+use phpseclib3\Exception\InconsistentSetupException;
+use phpseclib3\Exception\UnsupportedAlgorithmException;
+use phpseclib3\Math\BigInteger;
+
+/**
+ * Pure-PHP PKCS#1 compliant implementation of RSA.
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+abstract class RSA extends AsymmetricKey
+{
+    /**
+     * Algorithm Name
+     *
+     * @var string
+     */
+    const ALGORITHM = &#039;RSA&#039;;
+
+    /**
+     * Use {@link http://en.wikipedia.org/wiki/Optimal_Asymmetric_Encryption_Padding Optimal Asymmetric Encryption Padding}
+     * (OAEP) for encryption / decryption.
+     *
+     * Uses sha256 by default
+     *
+     * @see self::setHash()
+     * @see self::setMGFHash()
+     * @see self::encrypt()
+     * @see self::decrypt()
+     */
+    const ENCRYPTION_OAEP = 1;
+
+    /**
+     * Use PKCS#1 padding.
+     *
+     * Although self::PADDING_OAEP / self::PADDING_PSS  offers more security, including PKCS#1 padding is necessary for purposes of backwards
+     * compatibility with protocols (like SSH-1) written before OAEP&#039;s introduction.
+     *
+     * @see self::encrypt()
+     * @see self::decrypt()
+     */
+    const ENCRYPTION_PKCS1 = 2;
+
+    /**
+     * Do not use any padding
+     *
+     * Although this method is not recommended it can none-the-less sometimes be useful if you&#039;re trying to decrypt some legacy
+     * stuff, if you&#039;re trying to diagnose why an encrypted message isn&#039;t decrypting, etc.
+     *
+     * @see self::encrypt()
+     * @see self::decrypt()
+     */
+    const ENCRYPTION_NONE = 4;
+
+    /**
+     * Use the Probabilistic Signature Scheme for signing
+     *
+     * Uses sha256 and 0 as the salt length
+     *
+     * @see self::setSaltLength()
+     * @see self::setMGFHash()
+     * @see self::setHash()
+     * @see self::sign()
+     * @see self::verify()
+     * @see self::setHash()
+     */
+    const SIGNATURE_PSS = 16;
+
+    /**
+     * Use a relaxed version of PKCS#1 padding for signature verification
+     *
+     * @see self::sign()
+     * @see self::verify()
+     * @see self::setHash()
+     */
+    const SIGNATURE_RELAXED_PKCS1 = 32;
+
+    /**
+     * Use PKCS#1 padding for signature verification
+     *
+     * @see self::sign()
+     * @see self::verify()
+     * @see self::setHash()
+     */
+    const SIGNATURE_PKCS1 = 64;
+
+    /**
+     * Encryption padding mode
+     *
+     * @var int
+     */
+    protected $encryptionPadding = self::ENCRYPTION_OAEP;
+
+    /**
+     * Signature padding mode
+     *
+     * @var int
+     */
+    protected $signaturePadding = self::SIGNATURE_PSS;
+
+    /**
+     * Length of hash function output
+     *
+     * @var int
+     */
+    protected $hLen;
+
+    /**
+     * Length of salt
+     *
+     * @var int
+     */
+    protected $sLen;
+
+    /**
+     * Label
+     *
+     * @var string
+     */
+    protected $label = &#039;&#039;;
+
+    /**
+     * Hash function for the Mask Generation Function
+     *
+     * @var Hash
+     */
+    protected $mgfHash;
+
+    /**
+     * Length of MGF hash function output
+     *
+     * @var int
+     */
+    protected $mgfHLen;
+
+    /**
+     * Modulus (ie. n)
+     *
+     * @var Math\BigInteger
+     */
+    protected $modulus;
+
+    /**
+     * Modulus length
+     *
+     * @var Math\BigInteger
+     */
+    protected $k;
+
+    /**
+     * Exponent (ie. e or d)
+     *
+     * @var Math\BigInteger
+     */
+    protected $exponent;
+
+    /**
+     * Default public exponent
+     *
+     * @var int
+     * @link http://en.wikipedia.org/wiki/65537_%28number%29
+     */
+    private static $defaultExponent = 65537;
+
+    /**
+     * Enable Blinding?
+     *
+     * @var bool
+     */
+    protected static $enableBlinding = true;
+
+    /**
+     * OpenSSL configuration file name.
+     *
+     * @see self::createKey()
+     * @var ?string
+     */
+    protected static $configFile;
+
+    /**
+     * Smallest Prime
+     *
+     * Per &lt;http://cseweb.ucsd.edu/~hovav/dist/survey.pdf#page=5&gt;, this number ought not result in primes smaller
+     * than 256 bits. As a consequence if the key you&#039;re trying to create is 1024 bits and you&#039;ve set smallestPrime
+     * to 384 bits then you&#039;re going to get a 384 bit prime and a 640 bit prime (384 + 1024 % 384). At least if
+     * engine is set to self::ENGINE_INTERNAL. If Engine is set to self::ENGINE_OPENSSL then smallest Prime is
+     * ignored (ie. multi-prime RSA support is more intended as a way to speed up RSA key generation when there&#039;s
+     * a chance neither gmp nor OpenSSL are installed)
+     *
+     * @var int
+     */
+    private static $smallestPrime = 4096;
+
+    /**
+     * Public Exponent
+     *
+     * @var Math\BigInteger
+     */
+    protected $publicExponent;
+
+    /**
+     * Sets the public exponent for key generation
+     *
+     * This will be 65537 unless changed.
+     *
+     * @param int $val
+     */
+    public static function setExponent($val)
+    {
+        self::$defaultExponent = $val;
+    }
+
+    /**
+     * Sets the smallest prime number in bits. Used for key generation
+     *
+     * This will be 4096 unless changed.
+     *
+     * @param int $val
+     */
+    public static function setSmallestPrime($val)
+    {
+        self::$smallestPrime = $val;
+    }
+
+    /**
+     * Sets the OpenSSL config file path
+     *
+     * Set to the empty string to use the default config file
+     *
+     * @param string $val
+     */
+    public static function setOpenSSLConfigPath($val)
+    {
+        self::$configFile = $val;
+    }
+
+    /**
+     * Create a private key
+     *
+     * The public key can be extracted from the private key
+     *
+     * @return PrivateKey
+     * @param int $bits
+     */
+    public static function createKey($bits = 2048)
+    {
+        self::initialize_static_variables();
+
+        $class = new \ReflectionClass(static::class);
+        if ($class-&gt;isFinal()) {
+            throw new \RuntimeException(&#039;createKey() should not be called from final classes (&#039; . static::class . &#039;)&#039;);
+        }
+
+        $regSize = $bits &gt;&gt; 1; // divide by two to see how many bits P and Q would be
+        if ($regSize &gt; self::$smallestPrime) {
+            $num_primes = floor($bits / self::$smallestPrime);
+            $regSize = self::$smallestPrime;
+        } else {
+            $num_primes = 2;
+        }
+
+        if ($num_primes == 2 &amp;&amp; $bits &gt;= 384 &amp;&amp; self::$defaultExponent == 65537) {
+            if (!isset(self::$engines[&#039;PHP&#039;])) {
+                self::useBestEngine();
+            }
+
+            // OpenSSL uses 65537 as the exponent and requires RSA keys be 384 bits minimum
+            if (self::$engines[&#039;OpenSSL&#039;]) {
+                $config = [];
+                if (self::$configFile) {
+                    $config[&#039;config&#039;] = self::$configFile;
+                }
+                $rsa = openssl_pkey_new([&#039;private_key_bits&#039; =&gt; $bits] + $config);
+                openssl_pkey_export($rsa, $privatekeystr, null, $config);
+
+                // clear the buffer of error strings stemming from a minimalistic openssl.cnf
+                // https://github.com/php/php-src/issues/11054 talks about other errors this&#039;ll pick up
+                while (openssl_error_string() !== false) {
+                }
+
+                return RSA::load($privatekeystr);
+            }
+        }
+
+        static $e;
+        if (!isset($e)) {
+            $e = new BigInteger(self::$defaultExponent);
+        }
+
+        $n = clone self::$one;
+        $exponents = $coefficients = $primes = [];
+        $lcm = [
+            &#039;top&#039; =&gt; clone self::$one,
+            &#039;bottom&#039; =&gt; false
+        ];
+
+        do {
+            for ($i = 1; $i &lt;= $num_primes; $i++) {
+                if ($i != $num_primes) {
+                    $primes[$i] = BigInteger::randomPrime($regSize);
+                } else {
+                    $minMax = BigInteger::minMaxBits($bits);
+                    $min = $minMax[&#039;min&#039;];
+                    $max = $minMax[&#039;max&#039;];
+                    list($min) = $min-&gt;divide($n);
+                    $min = $min-&gt;add(self::$one);
+                    list($max) = $max-&gt;divide($n);
+                    $primes[$i] = BigInteger::randomRangePrime($min, $max);
+                }
+
+                // the first coefficient is calculated differently from the rest
+                // ie. instead of being $primes[1]-&gt;modInverse($primes[2]), it&#039;s $primes[2]-&gt;modInverse($primes[1])
+                if ($i &gt; 2) {
+                    $coefficients[$i] = $n-&gt;modInverse($primes[$i]);
+                }
+
+                $n = $n-&gt;multiply($primes[$i]);
+
+                $temp = $primes[$i]-&gt;subtract(self::$one);
+
+                // textbook RSA implementations use Euler&#039;s totient function instead of the least common multiple.
+                // see http://en.wikipedia.org/wiki/Euler%27s_totient_function
+                $lcm[&#039;top&#039;] = $lcm[&#039;top&#039;]-&gt;multiply($temp);
+                $lcm[&#039;bottom&#039;] = $lcm[&#039;bottom&#039;] === false ? $temp : $lcm[&#039;bottom&#039;]-&gt;gcd($temp);
+            }
+
+            list($temp) = $lcm[&#039;top&#039;]-&gt;divide($lcm[&#039;bottom&#039;]);
+            $gcd = $temp-&gt;gcd($e);
+            $i0 = 1;
+        } while (!$gcd-&gt;equals(self::$one));
+
+        $coefficients[2] = $primes[2]-&gt;modInverse($primes[1]);
+
+        $d = $e-&gt;modInverse($temp);
+
+        foreach ($primes as $i =&gt; $prime) {
+            $temp = $prime-&gt;subtract(self::$one);
+            $exponents[$i] = $e-&gt;modInverse($temp);
+        }
+
+        // from &lt;http://tools.ietf.org/html/rfc3447#appendix-A.1.2&gt;:
+        // RSAPrivateKey ::= SEQUENCE {
+        //     version           Version,
+        //     modulus           INTEGER,  -- n
+        //     publicExponent    INTEGER,  -- e
+        //     privateExponent   INTEGER,  -- d
+        //     prime1            INTEGER,  -- p
+        //     prime2            INTEGER,  -- q
+        //     exponent1         INTEGER,  -- d mod (p-1)
+        //     exponent2         INTEGER,  -- d mod (q-1)
+        //     coefficient       INTEGER,  -- (inverse of q) mod p
+        //     otherPrimeInfos   OtherPrimeInfos OPTIONAL
+        // }
+        $privatekey = new PrivateKey();
+        $privatekey-&gt;modulus = $n;
+        $privatekey-&gt;k = $bits &gt;&gt; 3;
+        $privatekey-&gt;publicExponent = $e;
+        $privatekey-&gt;exponent = $d;
+        $privatekey-&gt;primes = $primes;
+        $privatekey-&gt;exponents = $exponents;
+        $privatekey-&gt;coefficients = $coefficients;
+
+        /*
+        $publickey = new PublicKey;
+        $publickey-&gt;modulus = $n;
+        $publickey-&gt;k = $bits &gt;&gt; 3;
+        $publickey-&gt;exponent = $e;
+        $publickey-&gt;publicExponent = $e;
+        $publickey-&gt;isPublic = true;
+        */
+
+        return $privatekey;
+    }
+
+    /**
+     * OnLoad Handler
+     *
+     * @return bool
+     */
+    protected static function onLoad(array $components)
+    {
+        $key = $components[&#039;isPublicKey&#039;] ?
+            new PublicKey() :
+            new PrivateKey();
+
+        $key-&gt;modulus = $components[&#039;modulus&#039;];
+        $key-&gt;publicExponent = $components[&#039;publicExponent&#039;];
+        $key-&gt;k = $key-&gt;modulus-&gt;getLengthInBytes();
+
+        if ($components[&#039;isPublicKey&#039;] || !isset($components[&#039;privateExponent&#039;])) {
+            $key-&gt;exponent = $key-&gt;publicExponent;
+        } else {
+            $key-&gt;privateExponent = $components[&#039;privateExponent&#039;];
+            $key-&gt;exponent = $key-&gt;privateExponent;
+            $key-&gt;primes = $components[&#039;primes&#039;];
+            $key-&gt;exponents = $components[&#039;exponents&#039;];
+            $key-&gt;coefficients = $components[&#039;coefficients&#039;];
+        }
+
+        if ($components[&#039;format&#039;] == PSS::class) {
+            // in the X509 world RSA keys are assumed to use PKCS1 padding by default. only if the key is
+            // explicitly a PSS key is the use of PSS assumed. phpseclib does not work like this. phpseclib
+            // uses PSS padding by default. it assumes the more secure method by default and altho it provides
+            // for the less secure PKCS1 method you have to go out of your way to use it. this is consistent
+            // with the latest trends in crypto. libsodium (NaCl) is actually a little more extreme in that
+            // not only does it defaults to the most secure methods - it doesn&#039;t even let you choose less
+            // secure methods
+            //$key = $key-&gt;withPadding(self::SIGNATURE_PSS);
+            if (isset($components[&#039;hash&#039;])) {
+                $key = $key-&gt;withHash($components[&#039;hash&#039;]);
+            }
+            if (isset($components[&#039;MGFHash&#039;])) {
+                $key = $key-&gt;withMGFHash($components[&#039;MGFHash&#039;]);
+            }
+            if (isset($components[&#039;saltLength&#039;])) {
+                $key = $key-&gt;withSaltLength($components[&#039;saltLength&#039;]);
+            }
+        }
+
+        return $key;
+    }
+
+    /**
+     * Initialize static variables
+     */
+    protected static function initialize_static_variables()
+    {
+        if (!isset(self::$configFile)) {
+            self::$configFile = dirname(__FILE__) . &#039;/../openssl.cnf&#039;;
+        }
+
+        parent::initialize_static_variables();
+    }
+
+    /**
+     * Constructor
+     *
+     * PublicKey and PrivateKey objects can only be created from abstract RSA class
+     */
+    protected function __construct()
+    {
+        parent::__construct();
+
+        $this-&gt;hLen = $this-&gt;hash-&gt;getLengthInBytes();
+        $this-&gt;mgfHash = new Hash(&#039;sha256&#039;);
+        $this-&gt;mgfHLen = $this-&gt;mgfHash-&gt;getLengthInBytes();
+    }
+
+    /**
+     * Integer-to-Octet-String primitive
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-4.1 RFC3447#section-4.1}.
+     *
+     * @param bool|Math\BigInteger $x
+     * @param int $xLen
+     * @return bool|string
+     */
+    protected function i2osp($x, $xLen)
+    {
+        if ($x === false) {
+            return false;
+        }
+        $x = $x-&gt;toBytes();
+        if (strlen($x) &gt; $xLen) {
+            throw new \OutOfRangeException(&#039;Resultant string length out of range&#039;);
+        }
+        return str_pad($x, $xLen, chr(0), STR_PAD_LEFT);
+    }
+
+    /**
+     * Octet-String-to-Integer primitive
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-4.2 RFC3447#section-4.2}.
+     *
+     * @param string $x
+     * @return Math\BigInteger
+     */
+    protected function os2ip($x)
+    {
+        return new BigInteger($x, 256);
+    }
+
+    /**
+     * EMSA-PKCS1-V1_5-ENCODE
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#section-9.2 RFC3447#section-9.2}.
+     *
+     * @param string $m
+     * @param int $emLen
+     * @throws \LengthException if the intended encoded message length is too short
+     * @return string
+     */
+    protected function emsa_pkcs1_v1_5_encode($m, $emLen)
+    {
+        $h = $this-&gt;hash-&gt;hash($m);
+
+        // see http://tools.ietf.org/html/rfc3447#page-43
+        switch ($this-&gt;hash-&gt;getHash()) {
+            case &#039;md2&#039;:
+                $t = &quot;\x30\x20\x30\x0c\x06\x08\x2a\x86\x48\x86\xf7\x0d\x02\x02\x05\x00\x04\x10&quot;;
+                break;
+            case &#039;md5&#039;:
+                $t = &quot;\x30\x20\x30\x0c\x06\x08\x2a\x86\x48\x86\xf7\x0d\x02\x05\x05\x00\x04\x10&quot;;
+                break;
+            case &#039;sha1&#039;:
+                $t = &quot;\x30\x21\x30\x09\x06\x05\x2b\x0e\x03\x02\x1a\x05\x00\x04\x14&quot;;
+                break;
+            case &#039;sha256&#039;:
+                $t = &quot;\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20&quot;;
+                break;
+            case &#039;sha384&#039;:
+                $t = &quot;\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30&quot;;
+                break;
+            case &#039;sha512&#039;:
+                $t = &quot;\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40&quot;;
+                break;
+            // from https://www.emc.com/collateral/white-papers/h11300-pkcs-1v2-2-rsa-cryptography-standard-wp.pdf#page=40
+            case &#039;sha224&#039;:
+                $t = &quot;\x30\x2d\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x04\x05\x00\x04\x1c&quot;;
+                break;
+            case &#039;sha512/224&#039;:
+                $t = &quot;\x30\x2d\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x05\x05\x00\x04\x1c&quot;;
+                break;
+            case &#039;sha512/256&#039;:
+                $t = &quot;\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x06\x05\x00\x04\x20&quot;;
+        }
+        $t .= $h;
+        $tLen = strlen($t);
+
+        if ($emLen &lt; $tLen + 11) {
+            throw new \LengthException(&#039;Intended encoded message length too short&#039;);
+        }
+
+        $ps = str_repeat(chr(0xFF), $emLen - $tLen - 3);
+
+        $em = &quot;\0\1$ps\0$t&quot;;
+
+        return $em;
+    }
+
+    /**
+     * EMSA-PKCS1-V1_5-ENCODE (without NULL)
+     *
+     * Quoting https://tools.ietf.org/html/rfc8017#page-65,
+     *
+     * &quot;The parameters field associated with id-sha1, id-sha224, id-sha256,
+     *  id-sha384, id-sha512, id-sha512/224, and id-sha512/256 should
+     *  generally be omitted, but if present, it shall have a value of type
+     *  NULL&quot;
+     *
+     * @param string $m
+     * @param int $emLen
+     * @return string
+     */
+    protected function emsa_pkcs1_v1_5_encode_without_null($m, $emLen)
+    {
+        $h = $this-&gt;hash-&gt;hash($m);
+
+        // see http://tools.ietf.org/html/rfc3447#page-43
+        switch ($this-&gt;hash-&gt;getHash()) {
+            case &#039;sha1&#039;:
+                $t = &quot;\x30\x1f\x30\x07\x06\x05\x2b\x0e\x03\x02\x1a\x04\x14&quot;;
+                break;
+            case &#039;sha256&#039;:
+                $t = &quot;\x30\x2f\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x04\x20&quot;;
+                break;
+            case &#039;sha384&#039;:
+                $t = &quot;\x30\x3f\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x04\x30&quot;;
+                break;
+            case &#039;sha512&#039;:
+                $t = &quot;\x30\x4f\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x04\x40&quot;;
+                break;
+            // from https://www.emc.com/collateral/white-papers/h11300-pkcs-1v2-2-rsa-cryptography-standard-wp.pdf#page=40
+            case &#039;sha224&#039;:
+                $t = &quot;\x30\x2b\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x04\x04\x1c&quot;;
+                break;
+            case &#039;sha512/224&#039;:
+                $t = &quot;\x30\x2b\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x05\x04\x1c&quot;;
+                break;
+            case &#039;sha512/256&#039;:
+                $t = &quot;\x30\x2f\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x06\x04\x20&quot;;
+                break;
+            default:
+                throw new UnsupportedAlgorithmException(&#039;md2 and md5 require NULLs&#039;);
+        }
+        $t .= $h;
+        $tLen = strlen($t);
+
+        if ($emLen &lt; $tLen + 11) {
+            throw new \LengthException(&#039;Intended encoded message length too short&#039;);
+        }
+
+        $ps = str_repeat(chr(0xFF), $emLen - $tLen - 3);
+
+        $em = &quot;\0\1$ps\0$t&quot;;
+
+        return $em;
+    }
+
+    /**
+     * MGF1
+     *
+     * See {@link http://tools.ietf.org/html/rfc3447#appendix-B.2.1 RFC3447#appendix-B.2.1}.
+     *
+     * @param string $mgfSeed
+     * @param int $maskLen
+     * @return string
+     */
+    protected function mgf1($mgfSeed, $maskLen)
+    {
+        // if $maskLen would yield strings larger than 4GB, PKCS#1 suggests a &quot;Mask too long&quot; error be output.
+
+        $t = &#039;&#039;;
+        $count = ceil($maskLen / $this-&gt;mgfHLen);
+        for ($i = 0; $i &lt; $count; $i++) {
+            $c = pack(&#039;N&#039;, $i);
+            $t .= $this-&gt;mgfHash-&gt;hash($mgfSeed . $c);
+        }
+
+        return substr($t, 0, $maskLen);
+    }
+
+    /**
+     * Returns the key size
+     *
+     * More specifically, this returns the size of the modulo in bits.
+     *
+     * @return int
+     */
+    public function getLength()
+    {
+        return !isset($this-&gt;modulus) ? 0 : $this-&gt;modulus-&gt;getLength();
+    }
+
+    /**
+     * Determines which hashing function should be used
+     *
+     * Used with signature production / verification and (if the encryption mode is self::PADDING_OAEP) encryption and
+     * decryption.
+     *
+     * @param string $hash
+     */
+    public function withHash($hash)
+    {
+        $new = clone $this;
+
+        // Crypt\Hash supports algorithms that PKCS#1 doesn&#039;t support.  md5-96 and sha1-96, for example.
+        switch (strtolower($hash)) {
+            case &#039;md2&#039;:
+            case &#039;md5&#039;:
+            case &#039;sha1&#039;:
+            case &#039;sha256&#039;:
+            case &#039;sha384&#039;:
+            case &#039;sha512&#039;:
+            case &#039;sha224&#039;:
+            case &#039;sha512/224&#039;:
+            case &#039;sha512/256&#039;:
+                $new-&gt;hash = new Hash($hash);
+                break;
+            default:
+                throw new UnsupportedAlgorithmException(
+                    &#039;The only supported hash algorithms are: md2, md5, sha1, sha256, sha384, sha512, sha224, sha512/224, sha512/256&#039;
+                );
+        }
+        $new-&gt;hLen = $new-&gt;hash-&gt;getLengthInBytes();
+
+        return $new;
+    }
+
+    /**
+     * Determines which hashing function should be used for the mask generation function
+     *
+     * The mask generation function is used by self::PADDING_OAEP and self::PADDING_PSS and although it&#039;s
+     * best if Hash and MGFHash are set to the same thing this is not a requirement.
+     *
+     * @param string $hash
+     */
+    public function withMGFHash($hash)
+    {
+        $new = clone $this;
+
+        // Crypt\Hash supports algorithms that PKCS#1 doesn&#039;t support.  md5-96 and sha1-96, for example.
+        switch (strtolower($hash)) {
+            case &#039;md2&#039;:
+            case &#039;md5&#039;:
+            case &#039;sha1&#039;:
+            case &#039;sha256&#039;:
+            case &#039;sha384&#039;:
+            case &#039;sha512&#039;:
+            case &#039;sha224&#039;:
+            case &#039;sha512/224&#039;:
+            case &#039;sha512/256&#039;:
+                $new-&gt;mgfHash = new Hash($hash);
+                break;
+            default:
+                throw new UnsupportedAlgorithmException(
+                    &#039;The only supported hash algorithms are: md2, md5, sha1, sha256, sha384, sha512, sha224, sha512/224, sha512/256&#039;
+                );
+        }
+        $new-&gt;mgfHLen = $new-&gt;mgfHash-&gt;getLengthInBytes();
+
+        return $new;
+    }
+
+    /**
+     * Returns the MGF hash algorithm currently being used
+     *
+     */
+    public function getMGFHash()
+    {
+        return clone $this-&gt;mgfHash;
+    }
+
+    /**
+     * Determines the salt length
+     *
+     * Used by RSA::PADDING_PSS
+     *
+     * To quote from {@link http://tools.ietf.org/html/rfc3447#page-38 RFC3447#page-38}:
+     *
+     *    Typical salt lengths in octets are hLen (the length of the output
+     *    of the hash function Hash) and 0.
+     *
+     * @param int $sLen
+     */
+    public function withSaltLength($sLen)
+    {
+        $new = clone $this;
+        $new-&gt;sLen = $sLen;
+        return $new;
+    }
+
+    /**
+     * Returns the salt length currently being used
+     *
+     */
+    public function getSaltLength()
+    {
+        return $this-&gt;sLen !== null ? $this-&gt;sLen : $this-&gt;hLen;
+    }
+
+    /**
+     * Determines the label
+     *
+     * Used by RSA::PADDING_OAEP
+     *
+     * To quote from {@link http://tools.ietf.org/html/rfc3447#page-17 RFC3447#page-17}:
+     *
+     *    Both the encryption and the decryption operations of RSAES-OAEP take
+     *    the value of a label L as input.  In this version of PKCS #1, L is
+     *    the empty string; other uses of the label are outside the scope of
+     *    this document.
+     *
+     * @param string $label
+     */
+    public function withLabel($label)
+    {
+        $new = clone $this;
+        $new-&gt;label = $label;
+        return $new;
+    }
+
+    /**
+     * Returns the label currently being used
+     *
+     */
+    public function getLabel()
+    {
+        return $this-&gt;label;
+    }
+
+    /**
+     * Determines the padding modes
+     *
+     * Example: $key-&gt;withPadding(RSA::ENCRYPTION_PKCS1 | RSA::SIGNATURE_PKCS1);
+     *
+     * @param int $padding
+     */
+    public function withPadding($padding)
+    {
+        $masks = [
+            self::ENCRYPTION_OAEP,
+            self::ENCRYPTION_PKCS1,
+            self::ENCRYPTION_NONE
+        ];
+        $encryptedCount = 0;
+        $selected = 0;
+        foreach ($masks as $mask) {
+            if ($padding &amp; $mask) {
+                $selected = $mask;
+                $encryptedCount++;
+            }
+        }
+        if ($encryptedCount &gt; 1) {
+            throw new InconsistentSetupException(&#039;Multiple encryption padding modes have been selected; at most only one should be selected&#039;);
+        }
+        $encryptionPadding = $selected;
+
+        $masks = [
+            self::SIGNATURE_PSS,
+            self::SIGNATURE_RELAXED_PKCS1,
+            self::SIGNATURE_PKCS1
+        ];
+        $signatureCount = 0;
+        $selected = 0;
+        foreach ($masks as $mask) {
+            if ($padding &amp; $mask) {
+                $selected = $mask;
+                $signatureCount++;
+            }
+        }
+        if ($signatureCount &gt; 1) {
+            throw new InconsistentSetupException(&#039;Multiple signature padding modes have been selected; at most only one should be selected&#039;);
+        }
+        $signaturePadding = $selected;
+
+        $new = clone $this;
+        if ($encryptedCount) {
+            $new-&gt;encryptionPadding = $encryptionPadding;
+        }
+        if ($signatureCount) {
+            $new-&gt;signaturePadding = $signaturePadding;
+        }
+        return $new;
+    }
+
+    /**
+     * Returns the padding currently being used
+     *
+     */
+    public function getPadding()
+    {
+        return $this-&gt;signaturePadding | $this-&gt;encryptionPadding;
+    }
+
+    /**
+     * Returns the current engine being used
+     *
+     * OpenSSL is only used in this class (and it&#039;s subclasses) for key generation
+     * Even then it depends on the parameters you&#039;re using. It&#039;s not used for
+     * multi-prime RSA nor is it used if the key length is outside of the range
+     * supported by OpenSSL
+     *
+     * @see self::useInternalEngine()
+     * @see self::useBestEngine()
+     * @return string
+     */
+    public function getEngine()
+    {
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+        return self::$engines[&#039;OpenSSL&#039;] &amp;&amp; self::$defaultExponent == 65537 ?
+            &#039;OpenSSL&#039; :
+            &#039;PHP&#039;;
+    }
+
+    /**
+     * Enable RSA Blinding
+     *
+     */
+    public static function enableBlinding()
+    {
+        static::$enableBlinding = true;
+    }
+
+    /**
+     * Disable RSA Blinding
+     *
+     */
+    public static function disableBlinding()
+    {
+        static::$enableBlinding = false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/RSA/Formats/Keys/JWK.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/Common -->
+
+</body>
+</html>

@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/translation/PseudoLocalizationTranslator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Translation;
+
+use Symfony\Component\Translation\Exception\LogicException;
+use Symfony\Contracts\Translation\TranslatorInterface;
+
+/**
+ * This translator should only be used in a development environment.
+ */
+final class PseudoLocalizationTranslator implements TranslatorInterface, TranslatorBagInterface
+{
+    private const EXPANSION_CHARACTER = &#039;~&#039;;
+
+    private bool $accents;
+    private float $expansionFactor;
+    private bool $brackets;
+    private bool $parseHTML;
+
+    /**
+     * @var string[]
+     */
+    private array $localizableHTMLAttributes;
+
+    /**
+     * Available options:
+     *  * accents:
+     *      type: boolean
+     *      default: true
+     *      description: replace ASCII characters of the translated string with accented versions or similar characters
+     *      example: if true, &quot;foo&quot; =&gt; &quot;ƒöö&quot;.
+     *
+     *  * expansion_factor:
+     *      type: float
+     *      default: 1
+     *      validation: it must be greater than or equal to 1
+     *      description: expand the translated string by the given factor with spaces and tildes
+     *      example: if 2, &quot;foo&quot; =&gt; &quot;~foo ~&quot;
+     *
+     *  * brackets:
+     *      type: boolean
+     *      default: true
+     *      description: wrap the translated string with brackets
+     *      example: if true, &quot;foo&quot; =&gt; &quot;[foo]&quot;
+     *
+     *  * parse_html:
+     *      type: boolean
+     *      default: false
+     *      description: parse the translated string as HTML - looking for HTML tags has a performance impact but allows to preserve them from alterations - it also allows to compute the visible translated string length which is useful to correctly expand or when it contains HTML
+     *      warning: unclosed tags are unsupported, they will be fixed (closed) by the parser - eg, &quot;foo &lt;div&gt;bar&quot; =&gt; &quot;foo &lt;div&gt;bar&lt;/div&gt;&quot;
+     *
+     *  * localizable_html_attributes:
+     *      type: string[]
+     *      default: []
+     *      description: the list of HTML attributes whose values can be altered - it is only useful when the &quot;parse_html&quot; option is set to true
+     *      example: if [&quot;title&quot;], and with the &quot;accents&quot; option set to true, &quot;&lt;a href=&quot;#&quot; title=&quot;Go to your profile&quot;&gt;Profile&lt;/a&gt;&quot; =&gt; &quot;&lt;a href=&quot;#&quot; title=&quot;Ĝö ţö ýöûŕ þŕöƒîļé&quot;&gt;Þŕöƒîļé&lt;/a&gt;&quot; - if &quot;title&quot; was not in the &quot;localizable_html_attributes&quot; list, the title attribute data would be left unchanged.
+     */
+    public function __construct(
+        private TranslatorInterface $translator,
+        array $options = [],
+    ) {
+        $this-&gt;translator = $translator;
+        $this-&gt;accents = $options[&#039;accents&#039;] ?? true;
+
+        if (1.0 &gt; ($this-&gt;expansionFactor = $options[&#039;expansion_factor&#039;] ?? 1.0)) {
+            throw new \InvalidArgumentException(&#039;The expansion factor must be greater than or equal to 1.&#039;);
+        }
+
+        $this-&gt;brackets = $options[&#039;brackets&#039;] ?? true;
+
+        $this-&gt;parseHTML = $options[&#039;parse_html&#039;] ?? false;
+        if ($this-&gt;parseHTML &amp;&amp; !$this-&gt;accents &amp;&amp; 1.0 === $this-&gt;expansionFactor) {
+            $this-&gt;parseHTML = false;
+        }
+
+        $this-&gt;localizableHTMLAttributes = $options[&#039;localizable_html_attributes&#039;] ?? [];
+    }
+
+    public function trans(string $id, array $parameters = [], ?string $domain = null, ?string $locale = null): string
+    {
+        $trans = &#039;&#039;;
+        $visibleText = &#039;&#039;;
+
+        foreach ($this-&gt;getParts($this-&gt;translator-&gt;trans($id, $parameters, $domain, $locale)) as [$visible, $localizable, $text]) {
+            if ($visible) {
+                $visibleText .= $text;
+            }
+
+            if (!$localizable) {
+                $trans .= $text;
+
+                continue;
+            }
+
+            $this-&gt;addAccents($trans, $text);
+        }
+
+        $this-&gt;expand($trans, $visibleText);
+
+        $this-&gt;addBrackets($trans);
+
+        return $trans;
+    }
+
+    public function getLocale(): string
+    {
+        return $this-&gt;translator-&gt;getLocale();
+    }
+
+    public function getCatalogue(?string $locale = null): MessageCatalogueInterface
+    {
+        if (!$this-&gt;translator instanceof TranslatorBagInterface) {
+            throw new LogicException(\sprintf(&#039;The &quot;%s()&quot; method cannot be called as the wrapped translator class &quot;%s&quot; does not implement the &quot;%s&quot;.&#039;, __METHOD__, $this-&gt;translator::class, TranslatorBagInterface::class));
+        }
+
+        return $this-&gt;translator-&gt;getCatalogue($locale);
+    }
+
+    public function getCatalogues(): array
+    {
+        if (!$this-&gt;translator instanceof TranslatorBagInterface) {
+            throw new LogicException(\sprintf(&#039;The &quot;%s()&quot; method cannot be called as the wrapped translator class &quot;%s&quot; does not implement the &quot;%s&quot;.&#039;, __METHOD__, $this-&gt;translator::class, TranslatorBagInterface::class));
+        }
+
+        return $this-&gt;translator-&gt;getCatalogues();
+    }
+
+    private function getParts(string $originalTrans): array
+    {
+        if (!$this-&gt;parseHTML) {
+            return [[true, true, $originalTrans]];
+        }
+
+        $html = mb_encode_numericentity($originalTrans, [0x80, 0x10FFFF, 0, 0x1FFFFF], mb_detect_encoding($originalTrans, null, true) ?: &#039;UTF-8&#039;);
+
+        $useInternalErrors = libxml_use_internal_errors(true);
+
+        $dom = new \DOMDocument();
+        $dom-&gt;loadHTML(&#039;&lt;trans&gt;&#039;.$html.&#039;&lt;/trans&gt;&#039;);
+
+        libxml_clear_errors();
+        libxml_use_internal_errors($useInternalErrors);
+
+        return $this-&gt;parseNode($dom-&gt;childNodes-&gt;item(1)-&gt;childNodes-&gt;item(0)-&gt;childNodes-&gt;item(0));
+    }
+
+    private function parseNode(\DOMNode $node): array
+    {
+        $parts = [];
+
+        foreach ($node-&gt;childNodes as $childNode) {
+            if (!$childNode instanceof \DOMElement) {
+                $parts[] = [true, true, $childNode-&gt;nodeValue];
+
+                continue;
+            }
+
+            $parts[] = [false, false, &#039;&lt;&#039;.$childNode-&gt;tagName];
+
+            foreach ($childNode-&gt;attributes as $attribute) {
+                $parts[] = [false, false, &#039; &#039;.$attribute-&gt;nodeName.&#039;=&quot;&#039;];
+
+                $localizableAttribute = \in_array($attribute-&gt;nodeName, $this-&gt;localizableHTMLAttributes, true);
+                foreach (preg_split(&#039;/(&amp;(?:amp|quot|#039|lt|gt);+)/&#039;, htmlspecialchars($attribute-&gt;nodeValue, \ENT_QUOTES, &#039;UTF-8&#039;), -1, \PREG_SPLIT_DELIM_CAPTURE) as $i =&gt; $match) {
+                    if (&#039;&#039; === $match) {
+                        continue;
+                    }
+
+                    $parts[] = [false, $localizableAttribute &amp;&amp; 0 === $i % 2, $match];
+                }
+
+                $parts[] = [false, false, &#039;&quot;&#039;];
+            }
+
+            $parts[] = [false, false, &#039;&gt;&#039;];
+
+            $parts = array_merge($parts, $this-&gt;parseNode($childNode));
+
+            $parts[] = [false, false, &#039;&lt;/&#039;.$childNode-&gt;tagName.&#039;&gt;&#039;];
+        }
+
+        return $parts;
+    }
+
+    private function addAccents(string &amp;$trans, string $text): void
+    {
+        $trans .= $this-&gt;accents ? strtr($text, [
+            &#039; &#039; =&gt; &#039; &#039;,
+            &#039;!&#039; =&gt; &#039;¡&#039;,
+            &#039;&quot;&#039; =&gt; &#039;″&#039;,
+            &#039;#&#039; =&gt; &#039;♯&#039;,
+            &#039;$&#039; =&gt; &#039;€&#039;,
+            &#039;%&#039; =&gt; &#039;‰&#039;,
+            &#039;&amp;&#039; =&gt; &#039;⅋&#039;,
+            &#039;\&#039;&#039; =&gt; &#039;´&#039;,
+            &#039;(&#039; =&gt; &#039;{&#039;,
+            &#039;)&#039; =&gt; &#039;}&#039;,
+            &#039;*&#039; =&gt; &#039;⁎&#039;,
+            &#039;+&#039; =&gt; &#039;⁺&#039;,
+            &#039;,&#039; =&gt; &#039;،&#039;,
+            &#039;-&#039; =&gt; &#039;‐&#039;,
+            &#039;.&#039; =&gt; &#039;·&#039;,
+            &#039;/&#039; =&gt; &#039;⁄&#039;,
+            &#039;0&#039; =&gt; &#039;⓪&#039;,
+            &#039;1&#039; =&gt; &#039;①&#039;,
+            &#039;2&#039; =&gt; &#039;②&#039;,
+            &#039;3&#039; =&gt; &#039;③&#039;,
+            &#039;4&#039; =&gt; &#039;④&#039;,
+            &#039;5&#039; =&gt; &#039;⑤&#039;,
+            &#039;6&#039; =&gt; &#039;⑥&#039;,
+            &#039;7&#039; =&gt; &#039;⑦&#039;,
+            &#039;8&#039; =&gt; &#039;⑧&#039;,
+            &#039;9&#039; =&gt; &#039;⑨&#039;,
+            &#039;:&#039; =&gt; &#039;∶&#039;,
+            &#039;;&#039; =&gt; &#039;⁏&#039;,
+            &#039;&lt;&#039; =&gt; &#039;≤&#039;,
+            &#039;=&#039; =&gt; &#039;≂&#039;,
+            &#039;&gt;&#039; =&gt; &#039;≥&#039;,
+            &#039;?&#039; =&gt; &#039;¿&#039;,
+            &#039;@&#039; =&gt; &#039;՞&#039;,
+            &#039;A&#039; =&gt; &#039;Å&#039;,
+            &#039;B&#039; =&gt; &#039;Ɓ&#039;,
+            &#039;C&#039; =&gt; &#039;Ç&#039;,
+            &#039;D&#039; =&gt; &#039;Ð&#039;,
+            &#039;E&#039; =&gt; &#039;É&#039;,
+            &#039;F&#039; =&gt; &#039;Ƒ&#039;,
+            &#039;G&#039; =&gt; &#039;Ĝ&#039;,
+            &#039;H&#039; =&gt; &#039;Ĥ&#039;,
+            &#039;I&#039; =&gt; &#039;Î&#039;,
+            &#039;J&#039; =&gt; &#039;Ĵ&#039;,
+            &#039;K&#039; =&gt; &#039;Ķ&#039;,
+            &#039;L&#039; =&gt; &#039;Ļ&#039;,
+            &#039;M&#039; =&gt; &#039;Ṁ&#039;,
+            &#039;N&#039; =&gt; &#039;Ñ&#039;,
+            &#039;O&#039; =&gt; &#039;Ö&#039;,
+            &#039;P&#039; =&gt; &#039;Þ&#039;,
+            &#039;Q&#039; =&gt; &#039;Ǫ&#039;,
+            &#039;R&#039; =&gt; &#039;Ŕ&#039;,
+            &#039;S&#039; =&gt; &#039;Š&#039;,
+            &#039;T&#039; =&gt; &#039;Ţ&#039;,
+            &#039;U&#039; =&gt; &#039;Û&#039;,
+            &#039;V&#039; =&gt; &#039;Ṽ&#039;,
+            &#039;W&#039; =&gt; &#039;Ŵ&#039;,
+            &#039;X&#039; =&gt; &#039;Ẋ&#039;,
+            &#039;Y&#039; =&gt; &#039;Ý&#039;,
+            &#039;Z&#039; =&gt; &#039;Ž&#039;,
+            &#039;[&#039; =&gt; &#039;⁅&#039;,
+            &#039;\\&#039; =&gt; &#039;∖&#039;,
+            &#039;]&#039; =&gt; &#039;⁆&#039;,
+            &#039;^&#039; =&gt; &#039;˄&#039;,
+            &#039;_&#039; =&gt; &#039;‿&#039;,
+            &#039;`&#039; =&gt; &#039;‵&#039;,
+            &#039;a&#039; =&gt; &#039;å&#039;,
+            &#039;b&#039; =&gt; &#039;ƀ&#039;,
+            &#039;c&#039; =&gt; &#039;ç&#039;,
+            &#039;d&#039; =&gt; &#039;ð&#039;,
+            &#039;e&#039; =&gt; &#039;é&#039;,
+            &#039;f&#039; =&gt; &#039;ƒ&#039;,
+            &#039;g&#039; =&gt; &#039;ĝ&#039;,
+            &#039;h&#039; =&gt; &#039;ĥ&#039;,
+            &#039;i&#039; =&gt; &#039;î&#039;,
+            &#039;j&#039; =&gt; &#039;ĵ&#039;,
+            &#039;k&#039; =&gt; &#039;ķ&#039;,
+            &#039;l&#039; =&gt; &#039;ļ&#039;,
+            &#039;m&#039; =&gt; &#039;ɱ&#039;,
+            &#039;n&#039; =&gt; &#039;ñ&#039;,
+            &#039;o&#039; =&gt; &#039;ö&#039;,
+            &#039;p&#039; =&gt; &#039;þ&#039;,
+            &#039;q&#039; =&gt; &#039;ǫ&#039;,
+            &#039;r&#039; =&gt; &#039;ŕ&#039;,
+            &#039;s&#039; =&gt; &#039;š&#039;,
+            &#039;t&#039; =&gt; &#039;ţ&#039;,
+            &#039;u&#039; =&gt; &#039;û&#039;,
+            &#039;v&#039; =&gt; &#039;ṽ&#039;,
+            &#039;w&#039; =&gt; &#039;ŵ&#039;,
+            &#039;x&#039; =&gt; &#039;ẋ&#039;,
+            &#039;y&#039; =&gt; &#039;ý&#039;,
+            &#039;z&#039; =&gt; &#039;ž&#039;,
+            &#039;{&#039; =&gt; &#039;(&#039;,
+            &#039;|&#039; =&gt; &#039;¦&#039;,
+            &#039;}&#039; =&gt; &#039;)&#039;,
+            &#039;~&#039; =&gt; &#039;˞&#039;,
+        ]) : $text;
+    }
+
+    private function expand(string &amp;$trans, string $visibleText): void
+    {
+        if (1.0 &gt;= $this-&gt;expansionFactor) {
+            return;
+        }
+
+        $visibleLength = $this-&gt;strlen($visibleText);
+        $missingLength = (int) ceil($visibleLength * $this-&gt;expansionFactor) - $visibleLength;
+        if ($this-&gt;brackets) {
+            $missingLength -= 2;
+        }
+
+        if (0 &gt;= $missingLength) {
+            return;
+        }
+
+        $words = [];
+        $wordsCount = 0;
+        foreach (preg_split(&#039;/ +/&#039;, $visibleText, -1, \PREG_SPLIT_NO_EMPTY) as $word) {
+            $wordLength = $this-&gt;strlen($word);
+
+            if ($wordLength &gt;= $missingLength) {
+                continue;
+            }
+
+            if (!isset($words[$wordLength])) {
+                $words[$wordLength] = 0;
+            }
+
+            ++$words[$wordLength];
+            ++$wordsCount;
+        }
+
+        if (!$words) {
+            $trans .= 1 === $missingLength ? self::EXPANSION_CHARACTER : &#039; &#039;.str_repeat(self::EXPANSION_CHARACTER, $missingLength - 1);
+
+            return;
+        }
+
+        arsort($words, \SORT_NUMERIC);
+
+        $longestWordLength = max(array_keys($words));
+
+        while (true) {
+            $r = mt_rand(1, $wordsCount);
+
+            foreach ($words as $length =&gt; $count) {
+                $r -= $count;
+                if ($r &lt;= 0) {
+                    break;
+                }
+            }
+
+            $trans .= &#039; &#039;.str_repeat(self::EXPANSION_CHARACTER, $length);
+
+            $missingLength -= $length + 1;
+
+            if (0 === $missingLength) {
+                return;
+            }
+
+            while ($longestWordLength &gt;= $missingLength) {
+                $wordsCount -= $words[$longestWordLength];
+                unset($words[$longestWordLength]);
+
+                if (!$words) {
+                    $trans .= 1 === $missingLength ? self::EXPANSION_CHARACTER : &#039; &#039;.str_repeat(self::EXPANSION_CHARACTER, $missingLength - 1);
+
+                    return;
+                }
+
+                $longestWordLength = max(array_keys($words));
+            }
+        }
+    }
+
+    private function addBrackets(string &amp;$trans): void
+    {
+        if (!$this-&gt;brackets) {
+            return;
+        }
+
+        $trans = &#039;[&#039;.$trans.&#039;]&#039;;
+    }
+
+    private function strlen(string $s): int
+    {
+        return false === ($encoding = mb_detect_encoding($s, null, true)) ? \strlen($s) : mb_strlen($s, $encoding);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/translation/README.md -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/translation/Catalogue -->
+
+</body>
+</html>

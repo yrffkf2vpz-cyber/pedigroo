@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-kernel/DataCollector/LoggerDataCollector.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpKernel\DataCollector;
+
+use Symfony\Component\ErrorHandler\Exception\SilencedErrorContext;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Log\DebugLoggerConfigurator;
+use Symfony\Component\HttpKernel\Log\DebugLoggerInterface;
+use Symfony\Component\VarDumper\Cloner\Data;
+
+/**
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * @final
+ */
+class LoggerDataCollector extends DataCollector implements LateDataCollectorInterface
+{
+    private ?DebugLoggerInterface $logger;
+    private ?Request $currentRequest = null;
+    private ?array $processedLogs = null;
+
+    public function __construct(
+        ?object $logger = null,
+        private ?string $containerPathPrefix = null,
+        private ?RequestStack $requestStack = null,
+    ) {
+        $this-&gt;logger = DebugLoggerConfigurator::getDebugLogger($logger);
+    }
+
+    public function collect(Request $request, Response $response, ?\Throwable $exception = null): void
+    {
+        $this-&gt;currentRequest = $this-&gt;requestStack &amp;&amp; $this-&gt;requestStack-&gt;getMainRequest() !== $request ? $request : null;
+    }
+
+    public function lateCollect(): void
+    {
+        if ($this-&gt;logger) {
+            $containerDeprecationLogs = $this-&gt;getContainerDeprecationLogs();
+            $this-&gt;data = $this-&gt;computeErrorsCount($containerDeprecationLogs);
+            // get compiler logs later (only when they are needed) to improve performance
+            $this-&gt;data[&#039;compiler_logs&#039;] = [];
+            $this-&gt;data[&#039;compiler_logs_filepath&#039;] = $this-&gt;containerPathPrefix.&#039;Compiler.log&#039;;
+            $this-&gt;data[&#039;logs&#039;] = $this-&gt;sanitizeLogs(array_merge($this-&gt;logger-&gt;getLogs($this-&gt;currentRequest), $containerDeprecationLogs));
+            $this-&gt;data = $this-&gt;cloneVar($this-&gt;data);
+        }
+        $this-&gt;currentRequest = null;
+    }
+
+    public function getLogs(): Data|array
+    {
+        return $this-&gt;data[&#039;logs&#039;] ?? [];
+    }
+
+    public function getProcessedLogs(): array
+    {
+        if (null !== $this-&gt;processedLogs) {
+            return $this-&gt;processedLogs;
+        }
+
+        $rawLogs = $this-&gt;getLogs();
+        if ([] === $rawLogs) {
+            return $this-&gt;processedLogs = $rawLogs;
+        }
+
+        $logs = [];
+        foreach ($this-&gt;getLogs()-&gt;getValue() as $rawLog) {
+            $rawLogData = $rawLog-&gt;getValue();
+
+            if ($rawLogData[&#039;priority&#039;]-&gt;getValue() &gt; 300) {
+                $logType = &#039;error&#039;;
+            } elseif (isset($rawLogData[&#039;scream&#039;]) &amp;&amp; false === $rawLogData[&#039;scream&#039;]-&gt;getValue()) {
+                $logType = &#039;deprecation&#039;;
+            } elseif (isset($rawLogData[&#039;scream&#039;]) &amp;&amp; true === $rawLogData[&#039;scream&#039;]-&gt;getValue()) {
+                $logType = &#039;silenced&#039;;
+            } else {
+                $logType = &#039;regular&#039;;
+            }
+
+            $logs[] = [
+                &#039;type&#039; =&gt; $logType,
+                &#039;errorCount&#039; =&gt; $rawLog[&#039;errorCount&#039;] ?? 1,
+                &#039;timestamp&#039; =&gt; $rawLogData[&#039;timestamp_rfc3339&#039;]-&gt;getValue(),
+                &#039;priority&#039; =&gt; $rawLogData[&#039;priority&#039;]-&gt;getValue(),
+                &#039;priorityName&#039; =&gt; $rawLogData[&#039;priorityName&#039;]-&gt;getValue(),
+                &#039;channel&#039; =&gt; $rawLogData[&#039;channel&#039;]-&gt;getValue(),
+                &#039;message&#039; =&gt; $rawLogData[&#039;message&#039;],
+                &#039;context&#039; =&gt; $rawLogData[&#039;context&#039;],
+            ];
+        }
+
+        // sort logs from oldest to newest
+        usort($logs, static fn ($logA, $logB) =&gt; $logA[&#039;timestamp&#039;] &lt;=&gt; $logB[&#039;timestamp&#039;]);
+
+        return $this-&gt;processedLogs = $logs;
+    }
+
+    public function getFilters(): array
+    {
+        $filters = [
+            &#039;channel&#039; =&gt; [],
+            &#039;priority&#039; =&gt; [
+                &#039;Debug&#039; =&gt; 100,
+                &#039;Info&#039; =&gt; 200,
+                &#039;Notice&#039; =&gt; 250,
+                &#039;Warning&#039; =&gt; 300,
+                &#039;Error&#039; =&gt; 400,
+                &#039;Critical&#039; =&gt; 500,
+                &#039;Alert&#039; =&gt; 550,
+                &#039;Emergency&#039; =&gt; 600,
+            ],
+        ];
+
+        $allChannels = [];
+        foreach ($this-&gt;getProcessedLogs() as $log) {
+            if (&#039;&#039; === trim($log[&#039;channel&#039;] ?? &#039;&#039;)) {
+                continue;
+            }
+
+            $allChannels[] = $log[&#039;channel&#039;];
+        }
+        $channels = array_unique($allChannels);
+        sort($channels);
+        $filters[&#039;channel&#039;] = $channels;
+
+        return $filters;
+    }
+
+    public function getPriorities(): Data|array
+    {
+        return $this-&gt;data[&#039;priorities&#039;] ?? [];
+    }
+
+    public function countErrors(): int
+    {
+        return $this-&gt;data[&#039;error_count&#039;] ?? 0;
+    }
+
+    public function countDeprecations(): int
+    {
+        return $this-&gt;data[&#039;deprecation_count&#039;] ?? 0;
+    }
+
+    public function countWarnings(): int
+    {
+        return $this-&gt;data[&#039;warning_count&#039;] ?? 0;
+    }
+
+    public function countScreams(): int
+    {
+        return $this-&gt;data[&#039;scream_count&#039;] ?? 0;
+    }
+
+    public function getCompilerLogs(): Data
+    {
+        return $this-&gt;cloneVar($this-&gt;getContainerCompilerLogs($this-&gt;data[&#039;compiler_logs_filepath&#039;] ?? null));
+    }
+
+    public function getName(): string
+    {
+        return &#039;logger&#039;;
+    }
+
+    private function getContainerDeprecationLogs(): array
+    {
+        if (null === $this-&gt;containerPathPrefix || !is_file($file = $this-&gt;containerPathPrefix.&#039;Deprecations.log&#039;)) {
+            return [];
+        }
+
+        if (&#039;&#039; === $logContent = trim(file_get_contents($file))) {
+            return [];
+        }
+
+        $bootTime = filemtime($file);
+        $logs = [];
+        foreach (unserialize($logContent) as $log) {
+            $log[&#039;context&#039;] = [&#039;exception&#039; =&gt; new SilencedErrorContext($log[&#039;type&#039;], $log[&#039;file&#039;], $log[&#039;line&#039;], $log[&#039;trace&#039;], $log[&#039;count&#039;])];
+            $log[&#039;timestamp&#039;] = $bootTime;
+            $log[&#039;timestamp_rfc3339&#039;] = (new \DateTimeImmutable())-&gt;setTimestamp($bootTime)-&gt;format(\DateTimeInterface::RFC3339_EXTENDED);
+            $log[&#039;priority&#039;] = 100;
+            $log[&#039;priorityName&#039;] = &#039;DEBUG&#039;;
+            $log[&#039;channel&#039;] = null;
+            $log[&#039;scream&#039;] = false;
+            unset($log[&#039;type&#039;], $log[&#039;file&#039;], $log[&#039;line&#039;], $log[&#039;trace&#039;], $log[&#039;count&#039;]);
+            $logs[] = $log;
+        }
+
+        return $logs;
+    }
+
+    private function getContainerCompilerLogs(?string $compilerLogsFilepath = null): array
+    {
+        if (!$compilerLogsFilepath || !is_file($compilerLogsFilepath)) {
+            return [];
+        }
+
+        $logs = [];
+        foreach (file($compilerLogsFilepath, \FILE_IGNORE_NEW_LINES) as $log) {
+            $log = explode(&#039;: &#039;, $log, 2);
+            if (!isset($log[1]) || !preg_match(&#039;/^[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*+(?:\\\\[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*+)++$/&#039;, $log[0])) {
+                $log = [&#039;Unknown Compiler Pass&#039;, implode(&#039;: &#039;, $log)];
+            }
+
+            $logs[$log[0]][] = [&#039;message&#039; =&gt; $log[1]];
+        }
+
+        return $logs;
+    }
+
+    private function sanitizeLogs(array $logs): array
+    {
+        $sanitizedLogs = [];
+        $silencedLogs = [];
+
+        foreach ($logs as $log) {
+            if (!$this-&gt;isSilencedOrDeprecationErrorLog($log)) {
+                $sanitizedLogs[] = $log;
+
+                continue;
+            }
+
+            $message = &#039;_&#039;.$log[&#039;message&#039;];
+            $exception = $log[&#039;context&#039;][&#039;exception&#039;];
+
+            if ($exception instanceof SilencedErrorContext) {
+                if (isset($silencedLogs[$id = spl_object_id($exception)])) {
+                    continue;
+                }
+                $silencedLogs[$id] = true;
+
+                if (!isset($sanitizedLogs[$message])) {
+                    $sanitizedLogs[$message] = $log + [
+                        &#039;errorCount&#039; =&gt; 0,
+                        &#039;scream&#039; =&gt; true,
+                    ];
+                }
+                $sanitizedLogs[$message][&#039;errorCount&#039;] += $exception-&gt;count;
+
+                continue;
+            }
+
+            $errorId = hash(&#039;xxh128&#039;, &quot;{$exception-&gt;getSeverity()}/{$exception-&gt;getLine()}/{$exception-&gt;getFile()}\0{$message}&quot;, true);
+
+            if (isset($sanitizedLogs[$errorId])) {
+                ++$sanitizedLogs[$errorId][&#039;errorCount&#039;];
+            } else {
+                $log += [
+                    &#039;errorCount&#039; =&gt; 1,
+                    &#039;scream&#039; =&gt; false,
+                ];
+
+                $sanitizedLogs[$errorId] = $log;
+            }
+        }
+
+        return array_values($sanitizedLogs);
+    }
+
+    private function isSilencedOrDeprecationErrorLog(array $log): bool
+    {
+        if (!isset($log[&#039;context&#039;][&#039;exception&#039;])) {
+            return false;
+        }
+
+        $exception = $log[&#039;context&#039;][&#039;exception&#039;];
+
+        if ($exception instanceof SilencedErrorContext) {
+            return true;
+        }
+
+        if ($exception instanceof \ErrorException &amp;&amp; \in_array($exception-&gt;getSeverity(), [\E_DEPRECATED, \E_USER_DEPRECATED], true)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function computeErrorsCount(array $containerDeprecationLogs): array
+    {
+        $silencedLogs = [];
+        $count = [
+            &#039;error_count&#039; =&gt; $this-&gt;logger-&gt;countErrors($this-&gt;currentRequest),
+            &#039;deprecation_count&#039; =&gt; 0,
+            &#039;warning_count&#039; =&gt; 0,
+            &#039;scream_count&#039; =&gt; 0,
+            &#039;priorities&#039; =&gt; [],
+        ];
+
+        foreach ($this-&gt;logger-&gt;getLogs($this-&gt;currentRequest) as $log) {
+            if (isset($count[&#039;priorities&#039;][$log[&#039;priority&#039;]])) {
+                ++$count[&#039;priorities&#039;][$log[&#039;priority&#039;]][&#039;count&#039;];
+            } else {
+                $count[&#039;priorities&#039;][$log[&#039;priority&#039;]] = [
+                    &#039;count&#039; =&gt; 1,
+                    &#039;name&#039; =&gt; $log[&#039;priorityName&#039;],
+                ];
+            }
+            if (&#039;WARNING&#039; === $log[&#039;priorityName&#039;]) {
+                ++$count[&#039;warning_count&#039;];
+            }
+
+            if ($this-&gt;isSilencedOrDeprecationErrorLog($log)) {
+                $exception = $log[&#039;context&#039;][&#039;exception&#039;];
+                if ($exception instanceof SilencedErrorContext) {
+                    if (isset($silencedLogs[$id = spl_object_id($exception)])) {
+                        continue;
+                    }
+                    $silencedLogs[$id] = true;
+                    $count[&#039;scream_count&#039;] += $exception-&gt;count;
+                } else {
+                    ++$count[&#039;deprecation_count&#039;];
+                }
+            }
+        }
+
+        foreach ($containerDeprecationLogs as $deprecationLog) {
+            $count[&#039;deprecation_count&#039;] += $deprecationLog[&#039;context&#039;][&#039;exception&#039;]-&gt;count;
+        }
+
+        ksort($count[&#039;priorities&#039;]);
+
+        return $count;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-kernel/DataCollector/MemoryDataCollector.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-kernel/Debug -->
+
+</body>
+</html>

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/Post/Update/SingleStepForm.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services\Post\Update;
+
+use App\Http\Requests\Front\PostRequest;
+use App\Http\Resources\PostResource;
+use App\Models\City;
+use App\Models\Post;
+use App\Models\Scopes\ReviewedScope;
+use App\Models\Scopes\VerifiedScope;
+use Throwable;
+
+trait SingleStepForm
+{
+	/**
+	 * @param $postId
+	 * @param \App\Http\Requests\Front\PostRequest $request
+	 * @return \Illuminate\Http\JsonResponse|mixed
+	 */
+	protected function singleStepFormUpdate($postId, PostRequest $request): mixed
+	{
+		$authUser = auth(getAuthGuard())-&gt;user();
+		if (empty($authUser)) {
+			return apiResponse()-&gt;unauthorized();
+		}
+		
+		$countryCode = $request-&gt;input(&#039;country_code&#039;, config(&#039;country.code&#039;));
+		
+		$post = Post::withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+			-&gt;inCountry($countryCode)
+			-&gt;with([&#039;payment&#039;])
+			-&gt;where(&#039;user_id&#039;, $authUser-&gt;getAuthIdentifier())
+			-&gt;where(&#039;id&#039;, $postId)
+			-&gt;first();
+		
+		if (empty($post)) {
+			return apiResponse()-&gt;notFound(trans(&#039;global.post_not_found&#039;));
+		}
+		
+		// Get the Post&#039;s City
+		$city = City::find($request-&gt;input(&#039;city_id&#039;, 0));
+		if (empty($city)) {
+			return apiResponse()-&gt;error(trans(&#039;global.city_not_found&#039;));
+		}
+		
+		// Conditions to Verify User&#039;s Email or Phone
+		$emailVerificationRequired = config(&#039;settings.mail.email_verification&#039;) == &#039;1&#039;
+			&amp;&amp; $request-&gt;filled(&#039;email&#039;)
+			&amp;&amp; $request-&gt;input(&#039;email&#039;) != $post-&gt;email;
+		$phoneVerificationRequired = config(&#039;settings.sms.phone_verification&#039;) == &#039;1&#039;
+			&amp;&amp; $request-&gt;filled(&#039;phone&#039;)
+			&amp;&amp; $request-&gt;input(&#039;phone&#039;) != $post-&gt;phone;
+		
+		// Check if the listing sensitive data have been changed
+		$hasListingDataUpdated = false;
+		if (listingsNeedToBeReviewed()) {
+			$hasListingDataUpdated = (
+				md5($post-&gt;title) != md5($request-&gt;input(&#039;title&#039;))
+				|| md5($post-&gt;description) != md5($request-&gt;input(&#039;description&#039;))
+			);
+		}
+		
+		// Update Post
+		$input = $request-&gt;only($post-&gt;getFillable());
+		foreach ($input as $key =&gt; $value) {
+			$post-&gt;{$key} = $value;
+		}
+		
+		// Revoke the listing approval when its sensitive data have
+		// been changed, allowing the admin user to approve the changes
+		if ($hasListingDataUpdated) {
+			$post-&gt;reviewed_at = null;
+		}
+		
+		// Checkboxes
+		$post-&gt;negotiable = (int)$request-&gt;input(&#039;negotiable&#039;);
+		$post-&gt;phone_hidden = (int)$request-&gt;input(&#039;phone_hidden&#039;);
+		
+		// Other fields
+		$post-&gt;lat = $city-&gt;latitude;
+		$post-&gt;lon = $city-&gt;longitude;
+		
+		// Email verification key generation
+		if ($emailVerificationRequired) {
+			$post-&gt;email_token = generateToken(hashed: true);
+			$post-&gt;email_verified_at = null;
+		}
+		
+		// Phone verification key generation
+		if ($phoneVerificationRequired) {
+			$post-&gt;phone_token = generateOtp(defaultOtpLength());
+			$post-&gt;phone_verified_at = null;
+		}
+		
+		// Save
+		$post-&gt;save();
+		
+		$data = [
+			&#039;success&#039; =&gt; true,
+			&#039;message&#039; =&gt; null,
+			&#039;result&#039;  =&gt; (new PostResource($post))-&gt;toArray($request),
+		];
+		
+		$extra = [];
+		
+		// Save all pictures
+		$extra[&#039;pictures&#039;] = [];
+		try {
+			$extra[&#039;pictures&#039;] = $this-&gt;singleStepPicturesStore($post-&gt;id, $request);
+		} catch (Throwable $e) {
+			$data[&#039;success&#039;] = false;
+			$data[&#039;message&#039;] = $e-&gt;getMessage();
+			
+			return apiResponse()-&gt;json($data);
+		}
+		
+		// Custom Fields
+		$this-&gt;fieldsValuesStore($post, $request);
+		
+		if (!doesRequestIsFromWebClient()) {
+			// ===| Make|send payment (if needed) |==============
+			
+			$payResult = $this-&gt;isPaymentRequested($request, $post);
+			if (data_get($payResult, &#039;success&#039;)) {
+				return $this-&gt;sendPayment($request, $post);
+			}
+			if (data_get($payResult, &#039;failure&#039;)) {
+				return apiResponse()-&gt;error(data_get($payResult, &#039;message&#039;));
+			}
+			
+			// ===| If no payment is made (continue) |===========
+		}
+		
+		$data[&#039;success&#039;] = true;
+		$data[&#039;message&#039;] = trans(&#039;global.your_listing_is_updated&#039;);
+		
+		// Send an Email Verification message
+		if ($emailVerificationRequired) {
+			$extra[&#039;sendEmailVerification&#039;] = $this-&gt;sendEmailVerification(&#039;posts&#039;, $post);
+			if (
+				array_key_exists(&#039;success&#039;, $extra[&#039;sendEmailVerification&#039;])
+				&amp;&amp; array_key_exists(&#039;message&#039;, $extra[&#039;sendEmailVerification&#039;])
+			) {
+				$vMessage = getModelVerificationMessage($post, &#039;email&#039;);
+				$data[&#039;message&#039;] = $data[&#039;message&#039;] . &#039; &#039; . $vMessage;
+				$extra[&#039;mail&#039;][&#039;success&#039;] = $extra[&#039;sendEmailVerification&#039;][&#039;success&#039;];
+				$extra[&#039;mail&#039;][&#039;message&#039;] = $extra[&#039;sendEmailVerification&#039;][&#039;message&#039;];
+			}
+		}
+		
+		// Send a Phone Verification message
+		if ($phoneVerificationRequired) {
+			$extra[&#039;sendPhoneVerification&#039;] = $this-&gt;sendPhoneVerification(&#039;posts&#039;, $post);
+			if (
+				array_key_exists(&#039;success&#039;, $extra[&#039;sendPhoneVerification&#039;])
+				&amp;&amp; array_key_exists(&#039;message&#039;, $extra[&#039;sendPhoneVerification&#039;])
+			) {
+				$vMessage = getModelVerificationMessage($post, &#039;phone&#039;);
+				$data[&#039;message&#039;] = $data[&#039;message&#039;] . &#039; &#039; . $vMessage;
+				$extra[&#039;mail&#039;][&#039;success&#039;] = $extra[&#039;sendPhoneVerification&#039;][&#039;success&#039;];
+				$extra[&#039;mail&#039;][&#039;message&#039;] = $extra[&#039;sendPhoneVerification&#039;][&#039;message&#039;];
+			}
+		}
+		
+		$data[&#039;extra&#039;] = $extra;
+		
+		return apiResponse()-&gt;json($data);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/Post/UpdateTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Section -->
+
+</body>
+</html>

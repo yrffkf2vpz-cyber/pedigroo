@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/zbateson/mail-mime-parser/src/Message/PartStreamContainer.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/**
+ * This file is part of the ZBateson\MailMimeParser project.
+ *
+ * @license http://opensource.org/licenses/bsd-license.php BSD
+ */
+
+namespace ZBateson\MailMimeParser\Message;
+
+use GuzzleHttp\Psr7\CachingStream;
+use Psr\Http\Message\StreamInterface;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
+use ZBateson\MailMimeParser\ErrorBag;
+use ZBateson\MailMimeParser\Stream\MessagePartStreamDecorator;
+use ZBateson\MailMimeParser\Stream\StreamFactory;
+use ZBateson\MbWrapper\MbWrapper;
+use ZBateson\MbWrapper\UnsupportedCharsetException;
+
+/**
+ * Holds the stream and content stream objects for a part.
+ *
+ * Note that streams are not explicitly closed or detached on destruction of the
+ * PartSreamContainer by design: the passed StreamInterfaces will be closed on
+ * their destruction when no references to them remain, which is useful when the
+ * streams are passed around.
+ *
+ * In addition, all the streams passed to PartStreamContainer should be wrapping
+ * a ZBateson\StreamDecorators\NonClosingStream unless attached to a part by a
+ * user, this is because MMP uses a single seekable stream for content and wraps
+ * it in ZBateson\StreamDecorators\SeekingLimitStream objects for each part.
+ *
+ * @author Zaahid Bateson
+ */
+class PartStreamContainer extends ErrorBag
+{
+    /**
+     * @var MbWrapper to test charsets and see if they&#039;re supported.
+     */
+    protected MbWrapper $mbWrapper;
+
+    /**
+     * @var bool if false, reading from a content stream with an unsupported
+     *      charset will be tried with the default charset, otherwise the stream
+     *      created with the unsupported charset, and an exception will be
+     *      thrown when read from.
+     */
+    protected bool $throwExceptionReadingPartContentFromUnsupportedCharsets;
+
+    /**
+     * @var StreamFactory used to apply psr7 stream decorators to the
+     *      attached StreamInterface based on encoding.
+     */
+    protected StreamFactory $streamFactory;
+
+    /**
+     * @var MessagePartStreamDecorator stream containing the part&#039;s headers,
+     *      content and children wrapped in a MessagePartStreamDecorator
+     */
+    protected MessagePartStreamDecorator $stream;
+
+    /**
+     * @var StreamInterface a stream containing this part&#039;s content
+     */
+    protected ?StreamInterface $contentStream = null;
+
+    /**
+     * @var StreamInterface the content stream after attaching transfer encoding
+     *      streams to $contentStream.
+     */
+    protected ?StreamInterface $decodedStream = null;
+
+    /**
+     * @var StreamInterface attached charset stream to $decodedStream
+     */
+    protected ?StreamInterface $charsetStream = null;
+
+    /**
+     * @var bool true if the stream should be detached when this container is
+     *      destroyed.
+     */
+    protected bool $detachParsedStream = false;
+
+    /**
+     * @var array&lt;string, null&gt; map of the active encoding filter on the current handle.
+     */
+    private array $encoding = [
+        &#039;type&#039; =&gt; null,
+        &#039;filter&#039; =&gt; null
+    ];
+
+    /**
+     * @var array&lt;string, null&gt; map of the active charset filter on the current handle.
+     */
+    private array $charset = [
+        &#039;from&#039; =&gt; null,
+        &#039;to&#039; =&gt; null,
+        &#039;filter&#039; =&gt; null
+    ];
+
+    public function __construct(
+        LoggerInterface $logger,
+        StreamFactory $streamFactory,
+        MbWrapper $mbWrapper,
+        bool $throwExceptionReadingPartContentFromUnsupportedCharsets
+    ) {
+        parent::__construct($logger);
+        $this-&gt;streamFactory = $streamFactory;
+        $this-&gt;mbWrapper = $mbWrapper;
+        $this-&gt;throwExceptionReadingPartContentFromUnsupportedCharsets = $throwExceptionReadingPartContentFromUnsupportedCharsets;
+    }
+
+    /**
+     * Sets the part&#039;s stream containing the part&#039;s headers, content, and
+     * children.
+     */
+    public function setStream(MessagePartStreamDecorator $stream) : static
+    {
+        $this-&gt;stream = $stream;
+        return $this;
+    }
+
+    /**
+     * Returns the part&#039;s stream containing the part&#039;s headers, content, and
+     * children.
+     */
+    public function getStream() : MessagePartStreamDecorator
+    {
+        // error out if called before setStream, getStream should never return
+        // null.
+        $this-&gt;stream-&gt;rewind();
+        return $this-&gt;stream;
+    }
+
+    /**
+     * Returns true if there&#039;s a content stream associated with the part.
+     */
+    public function hasContent() : bool
+    {
+        return ($this-&gt;contentStream !== null);
+    }
+
+    /**
+     * Attaches the passed stream as the content portion of this
+     * StreamContainer.
+     *
+     * The content stream would represent the content portion of $this-&gt;stream.
+     *
+     * If the content is overridden, $this-&gt;stream should point to a dynamic
+     * {@see ZBateson\Stream\MessagePartStream} that dynamically creates the
+     * RFC822 formatted message based on the IMessagePart this
+     * PartStreamContainer belongs to.
+     *
+     * setContentStream can be called with &#039;null&#039; to indicate the IMessagePart
+     * does not contain any content.
+     */
+    public function setContentStream(?StreamInterface $contentStream = null) : static
+    {
+        $this-&gt;contentStream = $contentStream;
+        $this-&gt;decodedStream = null;
+        $this-&gt;charsetStream = null;
+        return $this;
+    }
+
+    /**
+     * Returns true if the attached stream filter used for decoding the content
+     * on the current handle is different from the one passed as an argument.
+     */
+    private function isTransferEncodingFilterChanged(?string $transferEncoding) : bool
+    {
+        return ($transferEncoding !== $this-&gt;encoding[&#039;type&#039;]);
+    }
+
+    /**
+     * Returns true if the attached stream filter used for charset conversion on
+     * the current handle is different from the one needed based on the passed
+     * arguments.
+     *
+     */
+    private function isCharsetFilterChanged(string $fromCharset, string $toCharset) : bool
+    {
+        return ($fromCharset !== $this-&gt;charset[&#039;from&#039;]
+            || $toCharset !== $this-&gt;charset[&#039;to&#039;]);
+    }
+
+    /**
+     * Attaches a decoding filter to the attached content handle, for the passed
+     * $transferEncoding.
+     */
+    protected function attachTransferEncodingFilter(?string $transferEncoding) : static
+    {
+        if ($this-&gt;decodedStream !== null) {
+            $this-&gt;encoding[&#039;type&#039;] = $transferEncoding;
+            $this-&gt;decodedStream = new CachingStream($this-&gt;streamFactory-&gt;getTransferEncodingDecoratedStream(
+                $this-&gt;decodedStream,
+                $transferEncoding
+            ));
+        }
+        return $this;
+    }
+
+    /**
+     * Attaches a charset conversion filter to the attached content handle, for
+     * the passed arguments.
+     *
+     * @param string $fromCharset the character set the content is encoded in
+     * @param string $toCharset the target encoding to return
+     */
+    protected function attachCharsetFilter(string $fromCharset, string $toCharset) : static
+    {
+        if ($this-&gt;charsetStream !== null) {
+            if (!$this-&gt;throwExceptionReadingPartContentFromUnsupportedCharsets) {
+                try {
+                    $this-&gt;mbWrapper-&gt;convert(&#039;t&#039;, $fromCharset, $toCharset);
+                    $this-&gt;charsetStream = new CachingStream($this-&gt;streamFactory-&gt;newCharsetStream(
+                        $this-&gt;charsetStream,
+                        $fromCharset,
+                        $toCharset
+                    ));
+                } catch (UnsupportedCharsetException $ex) {
+                    $this-&gt;addError(&#039;Unsupported character set found&#039;, LogLevel::ERROR, $ex);
+                    $this-&gt;charsetStream = new CachingStream($this-&gt;charsetStream);
+                }
+            } else {
+                $this-&gt;charsetStream = new CachingStream($this-&gt;streamFactory-&gt;newCharsetStream(
+                    $this-&gt;charsetStream,
+                    $fromCharset,
+                    $toCharset
+                ));
+            }
+            $this-&gt;charsetStream-&gt;rewind();
+            $this-&gt;charset[&#039;from&#039;] = $fromCharset;
+            $this-&gt;charset[&#039;to&#039;] = $toCharset;
+        }
+        return $this;
+    }
+
+    /**
+     * Resets just the charset stream, and rewinds the decodedStream.
+     */
+    private function resetCharsetStream() : static
+    {
+        $this-&gt;charset = [
+            &#039;from&#039; =&gt; null,
+            &#039;to&#039; =&gt; null,
+            &#039;filter&#039; =&gt; null
+        ];
+        $this-&gt;decodedStream-&gt;rewind();
+        $this-&gt;charsetStream = $this-&gt;decodedStream;
+        return $this;
+    }
+
+    /**
+     * Resets cached encoding and charset streams, and rewinds the stream.
+     */
+    public function reset() : static
+    {
+        $this-&gt;encoding = [
+            &#039;type&#039; =&gt; null,
+            &#039;filter&#039; =&gt; null
+        ];
+        $this-&gt;charset = [
+            &#039;from&#039; =&gt; null,
+            &#039;to&#039; =&gt; null,
+            &#039;filter&#039; =&gt; null
+        ];
+        $this-&gt;contentStream-&gt;rewind();
+        $this-&gt;decodedStream = $this-&gt;contentStream;
+        $this-&gt;charsetStream = $this-&gt;contentStream;
+        return $this;
+    }
+
+    /**
+     * Checks what transfer-encoding decoder stream and charset conversion
+     * stream are currently attached on the underlying contentStream, and resets
+     * them if the requested arguments differ from the currently assigned ones.
+     *
+     * @param IMessagePart $part the part the stream belongs to
+     * @param string $transferEncoding the transfer encoding
+     * @param string $fromCharset the character set the content is encoded in
+     * @param string $toCharset the target encoding to return
+     */
+    public function getContentStream(
+        IMessagePart $part,
+        ?string $transferEncoding,
+        ?string $fromCharset,
+        ?string $toCharset
+    ) : ?MessagePartStreamDecorator {
+        if ($this-&gt;contentStream === null) {
+            return null;
+        }
+        if (empty($fromCharset) || empty($toCharset)) {
+            return $this-&gt;getBinaryContentStream($part, $transferEncoding);
+        }
+        if ($this-&gt;charsetStream === null
+            || $this-&gt;isTransferEncodingFilterChanged($transferEncoding)
+            || $this-&gt;isCharsetFilterChanged($fromCharset, $toCharset)) {
+            if ($this-&gt;charsetStream === null
+                || $this-&gt;isTransferEncodingFilterChanged($transferEncoding)) {
+                $this-&gt;reset();
+                $this-&gt;attachTransferEncodingFilter($transferEncoding);
+            }
+            $this-&gt;resetCharsetStream();
+            $this-&gt;attachCharsetFilter($fromCharset, $toCharset);
+        }
+        $this-&gt;charsetStream-&gt;rewind();
+        return $this-&gt;streamFactory-&gt;newDecoratedMessagePartStream(
+            $part,
+            $this-&gt;charsetStream
+        );
+    }
+
+    /**
+     * Checks what transfer-encoding decoder stream is attached on the
+     * underlying stream, and resets it if the requested arguments differ.
+     */
+    public function getBinaryContentStream(IMessagePart $part, ?string $transferEncoding = null) : ?MessagePartStreamDecorator
+    {
+        if ($this-&gt;contentStream === null) {
+            return null;
+        }
+        if ($this-&gt;decodedStream === null
+            || $this-&gt;isTransferEncodingFilterChanged($transferEncoding)) {
+            $this-&gt;reset();
+            $this-&gt;attachTransferEncodingFilter($transferEncoding);
+        }
+        $this-&gt;decodedStream-&gt;rewind();
+        return $this-&gt;streamFactory-&gt;newDecoratedMessagePartStream($part, $this-&gt;decodedStream);
+    }
+
+    protected function getErrorBagChildren() : array
+    {
+        return [];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/zbateson/mail-mime-parser/src/Message/UUEncodedPart.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/zbateson/mail-mime-parser/src/Message/Factory -->
+
+</body>
+</html>

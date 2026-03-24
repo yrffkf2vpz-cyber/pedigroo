@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/nyholm/psr7/src/Stream.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Nyholm\Psr7;
+
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * @author Michael Dowling and contributors to guzzlehttp/psr7
+ * @author Tobias Nyholm &lt;tobias.nyholm@gmail.com&gt;
+ * @author Martijn van der Ven &lt;martijn@vanderven.se&gt;
+ *
+ * @final This class should never be extended. See https://github.com/Nyholm/psr7/blob/master/doc/final.md
+ */
+class Stream implements StreamInterface
+{
+    use StreamTrait;
+
+    /** @var resource|null A resource reference */
+    private $stream;
+
+    /** @var bool */
+    private $seekable;
+
+    /** @var bool */
+    private $readable;
+
+    /** @var bool */
+    private $writable;
+
+    /** @var array|mixed|void|bool|null */
+    private $uri;
+
+    /** @var int|null */
+    private $size;
+
+    /** @var array Hash of readable and writable stream types */
+    private const READ_WRITE_HASH = [
+        &#039;read&#039; =&gt; [
+            &#039;r&#039; =&gt; true, &#039;w+&#039; =&gt; true, &#039;r+&#039; =&gt; true, &#039;x+&#039; =&gt; true, &#039;c+&#039; =&gt; true,
+            &#039;rb&#039; =&gt; true, &#039;w+b&#039; =&gt; true, &#039;r+b&#039; =&gt; true, &#039;x+b&#039; =&gt; true,
+            &#039;c+b&#039; =&gt; true, &#039;rt&#039; =&gt; true, &#039;w+t&#039; =&gt; true, &#039;r+t&#039; =&gt; true,
+            &#039;x+t&#039; =&gt; true, &#039;c+t&#039; =&gt; true, &#039;a+&#039; =&gt; true,
+        ],
+        &#039;write&#039; =&gt; [
+            &#039;w&#039; =&gt; true, &#039;w+&#039; =&gt; true, &#039;rw&#039; =&gt; true, &#039;r+&#039; =&gt; true, &#039;x+&#039; =&gt; true,
+            &#039;c+&#039; =&gt; true, &#039;wb&#039; =&gt; true, &#039;w+b&#039; =&gt; true, &#039;r+b&#039; =&gt; true,
+            &#039;x+b&#039; =&gt; true, &#039;c+b&#039; =&gt; true, &#039;w+t&#039; =&gt; true, &#039;r+t&#039; =&gt; true,
+            &#039;x+t&#039; =&gt; true, &#039;c+t&#039; =&gt; true, &#039;a&#039; =&gt; true, &#039;a+&#039; =&gt; true,
+        ],
+    ];
+
+    /**
+     * @param resource $body
+     */
+    public function __construct($body)
+    {
+        if (!\is_resource($body)) {
+            throw new \InvalidArgumentException(&#039;First argument to Stream::__construct() must be resource&#039;);
+        }
+
+        $this-&gt;stream = $body;
+        $meta = \stream_get_meta_data($this-&gt;stream);
+        $this-&gt;seekable = $meta[&#039;seekable&#039;] &amp;&amp; 0 === \fseek($this-&gt;stream, 0, \SEEK_CUR);
+        $this-&gt;readable = isset(self::READ_WRITE_HASH[&#039;read&#039;][$meta[&#039;mode&#039;]]);
+        $this-&gt;writable = isset(self::READ_WRITE_HASH[&#039;write&#039;][$meta[&#039;mode&#039;]]);
+    }
+
+    /**
+     * Creates a new PSR-7 stream.
+     *
+     * @param string|resource|StreamInterface $body
+     *
+     * @throws \InvalidArgumentException
+     */
+    public static function create($body = &#039;&#039;): StreamInterface
+    {
+        if ($body instanceof StreamInterface) {
+            return $body;
+        }
+
+        if (\is_string($body)) {
+            if (200000 &lt;= \strlen($body)) {
+                $body = self::openZvalStream($body);
+            } else {
+                $resource = \fopen(&#039;php://memory&#039;, &#039;r+&#039;);
+                \fwrite($resource, $body);
+                \fseek($resource, 0);
+                $body = $resource;
+            }
+        }
+
+        if (!\is_resource($body)) {
+            throw new \InvalidArgumentException(&#039;First argument to Stream::create() must be a string, resource or StreamInterface&#039;);
+        }
+
+        return new self($body);
+    }
+
+    /**
+     * Closes the stream when the destructed.
+     */
+    public function __destruct()
+    {
+        $this-&gt;close();
+    }
+
+    public function close(): void
+    {
+        if (isset($this-&gt;stream)) {
+            if (\is_resource($this-&gt;stream)) {
+                \fclose($this-&gt;stream);
+            }
+            $this-&gt;detach();
+        }
+    }
+
+    public function detach()
+    {
+        if (!isset($this-&gt;stream)) {
+            return null;
+        }
+
+        $result = $this-&gt;stream;
+        unset($this-&gt;stream);
+        $this-&gt;size = $this-&gt;uri = null;
+        $this-&gt;readable = $this-&gt;writable = $this-&gt;seekable = false;
+
+        return $result;
+    }
+
+    private function getUri()
+    {
+        if (false !== $this-&gt;uri) {
+            $this-&gt;uri = $this-&gt;getMetadata(&#039;uri&#039;) ?? false;
+        }
+
+        return $this-&gt;uri;
+    }
+
+    public function getSize(): ?int
+    {
+        if (null !== $this-&gt;size) {
+            return $this-&gt;size;
+        }
+
+        if (!isset($this-&gt;stream)) {
+            return null;
+        }
+
+        // Clear the stat cache if the stream has a URI
+        if ($uri = $this-&gt;getUri()) {
+            \clearstatcache(true, $uri);
+        }
+
+        $stats = \fstat($this-&gt;stream);
+        if (isset($stats[&#039;size&#039;])) {
+            $this-&gt;size = $stats[&#039;size&#039;];
+
+            return $this-&gt;size;
+        }
+
+        return null;
+    }
+
+    public function tell(): int
+    {
+        if (!isset($this-&gt;stream)) {
+            throw new \RuntimeException(&#039;Stream is detached&#039;);
+        }
+
+        if (false === $result = @\ftell($this-&gt;stream)) {
+            throw new \RuntimeException(&#039;Unable to determine stream position: &#039; . (\error_get_last()[&#039;message&#039;] ?? &#039;&#039;));
+        }
+
+        return $result;
+    }
+
+    public function eof(): bool
+    {
+        return !isset($this-&gt;stream) || \feof($this-&gt;stream);
+    }
+
+    public function isSeekable(): bool
+    {
+        return $this-&gt;seekable;
+    }
+
+    public function seek($offset, $whence = \SEEK_SET): void
+    {
+        if (!isset($this-&gt;stream)) {
+            throw new \RuntimeException(&#039;Stream is detached&#039;);
+        }
+
+        if (!$this-&gt;seekable) {
+            throw new \RuntimeException(&#039;Stream is not seekable&#039;);
+        }
+
+        if (-1 === \fseek($this-&gt;stream, $offset, $whence)) {
+            throw new \RuntimeException(&#039;Unable to seek to stream position &quot;&#039; . $offset . &#039;&quot; with whence &#039; . \var_export($whence, true));
+        }
+    }
+
+    public function rewind(): void
+    {
+        $this-&gt;seek(0);
+    }
+
+    public function isWritable(): bool
+    {
+        return $this-&gt;writable;
+    }
+
+    public function write($string): int
+    {
+        if (!isset($this-&gt;stream)) {
+            throw new \RuntimeException(&#039;Stream is detached&#039;);
+        }
+
+        if (!$this-&gt;writable) {
+            throw new \RuntimeException(&#039;Cannot write to a non-writable stream&#039;);
+        }
+
+        // We can&#039;t know the size after writing anything
+        $this-&gt;size = null;
+
+        if (false === $result = @\fwrite($this-&gt;stream, $string)) {
+            throw new \RuntimeException(&#039;Unable to write to stream: &#039; . (\error_get_last()[&#039;message&#039;] ?? &#039;&#039;));
+        }
+
+        return $result;
+    }
+
+    public function isReadable(): bool
+    {
+        return $this-&gt;readable;
+    }
+
+    public function read($length): string
+    {
+        if (!isset($this-&gt;stream)) {
+            throw new \RuntimeException(&#039;Stream is detached&#039;);
+        }
+
+        if (!$this-&gt;readable) {
+            throw new \RuntimeException(&#039;Cannot read from non-readable stream&#039;);
+        }
+
+        if (false === $result = @\fread($this-&gt;stream, $length)) {
+            throw new \RuntimeException(&#039;Unable to read from stream: &#039; . (\error_get_last()[&#039;message&#039;] ?? &#039;&#039;));
+        }
+
+        return $result;
+    }
+
+    public function getContents(): string
+    {
+        if (!isset($this-&gt;stream)) {
+            throw new \RuntimeException(&#039;Stream is detached&#039;);
+        }
+
+        $exception = null;
+
+        \set_error_handler(static function ($type, $message) use (&amp;$exception) {
+            throw $exception = new \RuntimeException(&#039;Unable to read stream contents: &#039; . $message);
+        });
+
+        try {
+            return \stream_get_contents($this-&gt;stream);
+        } catch (\Throwable $e) {
+            throw $e === $exception ? $e : new \RuntimeException(&#039;Unable to read stream contents: &#039; . $e-&gt;getMessage(), 0, $e);
+        } finally {
+            \restore_error_handler();
+        }
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getMetadata($key = null)
+    {
+        if (null !== $key &amp;&amp; !\is_string($key)) {
+            throw new \InvalidArgumentException(&#039;Metadata key must be a string&#039;);
+        }
+
+        if (!isset($this-&gt;stream)) {
+            return $key ? null : [];
+        }
+
+        $meta = \stream_get_meta_data($this-&gt;stream);
+
+        if (null === $key) {
+            return $meta;
+        }
+
+        return $meta[$key] ?? null;
+    }
+
+    private static function openZvalStream(string $body)
+    {
+        static $wrapper;
+
+        $wrapper ?? \stream_wrapper_register(&#039;Nyholm-Psr7-Zval&#039;, $wrapper = \get_class(new class() {
+            public $context;
+
+            private $data;
+            private $position = 0;
+
+            public function stream_open(): bool
+            {
+                $this-&gt;data = \stream_context_get_options($this-&gt;context)[&#039;Nyholm-Psr7-Zval&#039;][&#039;data&#039;];
+                \stream_context_set_option($this-&gt;context, &#039;Nyholm-Psr7-Zval&#039;, &#039;data&#039;, null);
+
+                return true;
+            }
+
+            public function stream_read(int $count): string
+            {
+                $result = \substr($this-&gt;data, $this-&gt;position, $count);
+                $this-&gt;position += \strlen($result);
+
+                return $result;
+            }
+
+            public function stream_write(string $data): int
+            {
+                $this-&gt;data = \substr_replace($this-&gt;data, $data, $this-&gt;position, \strlen($data));
+                $this-&gt;position += \strlen($data);
+
+                return \strlen($data);
+            }
+
+            public function stream_tell(): int
+            {
+                return $this-&gt;position;
+            }
+
+            public function stream_eof(): bool
+            {
+                return \strlen($this-&gt;data) &lt;= $this-&gt;position;
+            }
+
+            public function stream_stat(): array
+            {
+                return [
+                    &#039;mode&#039; =&gt; 33206, // POSIX_S_IFREG | 0666
+                    &#039;nlink&#039; =&gt; 1,
+                    &#039;rdev&#039; =&gt; -1,
+                    &#039;size&#039; =&gt; \strlen($this-&gt;data),
+                    &#039;blksize&#039; =&gt; -1,
+                    &#039;blocks&#039; =&gt; -1,
+                ];
+            }
+
+            public function stream_seek(int $offset, int $whence): bool
+            {
+                if (\SEEK_SET === $whence &amp;&amp; (0 &lt;= $offset &amp;&amp; \strlen($this-&gt;data) &gt;= $offset)) {
+                    $this-&gt;position = $offset;
+                } elseif (\SEEK_CUR === $whence &amp;&amp; 0 &lt;= $offset) {
+                    $this-&gt;position += $offset;
+                } elseif (\SEEK_END === $whence &amp;&amp; (0 &gt; $offset &amp;&amp; 0 &lt;= $offset = \strlen($this-&gt;data) + $offset)) {
+                    $this-&gt;position = $offset;
+                } else {
+                    return false;
+                }
+
+                return true;
+            }
+
+            public function stream_set_option(): bool
+            {
+                return true;
+            }
+
+            public function stream_truncate(int $new_size): bool
+            {
+                if ($new_size) {
+                    $this-&gt;data = \substr($this-&gt;data, 0, $new_size);
+                    $this-&gt;position = \min($this-&gt;position, $new_size);
+                } else {
+                    $this-&gt;data = &#039;&#039;;
+                    $this-&gt;position = 0;
+                }
+
+                return true;
+            }
+        }));
+
+        $context = \stream_context_create([&#039;Nyholm-Psr7-Zval&#039; =&gt; [&#039;data&#039; =&gt; $body]]);
+
+        if (!$stream = @\fopen(&#039;Nyholm-Psr7-Zval://&#039;, &#039;r+&#039;, false, $context)) {
+            \stream_wrapper_register(&#039;Nyholm-Psr7-Zval&#039;, $wrapper);
+            $stream = \fopen(&#039;Nyholm-Psr7-Zval://&#039;, &#039;r+&#039;, false, $context);
+        }
+
+        return $stream;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/nyholm/psr7/src/StreamTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/nyholm/psr7/src/Factory -->
+
+</body>
+</html>

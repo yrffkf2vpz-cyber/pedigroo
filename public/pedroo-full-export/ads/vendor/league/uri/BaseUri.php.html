@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/uri/BaseUri.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * League.Uri (https://uri.thephpleague.com)
+ *
+ * (c) Ignace Nyamagana Butera &lt;nyamsprod@gmail.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+declare(strict_types=1);
+
+namespace League\Uri;
+
+use Deprecated;
+use JsonSerializable;
+use League\Uri\Contracts\UriAccess;
+use League\Uri\Contracts\UriInterface;
+use League\Uri\Exceptions\MissingFeature;
+use League\Uri\Idna\Converter as IdnaConverter;
+use League\Uri\IPv4\Converter as IPv4Converter;
+use League\Uri\IPv6\Converter as IPv6Converter;
+use Psr\Http\Message\UriFactoryInterface;
+use Psr\Http\Message\UriInterface as Psr7UriInterface;
+use Stringable;
+
+use function array_pop;
+use function array_reduce;
+use function count;
+use function explode;
+use function implode;
+use function in_array;
+use function preg_match;
+use function rawurldecode;
+use function sort;
+use function str_contains;
+use function str_repeat;
+use function str_replace;
+use function strpos;
+use function substr;
+
+/**
+ * @phpstan-import-type ComponentMap from UriInterface
+ * @deprecated since version 7.6.0
+ *
+ * @see Modifier
+ * @see Uri
+ */
+class BaseUri implements Stringable, JsonSerializable, UriAccess
+{
+    /** @var array&lt;string,int&gt; */
+    final protected const WHATWG_SPECIAL_SCHEMES = [&#039;ftp&#039; =&gt; 1, &#039;http&#039; =&gt; 1, &#039;https&#039; =&gt; 1, &#039;ws&#039; =&gt; 1, &#039;wss&#039; =&gt; 1];
+
+    /** @var array&lt;string,int&gt; */
+    final protected const DOT_SEGMENTS = [&#039;.&#039; =&gt; 1, &#039;..&#039; =&gt; 1];
+
+    protected readonly Psr7UriInterface|UriInterface|null $origin;
+    protected readonly ?string $nullValue;
+
+    /**
+     * @param UriFactoryInterface|null $uriFactory Deprecated, will be removed in the next major release
+     */
+    final protected function __construct(
+        protected readonly Psr7UriInterface|UriInterface $uri,
+        protected readonly ?UriFactoryInterface $uriFactory
+    ) {
+        $this-&gt;nullValue = $this-&gt;uri instanceof Psr7UriInterface ? &#039;&#039; : null;
+        $this-&gt;origin = $this-&gt;computeOrigin($this-&gt;uri, $this-&gt;nullValue);
+    }
+
+    public static function from(Stringable|string $uri, ?UriFactoryInterface $uriFactory = null): static
+    {
+        $uri = static::formatHost(static::filterUri($uri, $uriFactory));
+        return new static($uri, $uriFactory);
+    }
+
+    public function withUriFactory(UriFactoryInterface $uriFactory): static
+    {
+        return new static($this-&gt;uri, $uriFactory);
+    }
+
+    public function withoutUriFactory(): static
+    {
+        return new static($this-&gt;uri, null);
+    }
+
+    public function getUri(): Psr7UriInterface|UriInterface
+    {
+        return $this-&gt;uri;
+    }
+
+    public function getUriString(): string
+    {
+        return $this-&gt;uri-&gt;__toString();
+    }
+
+    public function jsonSerialize(): string
+    {
+        return $this-&gt;uri-&gt;__toString();
+    }
+
+    public function __toString(): string
+    {
+        return $this-&gt;uri-&gt;__toString();
+    }
+
+    public function origin(): ?self
+    {
+        return match (null) {
+            $this-&gt;origin =&gt; null,
+            default =&gt; new self($this-&gt;origin, $this-&gt;uriFactory),
+        };
+    }
+
+    /**
+     * Returns the Unix filesystem path.
+     *
+     * The method will return null if a scheme is present and is not the `file` scheme
+     */
+    public function unixPath(): ?string
+    {
+        return match ($this-&gt;uri-&gt;getScheme()) {
+            &#039;file&#039;, $this-&gt;nullValue =&gt; rawurldecode($this-&gt;uri-&gt;getPath()),
+            default =&gt; null,
+        };
+    }
+
+    /**
+     * Returns the Windows filesystem path.
+     *
+     * The method will return null if a scheme is present and is not the `file` scheme
+     */
+    public function windowsPath(): ?string
+    {
+        static $regexpWindowsPath = &#039;,^(?&lt;root&gt;[a-zA-Z]:),&#039;;
+
+        if (!in_array($this-&gt;uri-&gt;getScheme(), [&#039;file&#039;, $this-&gt;nullValue], true)) {
+            return null;
+        }
+
+        $originalPath = $this-&gt;uri-&gt;getPath();
+        $path = $originalPath;
+        if (&#039;/&#039; === ($path[0] ?? &#039;&#039;)) {
+            $path = substr($path, 1);
+        }
+
+        if (1 === preg_match($regexpWindowsPath, $path, $matches)) {
+            $root = $matches[&#039;root&#039;];
+            $path = substr($path, strlen($root));
+
+            return $root.str_replace(&#039;/&#039;, &#039;\\&#039;, rawurldecode($path));
+        }
+
+        $host = $this-&gt;uri-&gt;getHost();
+
+        return match ($this-&gt;nullValue) {
+            $host =&gt; str_replace(&#039;/&#039;, &#039;\\&#039;, rawurldecode($originalPath)),
+            default =&gt; &#039;\\\\&#039;.$host.&#039;\\&#039;.str_replace(&#039;/&#039;, &#039;\\&#039;, rawurldecode($path)),
+        };
+    }
+
+    /**
+     * Returns a string representation of a File URI according to RFC8089.
+     *
+     * The method will return null if the URI scheme is not the `file` scheme
+     */
+    public function toRfc8089(): ?string
+    {
+        $path = $this-&gt;uri-&gt;getPath();
+
+        return match (true) {
+            &#039;file&#039; !== $this-&gt;uri-&gt;getScheme() =&gt; null,
+            in_array($this-&gt;uri-&gt;getAuthority(), [&#039;&#039;, null, &#039;localhost&#039;], true) =&gt; &#039;file:&#039;.match (true) {
+                &#039;&#039; === $path,
+                &#039;/&#039; === $path[0] =&gt; $path,
+                default =&gt; &#039;/&#039;.$path,
+            },
+            default =&gt; (string) $this-&gt;uri,
+        };
+    }
+
+    /**
+     * Tells whether the `file` scheme base URI represents a local file.
+     */
+    public function isLocalFile(): bool
+    {
+        return match (true) {
+            &#039;file&#039; !== $this-&gt;uri-&gt;getScheme() =&gt; false,
+            in_array($this-&gt;uri-&gt;getAuthority(), [&#039;&#039;, null, &#039;localhost&#039;], true) =&gt; true,
+            default =&gt; false,
+        };
+    }
+
+    /**
+     * Tells whether the URI is opaque or not.
+     *
+     * A URI is opaque if and only if it is absolute
+     * and does not have an authority path.
+     */
+    public function isOpaque(): bool
+    {
+        return $this-&gt;nullValue === $this-&gt;uri-&gt;getAuthority()
+            &amp;&amp; $this-&gt;isAbsolute();
+    }
+
+    /**
+     * Tells whether two URI do not share the same origin.
+     */
+    public function isCrossOrigin(Stringable|string $uri): bool
+    {
+        if (null === $this-&gt;origin) {
+            return true;
+        }
+
+        $uri = static::filterUri($uri);
+        $uriOrigin = $this-&gt;computeOrigin($uri, $uri instanceof Psr7UriInterface ? &#039;&#039; : null);
+
+        return match(true) {
+            null === $uriOrigin,
+            $uriOrigin-&gt;__toString() !== $this-&gt;origin-&gt;__toString() =&gt; true,
+            default =&gt; false,
+        };
+    }
+
+    /**
+     * Tells whether the URI is absolute.
+     */
+    public function isAbsolute(): bool
+    {
+        return $this-&gt;nullValue !== $this-&gt;uri-&gt;getScheme();
+    }
+
+    /**
+     * Tells whether the URI is a network path.
+     */
+    public function isNetworkPath(): bool
+    {
+        return $this-&gt;nullValue === $this-&gt;uri-&gt;getScheme()
+            &amp;&amp; $this-&gt;nullValue !== $this-&gt;uri-&gt;getAuthority();
+    }
+
+    /**
+     * Tells whether the URI is an absolute path.
+     */
+    public function isAbsolutePath(): bool
+    {
+        return $this-&gt;nullValue === $this-&gt;uri-&gt;getScheme()
+            &amp;&amp; $this-&gt;nullValue === $this-&gt;uri-&gt;getAuthority()
+            &amp;&amp; &#039;/&#039; === ($this-&gt;uri-&gt;getPath()[0] ?? &#039;&#039;);
+    }
+
+    /**
+     * Tells whether the URI is a relative path.
+     */
+    public function isRelativePath(): bool
+    {
+        return $this-&gt;nullValue === $this-&gt;uri-&gt;getScheme()
+            &amp;&amp; $this-&gt;nullValue === $this-&gt;uri-&gt;getAuthority()
+            &amp;&amp; &#039;/&#039; !== ($this-&gt;uri-&gt;getPath()[0] ?? &#039;&#039;);
+    }
+
+    /**
+     * Tells whether both URI refers to the same document.
+     */
+    public function isSameDocument(Stringable|string $uri): bool
+    {
+        return self::normalizedUri($this-&gt;uri)-&gt;equals(self::normalizedUri($uri));
+    }
+
+    private static function normalizedUri(Stringable|string $uri): Uri
+    {
+        // Normalize the URI according to RFC3986
+        $uri = ($uri instanceof Uri ? $uri : Uri::new($uri))-&gt;normalize();
+
+        return $uri
+            //Normalization as per WHATWG URL standard
+            //only meaningful for WHATWG Special URI scheme protocol
+            -&gt;when(
+                condition: &#039;&#039; === $uri-&gt;getPath() &amp;&amp; null !== $uri-&gt;getAuthority(),
+                onSuccess: fn (Uri $uri) =&gt; $uri-&gt;withPath(&#039;/&#039;),
+            )
+            //Sorting as per WHATWG URLSearchParams class
+            //not included on any equivalence algorithm
+            -&gt;when(
+                condition: null !== ($query = $uri-&gt;getQuery()) &amp;&amp; str_contains($query, &#039;&amp;&#039;),
+                onSuccess: function (Uri $uri) use ($query) {
+                    $pairs = explode(&#039;&amp;&#039;, (string) $query);
+                    sort($pairs);
+
+                    return $uri-&gt;withQuery(implode(&#039;&amp;&#039;, $pairs));
+                }
+            );
+    }
+
+    /**
+     * Tells whether the URI contains an Internationalized Domain Name (IDN).
+     */
+    public function hasIdn(): bool
+    {
+        return IdnaConverter::isIdn($this-&gt;uri-&gt;getHost());
+    }
+
+    /**
+     * Tells whether the URI contains an IPv4 regardless if it is mapped or native.
+     */
+    public function hasIPv4(): bool
+    {
+        return IPv4Converter::fromEnvironment()-&gt;isIpv4($this-&gt;uri-&gt;getHost());
+    }
+
+    /**
+     * Resolves a URI against a base URI using RFC3986 rules.
+     *
+     * This method MUST retain the state of the submitted URI instance, and return
+     * a URI instance of the same type that contains the applied modifications.
+     *
+     * This method MUST be transparent when dealing with error and exceptions.
+     * It MUST not alter or silence them apart from validating its own parameters.
+     */
+    public function resolve(Stringable|string $uri): static
+    {
+        $resolved = UriString::resolve($uri, $this-&gt;uri);
+
+        return new static(match ($this-&gt;uriFactory) {
+            null =&gt; Uri::new($resolved),
+            default =&gt; $this-&gt;uriFactory-&gt;createUri($resolved),
+        }, $this-&gt;uriFactory);
+    }
+
+    /**
+     * Relativize a URI according to a base URI.
+     *
+     * This method MUST retain the state of the submitted URI instance, and return
+     * a URI instance of the same type that contains the applied modifications.
+     *
+     * This method MUST be transparent when dealing with error and exceptions.
+     * It MUST not alter of silence them apart from validating its own parameters.
+     */
+    public function relativize(Stringable|string $uri): static
+    {
+        $uri = static::formatHost(static::filterUri($uri, $this-&gt;uriFactory));
+        if ($this-&gt;canNotBeRelativize($uri)) {
+            return new static($uri, $this-&gt;uriFactory);
+        }
+
+        $null = $uri instanceof Psr7UriInterface ? &#039;&#039; : null;
+        $uri = $uri-&gt;withScheme($null)-&gt;withPort(null)-&gt;withUserInfo($null)-&gt;withHost($null);
+        $targetPath = $uri-&gt;getPath();
+        $basePath = $this-&gt;uri-&gt;getPath();
+
+        return new static(
+            match (true) {
+                $targetPath !== $basePath =&gt; $uri-&gt;withPath(static::relativizePath($targetPath, $basePath)),
+                static::componentEquals(&#039;query&#039;, $uri) =&gt; $uri-&gt;withPath(&#039;&#039;)-&gt;withQuery($null),
+                $null === $uri-&gt;getQuery() =&gt; $uri-&gt;withPath(static::formatPathWithEmptyBaseQuery($targetPath)),
+                default =&gt; $uri-&gt;withPath(&#039;&#039;),
+            },
+            $this-&gt;uriFactory
+        );
+    }
+
+    final protected function computeOrigin(Psr7UriInterface|UriInterface $uri, ?string $nullValue): Psr7UriInterface|UriInterface|null
+    {
+        if ($uri instanceof Uri) {
+            $origin = $uri-&gt;getOrigin();
+            if (null === $origin) {
+                return null;
+            }
+
+            return Uri::tryNew($origin);
+        }
+
+        $origin = Uri::tryNew($uri)?-&gt;getOrigin();
+        if (null === $origin) {
+            return null;
+        }
+
+        $components = UriString::parse($origin);
+
+        return $uri
+                -&gt;withFragment($nullValue)
+                -&gt;withQuery($nullValue)
+                -&gt;withPath(&#039;&#039;)
+                -&gt;withScheme(&#039;localhost&#039;)
+                -&gt;withHost((string) $components[&#039;host&#039;])
+                -&gt;withPort($components[&#039;port&#039;])
+                -&gt;withScheme((string) $components[&#039;scheme&#039;])
+                -&gt;withUserInfo($nullValue);
+    }
+
+    /**
+     * Input URI normalization to allow Stringable and string URI.
+     */
+    final protected static function filterUri(Stringable|string $uri, UriFactoryInterface|null $uriFactory = null): Psr7UriInterface|UriInterface
+    {
+        return match (true) {
+            $uri instanceof UriAccess =&gt; $uri-&gt;getUri(),
+            $uri instanceof Psr7UriInterface,
+            $uri instanceof UriInterface =&gt; $uri,
+            $uriFactory instanceof UriFactoryInterface =&gt; $uriFactory-&gt;createUri((string) $uri),
+            default =&gt; Uri::new($uri),
+        };
+    }
+
+    /**
+     * Tells whether the component value from both URI object equals.
+     *
+     * @pqram &#039;query&#039;|&#039;authority&#039;|&#039;scheme&#039; $property
+     */
+    final protected function componentEquals(string $property, Psr7UriInterface|UriInterface $uri): bool
+    {
+        $getComponent = function (string $property, Psr7UriInterface|UriInterface $uri): ?string {
+            $component = match ($property) {
+                &#039;query&#039; =&gt; $uri-&gt;getQuery(),
+                &#039;authority&#039; =&gt; $uri-&gt;getAuthority(),
+                default =&gt; $uri-&gt;getScheme(),
+            };
+
+            return match (true) {
+                $uri instanceof UriInterface, &#039;&#039; !== $component =&gt; $component,
+                default =&gt; null,
+            };
+        };
+
+        return $getComponent($property, $uri) === $getComponent($property, $this-&gt;uri);
+    }
+
+    /**
+     * Filter the URI object.
+     */
+    final protected static function formatHost(Psr7UriInterface|UriInterface $uri): Psr7UriInterface|UriInterface
+    {
+        $host = $uri-&gt;getHost();
+        try {
+            $converted = IPv4Converter::fromEnvironment()-&gt;toDecimal($host);
+        } catch (MissingFeature) {
+            $converted = null;
+        }
+
+        if (false === filter_var($converted, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            $converted = IPv6Converter::compress($host);
+        }
+
+        return match (true) {
+            null !== $converted =&gt; $uri-&gt;withHost($converted),
+            &#039;&#039; === $host,
+            $uri instanceof UriInterface =&gt; $uri,
+            default =&gt; $uri-&gt;withHost((string) Uri::fromComponents([&#039;host&#039; =&gt; $host])-&gt;getHost()),
+        };
+    }
+
+    /**
+     * Tells whether the submitted URI object can be relativized.
+     */
+    final protected function canNotBeRelativize(Psr7UriInterface|UriInterface $uri): bool
+    {
+        return !static::componentEquals(&#039;scheme&#039;, $uri)
+            || !static::componentEquals(&#039;authority&#039;, $uri)
+            || static::from($uri)-&gt;isRelativePath();
+    }
+
+    /**
+     * Relatives the URI for an authority-less target URI.
+     */
+    final protected static function relativizePath(string $path, string $basePath): string
+    {
+        $baseSegments = static::getSegments($basePath);
+        $targetSegments = static::getSegments($path);
+        $targetBasename = array_pop($targetSegments);
+        array_pop($baseSegments);
+        foreach ($baseSegments as $offset =&gt; $segment) {
+            if (!isset($targetSegments[$offset]) || $segment !== $targetSegments[$offset]) {
+                break;
+            }
+            unset($baseSegments[$offset], $targetSegments[$offset]);
+        }
+        $targetSegments[] = $targetBasename;
+
+        return static::formatPath(
+            str_repeat(&#039;../&#039;, count($baseSegments)).implode(&#039;/&#039;, $targetSegments),
+            $basePath
+        );
+    }
+
+    /**
+     * returns the path segments.
+     *
+     * @return string[]
+     */
+    final protected static function getSegments(string $path): array
+    {
+        return explode(&#039;/&#039;, match (true) {
+            &#039;&#039; === $path,
+            &#039;/&#039; !== $path[0] =&gt; $path,
+            default =&gt; substr($path, 1),
+        });
+    }
+
+    /**
+     * Formatting the path to keep a valid URI.
+     */
+    final protected static function formatPath(string $path, string $basePath): string
+    {
+        $colonPosition = strpos($path, &#039;:&#039;);
+        $slashPosition = strpos($path, &#039;/&#039;);
+
+        return match (true) {
+            &#039;&#039; === $path =&gt; match (true) {
+                &#039;&#039; === $basePath,
+                &#039;/&#039; === $basePath =&gt; $basePath,
+                default =&gt; &#039;./&#039;,
+            },
+            false === $colonPosition =&gt; $path,
+            false === $slashPosition,
+            $colonPosition &lt; $slashPosition  =&gt;  &quot;./$path&quot;,
+            default =&gt; $path,
+        };
+    }
+
+    /**
+     * Formatting the path to keep a resolvable URI.
+     */
+    final protected static function formatPathWithEmptyBaseQuery(string $path): string
+    {
+        $targetSegments = static::getSegments($path);
+        $basename = $targetSegments[array_key_last($targetSegments)];
+
+        return &#039;&#039; === $basename ? &#039;./&#039; : $basename;
+    }
+
+    /**
+     * Normalizes a URI for comparison; this URI string representation is not suitable for usage as per RFC guidelines.
+     *
+     * @deprecated since version 7.6.0
+     *
+     * @codeCoverageIgnore
+     */
+    #[Deprecated(message:&#039;no longer used by the isSameDocument method&#039;, since:&#039;league/uri-interfaces:7.6.0&#039;)]
+    final protected function normalize(Psr7UriInterface|UriInterface $uri): string
+    {
+        $newUri = $uri-&gt;withScheme($uri instanceof Psr7UriInterface ? &#039;&#039; : null);
+        if (&#039;&#039; === $newUri-&gt;__toString()) {
+            return &#039;&#039;;
+        }
+
+        return UriString::normalize($newUri);
+    }
+
+
+    /**
+     * Remove dot segments from the URI path as per RFC specification.
+     *
+     * @deprecated since version 7.6.0
+     *
+     * @codeCoverageIgnore
+     */
+    #[Deprecated(message:&#039;no longer used by the isSameDocument method&#039;, since:&#039;league/uri-interfaces:7.6.0&#039;)]
+    final protected function removeDotSegments(string $path): string
+    {
+        if (!str_contains($path, &#039;.&#039;)) {
+            return $path;
+        }
+
+        $reducer = function (array $carry, string $segment): array {
+            if (&#039;..&#039; === $segment) {
+                array_pop($carry);
+
+                return $carry;
+            }
+
+            if (!isset(static::DOT_SEGMENTS[$segment])) {
+                $carry[] = $segment;
+            }
+
+            return $carry;
+        };
+
+        $oldSegments = explode(&#039;/&#039;, $path);
+        $newPath = implode(&#039;/&#039;, array_reduce($oldSegments, $reducer(...), []));
+        if (isset(static::DOT_SEGMENTS[$oldSegments[array_key_last($oldSegments)]])) {
+            $newPath .= &#039;/&#039;;
+        }
+
+        // @codeCoverageIgnoreStart
+        // added because some PSR-7 implementations do not respect RFC3986
+        if (str_starts_with($path, &#039;/&#039;) &amp;&amp; !str_starts_with($newPath, &#039;/&#039;)) {
+            return &#039;/&#039;.$newPath;
+        }
+        // @codeCoverageIgnoreEnd
+
+        return $newPath;
+    }
+
+    /**
+     * Resolves an URI path and query component.
+     *
+     * @return array{0:string, 1:string|null}
+     *
+     * @deprecated since version 7.6.0
+     *
+     * @codeCoverageIgnore
+     */
+    #[Deprecated(message:&#039;no longer used by the isSameDocument method&#039;, since:&#039;league/uri-interfaces:7.6.0&#039;)]
+    final protected function resolvePathAndQuery(Psr7UriInterface|UriInterface $uri): array
+    {
+        $targetPath = $uri-&gt;getPath();
+        $null = $uri instanceof Psr7UriInterface ? &#039;&#039; : null;
+
+        if (str_starts_with($targetPath, &#039;/&#039;)) {
+            return [$targetPath, $uri-&gt;getQuery()];
+        }
+
+        if (&#039;&#039; === $targetPath) {
+            $targetQuery = $uri-&gt;getQuery();
+            if ($null === $targetQuery) {
+                $targetQuery = $this-&gt;uri-&gt;getQuery();
+            }
+
+            $targetPath = $this-&gt;uri-&gt;getPath();
+            //@codeCoverageIgnoreStart
+            //because some PSR-7 Uri implementations allow this RFC3986 forbidden construction
+            if (null !== $this-&gt;uri-&gt;getAuthority() &amp;&amp; !str_starts_with($targetPath, &#039;/&#039;)) {
+                $targetPath = &#039;/&#039;.$targetPath;
+            }
+            //@codeCoverageIgnoreEnd
+
+            return [$targetPath, $targetQuery];
+        }
+
+        $basePath = $this-&gt;uri-&gt;getPath();
+        if (null !== $this-&gt;uri-&gt;getAuthority() &amp;&amp; &#039;&#039; === $basePath) {
+            $targetPath = &#039;/&#039;.$targetPath;
+        }
+
+        if (&#039;&#039; !== $basePath) {
+            $segments = explode(&#039;/&#039;, $basePath);
+            array_pop($segments);
+            if ([] !== $segments) {
+                $targetPath = implode(&#039;/&#039;, $segments).&#039;/&#039;.$targetPath;
+            }
+        }
+
+        return [$targetPath, $uri-&gt;getQuery()];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/uri/Builder.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/uri/UriTemplate -->
+
+</body>
+</html>

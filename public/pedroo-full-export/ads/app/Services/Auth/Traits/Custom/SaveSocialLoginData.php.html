@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/Auth/Traits/Custom/SaveSocialLoginData.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services\Auth\Traits\Custom;
+
+use App\Helpers\Common\Ip;
+use App\Http\Resources\UserResource;
+use App\Models\Blacklist;
+use App\Models\Permission;
+use App\Models\Post;
+use App\Models\Scopes\ReviewedScope;
+use App\Models\Scopes\VerifiedScope;
+use App\Models\User;
+use App\Models\UserSocialLogin;
+use App\Services\Auth\App\Notifications\AccountCreatedWithPassword;
+use App\Services\Auth\App\Notifications\NewUserRegistered;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Notification;
+use Laravel\Socialite\Contracts\User as SocialiteUser;
+use Throwable;
+
+trait SaveSocialLoginData
+{
+	use RecognizedUser;
+	
+	/**
+	 * @param string $provider
+	 * @param SocialiteUser $providerData
+	 * @param string|null $token
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	protected function saveUser(string $provider, SocialiteUser $providerData, ?string $token = null): JsonResponse
+	{
+		// Get the Country Code
+		$countryCode = config(&#039;country.code&#039;, config(&#039;ipCountry.code&#039;));
+		
+		try {
+			$remoteId = $providerData-&gt;getId();
+			$name = $this-&gt;getName($providerData);
+			$email = $providerData-&gt;getEmail();
+			// $avatar = $providerData-&gt;getAvatar();
+			
+			// Check if the user&#039;s email address has been banned
+			$bannedUser = Blacklist::query()-&gt;ofType(&#039;email&#039;)-&gt;where(&#039;entry&#039;, $email)-&gt;first();
+			if (!empty($bannedUser)) {
+				return apiResponse()-&gt;error(trans(&#039;auth.account_suspended_due_to_violation&#039;));
+			}
+			
+			// GET LOCAL USER
+			$socialAccount = UserSocialLogin::query()
+				-&gt;where(&#039;provider&#039;, $provider)
+				-&gt;where(&#039;provider_id&#039;, $remoteId)
+				-&gt;first();
+			
+			// CREATE LOCAL USER IF DON&#039;T EXISTS
+			if (!empty($socialAccount)) {
+				
+				$user = $socialAccount-&gt;user;
+				$this-&gt;saveUserMissingData($user);
+				
+			} else {
+				// Before... Check if user has not signed up with an email
+				$user = User::query()
+					-&gt;withoutGlobalScopes([VerifiedScope::class])
+					-&gt;where(&#039;email&#039;, $email)
+					-&gt;first();
+				
+				if (!empty($user)) {
+					
+					$this-&gt;saveUserMissingData($user);
+					
+				} else {
+					// Generate random password
+					$generatedPassword = registerFromSocialAuthWithPasswordEnabled() ? generateRandomPassword(8) : null;
+					$hashedPassword = !empty($generatedPassword) ? Hash::make($generatedPassword) : null;
+					
+					// Register the User (As New User)
+					$userInfo = [
+						&#039;country_code&#039;      =&gt; $countryCode,
+						&#039;language_code&#039;     =&gt; config(&#039;app.locale&#039;),
+						&#039;name&#039;              =&gt; $name,
+						&#039;auth_field&#039;        =&gt; &#039;email&#039;,
+						&#039;email&#039;             =&gt; $email,
+						&#039;password&#039;          =&gt; $hashedPassword,
+						&#039;create_from_ip&#039;    =&gt; Ip::get(),
+						&#039;email_verified_at&#039; =&gt; now(),
+						&#039;phone_verified_at&#039; =&gt; now(),
+						&#039;accept_terms&#039;      =&gt; 1,
+						&#039;created_at&#039;        =&gt; now()-&gt;format(&#039;Y-m-d H:i:s&#039;),
+					];
+					$user = new User($userInfo);
+					$user-&gt;save();
+					
+					// Match User&#039;s Posts (posted as Guest)
+					$isEmailVerificationEnabled = config(&#039;settings.mail.email_verification&#039;);
+					$isPhoneVerificationEnabled = config(&#039;settings.sms.phone_verification&#039;);
+					config()-&gt;set(&#039;settings.mail.email_verification&#039;, &#039;1&#039;);
+					config()-&gt;set(&#039;settings.sms.phone_verification&#039;, &#039;1&#039;);
+					$this-&gt;matchAuthorPosts($user);
+					config()-&gt;set(&#039;settings.mail.email_verification&#039;, $isEmailVerificationEnabled);
+					config()-&gt;set(&#039;settings.sms.phone_verification&#039;, $isPhoneVerificationEnabled);
+					
+					// Send Generated Password by Email
+					if (!empty($generatedPassword)) {
+						try {
+							$user-&gt;notify(new AccountCreatedWithPassword($user, $generatedPassword));
+						} catch (Throwable $e) {
+						}
+					}
+					
+					// Update Listings created by this email
+					if (isset($user-&gt;id) &amp;&amp; $user-&gt;id &gt; 0) {
+						Post::query()
+							-&gt;withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+							-&gt;where(&#039;email&#039;, $userInfo[&#039;email&#039;])
+							-&gt;update([&#039;user_id&#039; =&gt; $user-&gt;id]);
+					}
+					
+					// Send Admin Notification Email
+					if (config(&#039;settings.mail.admin_notification&#039;) == 1) {
+						try {
+							// Get all admin users
+							$admins = User::permission(Permission::getStaffPermissions())-&gt;get();
+							if ($admins-&gt;count() &gt; 0) {
+								Notification::send($admins, new NewUserRegistered($user));
+							}
+						} catch (Throwable $e) {
+						}
+					}
+				}
+				
+				// Save the user&#039;s social account (As linked account)
+				$socialAccountInfo = [
+					&#039;user_id&#039;     =&gt; $user-&gt;id,
+					&#039;provider&#039;    =&gt; $provider,
+					&#039;provider_id&#039; =&gt; $remoteId,
+					&#039;token&#039;       =&gt; $token,
+					&#039;created_at&#039;  =&gt; now()-&gt;format(&#039;Y-m-d H:i:s&#039;),
+				];
+				$socialAccount = new UserSocialLogin($socialAccountInfo);
+				$socialAccount-&gt;save();
+			}
+			
+			return $this-&gt;loginUserFromApi($user, $provider);
+		} catch (Throwable $e) {
+			$message = $e-&gt;getMessage();
+			if (empty($message)) {
+				$message = $this-&gt;messages[&#039;userNotSavedError&#039;] ?? &#039;&#039;;
+			}
+			
+			return apiResponse()-&gt;error($message);
+		}
+	}
+	
+	/**
+	 * @param \App\Models\User $user
+	 * @param string|null $deviceName
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	private function loginUserFromApi(User $user, ?string $deviceName = null): JsonResponse
+	{
+		if (isApiRoute()) {
+			// Revoke previous tokens
+			$user-&gt;tokens()-&gt;delete();
+		}
+		
+		if (auth()-&gt;loginUsingId($user-&gt;id)) {
+			$extra = [];
+			
+			if (isApiRoute()) {
+				// Create the API access token
+				$defaultDeviceName = doesRequestIsFromWebClient() ? &#039;Website&#039; : &#039;Other Client&#039;;
+				$deviceName = !empty($deviceName) ? ucfirst($deviceName) : $defaultDeviceName;
+				$token = $user-&gt;createToken($deviceName);
+				
+				$extra[&#039;authToken&#039;] = $token-&gt;plainTextToken;
+				$extra[&#039;tokenType&#039;] = &#039;Bearer&#039;;
+			}
+			
+			// For JC
+			// If the user has not yet specified the type of account, redirect him to his user area where he can do so.
+			if (config(&#039;larapen.core.item.id&#039;) == &#039;18776089&#039;) {
+				$extra[&#039;userTypeId&#039;] = $user-&gt;userType?-&gt;id ?? null;
+			}
+			
+			$data = [
+				&#039;success&#039; =&gt; true,
+				&#039;result&#039;  =&gt; new UserResource($user),
+				&#039;extra&#039;   =&gt; $extra,
+			];
+			
+			return apiResponse()-&gt;json($data);
+		} else {
+			return apiResponse()-&gt;error(trans(&#039;auth.issue_to_login_in&#039;));
+		}
+	}
+	
+	/**
+	 * @param \App\Models\User $user
+	 * @return void
+	 */
+	private function saveUserMissingData(User $user): void
+	{
+		$user-&gt;email_verified_at = now();
+		$user-&gt;phone_verified_at = now();
+		
+		if (empty($user-&gt;accept_terms) || $user-&gt;accept_terms !== true) {
+			$user-&gt;accept_terms = 1;
+		}
+		
+		// Required (for time ago displaying)
+		if (empty($user-&gt;created_at)) {
+			$user-&gt;created_at = now()-&gt;format(&#039;Y-m-d H:i:s&#039;);
+		}
+		// Optional
+		if (empty($user-&gt;updated_at)) {
+			$user-&gt;updated_at = now()-&gt;format(&#039;Y-m-d H:i:s&#039;);
+		}
+		
+		$user-&gt;save();
+	}
+	
+	/**
+	 * @param \Laravel\Socialite\Contracts\User $providerData
+	 * @return string|null
+	 */
+	private function getName(SocialiteUser $providerData): ?string
+	{
+		$name = $providerData-&gt;getName();
+		if ($name != &#039;&#039;) {
+			return $name;
+		}
+		
+		// Get the user&#039;s name (First Name &amp; Last Name)
+		$name = (isset($providerData-&gt;name) &amp;&amp; is_string($providerData-&gt;name)) ? $providerData-&gt;name : &#039;&#039;;
+		if ($name == &#039;&#039;) {
+			// facebook
+			if (isset($providerData-&gt;user[&#039;first_name&#039;]) &amp;&amp; isset($providerData-&gt;user[&#039;last_name&#039;])) {
+				$name = $providerData-&gt;user[&#039;first_name&#039;] . &#039; &#039; . $providerData-&gt;user[&#039;last_name&#039;];
+			}
+		}
+		if ($name == &#039;&#039;) {
+			// linkedin
+			$name = (isset($providerData-&gt;user[&#039;formattedName&#039;])) ? $providerData-&gt;user[&#039;formattedName&#039;] : &#039;&#039;;
+			if ($name == &#039;&#039;) {
+				if (isset($providerData-&gt;user[&#039;firstName&#039;]) &amp;&amp; isset($providerData-&gt;user[&#039;lastName&#039;])) {
+					$name = $providerData-&gt;user[&#039;firstName&#039;] . &#039; &#039; . $providerData-&gt;user[&#039;lastName&#039;];
+				}
+			}
+		}
+		
+		return is_string($name) ? $name : &#039;Unnamed User&#039;;
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/Auth/Traits/Custom/TwoFactorCode.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Auth/Traits/Custom/RecognizedUser -->
+
+</body>
+</html>

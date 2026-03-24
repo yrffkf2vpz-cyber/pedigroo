@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/Picture/MultiStepsPictures.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services\Picture;
+
+use App\Helpers\Common\Files\FileSys;
+use App\Helpers\Common\Files\Upload;
+use App\Helpers\Common\JsonUtils;
+use App\Http\Requests\Front\PhotoRequest;
+use App\Http\Resources\PictureResource;
+use App\Http\Resources\PostResource;
+use App\Jobs\GeneratePostImageThumbsJob;
+use App\Models\Picture;
+use App\Models\Post;
+use App\Models\Scopes\ActiveScope;
+use App\Models\Scopes\ReviewedScope;
+use App\Models\Scopes\VerifiedScope;
+use Illuminate\Contracts\Database\Eloquent\Builder;
+use Illuminate\Http\JsonResponse;
+use Throwable;
+
+trait MultiStepsPictures
+{
+	/**
+	 * Store Pictures (from Multi Steps Form)
+	 *
+	 * @param \App\Http\Requests\Front\PhotoRequest $request
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function multiStepsPicturesStore(PhotoRequest $request): JsonResponse
+	{
+		// Get customized request variables
+		$countryCode = $request-&gt;input(&#039;country_code&#039;, config(&#039;country.code&#039;));
+		$countPackages = $request-&gt;integer(&#039;count_packages&#039;);
+		$countPaymentMethods = $request-&gt;integer(&#039;count_payment_methods&#039;);
+		$postId = $request-&gt;input(&#039;post_id&#039;);
+		
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		$post = null;
+		if (!empty($authUser) &amp;&amp; !empty($postId)) {
+			$post = Post::query()
+				-&gt;withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+				-&gt;inCountry($countryCode)
+				-&gt;where(&#039;user_id&#039;, $authUser-&gt;getAuthIdentifier())
+				-&gt;where(&#039;id&#039;, $postId)
+				-&gt;first();
+		}
+		
+		if (empty($post)) {
+			return apiResponse()-&gt;notFound(trans(&#039;global.post_not_found&#039;));
+		}
+		
+		$pictures = Picture::where(&#039;post_id&#039;, $post-&gt;id);
+		
+		// Get default/global pictures limit
+		$defaultPicturesLimit = (int)config(&#039;settings.listing_form.pictures_limit&#039;, 5);
+		if ($post-&gt;featured == 1 &amp;&amp; !empty($post-&gt;payment)) {
+			if (isset($post-&gt;payment-&gt;package) &amp;&amp; !empty($post-&gt;payment-&gt;package)) {
+				if (!empty($post-&gt;payment-&gt;package-&gt;pictures_limit)) {
+					$defaultPicturesLimit = $post-&gt;payment-&gt;package-&gt;pictures_limit;
+				}
+			}
+		}
+		
+		// Get picture limit
+		$countExistingPictures = $pictures-&gt;count();
+		$picturesLimit = $defaultPicturesLimit - $countExistingPictures;
+		
+		if ($picturesLimit &gt; 0) {
+			// Get pictures initial position
+			$latestPosition = $pictures-&gt;orderByDesc(&#039;position&#039;)-&gt;first();
+			$initialPosition = (!empty($latestPosition) &amp;&amp; (int)$latestPosition-&gt;position &gt; 0) ? (int)$latestPosition-&gt;position : 0;
+			$initialPosition = ($countExistingPictures &gt;= $initialPosition) ? $countExistingPictures : $initialPosition;
+			
+			// Get pictures&#039; uploaded files
+			$files = (array)$request-&gt;file(&#039;pictures&#039;, $request-&gt;files-&gt;get(&#039;pictures&#039;));
+			
+			// Save all pictures
+			$pictures = [];
+			if (!empty($files)) {
+				foreach ($files as $key =&gt; $file) {
+					if (empty($file)) {
+						continue;
+					}
+					
+					// Delete old file if new file has uploaded
+					// Check if current Listing has a pictures
+					$picturePosition = $initialPosition + (int)$key + 1;
+					$picture = Picture::query()
+						-&gt;where(&#039;post_id&#039;, $post-&gt;id)
+						-&gt;where(&#039;id&#039;, $key)
+						-&gt;first();
+					if (!empty($picture)) {
+						$picturePosition = $picture-&gt;position;
+						$picture-&gt;delete();
+					}
+					
+					// Post Picture in the database
+					$picture = new Picture([
+						&#039;post_id&#039;   =&gt; $post-&gt;id,
+						&#039;file_path&#039; =&gt; null,
+						&#039;mime_type&#039; =&gt; null,
+						&#039;position&#039;  =&gt; $picturePosition,
+					]);
+					
+					// Upload File
+					try {
+						$destPath = &#039;files/&#039; . strtolower($post-&gt;country_code) . &#039;/&#039; . $post-&gt;id;
+						$picture-&gt;file_path = Upload::image($file, $destPath, null, true);
+						$picture-&gt;mime_type = FileSys::getMimeType($file);
+					} catch (Throwable $e) {
+						$data = [
+							&#039;success&#039; =&gt; false,
+							&#039;message&#039; =&gt; $e-&gt;getMessage(),
+							&#039;result&#039;  =&gt; null,
+						];
+						
+						return apiResponse()-&gt;json($data);
+					}
+					
+					if (!empty($picture-&gt;file_path)) {
+						$picture-&gt;save();
+					}
+					
+					$pictures[] = (new PictureResource($picture));
+					
+					// Check the pictures limit
+					if ($key &gt;= ($picturesLimit - 1)) {
+						break;
+					}
+				}
+			}
+			
+			if (!empty($pictures)) {
+				$data = [
+					&#039;success&#039; =&gt; true,
+					&#039;message&#039; =&gt; trans(&#039;global.The pictures have been updated&#039;),
+					&#039;result&#039;  =&gt; $pictures,
+				];
+			} else {
+				$data = [
+					&#039;success&#039; =&gt; false,
+					&#039;message&#039; =&gt; trans(&#039;global.error_found&#039;),
+					&#039;result&#039;  =&gt; null,
+				];
+			}
+		} else {
+			$pictures = [];
+			$data = [
+				&#039;success&#039; =&gt; false,
+				&#039;message&#039; =&gt; trans(&#039;global.pictures_limit_reached&#039;),
+				&#039;result&#039;  =&gt; null,
+			];
+		}
+		
+		// Generate the listing&#039;s images thumbnails
+		GeneratePostImageThumbsJob::dispatchSync($post);
+		
+		$extra = [];
+		
+		$extra[&#039;post&#039;][&#039;result&#039;] = (new PostResource($post))-&gt;toArray($request);
+		
+		// User should he go on Payment page or not?
+		$shouldHeGoOnPaymentPage = (
+			is_numeric($countPackages)
+			&amp;&amp; is_numeric($countPaymentMethods)
+			&amp;&amp; $countPackages &gt; 0
+			&amp;&amp; $countPaymentMethods &gt; 0
+		);
+		if ($shouldHeGoOnPaymentPage) {
+			$extra[&#039;steps&#039;][&#039;payment&#039;] = true;
+			$extra[&#039;nextStepLabel&#039;] = trans(&#039;global.Next&#039;);
+		} else {
+			$extra[&#039;steps&#039;][&#039;payment&#039;] = false;
+			$extra[&#039;nextStepLabel&#039;] = trans(&#039;global.Done&#039;);
+		}
+		
+		if (doesRequestIsFromWebClient()) {
+			// Get the FileInput plugin&#039;s data
+			$fileInput = [];
+			$fileInput[&#039;initialPreview&#039;] = [];
+			$fileInput[&#039;initialPreviewConfig&#039;] = [];
+			
+			$pictures = collect($pictures);
+			if ($pictures-&gt;count() &gt; 0 &amp;&amp; isset($this-&gt;disk)) {
+				foreach ($pictures as $picture) {
+					if (empty($picture-&gt;file_path)) {
+						continue;
+					}
+					
+					$pictureUrl = $picture-&gt;file_url_medium;
+					$deleteUrl = url(&#039;posts/&#039; . $post-&gt;id . &#039;/photos/&#039; . $picture-&gt;id . &#039;/delete&#039;);
+					
+					try {
+						$fileSize = $this-&gt;disk-&gt;exists($picture-&gt;file_path)
+							? $this-&gt;disk-&gt;size($picture-&gt;file_path)
+							: 0;
+					} catch (Throwable $e) {
+						$fileSize = 0;
+					}
+					
+					// Build Bootstrap-FileInput plugin&#039;s parameters
+					$fileInput[&#039;initialPreview&#039;][] = $pictureUrl;
+					$fileInput[&#039;initialPreviewConfig&#039;][] = [
+						&#039;key&#039;     =&gt; $picture-&gt;id,
+						&#039;caption&#039; =&gt; basename($picture-&gt;file_path),
+						&#039;size&#039;    =&gt; $fileSize,
+						&#039;url&#039;     =&gt; $deleteUrl,
+						&#039;extra&#039;   =&gt; [&#039;id&#039; =&gt; $picture-&gt;id],
+					];
+				}
+			}
+			$extra[&#039;fileInput&#039;] = $fileInput;
+		}
+		
+		$data[&#039;extra&#039;] = $extra;
+		
+		return apiResponse()-&gt;json($data);
+	}
+	
+	/**
+	 * Delete a Picture (from Multi Steps Form)
+	 *
+	 * @param $pictureId
+	 * @param array $params
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function deleteMultiStepsPicture($pictureId, array $params = []): JsonResponse
+	{
+		// Get customized request variables
+		$postId = $params[&#039;post_id&#039;] ?? null;
+		
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		// Get Post
+		$post = null;
+		if (!empty($authUser) &amp;&amp; !empty($postId)) {
+			$post = Post::query()
+				-&gt;withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+				-&gt;where(&#039;user_id&#039;, $authUser-&gt;getAuthIdentifier())
+				-&gt;where(&#039;id&#039;, $postId)
+				-&gt;first();
+		}
+		
+		if (empty($post)) {
+			return apiResponse()-&gt;notFound(trans(&#039;global.post_not_found&#039;));
+		}
+		
+		$pictures = Picture::query()-&gt;withoutGlobalScopes([ActiveScope::class])-&gt;where(&#039;post_id&#039;, $postId);
+		
+		if ($pictures-&gt;count() &lt;= 0) {
+			return apiResponse()-&gt;forbidden();
+		}
+		
+		if ($pictures-&gt;count() == 1) {
+			if (config(&#039;settings.listing_form.picture_mandatory&#039;)) {
+				return apiResponse()-&gt;forbidden(trans(&#039;global.the_latest_picture_removal_text&#039;));
+			}
+		}
+		
+		$pictures = $pictures-&gt;get();
+		foreach ($pictures as $picture) {
+			if ($picture-&gt;id == $pictureId) {
+				$res = $picture-&gt;delete();
+				break;
+			}
+		}
+		
+		$message = trans(&#039;global.The picture has been deleted&#039;);
+		
+		return apiResponse()-&gt;success($message);
+	}
+	
+	/**
+	 * Reorder Pictures - Bulk Update
+	 *
+	 * @param array $params
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function reorderMultiStepsPictures(array $params = []): JsonResponse
+	{
+		if (isApiRoute()) {
+			if (request()-&gt;header(&#039;X-Action&#039;) != &#039;bulk&#039;) {
+				return apiResponse()-&gt;unauthorized();
+			}
+		}
+		
+		$postId = $params[&#039;post_id&#039;] ?? null;
+		$bodyJson = $params[&#039;body&#039;] ?? null;
+		
+		if (!JsonUtils::isJson($bodyJson)) {
+			return apiResponse()-&gt;error(&#039;Invalid JSON format for the &quot;body&quot; field.&#039;);
+		}
+		
+		$bodyArray = json_decode($bodyJson, true);
+		if (!is_array($bodyArray) || empty($bodyArray)) {
+			return apiResponse()-&gt;noContent();
+		}
+		
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		$pictures = [];
+		foreach ($bodyArray as $item) {
+			$itemId = $item[&#039;id&#039;] ?? null;
+			$itemPosition = $item[&#039;position&#039;] ?? null;
+			
+			if (empty($itemId) || !is_numeric($itemPosition)) {
+				continue;
+			}
+			
+			$picture = null;
+			if (!empty($authUser) &amp;&amp; !empty($postId)) {
+				$picture = Picture::query()
+					-&gt;where(&#039;id&#039;, (int)$itemId)
+					-&gt;whereHas(&#039;post&#039;, fn (Builder $query) =&gt; $query-&gt;where(&#039;user_id&#039;, $authUser-&gt;getAuthIdentifier()))
+					-&gt;first();
+			}
+			
+			if (!empty($picture)) {
+				$picture-&gt;position = $itemPosition;
+				$picture-&gt;save();
+				
+				$pictures[] = (new PictureResource($picture, $params));
+			}
+		}
+		
+		// Get endpoint output data
+		$data = [
+			&#039;success&#039; =&gt; !empty($pictures),
+			&#039;message&#039; =&gt; !empty($pictures) ? trans(&#039;global.Your picture has been reorder successfully&#039;) : null,
+			&#039;result&#039;  =&gt; !empty($pictures) ? $pictures : null,
+		];
+		
+		return apiResponse()-&gt;json($data);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/Picture/SingleStepPictures.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Post -->
+
+</body>
+</html>

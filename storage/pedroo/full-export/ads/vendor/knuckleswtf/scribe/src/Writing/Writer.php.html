@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Writing/Writer.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Writing;
+
+use Illuminate\Support\Facades\Storage;
+use Knuckles\Camel\Output\OutputEndpointData;
+use Knuckles\Scribe\Tools\ConsoleOutputUtils as c;
+use Knuckles\Scribe\Tools\DocumentationConfig;
+use Knuckles\Scribe\Tools\Globals;
+use Knuckles\Scribe\Tools\PathConfig;
+use Knuckles\Scribe\Tools\Utils;
+use Symfony\Component\Yaml\Yaml;
+
+class Writer
+{
+    protected bool $isStatic;
+    protected bool $isExternal;
+
+    protected ?string $staticTypeOutputPath;
+
+    protected ?string $laravelTypeOutputPath;
+    protected array $generatedFiles = [
+        &#039;postman&#039; =&gt; null,
+        &#039;openapi&#039; =&gt; null,
+        &#039;html&#039; =&gt; null,
+        &#039;blade&#039; =&gt; null,
+        &#039;assets&#039; =&gt; [
+            &#039;js&#039; =&gt; null,
+            &#039;css&#039; =&gt; null,
+            &#039;images&#039; =&gt; null,
+        ],
+    ];
+
+    protected string $laravelAssetsPath;
+
+    public function __construct(protected DocumentationConfig $config, public PathConfig $paths)
+    {
+        $this-&gt;isStatic = $this-&gt;config-&gt;outputIsStatic();
+        $this-&gt;isExternal = $this-&gt;config-&gt;outputIsExternal();
+
+        $this-&gt;laravelTypeOutputPath = $this-&gt;getLaravelTypeOutputPath();
+        $this-&gt;staticTypeOutputPath = rtrim($this-&gt;config-&gt;get(&#039;static.output_path&#039;, &#039;public/docs&#039;), &#039;/&#039;);
+
+        $this-&gt;laravelAssetsPath = $this-&gt;config-&gt;get(&#039;laravel.assets_directory&#039;)
+            ? &#039;/&#039; . $this-&gt;config-&gt;get(&#039;laravel.assets_directory&#039;)
+            : &quot;/vendor/&quot; . $this-&gt;paths-&gt;outputPath();
+    }
+
+    /**
+     * @param array&lt;string,array&gt; $groupedEndpoints
+     */
+    public function writeDocs(array $groupedEndpoints): void
+    {
+        // The static assets (js/, css/, and images/) always go in public/docs/.
+        // For &#039;static&#039; docs, the output files (index.html, collection.json) go in public/docs/.
+        // For &#039;laravel&#039; docs, the output files (index.blade.php, collection.json)
+        // go in resources/views/scribe/ and storage/app/scribe/ respectively.
+
+        if ($this-&gt;isExternal) {
+            $this-&gt;writeOpenAPISpec($groupedEndpoints);
+            $this-&gt;writePostmanCollection($groupedEndpoints);
+            $this-&gt;writeExternalHtmlDocs();
+        } else {
+            $this-&gt;writeHtmlDocs($groupedEndpoints);
+            $this-&gt;writePostmanCollection($groupedEndpoints);
+            $this-&gt;writeOpenAPISpec($groupedEndpoints);
+        }
+
+        $this-&gt;runAfterGeneratingHook();
+    }
+
+    protected function writePostmanCollection(array $groups): void
+    {
+        if ($this-&gt;config-&gt;get(&#039;postman.enabled&#039;, true)) {
+            c::info(&#039;Generating Postman collection&#039;);
+
+            $collection = $this-&gt;generatePostmanCollection($groups);
+            if ($this-&gt;isStatic) {
+                $collectionPath = &quot;{$this-&gt;staticTypeOutputPath}/collection.json&quot;;
+                file_put_contents($collectionPath, $collection);
+            } else {
+                $outputPath = $this-&gt;paths-&gt;outputPath(&#039;collection.json&#039;);
+                Storage::disk(&#039;local&#039;)-&gt;put($outputPath, $collection);
+                $collectionPath = Storage::disk(&#039;local&#039;)-&gt;path($outputPath);
+            }
+
+            c::success(&quot;Wrote Postman collection to: {$this-&gt;makePathFriendly($collectionPath)}&quot;);
+            $this-&gt;generatedFiles[&#039;postman&#039;] = realpath($collectionPath);
+        }
+    }
+
+    protected function writeOpenAPISpec(array $parsedRoutes): void
+    {
+        if ($this-&gt;config-&gt;get(&#039;openapi.enabled&#039;, false) || $this-&gt;isExternal) {
+            c::info(&#039;Generating OpenAPI specification&#039;);
+
+            $spec = $this-&gt;generateOpenAPISpec($parsedRoutes);
+            if ($this-&gt;isStatic) {
+                Utils::makeDirectoryRecursive($this-&gt;staticTypeOutputPath);
+                $specPath = &quot;{$this-&gt;staticTypeOutputPath}/openapi.yaml&quot;;
+                file_put_contents($specPath, $spec);
+            } else {
+                $outputPath = $this-&gt;paths-&gt;outputPath(&#039;openapi.yaml&#039;);
+                Storage::disk(&#039;local&#039;)-&gt;put($outputPath, $spec);
+                $specPath = Storage::disk(&#039;local&#039;)-&gt;path($outputPath);
+            }
+
+            c::success(&quot;Wrote OpenAPI specification to: {$this-&gt;makePathFriendly($specPath)}&quot;);
+            $this-&gt;generatedFiles[&#039;openapi&#039;] = realpath($specPath);
+        }
+    }
+
+    /**
+     * Generate Postman collection JSON file.
+     *
+     * @param array[] $groupedEndpoints
+     *
+     * @return string
+     */
+    public function generatePostmanCollection(array $groupedEndpoints): string
+    {
+        /** @var PostmanCollectionWriter $writer */
+        $writer = app()-&gt;makeWith(PostmanCollectionWriter::class, [&#039;config&#039; =&gt; $this-&gt;config]);
+
+        $collection = $writer-&gt;generatePostmanCollection($groupedEndpoints);
+        $overrides = $this-&gt;config-&gt;get(&#039;postman.overrides&#039;, []);
+        if (count($overrides)) {
+            foreach ($overrides as $key =&gt; $value) {
+                data_set($collection, $key, $value);
+            }
+        }
+        return json_encode($collection, JSON_PRETTY_PRINT|JSON_INVALID_UTF8_SUBSTITUTE);
+    }
+
+    /**
+     * @param array[] $groupedEndpoints
+     *
+     * @return string
+     */
+    public function generateOpenAPISpec(array $groupedEndpoints): string
+    {
+        /** @var OpenAPISpecWriter $writer */
+        $writer = app()-&gt;makeWith(OpenAPISpecWriter::class, [&#039;config&#039; =&gt; $this-&gt;config]);
+        $spec = $writer-&gt;generateSpecContent($groupedEndpoints);
+        return Yaml::dump($spec, 20, 2, Yaml::DUMP_EMPTY_ARRAY_AS_SEQUENCE | Yaml::DUMP_OBJECT_AS_MAP);
+    }
+
+    protected function performFinalTasksForLaravelType(): void
+    {
+        if (!is_dir($this-&gt;laravelTypeOutputPath)) {
+            mkdir($this-&gt;laravelTypeOutputPath, 0777, true);
+        }
+        $publicDirectory = public_path();
+        if (!is_dir($publicDirectory . $this-&gt;laravelAssetsPath)) {
+            mkdir($publicDirectory . $this-&gt;laravelAssetsPath, 0777, true);
+        }
+
+
+        // Transform output HTML to a Blade view
+        rename(&quot;{$this-&gt;staticTypeOutputPath}/index.html&quot;, &quot;$this-&gt;laravelTypeOutputPath/index.blade.php&quot;);
+
+        // Move assets from public/docs to public/vendor/scribe or config(&#039;laravel.assets_directory&#039;)
+        // We need to do this delete first, otherwise move won&#039;t work if folder exists
+        Utils::deleteDirectoryAndContents($publicDirectory . $this-&gt;laravelAssetsPath);
+        rename(&quot;{$this-&gt;staticTypeOutputPath}/&quot;, $publicDirectory . $this-&gt;laravelAssetsPath);
+
+        $contents = file_get_contents(&quot;$this-&gt;laravelTypeOutputPath/index.blade.php&quot;);
+
+        // Rewrite asset links to go through Laravel
+        $contents = preg_replace(&#039;#href=&quot;\.\./docs/css/(.+?)&quot;#&#039;, &#039;href=&quot;{{ asset(&quot;&#039; . $this-&gt;laravelAssetsPath . &#039;/css/$1&quot;) }}&quot;&#039;, $contents);
+        $contents = preg_replace(&#039;#src=&quot;\.\./docs/(js|images)/(.+?)&quot;#&#039;, &#039;src=&quot;{{ asset(&quot;&#039; . $this-&gt;laravelAssetsPath . &#039;/$1/$2&quot;) }}&quot;&#039;, $contents);
+        $contents = str_replace(&#039;href=&quot;../docs/collection.json&quot;&#039;, &#039;href=&quot;{{ route(&quot;&#039; . $this-&gt;paths-&gt;outputPath(&#039;postman&#039;, &#039;.&#039;) . &#039;&quot;) }}&quot;&#039;, $contents);
+        $contents = str_replace(&#039;href=&quot;../docs/openapi.yaml&quot;&#039;, &#039;href=&quot;{{ route(&quot;&#039; . $this-&gt;paths-&gt;outputPath(&#039;openapi&#039;, &#039;.&#039;) . &#039;&quot;) }}&quot;&#039;, $contents);
+        $contents = str_replace(&#039;url=&quot;../docs/openapi.yaml&quot;&#039;, &#039;url=&quot;{{ route(&quot;&#039; . $this-&gt;paths-&gt;outputPath(&#039;openapi&#039;, &#039;.&#039;) . &#039;&quot;) }}&quot;&#039;, $contents);
+        // With Elements theme, we&#039;d have &lt;elements-api apiDescriptionUrl=&quot;../docs/openapi.yaml&quot;
+        $contents = str_replace(&#039;Url=&quot;../docs/openapi.yaml&quot;&#039;, &#039;Url=&quot;{{ route(&quot;&#039; . $this-&gt;paths-&gt;outputPath(&#039;openapi&#039;, &#039;.&#039;) . &#039;&quot;) }}&quot;&#039;, $contents);
+
+        file_put_contents(&quot;$this-&gt;laravelTypeOutputPath/index.blade.php&quot;, $contents);
+    }
+
+    /**
+     * @param array[] $groupedEndpoints
+     */
+    public function writeHtmlDocs(array $groupedEndpoints): void
+    {
+        c::info(&#039;Writing &#039; . ($this-&gt;isStatic ? &#039;HTML&#039; : &#039;Blade&#039;) . &#039; docs...&#039;);
+
+        // Then we convert them to HTML, and throw in the endpoints as well.
+        /** @var HtmlWriter $writer */
+        $writer = app()-&gt;makeWith(HtmlWriter::class, [&#039;config&#039; =&gt; $this-&gt;config]);
+        $writer-&gt;generate($groupedEndpoints, $this-&gt;paths-&gt;intermediateOutputPath(), $this-&gt;staticTypeOutputPath);
+
+        if (!$this-&gt;isStatic) {
+            $this-&gt;performFinalTasksForLaravelType();
+        }
+
+        if ($this-&gt;isStatic) {
+            $outputPath = rtrim($this-&gt;staticTypeOutputPath, &#039;/&#039;) . &#039;/&#039;;
+            c::success(&quot;Wrote HTML docs and assets to: $outputPath&quot;);
+            $this-&gt;generatedFiles[&#039;html&#039;] = realpath(&quot;{$outputPath}index.html&quot;);
+            $assetsOutputPath = $outputPath;
+        } else {
+            $outputPath = rtrim($this-&gt;laravelTypeOutputPath, &#039;/&#039;) . &#039;/&#039;;
+            c::success(&quot;Wrote Blade docs to: &quot; . $this-&gt;makePathFriendly($outputPath));
+            $this-&gt;generatedFiles[&#039;blade&#039;] = realpath(&quot;{$outputPath}index.blade.php&quot;);
+            $assetsOutputPath = public_path() . $this-&gt;laravelAssetsPath . &#039;/&#039;;
+            c::success(&quot;Wrote Laravel assets to: &quot; . $this-&gt;makePathFriendly($assetsOutputPath));
+        }
+        $this-&gt;generatedFiles[&#039;assets&#039;][&#039;js&#039;] = realpath(&quot;{$assetsOutputPath}js&quot;);
+        $this-&gt;generatedFiles[&#039;assets&#039;][&#039;css&#039;] = realpath(&quot;{$assetsOutputPath}css&quot;);
+        $this-&gt;generatedFiles[&#039;assets&#039;][&#039;images&#039;] = realpath(&quot;{$assetsOutputPath}images&quot;);
+    }
+
+    public function writeExternalHtmlDocs(): void
+    {
+        c::info(&#039;Writing client-side HTML docs...&#039;);
+
+        /** @var ExternalHtmlWriter $writer */
+        $writer = app()-&gt;makeWith(ExternalHtmlWriter::class, [&#039;config&#039; =&gt; $this-&gt;config]);
+        $writer-&gt;generate([], $this-&gt;paths-&gt;intermediateOutputPath(), $this-&gt;staticTypeOutputPath);
+
+       if (!$this-&gt;isStatic) {
+           $this-&gt;performFinalTasksForLaravelType();
+       }
+
+        if ($this-&gt;isStatic) {
+            $outputPath = rtrim($this-&gt;staticTypeOutputPath, &#039;/&#039;) . &#039;/&#039;;
+            c::success(&quot;Wrote client-side HTML docs and assets to: $outputPath&quot;);
+            $this-&gt;generatedFiles[&#039;html&#039;] = realpath(&quot;{$outputPath}index.html&quot;);
+        } else {
+            $outputPath = rtrim($this-&gt;laravelTypeOutputPath, &#039;/&#039;) . &#039;/&#039;;
+            c::success(&quot;Wrote Blade docs to: &quot; . $this-&gt;makePathFriendly($outputPath));
+            $this-&gt;generatedFiles[&#039;blade&#039;] = realpath(&quot;{$outputPath}index.blade.php&quot;);
+            $assetsOutputPath = public_path() . $this-&gt;laravelAssetsPath . &#039;/&#039;;
+            c::success(&quot;Wrote Laravel assets to: &quot; . $this-&gt;makePathFriendly($assetsOutputPath));
+        }
+    }
+
+    protected function runAfterGeneratingHook()
+    {
+        if (is_callable(Globals::$__afterGenerating)) {
+            c::info(&quot;Running `afterGenerating()` hook...&quot;);
+            call_user_func_array(Globals::$__afterGenerating, [$this-&gt;generatedFiles]);
+        }
+    }
+
+    protected function getLaravelTypeOutputPath(): ?string
+    {
+        if ($this-&gt;isStatic) return null;
+
+        return config(
+            &#039;view.paths.0&#039;,
+            function_exists(&#039;base_path&#039;) ? base_path(&quot;resources/views&quot;) : &quot;resources/views&quot;
+        ). &quot;/&quot; . $this-&gt;paths-&gt;outputPath();
+    }
+
+    /**
+     * Turn a path from (possibly) C:\projects\myapp\resources\views
+     * or /projects/myapp/resources/views  to resources/views ie:
+     * - make it relative to PWD
+     * - normalise all slashes to forward slashes
+     */
+    protected function makePathFriendly(string $path): string
+    {
+        return str_replace(&quot;\\&quot;, &quot;/&quot;, str_replace(getcwd() . DIRECTORY_SEPARATOR, &quot;&quot;, $path));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/lab404/laravel-impersonate/composer.json -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Writing/OpenApiSpecGenerators -->
+
+</body>
+</html>

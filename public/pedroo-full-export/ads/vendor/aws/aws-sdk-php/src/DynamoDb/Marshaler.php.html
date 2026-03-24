@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/DynamoDb/Marshaler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\DynamoDb;
+
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Marshals and unmarshals JSON documents and PHP arrays into DynamoDB items.
+ */
+class Marshaler
+{
+    /** @var array Default options to merge into provided options. */
+    private static $defaultOptions = [
+        &#039;ignore_invalid&#039;  =&gt; false,
+        &#039;nullify_invalid&#039; =&gt; false,
+        &#039;wrap_numbers&#039;    =&gt; false,
+    ];
+
+    /** @var array Marshaler options. */
+    private $options;
+
+    /**
+     * Instantiates a DynamoDB Marshaler.
+     *
+     * The following options are valid.
+     *
+     * - ignore_invalid: (bool) Set to `true` if invalid values should be
+     *   ignored (i.e., not included) during marshaling.
+     * - nullify_invalid: (bool) Set to `true` if invalid values should be set
+     *   to null.
+     * - wrap_numbers: (bool) Set to `true` to wrap numbers with `NumberValue`
+     *   objects during unmarshaling to preserve the precision.
+     *
+     * @param array $options Marshaler options
+     */
+    public function __construct(array $options = [])
+    {
+        $this-&gt;options = $options + self::$defaultOptions;
+    }
+
+    /**
+     * Creates a special object to represent a DynamoDB binary (B) value.
+     *
+     * This helps disambiguate binary values from string (S) values.
+     *
+     * @param mixed $value A binary value compatible with Guzzle streams.
+     *
+     * @return BinaryValue
+     * @see GuzzleHttp\Stream\Stream::factory
+     */
+    public function binary($value)
+    {
+        return new BinaryValue($value);
+    }
+
+    /**
+     * Creates a special object to represent a DynamoDB number (N) value.
+     *
+     * This helps maintain the precision of large integer/float in PHP.
+     *
+     * @param string|int|float $value A number value.
+     *
+     * @return NumberValue
+     */
+    public function number($value)
+    {
+        return new NumberValue($value);
+    }
+
+    /**
+     * Creates a special object to represent a DynamoDB set (SS/NS/BS) value.
+     *
+     * This helps disambiguate set values from list (L) values.
+     *
+     * @param array $values The values of the set.
+     *
+     * @return SetValue
+     *
+     */
+    public function set(array $values)
+    {
+        return new SetValue($values);
+    }
+
+    /**
+     * Marshal a JSON document from a string to a DynamoDB item.
+     *
+     * The result is an array formatted in the proper parameter structure
+     * required by the DynamoDB API for items.
+     *
+     * @param string $json A valid JSON document.
+     *
+     * @return array Item formatted for DynamoDB.
+     * @throws \InvalidArgumentException if the JSON is invalid.
+     */
+    public function marshalJson($json)
+    {
+        $data = json_decode($json);
+        if (!($data instanceof \stdClass)) {
+            throw new \InvalidArgumentException(
+                &#039;The JSON document must be valid and be an object at its root.&#039;
+            );
+        }
+
+        return current($this-&gt;marshalValue($data));
+    }
+
+    /**
+     * Marshal a native PHP array of data to a DynamoDB item.
+     *
+     * The result is an array formatted in the proper parameter structure
+     * required by the DynamoDB API for items.
+     *
+     * @param array|\stdClass $item An associative array of data.
+     *
+     * @return array Item formatted for DynamoDB.
+     */
+    public function marshalItem($item)
+    {
+        return current($this-&gt;marshalValue($item));
+    }
+
+    /**
+     * Marshal a native PHP value into a DynamoDB attribute value.
+     *
+     * The result is an associative array that is formatted in the proper
+     * `[TYPE =&gt; VALUE]` parameter structure required by the DynamoDB API.
+     *
+     * @param mixed $value A scalar, array, or `stdClass` value.
+     *
+     * @return array Attribute formatted for DynamoDB.
+     * @throws \UnexpectedValueException if the value cannot be marshaled.
+     */
+    public function marshalValue($value)
+    {
+        $type = gettype($value);
+
+        // Handle string values.
+        if ($type === &#039;string&#039;) {
+            return [&#039;S&#039; =&gt; $value];
+        }
+
+        // Handle number values.
+        if ($type === &#039;integer&#039;
+            || $type === &#039;double&#039;
+            || $value instanceof NumberValue
+        ) {
+            return [&#039;N&#039; =&gt; (string) $value];
+        }
+
+        // Handle boolean values.
+        if ($type === &#039;boolean&#039;) {
+            return [&#039;BOOL&#039; =&gt; $value];
+        }
+
+        // Handle null values.
+        if ($type === &#039;NULL&#039;) {
+            return [&#039;NULL&#039; =&gt; true];
+        }
+
+        // Handle set values.
+        if ($value instanceof SetValue) {
+            if (count($value) === 0) {
+                return $this-&gt;handleInvalid(&#039;empty sets are invalid&#039;);
+            }
+            $previousType = null;
+            $data = [];
+            foreach ($value as $v) {
+                $marshaled = $this-&gt;marshalValue($v);
+                $setType = key($marshaled);
+                if (!$previousType) {
+                    $previousType = $setType;
+                } elseif ($setType !== $previousType) {
+                    return $this-&gt;handleInvalid(&#039;sets must be uniform in type&#039;);
+                }
+                $data[] = current($marshaled);
+            }
+
+            return [$previousType . &#039;S&#039; =&gt; array_values(array_unique($data))];
+        }
+
+        // Handle list and map values.
+        $dbType = &#039;L&#039;;
+        if ($value instanceof \stdClass) {
+            $type = &#039;array&#039;;
+            $dbType = &#039;M&#039;;
+        }
+        if ($type === &#039;array&#039; || $value instanceof \Traversable) {
+            $data = [];
+            $index = 0;
+            foreach ($value as $k =&gt; $v) {
+                if ($v = $this-&gt;marshalValue($v)) {
+                    $data[$k] = $v;
+                    if ($dbType === &#039;L&#039; &amp;&amp; (!is_int($k) || $k != $index++)) {
+                        $dbType = &#039;M&#039;;
+                    }
+                }
+            }
+            return [$dbType =&gt; $data];
+        }
+
+        // Handle binary values.
+        if (is_resource($value) || $value instanceof StreamInterface) {
+            $value = $this-&gt;binary($value);
+        }
+        if ($value instanceof BinaryValue) {
+            return [&#039;B&#039; =&gt; (string) $value];
+        }
+
+        // Handle invalid values.
+        return $this-&gt;handleInvalid(&#039;encountered unexpected value&#039;);
+    }
+
+    /**
+     * Unmarshal a document (item) from a DynamoDB operation result into a JSON
+     * document string.
+     *
+     * @param array $data            Item/document from a DynamoDB result.
+     * @param int   $jsonEncodeFlags Flags to use with `json_encode()`.
+     *
+     * @return string
+     */
+    public function unmarshalJson(array $data, $jsonEncodeFlags = 0)
+    {
+        return json_encode(
+            $this-&gt;unmarshalValue([&#039;M&#039; =&gt; $data], true),
+            $jsonEncodeFlags
+        );
+    }
+
+    /**
+     * Unmarshal an item from a DynamoDB operation result into a native PHP
+     * array. If you set $mapAsObject to true, then a stdClass value will be
+     * returned instead.
+     *
+     * @param array $data Item from a DynamoDB result.
+     * @param bool  $mapAsObject Whether maps should be represented as stdClass.
+     *
+     * @return array|\stdClass
+     */
+    public function unmarshalItem(array $data, $mapAsObject = false)
+    {
+        return $this-&gt;unmarshalValue([&#039;M&#039; =&gt; $data], $mapAsObject);
+    }
+
+    /**
+     * Unmarshal a value from a DynamoDB operation result into a native PHP
+     * value. Will return a scalar, array, or (if you set $mapAsObject to true)
+     * stdClass value.
+     *
+     * @param array $value       Value from a DynamoDB result.
+     * @param bool  $mapAsObject Whether maps should be represented as stdClass.
+     *
+     * @return mixed
+     * @throws \UnexpectedValueException
+     */
+    public function unmarshalValue(array $value, $mapAsObject = false)
+    {
+        $type = key($value);
+        $value = $value[$type];
+        switch ($type) {
+            case &#039;S&#039;:
+            case &#039;BOOL&#039;:
+                return $value;
+            case &#039;NULL&#039;:
+                return null;
+            case &#039;N&#039;:
+                if ($this-&gt;options[&#039;wrap_numbers&#039;]) {
+                    return new NumberValue($value);
+                }
+
+                // Use type coercion to unmarshal numbers to int/float.
+                return $value + 0;
+            case &#039;M&#039;:
+                if ($mapAsObject) {
+                    $data = new \stdClass;
+                    foreach ($value as $k =&gt; $v) {
+                        $data-&gt;$k = $this-&gt;unmarshalValue($v, $mapAsObject);
+                    }
+                    return $data;
+                }
+                // NOBREAK: Unmarshal M the same way as L, for arrays.
+            case &#039;L&#039;:
+                foreach ($value as $k =&gt; $v) {
+                    $value[$k] = $this-&gt;unmarshalValue($v, $mapAsObject);
+                }
+                return $value;
+            case &#039;B&#039;:
+                return new BinaryValue($value);
+            case &#039;SS&#039;:
+            case &#039;NS&#039;:
+            case &#039;BS&#039;:
+                foreach ($value as $k =&gt; $v) {
+                    $value[$k] = $this-&gt;unmarshalValue([$type[0] =&gt; $v]);
+                }
+                return new SetValue($value);
+        }
+
+        throw new \UnexpectedValueException(&quot;Unexpected type: {$type}.&quot;);
+    }
+
+    /**
+     * Handle invalid value based on marshaler configuration.
+     *
+     * @param string $message Error message
+     *
+     * @return array|null
+     */
+    private function handleInvalid($message)
+    {
+        if ($this-&gt;options[&#039;ignore_invalid&#039;]) {
+            return null;
+        }
+
+        if ($this-&gt;options[&#039;nullify_invalid&#039;]) {
+            return [&#039;NULL&#039; =&gt; true];
+        }
+
+        throw new \UnexpectedValueException(&quot;Marshaling error: {$message}.&quot;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/DynamoDb/NumberValue.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/DynamoDb/Exception -->
+
+</body>
+</html>

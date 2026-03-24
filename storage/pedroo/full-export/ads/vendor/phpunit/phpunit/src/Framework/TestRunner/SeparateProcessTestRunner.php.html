@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpunit/phpunit/src/Framework/TestRunner/SeparateProcessTestRunner.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of PHPUnit.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace PHPUnit\Framework;
+
+use function assert;
+use function defined;
+use function get_include_path;
+use function hrtime;
+use function serialize;
+use function sys_get_temp_dir;
+use function tempnam;
+use function unlink;
+use function unserialize;
+use function var_export;
+use PHPUnit\Event\NoPreviousThrowableException;
+use PHPUnit\Runner\CodeCoverage;
+use PHPUnit\TextUI\Configuration\Registry as ConfigurationRegistry;
+use PHPUnit\Util\GlobalState;
+use PHPUnit\Util\PHP\Job;
+use PHPUnit\Util\PHP\JobRunnerRegistry;
+use ReflectionClass;
+use SebastianBergmann\Template\InvalidArgumentException;
+use SebastianBergmann\Template\Template;
+
+/**
+ * @no-named-arguments Parameter names are not covered by the backward compatibility promise for PHPUnit
+ *
+ * @internal This class is not covered by the backward compatibility promise for PHPUnit
+ */
+final class SeparateProcessTestRunner implements IsolatedTestRunner
+{
+    /**
+     * @throws \PHPUnit\Runner\Exception
+     * @throws \PHPUnit\Util\Exception
+     * @throws Exception
+     * @throws InvalidArgumentException
+     * @throws NoPreviousThrowableException
+     * @throws ProcessIsolationException
+     */
+    public function run(TestCase $test, bool $runEntireClass, bool $preserveGlobalState, bool $requiresXdebug): void
+    {
+        $class = new ReflectionClass($test);
+
+        if ($runEntireClass) {
+            $template = new Template(
+                __DIR__ . &#039;/templates/class.tpl&#039;,
+            );
+        } else {
+            $template = new Template(
+                __DIR__ . &#039;/templates/method.tpl&#039;,
+            );
+        }
+
+        $bootstrap     = &#039;&#039;;
+        $constants     = &#039;&#039;;
+        $globals       = &#039;&#039;;
+        $includedFiles = &#039;&#039;;
+        $iniSettings   = &#039;&#039;;
+
+        if (ConfigurationRegistry::get()-&gt;hasBootstrap()) {
+            $bootstrap = ConfigurationRegistry::get()-&gt;bootstrap();
+        }
+
+        if ($preserveGlobalState) {
+            $constants     = GlobalState::getConstantsAsString();
+            $globals       = GlobalState::getGlobalsAsString();
+            $includedFiles = GlobalState::getIncludedFilesAsString();
+            $iniSettings   = GlobalState::getIniSettingsAsString();
+        }
+
+        $coverage = CodeCoverage::instance()-&gt;isActive() ? &#039;true&#039; : &#039;false&#039;;
+
+        if (defined(&#039;PHPUNIT_COMPOSER_INSTALL&#039;)) {
+            $composerAutoload = var_export(PHPUNIT_COMPOSER_INSTALL, true);
+        } else {
+            $composerAutoload = &#039;\&#039;\&#039;&#039;;
+        }
+
+        if (defined(&#039;__PHPUNIT_PHAR__&#039;)) {
+            $phar = var_export(__PHPUNIT_PHAR__, true);
+        } else {
+            $phar = &#039;\&#039;\&#039;&#039;;
+        }
+
+        $data            = var_export(serialize($test-&gt;providedData()), true);
+        $dataName        = var_export($test-&gt;dataName(), true);
+        $dependencyInput = var_export(serialize($test-&gt;dependencyInput()), true);
+        $includePath     = var_export(get_include_path(), true);
+        // must do these fixes because TestCaseMethod.tpl has unserialize(&#039;{data}&#039;) in it, and we can&#039;t break BC
+        // the lines above used to use addcslashes() rather than var_export(), which breaks null byte escape sequences
+        $data                    = &quot;&#039;.&quot; . $data . &quot;.&#039;&quot;;
+        $dataName                = &quot;&#039;.(&quot; . $dataName . &quot;).&#039;&quot;;
+        $dependencyInput         = &quot;&#039;.&quot; . $dependencyInput . &quot;.&#039;&quot;;
+        $includePath             = &quot;&#039;.&quot; . $includePath . &quot;.&#039;&quot;;
+        $offset                  = hrtime();
+        $serializedConfiguration = $this-&gt;saveConfigurationForChildProcess();
+        $processResultFile       = tempnam(sys_get_temp_dir(), &#039;phpunit_&#039;);
+
+        $file = $class-&gt;getFileName();
+
+        assert($file !== false);
+
+        $var = [
+            &#039;bootstrap&#039;                      =&gt; $bootstrap,
+            &#039;composerAutoload&#039;               =&gt; $composerAutoload,
+            &#039;phar&#039;                           =&gt; $phar,
+            &#039;filename&#039;                       =&gt; $file,
+            &#039;className&#039;                      =&gt; $class-&gt;getName(),
+            &#039;collectCodeCoverageInformation&#039; =&gt; $coverage,
+            &#039;data&#039;                           =&gt; $data,
+            &#039;dataName&#039;                       =&gt; $dataName,
+            &#039;dependencyInput&#039;                =&gt; $dependencyInput,
+            &#039;constants&#039;                      =&gt; $constants,
+            &#039;globals&#039;                        =&gt; $globals,
+            &#039;include_path&#039;                   =&gt; $includePath,
+            &#039;included_files&#039;                 =&gt; $includedFiles,
+            &#039;iniSettings&#039;                    =&gt; $iniSettings,
+            &#039;name&#039;                           =&gt; $test-&gt;name(),
+            &#039;offsetSeconds&#039;                  =&gt; (string) $offset[0],
+            &#039;offsetNanoseconds&#039;              =&gt; (string) $offset[1],
+            &#039;serializedConfiguration&#039;        =&gt; $serializedConfiguration,
+            &#039;processResultFile&#039;              =&gt; $processResultFile,
+        ];
+
+        if (!$runEntireClass) {
+            $var[&#039;methodName&#039;] = $test-&gt;name();
+        }
+
+        $template-&gt;setVar($var);
+
+        $code = $template-&gt;render();
+
+        assert($code !== &#039;&#039;);
+
+        JobRunnerRegistry::runTestJob(new Job($code, requiresXdebug: $requiresXdebug), $processResultFile, $test);
+
+        @unlink($serializedConfiguration);
+    }
+
+    /**
+     * @throws ProcessIsolationException
+     */
+    private function saveConfigurationForChildProcess(): string
+    {
+        $path = tempnam(sys_get_temp_dir(), &#039;phpunit_&#039;);
+
+        if ($path === false) {
+            throw new ProcessIsolationException;
+        }
+
+        if (!ConfigurationRegistry::saveTo($path)) {
+            throw new ProcessIsolationException;
+        }
+
+        return $path;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpunit/phpunit/src/Framework/TestRunner/TestRunner.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpunit/phpunit/src/Framework/TestRunner/templates -->
+
+</body>
+</html>

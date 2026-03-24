@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-http/client-common/src/Plugin/RedirectPlugin.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Http\Client\Common\Plugin;
+
+use GuzzleHttp\Psr7\Utils;
+use Http\Client\Common\Exception\CircularRedirectionException;
+use Http\Client\Common\Exception\MultipleRedirectionException;
+use Http\Client\Common\Plugin;
+use Http\Client\Exception\HttpException;
+use Http\Discovery\Psr17FactoryDiscovery;
+use Http\Promise\Promise;
+use Nyholm\Psr7\Factory\Psr17Factory;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamFactoryInterface;
+use Psr\Http\Message\StreamInterface;
+use Psr\Http\Message\UriInterface;
+use Symfony\Component\OptionsResolver\Options;
+use Symfony\Component\OptionsResolver\OptionsResolver;
+
+/**
+ * Follow redirections.
+ *
+ * @author Joel Wurtz &lt;joel.wurtz@gmail.com&gt;
+ */
+final class RedirectPlugin implements Plugin
+{
+    /**
+     * Rule on how to redirect, change method for the new request.
+     *
+     * @var array
+     */
+    private $redirectCodes = [
+        300 =&gt; [
+            &#039;switch&#039; =&gt; [
+                &#039;unless&#039; =&gt; [&#039;GET&#039;, &#039;HEAD&#039;],
+                &#039;to&#039; =&gt; &#039;GET&#039;,
+            ],
+            &#039;multiple&#039; =&gt; true,
+            &#039;permanent&#039; =&gt; false,
+        ],
+        301 =&gt; [
+            &#039;switch&#039; =&gt; [
+                &#039;unless&#039; =&gt; [&#039;GET&#039;, &#039;HEAD&#039;],
+                &#039;to&#039; =&gt; &#039;GET&#039;,
+            ],
+            &#039;multiple&#039; =&gt; false,
+            &#039;permanent&#039; =&gt; true,
+        ],
+        302 =&gt; [
+            &#039;switch&#039; =&gt; [
+                &#039;unless&#039; =&gt; [&#039;GET&#039;, &#039;HEAD&#039;],
+                &#039;to&#039; =&gt; &#039;GET&#039;,
+            ],
+            &#039;multiple&#039; =&gt; false,
+            &#039;permanent&#039; =&gt; false,
+        ],
+        303 =&gt; [
+            &#039;switch&#039; =&gt; [
+                &#039;unless&#039; =&gt; [&#039;GET&#039;, &#039;HEAD&#039;],
+                &#039;to&#039; =&gt; &#039;GET&#039;,
+            ],
+            &#039;multiple&#039; =&gt; false,
+            &#039;permanent&#039; =&gt; false,
+        ],
+        307 =&gt; [
+            &#039;switch&#039; =&gt; false,
+            &#039;multiple&#039; =&gt; false,
+            &#039;permanent&#039; =&gt; false,
+        ],
+        308 =&gt; [
+            &#039;switch&#039; =&gt; false,
+            &#039;multiple&#039; =&gt; false,
+            &#039;permanent&#039; =&gt; true,
+        ],
+    ];
+
+    /**
+     * Determine how header should be preserved from old request.
+     *
+     * @var bool|array
+     *
+     * true     will keep all previous headers (default value)
+     * false    will ditch all previous headers
+     * string[] will keep only headers with the specified names
+     */
+    private $preserveHeader;
+
+    /**
+     * Store all previous redirect from 301 / 308 status code.
+     *
+     * @var array
+     */
+    private $redirectStorage = [];
+
+    /**
+     * Whether the location header must be directly used for a multiple redirection status code (300).
+     *
+     * @var bool
+     */
+    private $useDefaultForMultiple;
+
+    /**
+     * @var string[][] Chain identifier =&gt; list of URLs for this chain
+     */
+    private $circularDetection = [];
+
+    /**
+     * @var StreamFactoryInterface|null
+     */
+    private $streamFactory;
+
+    /**
+     * @param array{&#039;preserve_header&#039;?: bool|string[], &#039;use_default_for_multiple&#039;?: bool, &#039;strict&#039;?: bool, &#039;stream_factory&#039;?:StreamFactoryInterface} $config
+     *
+     * Configuration options:
+     *   - preserve_header: True keeps all headers, false remove all of them, an array is interpreted as a list of header names to keep
+     *   - use_default_for_multiple: Whether the location header must be directly used for a multiple redirection status code (300)
+     *   - strict: When true, redirect codes 300, 301, 302 will not modify request method and body
+     *   - stream_factory: If set, must be a PSR-17 StreamFactoryInterface - if not set, we try to discover one
+     */
+    public function __construct(array $config = [])
+    {
+        $resolver = new OptionsResolver();
+        $resolver-&gt;setDefaults([
+            &#039;preserve_header&#039; =&gt; true,
+            &#039;use_default_for_multiple&#039; =&gt; true,
+            &#039;strict&#039; =&gt; false,
+            &#039;stream_factory&#039; =&gt; null,
+        ]);
+        $resolver-&gt;setAllowedTypes(&#039;preserve_header&#039;, [&#039;bool&#039;, &#039;array&#039;]);
+        $resolver-&gt;setAllowedTypes(&#039;use_default_for_multiple&#039;, &#039;bool&#039;);
+        $resolver-&gt;setAllowedTypes(&#039;strict&#039;, &#039;bool&#039;);
+        $resolver-&gt;setAllowedTypes(&#039;stream_factory&#039;, [StreamFactoryInterface::class, &#039;null&#039;]);
+        $resolver-&gt;setNormalizer(&#039;preserve_header&#039;, function (OptionsResolver $resolver, $value) {
+            if (is_bool($value) &amp;&amp; false === $value) {
+                return [];
+            }
+
+            return $value;
+        });
+        $resolver-&gt;setDefault(&#039;stream_factory&#039;, function (Options $options): ?StreamFactoryInterface {
+            return $this-&gt;guessStreamFactory();
+        });
+        $options = $resolver-&gt;resolve($config);
+
+        $this-&gt;preserveHeader = $options[&#039;preserve_header&#039;];
+        $this-&gt;useDefaultForMultiple = $options[&#039;use_default_for_multiple&#039;];
+
+        if ($options[&#039;strict&#039;]) {
+            $this-&gt;redirectCodes[300][&#039;switch&#039;] = false;
+            $this-&gt;redirectCodes[301][&#039;switch&#039;] = false;
+            $this-&gt;redirectCodes[302][&#039;switch&#039;] = false;
+        }
+
+        $this-&gt;streamFactory = $options[&#039;stream_factory&#039;];
+    }
+
+    public function handleRequest(RequestInterface $request, callable $next, callable $first): Promise
+    {
+        // Check in storage
+        if (array_key_exists((string) $request-&gt;getUri(), $this-&gt;redirectStorage)) {
+            $uri = $this-&gt;redirectStorage[(string) $request-&gt;getUri()][&#039;uri&#039;];
+            $statusCode = $this-&gt;redirectStorage[(string) $request-&gt;getUri()][&#039;status&#039;];
+            $redirectRequest = $this-&gt;buildRedirectRequest($request, $uri, $statusCode);
+
+            return $first($redirectRequest);
+        }
+
+        return $next($request)-&gt;then(function (ResponseInterface $response) use ($request, $first): ResponseInterface {
+            $statusCode = $response-&gt;getStatusCode();
+
+            if (!array_key_exists($statusCode, $this-&gt;redirectCodes)) {
+                return $response;
+            }
+
+            $uri = $this-&gt;createUri($response, $request);
+            $redirectRequest = $this-&gt;buildRedirectRequest($request, $uri, $statusCode);
+            $chainIdentifier = spl_object_hash((object) $first);
+
+            if (!array_key_exists($chainIdentifier, $this-&gt;circularDetection)) {
+                $this-&gt;circularDetection[$chainIdentifier] = [];
+            }
+
+            $this-&gt;circularDetection[$chainIdentifier][] = (string) $request-&gt;getUri();
+
+            if (in_array((string) $redirectRequest-&gt;getUri(), $this-&gt;circularDetection[$chainIdentifier], true)) {
+                throw new CircularRedirectionException(&#039;Circular redirection detected&#039;, $request, $response);
+            }
+
+            if ($this-&gt;redirectCodes[$statusCode][&#039;permanent&#039;]) {
+                $this-&gt;redirectStorage[(string) $request-&gt;getUri()] = [
+                    &#039;uri&#039; =&gt; $uri,
+                    &#039;status&#039; =&gt; $statusCode,
+                ];
+            }
+
+            // Call redirect request synchronously
+            return $first($redirectRequest)-&gt;wait();
+        });
+    }
+
+    /**
+     * The default only needs to be determined if no value is provided.
+     */
+    public function guessStreamFactory(): ?StreamFactoryInterface
+    {
+        if (class_exists(Psr17FactoryDiscovery::class)) {
+            try {
+                return Psr17FactoryDiscovery::findStreamFactory();
+            } catch (\Throwable $t) {
+                // ignore and try other options
+            }
+        }
+        if (class_exists(Psr17Factory::class)) {
+            return new Psr17Factory();
+        }
+        if (class_exists(Utils::class)) {
+            return new class implements StreamFactoryInterface {
+                public function createStream(string $content = &#039;&#039;): StreamInterface
+                {
+                    return Utils::streamFor($content);
+                }
+
+                public function createStreamFromFile(string $filename, string $mode = &#039;r&#039;): StreamInterface
+                {
+                    throw new \RuntimeException(&#039;Internal error: this method should not be needed&#039;);
+                }
+
+                public function createStreamFromResource($resource): StreamInterface
+                {
+                    throw new \RuntimeException(&#039;Internal error: this method should not be needed&#039;);
+                }
+            };
+        }
+
+        return null;
+    }
+
+    private function buildRedirectRequest(RequestInterface $originalRequest, UriInterface $targetUri, int $statusCode): RequestInterface
+    {
+        $originalRequest = $originalRequest-&gt;withUri($targetUri);
+
+        if (false !== $this-&gt;redirectCodes[$statusCode][&#039;switch&#039;] &amp;&amp; !in_array($originalRequest-&gt;getMethod(), $this-&gt;redirectCodes[$statusCode][&#039;switch&#039;][&#039;unless&#039;], true)) {
+            $originalRequest = $originalRequest-&gt;withMethod($this-&gt;redirectCodes[$statusCode][&#039;switch&#039;][&#039;to&#039;]);
+            if (&#039;GET&#039; === $this-&gt;redirectCodes[$statusCode][&#039;switch&#039;][&#039;to&#039;] &amp;&amp; $this-&gt;streamFactory) {
+                // if we found a stream factory, remove the request body. otherwise leave the body there.
+                $originalRequest = $originalRequest-&gt;withoutHeader(&#039;content-type&#039;);
+                $originalRequest = $originalRequest-&gt;withoutHeader(&#039;content-length&#039;);
+                $originalRequest = $originalRequest-&gt;withBody($this-&gt;streamFactory-&gt;createStream());
+            }
+        }
+
+        if (is_array($this-&gt;preserveHeader)) {
+            $headers = array_keys($originalRequest-&gt;getHeaders());
+
+            foreach ($headers as $name) {
+                if (!in_array($name, $this-&gt;preserveHeader, true)) {
+                    $originalRequest = $originalRequest-&gt;withoutHeader($name);
+                }
+            }
+        }
+
+        return $originalRequest;
+    }
+
+    /**
+     * Creates a new Uri from the old request and the location header.
+     *
+     * @throws HttpException                If location header is not usable (missing or incorrect)
+     * @throws MultipleRedirectionException If a 300 status code is received and default location cannot be resolved (doesn&#039;t use the location header or not present)
+     */
+    private function createUri(ResponseInterface $redirectResponse, RequestInterface $originalRequest): UriInterface
+    {
+        if ($this-&gt;redirectCodes[$redirectResponse-&gt;getStatusCode()][&#039;multiple&#039;] &amp;&amp; (!$this-&gt;useDefaultForMultiple || !$redirectResponse-&gt;hasHeader(&#039;Location&#039;))) {
+            throw new MultipleRedirectionException(&#039;Cannot choose a redirection&#039;, $originalRequest, $redirectResponse);
+        }
+
+        if (!$redirectResponse-&gt;hasHeader(&#039;Location&#039;)) {
+            throw new HttpException(&#039;Redirect status code, but no location header present in the response&#039;, $originalRequest, $redirectResponse);
+        }
+
+        $location = $redirectResponse-&gt;getHeaderLine(&#039;Location&#039;);
+        $parsedLocation = parse_url($location);
+
+        if (false === $parsedLocation || &#039;&#039; === $location) {
+            throw new HttpException(sprintf(&#039;Location &quot;%s&quot; could not be parsed&#039;, $location), $originalRequest, $redirectResponse);
+        }
+
+        $uri = $originalRequest-&gt;getUri();
+
+        // Redirections can either use an absolute uri or a relative reference https://www.rfc-editor.org/rfc/rfc3986#section-4.2
+        // If relative, we need to check if we have an absolute path or not
+
+        $path = array_key_exists(&#039;path&#039;, $parsedLocation) ? $parsedLocation[&#039;path&#039;] : &#039;&#039;;
+        if (!array_key_exists(&#039;host&#039;, $parsedLocation) &amp;&amp; &#039;/&#039; !== $location[0]) {
+            // the target is a relative-path reference, we need to merge it with the base path
+            $originalPath = $uri-&gt;getPath();
+            if (&#039;&#039; === $path) {
+                $path = $originalPath;
+            } elseif (($pos = strrpos($originalPath, &#039;/&#039;)) !== false) {
+                $path = substr($originalPath, 0, $pos + 1).$path;
+            } else {
+                $path = &#039;/&#039;.$path;
+            }
+            /* replace &#039;/./&#039; or &#039;/foo/../&#039; with &#039;/&#039; */
+            $re = [&#039;#(/\./)#&#039;, &#039;#/(?!\.\.)[^/]+/\.\./#&#039;];
+            for ($n = 1; $n &gt; 0; $path = preg_replace($re, &#039;/&#039;, $path, -1, $n)) {
+                if (null === $path) {
+                    throw new HttpException(sprintf(&#039;Failed to resolve Location %s&#039;, $location), $originalRequest, $redirectResponse);
+                }
+            }
+        }
+        if (null === $path) {
+            throw new HttpException(sprintf(&#039;Failed to resolve Location %s&#039;, $location), $originalRequest, $redirectResponse);
+        }
+        $uri = $uri
+            -&gt;withPath($path)
+            -&gt;withQuery(array_key_exists(&#039;query&#039;, $parsedLocation) ? $parsedLocation[&#039;query&#039;] : &#039;&#039;)
+            -&gt;withFragment(array_key_exists(&#039;fragment&#039;, $parsedLocation) ? $parsedLocation[&#039;fragment&#039;] : &#039;&#039;)
+        ;
+
+        if (array_key_exists(&#039;scheme&#039;, $parsedLocation)) {
+            $uri = $uri-&gt;withScheme($parsedLocation[&#039;scheme&#039;]);
+        }
+
+        if (array_key_exists(&#039;host&#039;, $parsedLocation)) {
+            $uri = $uri-&gt;withHost($parsedLocation[&#039;host&#039;]);
+        }
+
+        if (array_key_exists(&#039;port&#039;, $parsedLocation)) {
+            $uri = $uri-&gt;withPort($parsedLocation[&#039;port&#039;]);
+        } elseif (array_key_exists(&#039;host&#039;, $parsedLocation)) {
+            $uri = $uri-&gt;withPort(null);
+        }
+
+        return $uri;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-http/client-common/src/Plugin/RequestMatcherPlugin.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-http/discovery -->
+
+</body>
+</html>

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/routing/Matcher/TraceableUrlMatcher.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Routing\Matcher;
+
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Routing\Exception\ExceptionInterface;
+use Symfony\Component\Routing\Route;
+use Symfony\Component\Routing\RouteCollection;
+
+/**
+ * TraceableUrlMatcher helps debug path info matching by tracing the match.
+ *
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ */
+class TraceableUrlMatcher extends UrlMatcher
+{
+    public const ROUTE_DOES_NOT_MATCH = 0;
+    public const ROUTE_ALMOST_MATCHES = 1;
+    public const ROUTE_MATCHES = 2;
+
+    protected array $traces;
+
+    public function getTraces(string $pathinfo): array
+    {
+        $this-&gt;traces = [];
+
+        try {
+            $this-&gt;match($pathinfo);
+        } catch (ExceptionInterface) {
+        }
+
+        return $this-&gt;traces;
+    }
+
+    public function getTracesForRequest(Request $request): array
+    {
+        $this-&gt;request = $request;
+        $traces = $this-&gt;getTraces($request-&gt;getPathInfo());
+        $this-&gt;request = null;
+
+        return $traces;
+    }
+
+    protected function matchCollection(string $pathinfo, RouteCollection $routes): array
+    {
+        // HEAD and GET are equivalent as per RFC
+        if (&#039;HEAD&#039; === $method = $this-&gt;context-&gt;getMethod()) {
+            $method = &#039;GET&#039;;
+        }
+        $supportsTrailingSlash = &#039;GET&#039; === $method &amp;&amp; $this instanceof RedirectableUrlMatcherInterface;
+        $trimmedPathinfo = &#039;&#039; === ($trimmedPathinfo = rtrim($pathinfo, &#039;/&#039;)) ? &#039;/&#039; : $trimmedPathinfo;
+
+        foreach ($routes as $name =&gt; $route) {
+            $compiledRoute = $route-&gt;compile();
+            $staticPrefix = rtrim($compiledRoute-&gt;getStaticPrefix(), &#039;/&#039;);
+            $requiredMethods = $route-&gt;getMethods();
+
+            // check the static prefix of the URL first. Only use the more expensive preg_match when it matches
+            if (&#039;&#039; !== $staticPrefix &amp;&amp; !str_starts_with($trimmedPathinfo, $staticPrefix)) {
+                $this-&gt;addTrace(\sprintf(&#039;Path &quot;%s&quot; does not match&#039;, $route-&gt;getPath()), self::ROUTE_DOES_NOT_MATCH, $name, $route);
+                continue;
+            }
+            $regex = $compiledRoute-&gt;getRegex();
+
+            $pos = strrpos($regex, &#039;$&#039;);
+            $hasTrailingSlash = &#039;/&#039; === $regex[$pos - 1];
+            $regex = substr_replace($regex, &#039;/?$&#039;, $pos - $hasTrailingSlash, 1 + $hasTrailingSlash);
+
+            if (!preg_match($regex, $pathinfo, $matches)) {
+                // does it match without any requirements?
+                $r = new Route($route-&gt;getPath(), $route-&gt;getDefaults(), [], $route-&gt;getOptions());
+                $cr = $r-&gt;compile();
+                if (!preg_match($cr-&gt;getRegex(), $pathinfo)) {
+                    $this-&gt;addTrace(\sprintf(&#039;Path &quot;%s&quot; does not match&#039;, $route-&gt;getPath()), self::ROUTE_DOES_NOT_MATCH, $name, $route);
+
+                    continue;
+                }
+
+                foreach ($route-&gt;getRequirements() as $n =&gt; $regex) {
+                    $r = new Route($route-&gt;getPath(), $route-&gt;getDefaults(), [$n =&gt; $regex], $route-&gt;getOptions());
+                    $cr = $r-&gt;compile();
+
+                    if (\in_array($n, $cr-&gt;getVariables()) &amp;&amp; !preg_match($cr-&gt;getRegex(), $pathinfo)) {
+                        $this-&gt;addTrace(\sprintf(&#039;Requirement for &quot;%s&quot; does not match (%s)&#039;, $n, $regex), self::ROUTE_ALMOST_MATCHES, $name, $route);
+
+                        continue 2;
+                    }
+                }
+
+                continue;
+            }
+
+            $hasTrailingVar = $trimmedPathinfo !== $pathinfo &amp;&amp; preg_match(&#039;#\{[\w\x80-\xFF]+\}/?$#&#039;, $route-&gt;getPath());
+
+            if ($hasTrailingVar &amp;&amp; ($hasTrailingSlash || (null === $m = $matches[\count($compiledRoute-&gt;getPathVariables())] ?? null) || &#039;/&#039; !== ($m[-1] ?? &#039;/&#039;)) &amp;&amp; preg_match($regex, $trimmedPathinfo, $m)) {
+                if ($hasTrailingSlash) {
+                    $matches = $m;
+                } else {
+                    $hasTrailingVar = false;
+                }
+            }
+
+            $hostMatches = [];
+            if ($compiledRoute-&gt;getHostRegex() &amp;&amp; !preg_match($compiledRoute-&gt;getHostRegex(), $this-&gt;context-&gt;getHost(), $hostMatches)) {
+                $this-&gt;addTrace(\sprintf(&#039;Host &quot;%s&quot; does not match the requirement (&quot;%s&quot;)&#039;, $this-&gt;context-&gt;getHost(), $route-&gt;getHost()), self::ROUTE_ALMOST_MATCHES, $name, $route);
+                continue;
+            }
+
+            $attributes = $this-&gt;getAttributes($route, $name, array_replace($matches, $hostMatches));
+
+            $status = $this-&gt;handleRouteRequirements($pathinfo, $name, $route, $attributes);
+
+            if (self::REQUIREMENT_MISMATCH === $status[0]) {
+                $this-&gt;addTrace(\sprintf(&#039;Condition &quot;%s&quot; does not evaluate to &quot;true&quot;&#039;, $route-&gt;getCondition()), self::ROUTE_ALMOST_MATCHES, $name, $route);
+                continue;
+            }
+
+            if (&#039;/&#039; !== $pathinfo &amp;&amp; !$hasTrailingVar &amp;&amp; $hasTrailingSlash === ($trimmedPathinfo === $pathinfo)) {
+                if ($supportsTrailingSlash &amp;&amp; (!$requiredMethods || \in_array(&#039;GET&#039;, $requiredMethods, true))) {
+                    $this-&gt;addTrace(&#039;Route matches!&#039;, self::ROUTE_MATCHES, $name, $route);
+
+                    return $this-&gt;allow = $this-&gt;allowSchemes = [];
+                }
+                $this-&gt;addTrace(\sprintf(&#039;Path &quot;%s&quot; does not match&#039;, $route-&gt;getPath()), self::ROUTE_DOES_NOT_MATCH, $name, $route);
+                continue;
+            }
+
+            if ($route-&gt;getSchemes() &amp;&amp; !$route-&gt;hasScheme($this-&gt;context-&gt;getScheme())) {
+                $this-&gt;allowSchemes = array_merge($this-&gt;allowSchemes, $route-&gt;getSchemes());
+                $this-&gt;addTrace(\sprintf(&#039;Scheme &quot;%s&quot; does not match any of the required schemes (%s)&#039;, $this-&gt;context-&gt;getScheme(), implode(&#039;, &#039;, $route-&gt;getSchemes())), self::ROUTE_ALMOST_MATCHES, $name, $route);
+                continue;
+            }
+
+            if ($requiredMethods &amp;&amp; !\in_array($method, $requiredMethods, true)) {
+                $this-&gt;allow = array_merge($this-&gt;allow, $requiredMethods);
+                $this-&gt;addTrace(\sprintf(&#039;Method &quot;%s&quot; does not match any of the required methods (%s)&#039;, $this-&gt;context-&gt;getMethod(), implode(&#039;, &#039;, $requiredMethods)), self::ROUTE_ALMOST_MATCHES, $name, $route);
+                continue;
+            }
+
+            $this-&gt;addTrace(&#039;Route matches!&#039;, self::ROUTE_MATCHES, $name, $route);
+
+            return array_replace($attributes, $status[1] ?? []);
+        }
+
+        return [];
+    }
+
+    private function addTrace(string $log, int $level = self::ROUTE_DOES_NOT_MATCH, ?string $name = null, ?Route $route = null): void
+    {
+        $this-&gt;traces[] = [
+            &#039;log&#039; =&gt; $log,
+            &#039;name&#039; =&gt; $name,
+            &#039;level&#039; =&gt; $level,
+            &#039;path&#039; =&gt; $route?-&gt;getPath(),
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/routing/Matcher/UrlMatcher.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/routing/Matcher/Dumper -->
+
+</body>
+</html>

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Endpoint/UseDualstackEndpoint/ConfigurationProvider.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Endpoint\UseDualstackEndpoint;
+
+use Aws\AbstractConfigurationProvider;
+use Aws\CacheInterface;
+use Aws\ConfigurationProviderInterface;
+use Aws\Endpoint\UseDualstackEndpoint\Exception\ConfigurationException;
+use GuzzleHttp\Promise;
+
+/**
+ * A configuration provider is a function that returns a promise that is
+ * fulfilled with a {@see \Aws\Endpoint\UseDualstackEndpoint\onfigurationInterface}
+ * or rejected with an {@see \Aws\Endpoint\UseDualstackEndpoint\ConfigurationException}.
+ *
+ * &lt;code&gt;
+ * use Aws\Endpoint\UseDualstackEndpoint\ConfigurationProvider;
+ * $provider = ConfigurationProvider::defaultProvider();
+ * // Returns a ConfigurationInterface or throws.
+ * $config = $provider()-&gt;wait();
+ * &lt;/code&gt;
+ *
+ * Configuration providers can be composed to create configuration using
+ * conditional logic that can create different configurations in different
+ * environments. You can compose multiple providers into a single provider using
+ * {@see Aws\Endpoint\UseDualstackEndpoint\ConfigurationProvider::chain}. This function
+ * accepts providers as variadic arguments and returns a new function that will
+ * invoke each provider until a successful configuration is returned.
+ *
+ * &lt;code&gt;
+ * // First try an INI file at this location.
+ * $a = ConfigurationProvider::ini(null, &#039;/path/to/file.ini&#039;);
+ * // Then try an INI file at this location.
+ * $b = ConfigurationProvider::ini(null, &#039;/path/to/other-file.ini&#039;);
+ * // Then try loading from environment variables.
+ * $c = ConfigurationProvider::env();
+ * // Combine the three providers together.
+ * $composed = ConfigurationProvider::chain($a, $b, $c);
+ * // Returns a promise that is fulfilled with a configuration or throws.
+ * $promise = $composed();
+ * // Wait on the configuration to resolve.
+ * $config = $promise-&gt;wait();
+ * &lt;/code&gt;
+ */
+class ConfigurationProvider extends AbstractConfigurationProvider
+    implements ConfigurationProviderInterface
+{
+    const ENV_USE_DUAL_STACK_ENDPOINT = &#039;AWS_USE_DUALSTACK_ENDPOINT&#039;;
+    const INI_USE_DUAL_STACK_ENDPOINT = &#039;use_dualstack_endpoint&#039;;
+
+    public static $cacheKey = &#039;aws_cached_use_dualstack_endpoint_config&#039;;
+
+    protected static $interfaceClass = ConfigurationInterface::class;
+    protected static $exceptionClass = ConfigurationException::class;
+
+    /**
+     * Create a default config provider that first checks for environment
+     * variables, then checks for a specified profile in the environment-defined
+     * config file location (env variable is &#039;AWS_CONFIG_FILE&#039;, file location
+     * defaults to ~/.aws/config), then checks for the &quot;default&quot; profile in the
+     * environment-defined config file location, and failing those uses a default
+     * fallback set of configuration options.
+     *
+     * This provider is automatically wrapped in a memoize function that caches
+     * previously provided config options.
+     *
+     * @param array $config
+     *
+     * @return callable
+     */
+    public static function defaultProvider(array $config = [])
+    {
+        $region = $config[&#039;region&#039;];
+        $configProviders = [self::env($region)];
+        if (
+            !isset($config[&#039;use_aws_shared_config_files&#039;])
+            || $config[&#039;use_aws_shared_config_files&#039;] != false
+        ) {
+            $configProviders[] = self::ini($region);
+        }
+        $configProviders[] = self::fallback($region);
+
+        $memo = self::memoize(
+            call_user_func_array([ConfigurationProvider::class, &#039;chain&#039;], $configProviders)
+        );
+
+        if (isset($config[&#039;use_dual_stack_endpoint&#039;])
+            &amp;&amp; $config[&#039;use_dual_stack_endpoint&#039;] instanceof CacheInterface
+        ) {
+            return self::cache($memo, $config[&#039;use_dual_stack_endpoint&#039;], self::$cacheKey);
+        }
+
+        return $memo;
+    }
+
+    /**
+     * Provider that creates config from environment variables.
+     *
+     * @return callable
+     */
+    public static function env($region)
+    {
+        return function () use ($region) {
+            // Use config from environment variables, if available
+            $useDualstackEndpoint = getenv(self::ENV_USE_DUAL_STACK_ENDPOINT);
+            if (!empty($useDualstackEndpoint)) {
+                return Promise\Create::promiseFor(
+                    new Configuration($useDualstackEndpoint, $region)
+                );
+            }
+
+            return self::reject(&#039;Could not find environment variable config&#039;
+                . &#039; in &#039; . self::ENV_USE_DUAL_STACK_ENDPOINT);
+        };
+    }
+
+    /**
+     * Config provider that creates config using a config file whose location
+     * is specified by an environment variable &#039;AWS_CONFIG_FILE&#039;, defaulting to
+     * ~/.aws/config if not specified
+     *
+     * @param string|null $profile  Profile to use. If not specified will use
+     *                              the &quot;default&quot; profile.
+     * @param string|null $filename If provided, uses a custom filename rather
+     *                              than looking in the default directory.
+     *
+     * @return callable
+     */
+    public static function ini($region, $profile = null, $filename = null)
+    {
+        $filename = $filename ?: (self::getDefaultConfigFilename());
+        $profile = $profile ?: (getenv(self::ENV_PROFILE) ?: &#039;default&#039;);
+
+        return function () use ($region, $profile, $filename) {
+            if (!@is_readable($filename)) {
+                return self::reject(&quot;Cannot read configuration from $filename&quot;);
+            }
+
+            // Use INI_SCANNER_NORMAL instead of INI_SCANNER_TYPED for PHP 5.5 compatibility
+            $data = \Aws\parse_ini_file($filename, true, INI_SCANNER_NORMAL);
+            if ($data === false) {
+                return self::reject(&quot;Invalid config file: $filename&quot;);
+            }
+            if (!isset($data[$profile])) {
+                return self::reject(&quot;&#039;$profile&#039; not found in config file&quot;);
+            }
+            if (!isset($data[$profile][self::INI_USE_DUAL_STACK_ENDPOINT])) {
+                return self::reject(&quot;Required use dualstack endpoint config values
+                    not present in INI profile &#039;{$profile}&#039; ({$filename})&quot;);
+            }
+
+            // INI_SCANNER_NORMAL parses false-y values as an empty string
+            if ($data[$profile][self::INI_USE_DUAL_STACK_ENDPOINT] === &quot;&quot;) {
+                $data[$profile][self::INI_USE_DUAL_STACK_ENDPOINT] = false;
+            }
+
+            return Promise\Create::promiseFor(
+                new Configuration($data[$profile][self::INI_USE_DUAL_STACK_ENDPOINT], $region)
+            );
+        };
+    }
+
+    /**
+     * Fallback config options when other sources are not set.
+     *
+     * @return callable
+     */
+    public static function fallback($region)
+    {
+        return function () use ($region) {
+            return Promise\Create::promiseFor(new Configuration(false, $region));
+        };
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Endpoint/UseDualstackEndpoint/Exception/ConfigurationException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Endpoint/UseDualstackEndpoint/Exception -->
+
+</body>
+</html>

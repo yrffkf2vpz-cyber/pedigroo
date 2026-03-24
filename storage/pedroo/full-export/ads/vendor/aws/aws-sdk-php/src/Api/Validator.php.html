@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Api/Validator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Api;
+
+use Aws;
+use stdClass;
+
+/**
+ * Validates a schema against a hash of input.
+ */
+class Validator
+{
+    private $path = [];
+    private $errors = [];
+    private $constraints = [];
+
+    private static $defaultConstraints = [
+        &#039;required&#039; =&gt; true,
+        &#039;min&#039;      =&gt; true,
+        &#039;max&#039;      =&gt; false,
+        &#039;pattern&#039;  =&gt; false
+    ];
+
+    /**
+     * @param array $constraints Associative array of constraints to enforce.
+     *                           Accepts the following keys: &quot;required&quot;, &quot;min&quot;,
+     *                           &quot;max&quot;, and &quot;pattern&quot;. If a key is not
+     *                           provided, the constraint will assume false.
+     */
+    public function __construct(?array $constraints = null)
+    {
+        static $assumedFalseValues = [
+            &#039;required&#039; =&gt; false,
+            &#039;min&#039;      =&gt; false,
+            &#039;max&#039;      =&gt; false,
+            &#039;pattern&#039;  =&gt; false
+        ];
+        $this-&gt;constraints = empty($constraints)
+            ? self::$defaultConstraints
+            : $constraints + $assumedFalseValues;
+    }
+
+    /**
+     * Validates the given input against the schema.
+     *
+     * @param string $name  Operation name
+     * @param Shape  $shape Shape to validate
+     * @param array  $input Input to validate
+     *
+     * @throws \InvalidArgumentException if the input is invalid.
+     */
+    public function validate($name, Shape $shape, array $input)
+    {
+        $this-&gt;dispatch($shape, $input);
+
+        if ($this-&gt;errors) {
+            $message = sprintf(
+                &quot;Found %d error%s while validating the input provided for the &quot;
+                    . &quot;%s operation:\n%s&quot;,
+                count($this-&gt;errors),
+                count($this-&gt;errors) &gt; 1 ? &#039;s&#039; : &#039;&#039;,
+                $name,
+                implode(&quot;\n&quot;, $this-&gt;errors)
+            );
+            $this-&gt;errors = [];
+
+            throw new \InvalidArgumentException($message);
+        }
+    }
+
+    private function dispatch(Shape $shape, $value)
+    {
+        static $methods = [
+            &#039;structure&#039; =&gt; &#039;check_structure&#039;,
+            &#039;list&#039;      =&gt; &#039;check_list&#039;,
+            &#039;map&#039;       =&gt; &#039;check_map&#039;,
+            &#039;blob&#039;      =&gt; &#039;check_blob&#039;,
+            &#039;boolean&#039;   =&gt; &#039;check_boolean&#039;,
+            &#039;integer&#039;   =&gt; &#039;check_numeric&#039;,
+            &#039;float&#039;     =&gt; &#039;check_numeric&#039;,
+            &#039;long&#039;      =&gt; &#039;check_numeric&#039;,
+            &#039;string&#039;    =&gt; &#039;check_string&#039;,
+            &#039;byte&#039;      =&gt; &#039;check_string&#039;,
+            &#039;char&#039;      =&gt; &#039;check_string&#039;
+        ];
+
+        $type = $shape-&gt;getType();
+        if (isset($methods[$type])) {
+            $this-&gt;{$methods[$type]}($shape, $value);
+        }
+    }
+
+    private function check_structure(StructureShape $shape, $value)
+    {
+        $isDocument = (isset($shape[&#039;document&#039;]) &amp;&amp; $shape[&#039;document&#039;]);
+        $isUnion = (isset($shape[&#039;union&#039;]) &amp;&amp; $shape[&#039;union&#039;]);
+        if ($isDocument) {
+            if (!$this-&gt;checkDocumentType($value)) {
+                $this-&gt;addError(&quot;is not a valid document type&quot;);
+                return;
+            }
+        } elseif ($isUnion) {
+            if (!$this-&gt;checkUnion($value)) {
+                $this-&gt;addError(&quot;is a union type and must have exactly one non null value&quot;);
+                return;
+            }
+        } elseif (!$this-&gt;checkAssociativeArray($value)) {
+            return;
+        }
+
+        if ($this-&gt;constraints[&#039;required&#039;] &amp;&amp; $shape[&#039;required&#039;]) {
+            foreach ($shape[&#039;required&#039;] as $req) {
+                if (!isset($value[$req])) {
+                    $this-&gt;path[] = $req;
+                    $this-&gt;addError(&#039;is missing and is a required parameter&#039;);
+                    array_pop($this-&gt;path);
+                }
+            }
+        }
+        if (!$isDocument) {
+            foreach ($value as $name =&gt; $v) {
+                if ($shape-&gt;hasMember($name)) {
+                    $this-&gt;path[] = $name;
+                    $this-&gt;dispatch(
+                        $shape-&gt;getMember($name),
+                        isset($value[$name]) ? $value[$name] : null
+                    );
+                    array_pop($this-&gt;path);
+                }
+            }
+        }
+    }
+
+    private function check_list(ListShape $shape, $value)
+    {
+        if (!is_array($value)) {
+            $this-&gt;addError(&#039;must be an array. Found &#039;
+                . Aws\describe_type($value));
+            return;
+        }
+
+        $this-&gt;validateRange($shape, count($value), &quot;list element count&quot;);
+
+        $items = $shape-&gt;getMember();
+        foreach ($value as $index =&gt; $v) {
+            $this-&gt;path[] = $index;
+            $this-&gt;dispatch($items, $v);
+            array_pop($this-&gt;path);
+        }
+    }
+
+    private function check_map(MapShape $shape, $value)
+    {
+        if (!$this-&gt;checkAssociativeArray($value)) {
+            return;
+        }
+
+        $values = $shape-&gt;getValue();
+        foreach ($value as $key =&gt; $v) {
+            $this-&gt;path[] = $key;
+            $this-&gt;dispatch($values, $v);
+            array_pop($this-&gt;path);
+        }
+    }
+
+    private function check_blob(Shape $shape, $value)
+    {
+        static $valid = [
+            &#039;string&#039; =&gt; true,
+            &#039;integer&#039; =&gt; true,
+            &#039;double&#039; =&gt; true,
+            &#039;resource&#039; =&gt; true
+        ];
+
+        $type = gettype($value);
+        if (!isset($valid[$type])) {
+            if ($type != &#039;object&#039; || !method_exists($value, &#039;__toString&#039;)) {
+                $this-&gt;addError(&#039;must be an fopen resource, a &#039;
+                    . &#039;GuzzleHttp\Stream\StreamInterface object, or something &#039;
+                    . &#039;that can be cast to a string. Found &#039;
+                    . Aws\describe_type($value));
+            }
+        }
+    }
+
+    private function check_numeric(Shape $shape, $value)
+    {
+        if (!is_numeric($value)) {
+            $this-&gt;addError(&#039;must be numeric. Found &#039;
+                . Aws\describe_type($value));
+            return;
+        }
+
+        $this-&gt;validateRange($shape, $value, &quot;numeric value&quot;);
+    }
+
+    private function check_boolean(Shape $shape, $value)
+    {
+        if (!is_bool($value)) {
+            $this-&gt;addError(&#039;must be a boolean. Found &#039;
+                . Aws\describe_type($value));
+        }
+    }
+
+    private function check_string(Shape $shape, $value)
+    {
+        if ($shape[&#039;jsonvalue&#039;]) {
+            if (!self::canJsonEncode($value)) {
+                $this-&gt;addError(&#039;must be a value encodable with \&#039;json_encode\&#039;.&#039;
+                    . &#039; Found &#039; . Aws\describe_type($value));
+            }
+            return;
+        }
+
+        if (!$this-&gt;checkCanString($value)) {
+            $this-&gt;addError(&#039;must be a string or an object that implements &#039;
+                . &#039;__toString(). Found &#039; . Aws\describe_type($value));
+            return;
+        }
+
+        $value = isset($value) ? $value : &#039;&#039;;
+        $this-&gt;validateRange($shape, strlen($value), &quot;string length&quot;);
+
+        if ($this-&gt;constraints[&#039;pattern&#039;]) {
+            $pattern = $shape[&#039;pattern&#039;];
+            if ($pattern &amp;&amp; !preg_match(&quot;/$pattern/&quot;, $value)) {
+                $this-&gt;addError(&quot;Pattern /$pattern/ failed to match &#039;$value&#039;&quot;);
+            }
+        }
+    }
+
+    private function validateRange(Shape $shape, $length, $descriptor)
+    {
+        if ($this-&gt;constraints[&#039;min&#039;]) {
+            $min = $shape[&#039;min&#039;];
+            if ($min &amp;&amp; $length &lt; $min) {
+                $this-&gt;addError(&quot;expected $descriptor to be &gt;= $min, but &quot;
+                    . &quot;found $descriptor of $length&quot;);
+            }
+        }
+
+        if ($this-&gt;constraints[&#039;max&#039;]) {
+            $max = $shape[&#039;max&#039;];
+            if ($max &amp;&amp; $length &gt; $max) {
+                $this-&gt;addError(&quot;expected $descriptor to be &lt;= $max, but &quot;
+                    . &quot;found $descriptor of $length&quot;);
+            }
+        }
+    }
+
+    private function checkArray($arr)
+    {
+        return array_is_list($arr) || Aws\is_associative($arr);
+    }
+
+    private function checkCanString($value)
+    {
+        static $valid = [
+            &#039;string&#039;  =&gt; true,
+            &#039;integer&#039; =&gt; true,
+            &#039;double&#039;  =&gt; true,
+            &#039;NULL&#039;    =&gt; true,
+        ];
+
+        $type = gettype($value);
+
+        return isset($valid[$type]) ||
+            ($type == &#039;object&#039; &amp;&amp; method_exists($value, &#039;__toString&#039;));
+    }
+
+    private function checkAssociativeArray($value)
+    {
+        $isAssociative = false;
+
+        if (is_array($value)) {
+            $expectedIndex = 0;
+            $key = key($value);
+
+            do {
+                $isAssociative = $key !== $expectedIndex++;
+                next($value);
+                $key = key($value);
+            } while (!$isAssociative &amp;&amp; null !== $key);
+        }
+
+        if (!$isAssociative) {
+            $this-&gt;addError(&#039;must be an associative array. Found &#039;
+                . Aws\describe_type($value));
+            return false;
+        }
+
+        return true;
+    }
+
+    private function checkDocumentType($value)
+    {
+        // To allow objects like value, which
+        // can be used within a member which type is `Document`
+        if ($value instanceof stdClass) {
+            $value = (array) $value;
+        }
+
+        if (is_array($value)) {
+            $typeOfFirstKey = gettype(key($value));
+            foreach ($value as $key =&gt; $val) {
+               if (!$this-&gt;checkDocumentType($val) || gettype($key) != $typeOfFirstKey) {
+                   return false;
+               }
+            }
+            return $this-&gt;checkArray($value);
+        }
+        return is_null($value)
+            || is_numeric($value)
+            || is_string($value)
+            || is_bool($value);
+    }
+
+    private function checkUnion($value)
+    {
+        if (is_array($value)) {
+            $nonNullCount = 0;
+            foreach ($value as $key =&gt; $val) {
+                if (!is_null($val) &amp;&amp; !(strpos($key, &quot;@&quot;) === 0)) {
+                    $nonNullCount++;
+                }
+            }
+            return $nonNullCount == 1;
+        }
+        return !is_null($value);
+    }
+
+    private function addError($message)
+    {
+        $this-&gt;errors[] =
+            implode(&#039;&#039;, array_map(function ($s) { return &quot;[{$s}]&quot;; }, $this-&gt;path))
+            . &#039; &#039;
+            . $message;
+    }
+
+    private function canJsonEncode($data)
+    {
+        return !is_resource($data);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/ApiGateway/ApiGatewayClient.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Api/ErrorParser -->
+
+</body>
+</html>

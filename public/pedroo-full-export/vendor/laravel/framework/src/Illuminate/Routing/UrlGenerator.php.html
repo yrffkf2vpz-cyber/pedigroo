@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Routing/UrlGenerator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Routing;
+
+use BackedEnum;
+use Closure;
+use Illuminate\Contracts\Routing\UrlGenerator as UrlGeneratorContract;
+use Illuminate\Contracts\Routing\UrlRoutable;
+use Illuminate\Http\Request;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\InteractsWithTime;
+use Illuminate\Support\Str;
+use Illuminate\Support\Traits\Macroable;
+use InvalidArgumentException;
+use Symfony\Component\Routing\Exception\RouteNotFoundException;
+
+class UrlGenerator implements UrlGeneratorContract
+{
+    use InteractsWithTime, Macroable;
+
+    /**
+     * The route collection.
+     *
+     * @var \Illuminate\Routing\RouteCollectionInterface
+     */
+    protected $routes;
+
+    /**
+     * The request instance.
+     *
+     * @var \Illuminate\Http\Request
+     */
+    protected $request;
+
+    /**
+     * The asset root URL.
+     *
+     * @var string
+     */
+    protected $assetRoot;
+
+    /**
+     * The forced URL root.
+     *
+     * @var string
+     */
+    protected $forcedRoot;
+
+    /**
+     * The forced scheme for URLs.
+     *
+     * @var string
+     */
+    protected $forceScheme;
+
+    /**
+     * A cached copy of the URL root for the current request.
+     *
+     * @var string|null
+     */
+    protected $cachedRoot;
+
+    /**
+     * A cached copy of the URL scheme for the current request.
+     *
+     * @var string|null
+     */
+    protected $cachedScheme;
+
+    /**
+     * The root namespace being applied to controller actions.
+     *
+     * @var string
+     */
+    protected $rootNamespace;
+
+    /**
+     * The session resolver callable.
+     *
+     * @var callable
+     */
+    protected $sessionResolver;
+
+    /**
+     * The encryption key resolver callable.
+     *
+     * @var callable
+     */
+    protected $keyResolver;
+
+    /**
+     * The missing named route resolver callable.
+     *
+     * @var callable
+     */
+    protected $missingNamedRouteResolver;
+
+    /**
+     * The callback to use to format hosts.
+     *
+     * @var \Closure
+     */
+    protected $formatHostUsing;
+
+    /**
+     * The callback to use to format paths.
+     *
+     * @var \Closure
+     */
+    protected $formatPathUsing;
+
+    /**
+     * The route URL generator instance.
+     *
+     * @var \Illuminate\Routing\RouteUrlGenerator|null
+     */
+    protected $routeGenerator;
+
+    /**
+     * Create a new URL Generator instance.
+     *
+     * @param  \Illuminate\Routing\RouteCollectionInterface  $routes
+     * @param  \Illuminate\Http\Request  $request
+     * @param  string|null  $assetRoot
+     */
+    public function __construct(RouteCollectionInterface $routes, Request $request, $assetRoot = null)
+    {
+        $this-&gt;routes = $routes;
+        $this-&gt;assetRoot = $assetRoot;
+
+        $this-&gt;setRequest($request);
+    }
+
+    /**
+     * Get the full URL for the current request.
+     *
+     * @return string
+     */
+    public function full()
+    {
+        return $this-&gt;request-&gt;fullUrl();
+    }
+
+    /**
+     * Get the current URL for the request.
+     *
+     * @return string
+     */
+    public function current()
+    {
+        return $this-&gt;to($this-&gt;request-&gt;getPathInfo());
+    }
+
+    /**
+     * Get the URL for the previous request.
+     *
+     * @param  mixed  $fallback
+     * @return string
+     */
+    public function previous($fallback = false)
+    {
+        $referrer = $this-&gt;request-&gt;headers-&gt;get(&#039;referer&#039;);
+
+        $url = $referrer ? $this-&gt;to($referrer) : $this-&gt;getPreviousUrlFromSession();
+
+        if ($url) {
+            return $url;
+        } elseif ($fallback) {
+            return $this-&gt;to($fallback);
+        }
+
+        return $this-&gt;to(&#039;/&#039;);
+    }
+
+    /**
+     * Get the previous path info for the request.
+     *
+     * @param  mixed  $fallback
+     * @return string
+     */
+    public function previousPath($fallback = false)
+    {
+        $previousPath = str_replace($this-&gt;to(&#039;/&#039;), &#039;&#039;, rtrim(preg_replace(&#039;/\?.*/&#039;, &#039;&#039;, $this-&gt;previous($fallback)), &#039;/&#039;));
+
+        return $previousPath === &#039;&#039; ? &#039;/&#039; : $previousPath;
+    }
+
+    /**
+     * Get the previous URL from the session if possible.
+     *
+     * @return string|null
+     */
+    protected function getPreviousUrlFromSession()
+    {
+        return $this-&gt;getSession()?-&gt;previousUrl();
+    }
+
+    /**
+     * Generate an absolute URL to the given path.
+     *
+     * @param  string  $path
+     * @param  mixed  $extra
+     * @param  bool|null  $secure
+     * @return string
+     */
+    public function to($path, $extra = [], $secure = null)
+    {
+        // First we will check if the URL is already a valid URL. If it is we will not
+        // try to generate a new one but will simply return the URL as is, which is
+        // convenient since developers do not always have to check if it&#039;s valid.
+        if ($this-&gt;isValidUrl($path)) {
+            return $path;
+        }
+
+        $tail = implode(&#039;/&#039;, array_map(
+            &#039;rawurlencode&#039;, (array) $this-&gt;formatParameters($extra))
+        );
+
+        // Once we have the scheme we will compile the &quot;tail&quot; by collapsing the values
+        // into a single string delimited by slashes. This just makes it convenient
+        // for passing the array of parameters to this URL as a list of segments.
+        $root = $this-&gt;formatRoot($this-&gt;formatScheme($secure));
+
+        [$path, $query] = $this-&gt;extractQueryString($path);
+
+        return $this-&gt;format(
+            $root, &#039;/&#039;.trim($path.&#039;/&#039;.$tail, &#039;/&#039;)
+        ).$query;
+    }
+
+    /**
+     * Generate an absolute URL with the given query parameters.
+     *
+     * @param  string  $path
+     * @param  array  $query
+     * @param  mixed  $extra
+     * @param  bool|null  $secure
+     * @return string
+     */
+    public function query($path, $query = [], $extra = [], $secure = null)
+    {
+        [$path, $existingQueryString] = $this-&gt;extractQueryString($path);
+
+        parse_str(Str::after($existingQueryString, &#039;?&#039;), $existingQueryArray);
+
+        return rtrim($this-&gt;to($path.&#039;?&#039;.Arr::query(
+            array_merge($existingQueryArray, $query)
+        ), $extra, $secure), &#039;?&#039;);
+    }
+
+    /**
+     * Generate a secure, absolute URL to the given path.
+     *
+     * @param  string  $path
+     * @param  array  $parameters
+     * @return string
+     */
+    public function secure($path, $parameters = [])
+    {
+        return $this-&gt;to($path, $parameters, true);
+    }
+
+    /**
+     * Generate the URL to an application asset.
+     *
+     * @param  string  $path
+     * @param  bool|null  $secure
+     * @return string
+     */
+    public function asset($path, $secure = null)
+    {
+        if ($this-&gt;isValidUrl($path)) {
+            return $path;
+        }
+
+        // Once we get the root URL, we will check to see if it contains an index.php
+        // file in the paths. If it does, we will remove it since it is not needed
+        // for asset paths, but only for routes to endpoints in the application.
+        $root = $this-&gt;assetRoot ?: $this-&gt;formatRoot($this-&gt;formatScheme($secure));
+
+        return Str::finish($this-&gt;removeIndex($root), &#039;/&#039;).trim($path, &#039;/&#039;);
+    }
+
+    /**
+     * Generate the URL to a secure asset.
+     *
+     * @param  string  $path
+     * @return string
+     */
+    public function secureAsset($path)
+    {
+        return $this-&gt;asset($path, true);
+    }
+
+    /**
+     * Generate the URL to an asset from a custom root domain such as CDN, etc.
+     *
+     * @param  string  $root
+     * @param  string  $path
+     * @param  bool|null  $secure
+     * @return string
+     */
+    public function assetFrom($root, $path, $secure = null)
+    {
+        // Once we get the root URL, we will check to see if it contains an index.php
+        // file in the paths. If it does, we will remove it since it is not needed
+        // for asset paths, but only for routes to endpoints in the application.
+        $root = $this-&gt;formatRoot($this-&gt;formatScheme($secure), $root);
+
+        return $this-&gt;removeIndex($root).&#039;/&#039;.trim($path, &#039;/&#039;);
+    }
+
+    /**
+     * Remove the index.php file from a path.
+     *
+     * @param  string  $root
+     * @return string
+     */
+    protected function removeIndex($root)
+    {
+        $i = &#039;index.php&#039;;
+
+        return str_contains($root, $i) ? str_replace(&#039;/&#039;.$i, &#039;&#039;, $root) : $root;
+    }
+
+    /**
+     * Get the default scheme for a raw URL.
+     *
+     * @param  bool|null  $secure
+     * @return string
+     */
+    public function formatScheme($secure = null)
+    {
+        if (! is_null($secure)) {
+            return $secure ? &#039;https://&#039; : &#039;http://&#039;;
+        }
+
+        if (is_null($this-&gt;cachedScheme)) {
+            $this-&gt;cachedScheme = $this-&gt;forceScheme ?: $this-&gt;request-&gt;getScheme().&#039;://&#039;;
+        }
+
+        return $this-&gt;cachedScheme;
+    }
+
+    /**
+     * Create a signed route URL for a named route.
+     *
+     * @param  \BackedEnum|string  $name
+     * @param  mixed  $parameters
+     * @param  \DateTimeInterface|\DateInterval|int|null  $expiration
+     * @param  bool  $absolute
+     * @return string
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function signedRoute($name, $parameters = [], $expiration = null, $absolute = true)
+    {
+        $this-&gt;ensureSignedRouteParametersAreNotReserved(
+            $parameters = Arr::wrap($parameters)
+        );
+
+        if ($expiration) {
+            $parameters = $parameters + [&#039;expires&#039; =&gt; $this-&gt;availableAt($expiration)];
+        }
+
+        ksort($parameters);
+
+        $key = call_user_func($this-&gt;keyResolver);
+
+        return $this-&gt;route($name, $parameters + [
+            &#039;signature&#039; =&gt; hash_hmac(
+                &#039;sha256&#039;,
+                $this-&gt;route($name, $parameters, $absolute),
+                is_array($key) ? $key[0] : $key
+            ),
+        ], $absolute);
+    }
+
+    /**
+     * Ensure the given signed route parameters are not reserved.
+     *
+     * @param  mixed  $parameters
+     * @return void
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function ensureSignedRouteParametersAreNotReserved($parameters)
+    {
+        if (array_key_exists(&#039;signature&#039;, $parameters)) {
+            throw new InvalidArgumentException(
+                &#039;&quot;Signature&quot; is a reserved parameter when generating signed routes. Please rename your route parameter.&#039;
+            );
+        }
+
+        if (array_key_exists(&#039;expires&#039;, $parameters)) {
+            throw new InvalidArgumentException(
+                &#039;&quot;Expires&quot; is a reserved parameter when generating signed routes. Please rename your route parameter.&#039;
+            );
+        }
+    }
+
+    /**
+     * Create a temporary signed route URL for a named route.
+     *
+     * @param  \BackedEnum|string  $name
+     * @param  \DateTimeInterface|\DateInterval|int  $expiration
+     * @param  array  $parameters
+     * @param  bool  $absolute
+     * @return string
+     */
+    public function temporarySignedRoute($name, $expiration, $parameters = [], $absolute = true)
+    {
+        return $this-&gt;signedRoute($name, $parameters, $expiration, $absolute);
+    }
+
+    /**
+     * Determine if the given request has a valid signature.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  bool  $absolute
+     * @param  \Closure|array  $ignoreQuery
+     * @return bool
+     */
+    public function hasValidSignature(Request $request, $absolute = true, Closure|array $ignoreQuery = [])
+    {
+        return $this-&gt;hasCorrectSignature($request, $absolute, $ignoreQuery)
+            &amp;&amp; $this-&gt;signatureHasNotExpired($request);
+    }
+
+    /**
+     * Determine if the given request has a valid signature for a relative URL.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  \Closure|array  $ignoreQuery
+     * @return bool
+     */
+    public function hasValidRelativeSignature(Request $request, Closure|array $ignoreQuery = [])
+    {
+        return $this-&gt;hasValidSignature($request, false, $ignoreQuery);
+    }
+
+    /**
+     * Determine if the signature from the given request matches the URL.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  bool  $absolute
+     * @param  \Closure|array  $ignoreQuery
+     * @return bool
+     */
+    public function hasCorrectSignature(Request $request, $absolute = true, Closure|array $ignoreQuery = [])
+    {
+        $url = $absolute ? $request-&gt;url() : &#039;/&#039;.$request-&gt;path();
+
+        $queryString = (new Collection(explode(&#039;&amp;&#039;, (string) $request-&gt;server-&gt;get(&#039;QUERY_STRING&#039;))))
+            -&gt;reject(function ($parameter) use ($ignoreQuery) {
+                $parameter = Str::before($parameter, &#039;=&#039;);
+
+                if ($parameter === &#039;signature&#039;) {
+                    return true;
+                }
+
+                if ($ignoreQuery instanceof Closure) {
+                    return $ignoreQuery($parameter);
+                }
+
+                return in_array($parameter, $ignoreQuery);
+            })
+            -&gt;join(&#039;&amp;&#039;);
+
+        $original = rtrim($url.&#039;?&#039;.$queryString, &#039;?&#039;);
+
+        $keys = call_user_func($this-&gt;keyResolver);
+
+        $keys = is_array($keys) ? $keys : [$keys];
+
+        foreach ($keys as $key) {
+            if (hash_equals(
+                hash_hmac(&#039;sha256&#039;, $original, $key),
+                (string) $request-&gt;query(&#039;signature&#039;, &#039;&#039;)
+            )) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Determine if the expires timestamp from the given request is not from the past.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return bool
+     */
+    public function signatureHasNotExpired(Request $request)
+    {
+        $expires = $request-&gt;query(&#039;expires&#039;);
+
+        return ! ($expires &amp;&amp; Carbon::now()-&gt;getTimestamp() &gt; $expires);
+    }
+
+    /**
+     * Get the URL to a named route.
+     *
+     * @param  \BackedEnum|string  $name
+     * @param  mixed  $parameters
+     * @param  bool  $absolute
+     * @return string
+     *
+     * @throws \Symfony\Component\Routing\Exception\RouteNotFoundException|\InvalidArgumentException
+     */
+    public function route($name, $parameters = [], $absolute = true)
+    {
+        if ($name instanceof BackedEnum &amp;&amp; ! is_string($name = $name-&gt;value)) {
+            throw new InvalidArgumentException(&#039;Attribute [name] expects a string backed enum.&#039;);
+        }
+
+        if (! is_null($route = $this-&gt;routes-&gt;getByName($name))) {
+            return $this-&gt;toRoute($route, $parameters, $absolute);
+        }
+
+        if (! is_null($this-&gt;missingNamedRouteResolver) &amp;&amp;
+            ! is_null($url = call_user_func($this-&gt;missingNamedRouteResolver, $name, $parameters, $absolute))) {
+            return $url;
+        }
+
+        throw new RouteNotFoundException(&quot;Route [{$name}] not defined.&quot;);
+    }
+
+    /**
+     * Get the URL for a given route instance.
+     *
+     * @param  \Illuminate\Routing\Route  $route
+     * @param  mixed  $parameters
+     * @param  bool  $absolute
+     * @return string
+     *
+     * @throws \Illuminate\Routing\Exceptions\UrlGenerationException
+     */
+    public function toRoute($route, $parameters, $absolute)
+    {
+        return $this-&gt;routeUrl()-&gt;to(
+            $route, $parameters, $absolute
+        );
+    }
+
+    /**
+     * Get the URL to a controller action.
+     *
+     * @param  string|array  $action
+     * @param  mixed  $parameters
+     * @param  bool  $absolute
+     * @return string
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function action($action, $parameters = [], $absolute = true)
+    {
+        if (is_null($route = $this-&gt;routes-&gt;getByAction($action = $this-&gt;formatAction($action)))) {
+            throw new InvalidArgumentException(&quot;Action {$action} not defined.&quot;);
+        }
+
+        return $this-&gt;toRoute($route, $parameters, $absolute);
+    }
+
+    /**
+     * Format the given controller action.
+     *
+     * @param  string|array  $action
+     * @return string
+     */
+    protected function formatAction($action)
+    {
+        if (is_array($action)) {
+            $action = &#039;\\&#039;.implode(&#039;@&#039;, $action);
+        }
+
+        if ($this-&gt;rootNamespace &amp;&amp; ! str_starts_with($action, &#039;\\&#039;)) {
+            return $this-&gt;rootNamespace.&#039;\\&#039;.$action;
+        }
+
+        return trim($action, &#039;\\&#039;);
+    }
+
+    /**
+     * Format the array of URL parameters.
+     *
+     * @param  mixed  $parameters
+     * @return array
+     */
+    public function formatParameters($parameters)
+    {
+        $parameters = Arr::wrap($parameters);
+
+        foreach ($parameters as $key =&gt; $parameter) {
+            if ($parameter instanceof UrlRoutable) {
+                $parameters[$key] = $parameter-&gt;getRouteKey();
+            }
+        }
+
+        return $parameters;
+    }
+
+    /**
+     * Extract the query string from the given path.
+     *
+     * @param  string  $path
+     * @return array
+     */
+    protected function extractQueryString($path)
+    {
+        if (($queryPosition = strpos($path, &#039;?&#039;)) !== false) {
+            return [
+                substr($path, 0, $queryPosition),
+                substr($path, $queryPosition),
+            ];
+        }
+
+        return [$path, &#039;&#039;];
+    }
+
+    /**
+     * Get the base URL for the request.
+     *
+     * @param  string  $scheme
+     * @param  string|null  $root
+     * @return string
+     */
+    public function formatRoot($scheme, $root = null)
+    {
+        if (is_null($root)) {
+            if (is_null($this-&gt;cachedRoot)) {
+                $this-&gt;cachedRoot = $this-&gt;forcedRoot ?: $this-&gt;request-&gt;root();
+            }
+
+            $root = $this-&gt;cachedRoot;
+        }
+
+        $start = str_starts_with($root, &#039;http://&#039;) ? &#039;http://&#039; : &#039;https://&#039;;
+
+        return preg_replace(&#039;~&#039;.$start.&#039;~&#039;, $scheme, $root, 1);
+    }
+
+    /**
+     * Format the given URL segments into a single URL.
+     *
+     * @param  string  $root
+     * @param  string  $path
+     * @param  \Illuminate\Routing\Route|null  $route
+     * @return string
+     */
+    public function format($root, $path, $route = null)
+    {
+        $path = &#039;/&#039;.trim($path, &#039;/&#039;);
+
+        if ($this-&gt;formatHostUsing) {
+            $root = call_user_func($this-&gt;formatHostUsing, $root, $route);
+        }
+
+        if ($this-&gt;formatPathUsing) {
+            $path = call_user_func($this-&gt;formatPathUsing, $path, $route);
+        }
+
+        return trim($root.$path, &#039;/&#039;);
+    }
+
+    /**
+     * Determine if the given path is a valid URL.
+     *
+     * @param  string  $path
+     * @return bool
+     */
+    public function isValidUrl($path)
+    {
+        if (! preg_match(&#039;~^(#|//|https?://|(mailto|tel|sms):)~&#039;, $path)) {
+            return filter_var($path, FILTER_VALIDATE_URL) !== false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Get the Route URL generator instance.
+     *
+     * @return \Illuminate\Routing\RouteUrlGenerator
+     */
+    protected function routeUrl()
+    {
+        if (! $this-&gt;routeGenerator) {
+            $this-&gt;routeGenerator = new RouteUrlGenerator($this, $this-&gt;request);
+        }
+
+        return $this-&gt;routeGenerator;
+    }
+
+    /**
+     * Set the default named parameters used by the URL generator.
+     *
+     * @param  array  $defaults
+     * @return void
+     */
+    public function defaults(array $defaults)
+    {
+        $this-&gt;routeUrl()-&gt;defaults($defaults);
+    }
+
+    /**
+     * Get the default named parameters used by the URL generator.
+     *
+     * @return array
+     */
+    public function getDefaultParameters()
+    {
+        return $this-&gt;routeUrl()-&gt;defaultParameters;
+    }
+
+    /**
+     * Force the scheme for URLs.
+     *
+     * @param  string|null  $scheme
+     * @return void
+     */
+    public function forceScheme($scheme)
+    {
+        $this-&gt;cachedScheme = null;
+
+        $this-&gt;forceScheme = $scheme ? $scheme.&#039;://&#039; : null;
+    }
+
+    /**
+     * Force the use of the HTTPS scheme for all generated URLs.
+     *
+     * @param  bool  $force
+     * @return void
+     */
+    public function forceHttps($force = true)
+    {
+        if ($force) {
+            $this-&gt;forceScheme(&#039;https&#039;);
+        }
+    }
+
+    /**
+     * Set the URL origin for all generated URLs.
+     *
+     * @param  string|null  $root
+     * @return void
+     */
+    public function useOrigin(?string $root)
+    {
+        $this-&gt;forceRootUrl($root);
+    }
+
+    /**
+     * Set the forced root URL.
+     *
+     * @param  string|null  $root
+     * @return void
+     *
+     * @deprecated Use useOrigin
+     */
+    public function forceRootUrl($root)
+    {
+        $this-&gt;forcedRoot = $root ? rtrim($root, &#039;/&#039;) : null;
+
+        $this-&gt;cachedRoot = null;
+    }
+
+    /**
+     * Set the URL origin for all generated asset URLs.
+     *
+     * @param  string|null  $root
+     * @return void
+     */
+    public function useAssetOrigin(?string $root)
+    {
+        $this-&gt;assetRoot = $root ? rtrim($root, &#039;/&#039;) : null;
+    }
+
+    /**
+     * Set a callback to be used to format the host of generated URLs.
+     *
+     * @param  \Closure  $callback
+     * @return $this
+     */
+    public function formatHostUsing(Closure $callback)
+    {
+        $this-&gt;formatHostUsing = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Set a callback to be used to format the path of generated URLs.
+     *
+     * @param  \Closure  $callback
+     * @return $this
+     */
+    public function formatPathUsing(Closure $callback)
+    {
+        $this-&gt;formatPathUsing = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Get the path formatter being used by the URL generator.
+     *
+     * @return \Closure
+     */
+    public function pathFormatter()
+    {
+        return $this-&gt;formatPathUsing ?: function ($path) {
+            return $path;
+        };
+    }
+
+    /**
+     * Get the request instance.
+     *
+     * @return \Illuminate\Http\Request
+     */
+    public function getRequest()
+    {
+        return $this-&gt;request;
+    }
+
+    /**
+     * Set the current request instance.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return void
+     */
+    public function setRequest(Request $request)
+    {
+        $this-&gt;request = $request;
+
+        $this-&gt;cachedRoot = null;
+        $this-&gt;cachedScheme = null;
+
+        tap($this-&gt;routeGenerator?-&gt;defaultParameters ?: [], function ($defaults) {
+            $this-&gt;routeGenerator = null;
+
+            if (! empty($defaults)) {
+                $this-&gt;defaults($defaults);
+            }
+        });
+    }
+
+    /**
+     * Set the route collection.
+     *
+     * @param  \Illuminate\Routing\RouteCollectionInterface  $routes
+     * @return $this
+     */
+    public function setRoutes(RouteCollectionInterface $routes)
+    {
+        $this-&gt;routes = $routes;
+
+        return $this;
+    }
+
+    /**
+     * Get the session implementation from the resolver.
+     *
+     * @return \Illuminate\Session\Store|null
+     */
+    protected function getSession()
+    {
+        if ($this-&gt;sessionResolver) {
+            return call_user_func($this-&gt;sessionResolver);
+        }
+    }
+
+    /**
+     * Set the session resolver for the generator.
+     *
+     * @param  callable  $sessionResolver
+     * @return $this
+     */
+    public function setSessionResolver(callable $sessionResolver)
+    {
+        $this-&gt;sessionResolver = $sessionResolver;
+
+        return $this;
+    }
+
+    /**
+     * Set the encryption key resolver.
+     *
+     * @param  callable  $keyResolver
+     * @return $this
+     */
+    public function setKeyResolver(callable $keyResolver)
+    {
+        $this-&gt;keyResolver = $keyResolver;
+
+        return $this;
+    }
+
+    /**
+     * Clone a new instance of the URL generator with a different encryption key resolver.
+     *
+     * @param  callable  $keyResolver
+     * @return \Illuminate\Routing\UrlGenerator
+     */
+    public function withKeyResolver(callable $keyResolver)
+    {
+        return (clone $this)-&gt;setKeyResolver($keyResolver);
+    }
+
+    /**
+     * Set the callback that should be used to attempt to resolve missing named routes.
+     *
+     * @param  callable  $missingNamedRouteResolver
+     * @return $this
+     */
+    public function resolveMissingNamedRoutesUsing(callable $missingNamedRouteResolver)
+    {
+        $this-&gt;missingNamedRouteResolver = $missingNamedRouteResolver;
+
+        return $this;
+    }
+
+    /**
+     * Get the root controller namespace.
+     *
+     * @return string
+     */
+    public function getRootControllerNamespace()
+    {
+        return $this-&gt;rootNamespace;
+    }
+
+    /**
+     * Set the root controller namespace.
+     *
+     * @param  string  $rootNamespace
+     * @return $this
+     */
+    public function setRootControllerNamespace($rootNamespace)
+    {
+        $this-&gt;rootNamespace = $rootNamespace;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Routing/ViewController.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Routing/Console -->
+
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Internal/AmpListenerV5.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Internal;
+
+use Amp\Http\Client\ApplicationInterceptor;
+use Amp\Http\Client\Connection\Connection;
+use Amp\Http\Client\Connection\Stream;
+use Amp\Http\Client\EventListener;
+use Amp\Http\Client\NetworkInterceptor;
+use Amp\Http\Client\Request;
+use Amp\Http\Client\Response;
+use Amp\Socket\InternetAddress;
+use Symfony\Component\HttpClient\Exception\TransportException;
+
+/**
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+class AmpListenerV5 implements EventListener
+{
+    private array $info;
+
+    /**
+     * @param resource|null $handle
+     */
+    public function __construct(
+        array &amp;$info,
+        private array $pinSha256,
+        private \Closure $onProgress,
+        private &amp;$handle,
+    ) {
+        $info += [
+            &#039;connect_time&#039; =&gt; 0.0,
+            &#039;pretransfer_time&#039; =&gt; 0.0,
+            &#039;starttransfer_time&#039; =&gt; 0.0,
+            &#039;total_time&#039; =&gt; 0.0,
+            &#039;namelookup_time&#039; =&gt; 0.0,
+            &#039;primary_ip&#039; =&gt; &#039;&#039;,
+            &#039;primary_port&#039; =&gt; 0,
+        ];
+
+        $this-&gt;info = &amp;$info;
+    }
+
+    public function requestStart(Request $request): void
+    {
+        $this-&gt;info[&#039;start_time&#039;] ??= microtime(true);
+        ($this-&gt;onProgress)();
+    }
+
+    public function connectionAcquired(Request $request, Connection $connection, int $streamCount): void
+    {
+        $this-&gt;info[&#039;namelookup_time&#039;] = microtime(true) - $this-&gt;info[&#039;start_time&#039;]; // see https://github.com/amphp/socket/issues/114
+        $this-&gt;info[&#039;connect_time&#039;] = microtime(true) - $this-&gt;info[&#039;start_time&#039;];
+        ($this-&gt;onProgress)();
+    }
+
+    public function requestHeaderStart(Request $request, Stream $stream): void
+    {
+        $host = $stream-&gt;getRemoteAddress()-&gt;toString();
+        if ($stream-&gt;getRemoteAddress() instanceof InternetAddress) {
+            $host = $stream-&gt;getRemoteAddress()-&gt;getAddress();
+            $this-&gt;info[&#039;primary_port&#039;] = $stream-&gt;getRemoteAddress()-&gt;getPort();
+        }
+
+        $this-&gt;info[&#039;primary_ip&#039;] = $host;
+
+        if (str_contains($host, &#039;:&#039;)) {
+            $host = &#039;[&#039;.$host.&#039;]&#039;;
+        }
+
+        $this-&gt;info[&#039;pretransfer_time&#039;] = microtime(true) - $this-&gt;info[&#039;start_time&#039;];
+        $this-&gt;info[&#039;debug&#039;] .= \sprintf(&quot;* Connected to %s (%s) port %d\n&quot;, $request-&gt;getUri()-&gt;getHost(), $host, $this-&gt;info[&#039;primary_port&#039;]);
+
+        if ((isset($this-&gt;info[&#039;peer_certificate_chain&#039;]) || $this-&gt;pinSha256) &amp;&amp; null !== $tlsInfo = $stream-&gt;getTlsInfo()) {
+            foreach ($tlsInfo-&gt;getPeerCertificates() as $cert) {
+                $this-&gt;info[&#039;peer_certificate_chain&#039;][] = openssl_x509_read($cert-&gt;toPem());
+            }
+
+            if ($this-&gt;pinSha256) {
+                $pin = openssl_pkey_get_public($this-&gt;info[&#039;peer_certificate_chain&#039;][0]);
+                $pin = openssl_pkey_get_details($pin)[&#039;key&#039;];
+                $pin = \array_slice(explode(&quot;\n&quot;, $pin), 1, -2);
+                $pin = base64_decode(implode(&#039;&#039;, $pin));
+                $pin = base64_encode(hash(&#039;sha256&#039;, $pin, true));
+
+                if (!\in_array($pin, $this-&gt;pinSha256, true)) {
+                    throw new TransportException(\sprintf(&#039;SSL public key does not match pinned public key for &quot;%s&quot;.&#039;, $this-&gt;info[&#039;url&#039;]));
+                }
+            }
+        }
+        ($this-&gt;onProgress)();
+
+        $uri = $request-&gt;getUri();
+        $requestUri = $uri-&gt;getPath() ?: &#039;/&#039;;
+
+        if (&#039;&#039; !== $query = $uri-&gt;getQuery()) {
+            $requestUri .= &#039;?&#039;.$query;
+        }
+
+        if (&#039;CONNECT&#039; === $method = $request-&gt;getMethod()) {
+            $requestUri = $uri-&gt;getHost().&#039;: &#039;.($uri-&gt;getPort() ?? (&#039;https&#039; === $uri-&gt;getScheme() ? 443 : 80));
+        }
+
+        $this-&gt;info[&#039;debug&#039;] .= \sprintf(&quot;&gt; %s %s HTTP/%s \r\n&quot;, $method, $requestUri, $request-&gt;getProtocolVersions()[0]);
+
+        foreach ($request-&gt;getHeaderPairs() as [$name, $value]) {
+            $this-&gt;info[&#039;debug&#039;] .= $name.&#039;: &#039;.$value.&quot;\r\n&quot;;
+        }
+        $this-&gt;info[&#039;debug&#039;] .= &quot;\r\n&quot;;
+    }
+
+    public function requestBodyEnd(Request $request, Stream $stream): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function responseHeaderStart(Request $request, Stream $stream): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function requestEnd(Request $request, Response $response): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function requestFailed(Request $request, \Throwable $exception): void
+    {
+        $this-&gt;handle = null;
+        ($this-&gt;onProgress)();
+    }
+
+    public function requestHeaderEnd(Request $request, Stream $stream): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function requestBodyStart(Request $request, Stream $stream): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function requestBodyProgress(Request $request, Stream $stream): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function responseHeaderEnd(Request $request, Stream $stream, Response $response): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function responseBodyStart(Request $request, Stream $stream, Response $response): void
+    {
+        $this-&gt;info[&#039;starttransfer_time&#039;] = microtime(true) - $this-&gt;info[&#039;start_time&#039;];
+        ($this-&gt;onProgress)();
+    }
+
+    public function responseBodyProgress(Request $request, Stream $stream, Response $response): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function responseBodyEnd(Request $request, Stream $stream, Response $response): void
+    {
+        $this-&gt;handle = null;
+        ($this-&gt;onProgress)();
+    }
+
+    public function applicationInterceptorStart(Request $request, ApplicationInterceptor $interceptor): void
+    {
+    }
+
+    public function applicationInterceptorEnd(Request $request, ApplicationInterceptor $interceptor, Response $response): void
+    {
+    }
+
+    public function networkInterceptorStart(Request $request, NetworkInterceptor $interceptor): void
+    {
+    }
+
+    public function networkInterceptorEnd(Request $request, NetworkInterceptor $interceptor, Response $response): void
+    {
+    }
+
+    public function push(Request $request): void
+    {
+        ($this-&gt;onProgress)();
+    }
+
+    public function requestRejected(Request $request): void
+    {
+        $this-&gt;handle = null;
+        ($this-&gt;onProgress)();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Internal/AmpResolverV4.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Messenger -->
+
+</body>
+</html>

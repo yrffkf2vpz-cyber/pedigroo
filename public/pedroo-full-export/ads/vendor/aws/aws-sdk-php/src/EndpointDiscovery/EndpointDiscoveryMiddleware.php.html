@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/EndpointDiscovery/EndpointDiscoveryMiddleware.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\EndpointDiscovery;
+
+use Aws\AwsClient;
+use Aws\CacheInterface;
+use Aws\CommandInterface;
+use Aws\Credentials\CredentialsInterface;
+use Aws\Exception\AwsException;
+use Aws\Exception\UnresolvedEndpointException;
+use Aws\LruArrayCache;
+use Aws\Middleware;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\UriInterface;
+
+class EndpointDiscoveryMiddleware
+{
+    /**
+     * @var CacheInterface
+     */
+    private static $cache;
+    private static $discoveryCooldown = 60;
+
+    private $args;
+    private $client;
+    private $config;
+    private $discoveryTimes = [];
+    private $nextHandler;
+    private $service;
+
+    public static function wrap(
+        $client,
+        $args,
+        $config
+    ) {
+        return function (callable $handler) use (
+            $client,
+            $args,
+            $config
+        ) {
+            return new static(
+                $handler,
+                $client,
+                $args,
+                $config
+            );
+        };
+    }
+
+    public function __construct(
+        callable $handler,
+        AwsClient $client,
+        array $args,
+        $config
+    ) {
+        $this-&gt;nextHandler = $handler;
+        $this-&gt;client = $client;
+        $this-&gt;args = $args;
+        $this-&gt;service = $client-&gt;getApi();
+        $this-&gt;config = $config;
+    }
+
+    public function __invoke(CommandInterface $cmd, RequestInterface $request)
+    {
+        $nextHandler = $this-&gt;nextHandler;
+        $op = $this-&gt;service-&gt;getOperation($cmd-&gt;getName())-&gt;toArray();
+
+        // Continue only if endpointdiscovery trait is set
+        if (isset($op[&#039;endpointdiscovery&#039;])) {
+            $config = ConfigurationProvider::unwrap($this-&gt;config);
+            $isRequired = !empty($op[&#039;endpointdiscovery&#039;][&#039;required&#039;]);
+
+            if ($isRequired &amp;&amp; !($config-&gt;isEnabled())) {
+                throw new UnresolvedEndpointException(&#039;This operation &#039;
+                    . &#039;requires the use of endpoint discovery, but this has &#039;
+                    . &#039;been disabled in the configuration. Enable endpoint &#039;
+                    . &#039;discovery or use a different operation.&#039;);
+            }
+
+            // Continue only if enabled by config
+            if ($config-&gt;isEnabled()) {
+                if (isset($op[&#039;endpointoperation&#039;])) {
+                    throw new UnresolvedEndpointException(&#039;This operation is &#039;
+                        . &#039;contradictorily marked both as using endpoint discovery &#039;
+                        . &#039;and being the endpoint discovery operation. Please &#039;
+                        . &#039;verify the accuracy of your model files.&#039;);
+                }
+
+                // Original endpoint may be used if discovery optional
+                $originalUri = $request-&gt;getUri();
+
+                $identifiers = $this-&gt;getIdentifiers($op);
+
+                $cacheKey = $this-&gt;getCacheKey(
+                    $this-&gt;client-&gt;getCredentials()-&gt;wait(),
+                    $cmd,
+                    $identifiers
+                );
+
+                // Check/create cache
+                if (!isset(self::$cache)) {
+                    self::$cache = new LruArrayCache($config-&gt;getCacheLimit());
+                }
+
+                if (empty($endpointList = self::$cache-&gt;get($cacheKey))) {
+                    $endpointList = new EndpointList([]);
+                }
+                $endpoint = $endpointList-&gt;getActive();
+
+                // Retrieve endpoints if there is no active endpoint
+                if (empty($endpoint)) {
+                    try {
+                        $endpoint = $this-&gt;discoverEndpoint(
+                            $cacheKey,
+                            $cmd,
+                            $identifiers
+                        );
+                    } catch (\Exception $e) {
+                        // Use cached endpoint, expired or active, if any remain
+                        $endpoint = $endpointList-&gt;getEndpoint();
+
+                        if (empty($endpoint)) {
+                            return $this-&gt;handleDiscoveryException(
+                                $isRequired,
+                                $originalUri,
+                                $e,
+                                $cmd,
+                                $request
+                            );
+                        }
+                    }
+                }
+
+                $request = $this-&gt;modifyRequest($request, $endpoint);
+
+                $g = function ($value) use (
+                    $cacheKey,
+                    $cmd,
+                    $identifiers,
+                    $isRequired,
+                    $originalUri,
+                    $request,
+                    &amp;$endpoint,
+                    &amp;$g
+                ) {
+                    if ($value instanceof AwsException
+                        &amp;&amp; (
+                            $value-&gt;getAwsErrorCode() == &#039;InvalidEndpointException&#039;
+                            || $value-&gt;getStatusCode() == 421
+                        )
+                    ) {
+                        return $this-&gt;handleInvalidEndpoint(
+                            $cacheKey,
+                            $cmd,
+                            $identifiers,
+                            $isRequired,
+                            $originalUri,
+                            $request,
+                            $value,
+                            $endpoint,
+                            $g
+                        );
+                    }
+                    
+                    return $value;
+                };
+
+                return $nextHandler($cmd, $request)-&gt;otherwise($g);
+            }
+        }
+
+        return $nextHandler($cmd, $request);
+    }
+
+    private function discoverEndpoint(
+        $cacheKey,
+        CommandInterface $cmd,
+        array $identifiers
+    ) {
+        $discCmd = $this-&gt;getDiscoveryCommand($cmd, $identifiers);
+        $this-&gt;discoveryTimes[$cacheKey] = time();
+        $result = $this-&gt;client-&gt;execute($discCmd);
+
+        if (isset($result[&#039;Endpoints&#039;])) {
+            $endpointData = [];
+            foreach ($result[&#039;Endpoints&#039;] as $datum) {
+                $endpointData[$datum[&#039;Address&#039;]] = time()
+                    + ($datum[&#039;CachePeriodInMinutes&#039;] * 60);
+            }
+            $endpointList = new EndpointList($endpointData);
+            self::$cache-&gt;set($cacheKey, $endpointList);
+            return $endpointList-&gt;getEndpoint();
+        }
+
+        throw new UnresolvedEndpointException(&#039;The endpoint discovery operation &#039;
+            . &#039;yielded a response that did not contain properly formatted &#039;
+            . &#039;endpoint data.&#039;);
+    }
+
+    private function getCacheKey(
+        CredentialsInterface $creds,
+        CommandInterface $cmd,
+        array $identifiers
+    ) {
+        $key = $this-&gt;service-&gt;getServiceName() . &#039;_&#039; . $creds-&gt;getAccessKeyId();
+        if (!empty($identifiers)) {
+            $key .= &#039;_&#039; . $cmd-&gt;getName();
+            foreach ($identifiers as $identifier) {
+                $key .= &quot;_{$cmd[$identifier]}&quot;;
+            }
+        }
+
+        return $key;
+    }
+
+    private function getDiscoveryCommand(
+        CommandInterface $cmd,
+        array $identifiers
+    ) {
+        foreach ($this-&gt;service-&gt;getOperations() as $op) {
+            if (isset($op[&#039;endpointoperation&#039;])) {
+                $endpointOperation = $op-&gt;toArray()[&#039;name&#039;];
+                break;
+            }
+        }
+
+        if (!isset($endpointOperation)) {
+            throw new UnresolvedEndpointException(&#039;This command is set to use &#039;
+                . &#039;endpoint discovery, but no endpoint discovery operation was &#039;
+                . &#039;found. Please verify the accuracy of your model files.&#039;);
+        }
+
+        $params = [];
+        if (!empty($identifiers)) {
+            $params[&#039;Operation&#039;] = $cmd-&gt;getName();
+            $params[&#039;Identifiers&#039;] = [];
+            foreach ($identifiers as $identifier) {
+                $params[&#039;Identifiers&#039;][$identifier] = $cmd[$identifier];
+            }
+        }
+        $command = $this-&gt;client-&gt;getCommand($endpointOperation, $params);
+        $command-&gt;getHandlerList()-&gt;appendBuild(
+            Middleware::mapRequest(function (RequestInterface $r) {
+                return $r-&gt;withHeader(
+                    &#039;x-amz-api-version&#039;,
+                    $this-&gt;service-&gt;getApiVersion()
+                );
+            }),
+            &#039;x-amz-api-version-header&#039;
+        );
+
+        return $command;
+    }
+
+    private function getIdentifiers(array $operation)
+    {
+        $inputShape = $this-&gt;service-&gt;getShapeMap()
+            -&gt;resolve($operation[&#039;input&#039;])
+            -&gt;toArray();
+        $identifiers = [];
+        foreach ($inputShape[&#039;members&#039;] as $key =&gt; $member) {
+            if (!empty($member[&#039;endpointdiscoveryid&#039;])) {
+                $identifiers[] = $key;
+            }
+        }
+        return $identifiers;
+    }
+
+    private function handleDiscoveryException(
+        $isRequired,
+        $originalUri,
+        \Exception $e,
+        CommandInterface $cmd,
+        RequestInterface $request
+    ) {
+        // If no cached endpoints and discovery required,
+        // throw exception
+        if ($isRequired) {
+            $message = &#039;The endpoint required for this service is currently &#039;
+                . &#039;unable to be retrieved, and your request can not be fulfilled &#039;
+                . &#039;unless you manually specify an endpoint.&#039;;
+            throw new AwsException(
+                $message,
+                $cmd,
+                [
+                    &#039;code&#039; =&gt; &#039;EndpointDiscoveryException&#039;,
+                    &#039;message&#039; =&gt; $message
+                ],
+                $e
+            );
+        }
+
+        // If discovery isn&#039;t required, use original endpoint
+        return $this-&gt;useOriginalUri(
+            $originalUri,
+            $cmd,
+            $request
+        );
+    }
+
+    private function handleInvalidEndpoint(
+        $cacheKey,
+        $cmd,
+        $identifiers,
+        $isRequired,
+        $originalUri,
+        $request,
+        $value,
+        &amp;$endpoint,
+        &amp;$g
+    ) {
+        $nextHandler = $this-&gt;nextHandler;
+        $endpointList = self::$cache-&gt;get($cacheKey);
+        if ($endpointList instanceof EndpointList) {
+
+            // Remove invalid endpoint from cached list
+            $endpointList-&gt;remove($endpoint);
+
+            // If possible, get another cached endpoint
+            $newEndpoint = $endpointList-&gt;getEndpoint();
+        }
+        if (empty($newEndpoint)) {
+
+            // If no more cached endpoints, make discovery call
+            // if none made within cooldown for given key
+            if (isset($this-&gt;discoveryTimes[$cacheKey])
+                &amp;&amp; time() - $this-&gt;discoveryTimes[$cacheKey] &lt; self::$discoveryCooldown
+            ) {
+
+                // If no more cached endpoints and it&#039;s required,
+                // fail with original exception
+                if ($isRequired) {
+                    return $value;
+                }
+
+                // Use original endpoint if not required
+                return $this-&gt;useOriginalUri(
+                    $originalUri,
+                    $cmd,
+                    $request
+                );
+            }
+
+            $newEndpoint = $this-&gt;discoverEndpoint(
+                $cacheKey,
+                $cmd,
+                $identifiers
+            );
+        }
+        $endpoint = $newEndpoint;
+        $request = $this-&gt;modifyRequest($request, $endpoint);
+        return $nextHandler($cmd, $request)-&gt;otherwise($g);
+    }
+
+    private function modifyRequest(RequestInterface $request, $endpoint)
+    {
+        $parsed = $this-&gt;parseEndpoint($endpoint);
+        if (!empty($request-&gt;getHeader(&#039;User-Agent&#039;))) {
+            $userAgent = $request-&gt;getHeader(&#039;User-Agent&#039;)[0];
+            if (strpos($userAgent, &#039;endpoint-discovery&#039;) === false) {
+                $userAgent = $userAgent . &#039; endpoint-discovery&#039;;
+            }
+        } else {
+            $userAgent = &#039;endpoint-discovery&#039;;
+        }
+
+        return $request
+            -&gt;withUri(
+                $request-&gt;getUri()
+                    -&gt;withHost($parsed[&#039;host&#039;])
+                    -&gt;withPath($parsed[&#039;path&#039;])
+            )
+            -&gt;withHeader(&#039;User-Agent&#039;, $userAgent);
+    }
+
+    /**
+     * Parses an endpoint returned from the discovery API into an array with
+     * &#039;host&#039; and &#039;path&#039; keys.
+     *
+     * @param $endpoint
+     * @return array
+     */
+    private function parseEndpoint($endpoint)
+    {
+        $parsed = parse_url($endpoint);
+
+        // parse_url() will correctly parse full URIs with schemes
+        if (isset($parsed[&#039;host&#039;])) {
+            return $parsed;
+        }
+
+        // parse_url() will put host &amp; path in &#039;path&#039; if scheme is not provided
+        if (isset($parsed[&#039;path&#039;])) {
+            $split = explode(&#039;/&#039;, $parsed[&#039;path&#039;], 2);
+            $parsed[&#039;host&#039;] = $split[0];
+            if (isset($split[1])) {
+                if (substr($split[1], 0 , 1) !== &#039;/&#039;) {
+                    $split[1] = &#039;/&#039; . $split[1];
+                }
+                $parsed[&#039;path&#039;] = $split[1];
+            } else {
+                $parsed[&#039;path&#039;] = &#039;&#039;;
+            }
+            return $parsed;
+        }
+
+        throw new UnresolvedEndpointException(&quot;The supplied endpoint &#039;&quot;
+            . &quot;{$endpoint}&#039; is invalid.&quot;);
+    }
+
+    private function useOriginalUri(
+        UriInterface $uri,
+        CommandInterface $cmd,
+        RequestInterface $request
+    ) {
+        $nextHandler = $this-&gt;nextHandler;
+        $endpoint = $uri-&gt;getHost() . $uri-&gt;getPath();
+        $request = $this-&gt;modifyRequest(
+            $request,
+            $endpoint
+        );
+        return $nextHandler($cmd, $request);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/EndpointDiscovery/EndpointList.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/EndpointDiscovery/Exception -->
+
+</body>
+</html>

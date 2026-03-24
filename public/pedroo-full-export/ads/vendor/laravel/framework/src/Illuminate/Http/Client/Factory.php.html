@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Http/Client/Factory.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Http\Client;
+
+use Closure;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Middleware;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Psr7\Response as Psr7Response;
+use GuzzleHttp\TransferStats;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
+use Illuminate\Support\Traits\Macroable;
+use PHPUnit\Framework\Assert as PHPUnit;
+
+/**
+ * @mixin \Illuminate\Http\Client\PendingRequest
+ */
+class Factory
+{
+    use Macroable {
+        __call as macroCall;
+    }
+
+    /**
+     * The event dispatcher implementation.
+     *
+     * @var \Illuminate\Contracts\Events\Dispatcher|null
+     */
+    protected $dispatcher;
+
+    /**
+     * The middleware to apply to every request.
+     *
+     * @var array
+     */
+    protected $globalMiddleware = [];
+
+    /**
+     * The options to apply to every request.
+     *
+     * @var \Closure|array
+     */
+    protected $globalOptions = [];
+
+    /**
+     * The stub callables that will handle requests.
+     *
+     * @var \Illuminate\Support\Collection
+     */
+    protected $stubCallbacks;
+
+    /**
+     * Indicates if the factory is recording requests and responses.
+     *
+     * @var bool
+     */
+    protected $recording = false;
+
+    /**
+     * The recorded response array.
+     *
+     * @var list&lt;array{0: \Illuminate\Http\Client\Request, 1: \Illuminate\Http\Client\Response|null}&gt;
+     */
+    protected $recorded = [];
+
+    /**
+     * All created response sequences.
+     *
+     * @var list&lt;\Illuminate\Http\Client\ResponseSequence&gt;
+     */
+    protected $responseSequences = [];
+
+    /**
+     * Indicates that an exception should be thrown if any request is not faked.
+     *
+     * @var bool
+     */
+    protected $preventStrayRequests = false;
+
+    /**
+     * A list of URL patterns that are allowed to bypass the stray request guard.
+     *
+     * @var array&lt;int, string&gt;
+     */
+    protected $allowedStrayRequestUrls = [];
+
+    /**
+     * Create a new factory instance.
+     *
+     * @param  \Illuminate\Contracts\Events\Dispatcher|null  $dispatcher
+     */
+    public function __construct(?Dispatcher $dispatcher = null)
+    {
+        $this-&gt;dispatcher = $dispatcher;
+
+        $this-&gt;stubCallbacks = new Collection;
+    }
+
+    /**
+     * Add middleware to apply to every request.
+     *
+     * @param  callable  $middleware
+     * @return $this
+     */
+    public function globalMiddleware($middleware)
+    {
+        $this-&gt;globalMiddleware[] = $middleware;
+
+        return $this;
+    }
+
+    /**
+     * Add request middleware to apply to every request.
+     *
+     * @param  callable  $middleware
+     * @return $this
+     */
+    public function globalRequestMiddleware($middleware)
+    {
+        $this-&gt;globalMiddleware[] = Middleware::mapRequest($middleware);
+
+        return $this;
+    }
+
+    /**
+     * Add response middleware to apply to every request.
+     *
+     * @param  callable  $middleware
+     * @return $this
+     */
+    public function globalResponseMiddleware($middleware)
+    {
+        $this-&gt;globalMiddleware[] = Middleware::mapResponse($middleware);
+
+        return $this;
+    }
+
+    /**
+     * Set the options to apply to every request.
+     *
+     * @param  \Closure|array  $options
+     * @return $this
+     */
+    public function globalOptions($options)
+    {
+        $this-&gt;globalOptions = $options;
+
+        return $this;
+    }
+
+    /**
+     * Create a new response instance for use during stubbing.
+     *
+     * @param  array|string|null  $body
+     * @param  int  $status
+     * @param  array  $headers
+     * @return \GuzzleHttp\Promise\PromiseInterface
+     */
+    public static function response($body = null, $status = 200, $headers = [])
+    {
+        return Create::promiseFor(
+            static::psr7Response($body, $status, $headers)
+        );
+    }
+
+    /**
+     * Create a new PSR-7 response instance for use during stubbing.
+     *
+     * @param  array|string|null  $body
+     * @param  int  $status
+     * @param  array&lt;string, mixed&gt;  $headers
+     * @return \GuzzleHttp\Psr7\Response
+     */
+    public static function psr7Response($body = null, $status = 200, $headers = [])
+    {
+        if (is_array($body)) {
+            $body = json_encode($body);
+
+            $headers[&#039;Content-Type&#039;] = &#039;application/json&#039;;
+        }
+
+        return new Psr7Response($status, $headers, $body);
+    }
+
+    /**
+     * Create a new RequestException instance for use during stubbing.
+     *
+     * @param  array|string|null  $body
+     * @param  int  $status
+     * @param  array&lt;string, mixed&gt;  $headers
+     * @return \Illuminate\Http\Client\RequestException
+     */
+    public static function failedRequest($body = null, $status = 200, $headers = [])
+    {
+        return new RequestException(new Response(static::psr7Response($body, $status, $headers)));
+    }
+
+    /**
+     * Create a new connection exception for use during stubbing.
+     *
+     * @param  string|null  $message
+     * @return \Closure(\Illuminate\Http\Client\Request): \GuzzleHttp\Promise\PromiseInterface
+     */
+    public static function failedConnection($message = null)
+    {
+        return function ($request) use ($message) {
+            return Create::rejectionFor(new ConnectException(
+                $message ?? &quot;cURL error 6: Could not resolve host: {$request-&gt;toPsrRequest()-&gt;getUri()-&gt;getHost()} (see https://curl.haxx.se/libcurl/c/libcurl-errors.html) for {$request-&gt;toPsrRequest()-&gt;getUri()}.&quot;,
+                $request-&gt;toPsrRequest(),
+            ));
+        };
+    }
+
+    /**
+     * Get an invokable object that returns a sequence of responses in order for use during stubbing.
+     *
+     * @param  array  $responses
+     * @return \Illuminate\Http\Client\ResponseSequence
+     */
+    public function sequence(array $responses = [])
+    {
+        return $this-&gt;responseSequences[] = new ResponseSequence($responses);
+    }
+
+    /**
+     * Register a stub callable that will intercept requests and be able to return stub responses.
+     *
+     * @param  callable|array&lt;string, mixed&gt;|null  $callback
+     * @return $this
+     */
+    public function fake($callback = null)
+    {
+        $this-&gt;record();
+
+        $this-&gt;recorded = [];
+
+        if (is_null($callback)) {
+            $callback = function () {
+                return static::response();
+            };
+        }
+
+        if (is_array($callback)) {
+            foreach ($callback as $url =&gt; $callable) {
+                $this-&gt;stubUrl($url, $callable);
+            }
+
+            return $this;
+        }
+
+        $this-&gt;stubCallbacks = $this-&gt;stubCallbacks-&gt;merge(new Collection([
+            function ($request, $options) use ($callback) {
+                $response = $callback;
+
+                while ($response instanceof Closure) {
+                    $response = $response($request, $options);
+                }
+
+                if ($response instanceof PromiseInterface) {
+                    $options[&#039;on_stats&#039;](new TransferStats(
+                        $request-&gt;toPsrRequest(),
+                        $response-&gt;wait(),
+                    ));
+                }
+
+                return $response;
+            },
+        ]));
+
+        return $this;
+    }
+
+    /**
+     * Register a response sequence for the given URL pattern.
+     *
+     * @param  string  $url
+     * @return \Illuminate\Http\Client\ResponseSequence
+     */
+    public function fakeSequence($url = &#039;*&#039;)
+    {
+        return tap($this-&gt;sequence(), function ($sequence) use ($url) {
+            $this-&gt;fake([$url =&gt; $sequence]);
+        });
+    }
+
+    /**
+     * Stub the given URL using the given callback.
+     *
+     * @param  string  $url
+     * @param  \Illuminate\Http\Client\Response|\GuzzleHttp\Promise\PromiseInterface|callable|int|string|array|\Illuminate\Http\Client\ResponseSequence  $callback
+     * @return $this
+     */
+    public function stubUrl($url, $callback)
+    {
+        return $this-&gt;fake(function ($request, $options) use ($url, $callback) {
+            if (! Str::is(Str::start($url, &#039;*&#039;), $request-&gt;url())) {
+                return;
+            }
+
+            if (is_int($callback) &amp;&amp; $callback &gt;= 100 &amp;&amp; $callback &lt; 600) {
+                return static::response(status: $callback);
+            }
+
+            if (is_int($callback) || is_string($callback)) {
+                return static::response($callback);
+            }
+
+            if ($callback instanceof Closure || $callback instanceof ResponseSequence) {
+                return $callback($request, $options);
+            }
+
+            return $callback;
+        });
+    }
+
+    /**
+     * Indicate that an exception should be thrown if any request is not faked.
+     *
+     * @param  bool  $prevent
+     * @return $this
+     */
+    public function preventStrayRequests($prevent = true)
+    {
+        $this-&gt;preventStrayRequests = $prevent;
+
+        return $this;
+    }
+
+    /**
+     * Determine if stray requests are being prevented.
+     *
+     * @return bool
+     */
+    public function preventingStrayRequests()
+    {
+        return $this-&gt;preventStrayRequests;
+    }
+
+    /**
+     * Allow stray, unfaked requests entirely, or optionally allow only specific URLs.
+     *
+     * @param  array&lt;int, string&gt;|null  $only
+     * @return $this
+     */
+    public function allowStrayRequests(?array $only = null)
+    {
+        if (is_null($only)) {
+            $this-&gt;preventStrayRequests(false);
+
+            $this-&gt;allowedStrayRequestUrls = [];
+        } else {
+            $this-&gt;allowedStrayRequestUrls = array_values($only);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Begin recording request / response pairs.
+     *
+     * @return $this
+     */
+    public function record()
+    {
+        $this-&gt;recording = true;
+
+        return $this;
+    }
+
+    /**
+     * Record a request response pair.
+     *
+     * @param  \Illuminate\Http\Client\Request  $request
+     * @param  \Illuminate\Http\Client\Response|null  $response
+     * @return void
+     */
+    public function recordRequestResponsePair($request, $response)
+    {
+        if ($this-&gt;recording) {
+            $this-&gt;recorded[] = [$request, $response];
+        }
+    }
+
+    /**
+     * Assert that a request / response pair was recorded matching a given truth test.
+     *
+     * @param  callable|(\Closure(\Illuminate\Http\Client\Request, \Illuminate\Http\Client\Response|null): bool)  $callback
+     * @return void
+     */
+    public function assertSent($callback)
+    {
+        PHPUnit::assertTrue(
+            $this-&gt;recorded($callback)-&gt;count() &gt; 0,
+            &#039;An expected request was not recorded.&#039;
+        );
+    }
+
+    /**
+     * Assert that the given request was sent in the given order.
+     *
+     * @param  list&lt;string|(\Closure(\Illuminate\Http\Client\Request, \Illuminate\Http\Client\Response|null): bool)|callable&gt;  $callbacks
+     * @return void
+     */
+    public function assertSentInOrder($callbacks)
+    {
+        $this-&gt;assertSentCount(count($callbacks));
+
+        foreach ($callbacks as $index =&gt; $url) {
+            $callback = is_callable($url) ? $url : function ($request) use ($url) {
+                return $request-&gt;url() == $url;
+            };
+
+            PHPUnit::assertTrue($callback(
+                $this-&gt;recorded[$index][0],
+                $this-&gt;recorded[$index][1]
+            ), &#039;An expected request (#&#039;.($index + 1).&#039;) was not recorded.&#039;);
+        }
+    }
+
+    /**
+     * Assert that a request / response pair was not recorded matching a given truth test.
+     *
+     * @param  callable|(\Closure(\Illuminate\Http\Client\Request, \Illuminate\Http\Client\Response|null): bool)  $callback
+     * @return void
+     */
+    public function assertNotSent($callback)
+    {
+        PHPUnit::assertFalse(
+            $this-&gt;recorded($callback)-&gt;count() &gt; 0,
+            &#039;Unexpected request was recorded.&#039;
+        );
+    }
+
+    /**
+     * Assert that no request / response pair was recorded.
+     *
+     * @return void
+     */
+    public function assertNothingSent()
+    {
+        PHPUnit::assertEmpty(
+            $this-&gt;recorded,
+            &#039;Requests were recorded.&#039;
+        );
+    }
+
+    /**
+     * Assert how many requests have been recorded.
+     *
+     * @param  int  $count
+     * @return void
+     */
+    public function assertSentCount($count)
+    {
+        PHPUnit::assertCount($count, $this-&gt;recorded);
+    }
+
+    /**
+     * Assert that every created response sequence is empty.
+     *
+     * @return void
+     */
+    public function assertSequencesAreEmpty()
+    {
+        foreach ($this-&gt;responseSequences as $responseSequence) {
+            PHPUnit::assertTrue(
+                $responseSequence-&gt;isEmpty(),
+                &#039;Not all response sequences are empty.&#039;
+            );
+        }
+    }
+
+    /**
+     * Get a collection of the request / response pairs matching the given truth test.
+     *
+     * @param  (\Closure(\Illuminate\Http\Client\Request, \Illuminate\Http\Client\Response|null): bool)|callable  $callback
+     * @return \Illuminate\Support\Collection&lt;int, array{0: \Illuminate\Http\Client\Request, 1: \Illuminate\Http\Client\Response|null}&gt;
+     */
+    public function recorded($callback = null)
+    {
+        if (empty($this-&gt;recorded)) {
+            return new Collection;
+        }
+
+        $collect = new Collection($this-&gt;recorded);
+
+        if ($callback) {
+            return $collect-&gt;filter(fn ($pair) =&gt; $callback($pair[0], $pair[1]));
+        }
+
+        return $collect;
+    }
+
+    /**
+     * Create a new pending request instance for this factory.
+     *
+     * @return \Illuminate\Http\Client\PendingRequest
+     */
+    public function createPendingRequest()
+    {
+        return tap($this-&gt;newPendingRequest(), function ($request) {
+            $request
+                -&gt;stub($this-&gt;stubCallbacks)
+                -&gt;preventStrayRequests($this-&gt;preventStrayRequests)
+                -&gt;allowStrayRequests($this-&gt;allowedStrayRequestUrls);
+        });
+    }
+
+    /**
+     * Instantiate a new pending request instance for this factory.
+     *
+     * @return \Illuminate\Http\Client\PendingRequest
+     */
+    protected function newPendingRequest()
+    {
+        return (new PendingRequest($this, $this-&gt;globalMiddleware))-&gt;withOptions(value($this-&gt;globalOptions));
+    }
+
+    /**
+     * Get the current event dispatcher implementation.
+     *
+     * @return \Illuminate\Contracts\Events\Dispatcher|null
+     */
+    public function getDispatcher()
+    {
+        return $this-&gt;dispatcher;
+    }
+
+    /**
+     * Get the array of global middleware.
+     *
+     * @return array
+     */
+    public function getGlobalMiddleware()
+    {
+        return $this-&gt;globalMiddleware;
+    }
+
+    /**
+     * Execute a method against a new pending request instance.
+     *
+     * @param  string  $method
+     * @param  array  $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        if (static::hasMacro($method)) {
+            return $this-&gt;macroCall($method, $parameters);
+        }
+
+        return $this-&gt;createPendingRequest()-&gt;{$method}(...$parameters);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Http/Client/HttpClientException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Http/Client/Concerns -->
+
+</body>
+</html>

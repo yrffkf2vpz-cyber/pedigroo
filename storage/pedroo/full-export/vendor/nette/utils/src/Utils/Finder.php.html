@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/nette/utils/src/Utils/Finder.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * This file is part of the Nette Framework (https://nette.org)
+ * Copyright (c) 2004 David Grudl (https://davidgrudl.com)
+ */
+
+declare(strict_types=1);
+
+namespace Nette\Utils;
+
+use Nette;
+use function array_merge, count, func_get_args, func_num_args, glob, implode, is_array, is_dir, iterator_to_array, preg_match, preg_quote, preg_replace, preg_split, rtrim, spl_object_id, sprintf, str_ends_with, str_starts_with, strnatcmp, strpbrk, strrpos, strtolower, strtr, substr, usort;
+use const GLOB_NOESCAPE, GLOB_NOSORT, GLOB_ONLYDIR;
+
+
+/**
+ * Finder allows searching through directory trees using iterator.
+ *
+ * Finder::findFiles(&#039;*.php&#039;)
+ *     -&gt;size(&#039;&gt; 10kB&#039;)
+ *     -&gt;from(&#039;.&#039;)
+ *     -&gt;exclude(&#039;temp&#039;);
+ *
+ * @implements \IteratorAggregate&lt;string, FileInfo&gt;
+ */
+class Finder implements \IteratorAggregate
+{
+	/** @var array&lt;array{string, string}&gt; */
+	private array $find = [];
+
+	/** @var string[] */
+	private array $in = [];
+
+	/** @var array&lt;\Closure(FileInfo): bool&gt; */
+	private array $filters = [];
+
+	/** @var array&lt;\Closure(FileInfo): bool&gt; */
+	private array $descentFilters = [];
+
+	/** @var array&lt;string|self&gt; */
+	private array $appends = [];
+	private bool $childFirst = false;
+
+	/** @var ?(\Closure(FileInfo, FileInfo): int) */
+	private ?\Closure $sort = null;
+	private int $maxDepth = -1;
+	private bool $ignoreUnreadableDirs = true;
+
+
+	/**
+	 * Begins search for files and directories matching mask.
+	 * @param  string|list&lt;string&gt;  $masks
+	 */
+	public static function find(string|array $masks = [&#039;*&#039;]): static
+	{
+		$masks = is_array($masks) ? $masks : func_get_args(); // compatibility with variadic
+		return (new static)-&gt;addMask($masks, &#039;dir&#039;)-&gt;addMask($masks, &#039;file&#039;);
+	}
+
+
+	/**
+	 * Begins search for files matching mask.
+	 * @param  string|list&lt;string&gt;  $masks
+	 */
+	public static function findFiles(string|array $masks = [&#039;*&#039;]): static
+	{
+		$masks = is_array($masks) ? $masks : func_get_args(); // compatibility with variadic
+		return (new static)-&gt;addMask($masks, &#039;file&#039;);
+	}
+
+
+	/**
+	 * Begins search for directories matching mask.
+	 * @param  string|list&lt;string&gt;  $masks
+	 */
+	public static function findDirectories(string|array $masks = [&#039;*&#039;]): static
+	{
+		$masks = is_array($masks) ? $masks : func_get_args(); // compatibility with variadic
+		return (new static)-&gt;addMask($masks, &#039;dir&#039;);
+	}
+
+
+	/**
+	 * Finds files matching the specified masks.
+	 * @param  string|list&lt;string&gt;  $masks
+	 */
+	public function files(string|array $masks = [&#039;*&#039;]): static
+	{
+		return $this-&gt;addMask((array) $masks, &#039;file&#039;);
+	}
+
+
+	/**
+	 * Finds directories matching the specified masks.
+	 * @param  string|list&lt;string&gt;  $masks
+	 */
+	public function directories(string|array $masks = [&#039;*&#039;]): static
+	{
+		return $this-&gt;addMask((array) $masks, &#039;dir&#039;);
+	}
+
+
+	/** @param  list&lt;string&gt;  $masks */
+	private function addMask(array $masks, string $mode): static
+	{
+		foreach ($masks as $mask) {
+			$mask = FileSystem::unixSlashes($mask);
+			if ($mode === &#039;dir&#039;) {
+				$mask = rtrim($mask, &#039;/&#039;);
+			}
+			if ($mask === &#039;&#039; || ($mode === &#039;file&#039; &amp;&amp; str_ends_with($mask, &#039;/&#039;))) {
+				throw new Nette\InvalidArgumentException(&quot;Invalid mask &#039;$mask&#039;&quot;);
+			}
+			if (str_starts_with($mask, &#039;**/&#039;)) {
+				$mask = substr($mask, 3);
+			}
+			$this-&gt;find[] = [$mask, $mode];
+		}
+		return $this;
+	}
+
+
+	/**
+	 * Searches in the given directories. Wildcards are allowed.
+	 * @param  string|list&lt;string&gt;  $paths
+	 */
+	public function in(string|array $paths): static
+	{
+		$paths = is_array($paths) ? $paths : func_get_args(); // compatibility with variadic
+		$this-&gt;addLocation($paths, &#039;&#039;);
+		return $this;
+	}
+
+
+	/**
+	 * Searches recursively from the given directories. Wildcards are allowed.
+	 * @param  string|list&lt;string&gt;  $paths
+	 */
+	public function from(string|array $paths): static
+	{
+		$paths = is_array($paths) ? $paths : func_get_args(); // compatibility with variadic
+		$this-&gt;addLocation($paths, &#039;/**&#039;);
+		return $this;
+	}
+
+
+	/** @param  list&lt;string&gt;  $paths */
+	private function addLocation(array $paths, string $ext): void
+	{
+		foreach ($paths as $path) {
+			if ($path === &#039;&#039;) {
+				throw new Nette\InvalidArgumentException(&quot;Invalid directory &#039;$path&#039;&quot;);
+			}
+			$path = rtrim(FileSystem::unixSlashes($path), &#039;/&#039;);
+			$this-&gt;in[] = $path . $ext;
+		}
+	}
+
+
+	/**
+	 * Lists directory&#039;s contents before the directory itself. By default, this is disabled.
+	 */
+	public function childFirst(bool $state = true): static
+	{
+		$this-&gt;childFirst = $state;
+		return $this;
+	}
+
+
+	/**
+	 * Ignores unreadable directories. By default, this is enabled.
+	 */
+	public function ignoreUnreadableDirs(bool $state = true): static
+	{
+		$this-&gt;ignoreUnreadableDirs = $state;
+		return $this;
+	}
+
+
+	/**
+	 * Set a compare function for sorting directory entries. The function will be called to sort entries from the same directory.
+	 * @param  callable(FileInfo, FileInfo): int  $callback
+	 */
+	public function sortBy(callable $callback): static
+	{
+		$this-&gt;sort = $callback(...);
+		return $this;
+	}
+
+
+	/**
+	 * Sorts files in each directory naturally by name.
+	 */
+	public function sortByName(): static
+	{
+		$this-&gt;sort = fn(FileInfo $a, FileInfo $b): int =&gt; strnatcmp($a-&gt;getBasename(), $b-&gt;getBasename());
+		return $this;
+	}
+
+
+	/**
+	 * Adds the specified paths or appends a new finder that returns.
+	 * @param  string|list&lt;string&gt;|null  $paths
+	 */
+	public function append(string|array|null $paths = null): static
+	{
+		if ($paths === null) {
+			return $this-&gt;appends[] = new static;
+		}
+
+		$this-&gt;appends = array_merge($this-&gt;appends, (array) $paths);
+		return $this;
+	}
+
+
+	/********************* filtering ****************d*g**/
+
+
+	/**
+	 * Skips entries that matches the given masks relative to the ones defined with the in() or from() methods.
+	 * @param  string|list&lt;string&gt;  $masks
+	 */
+	public function exclude(string|array $masks): static
+	{
+		$masks = is_array($masks) ? $masks : func_get_args(); // compatibility with variadic
+		foreach ($masks as $mask) {
+			$mask = FileSystem::unixSlashes($mask);
+			if (!preg_match(&#039;~^/?(\*\*/)?(.+)(/\*\*|/\*|/|)$~D&#039;, $mask, $m)) {
+				throw new Nette\InvalidArgumentException(&quot;Invalid mask &#039;$mask&#039;&quot;);
+			}
+			$end = $m[3];
+			$re = $this-&gt;buildPattern($m[2]);
+			$filter = fn(FileInfo $file): bool =&gt; ($end &amp;&amp; !$file-&gt;isDir())
+				|| !preg_match($re, FileSystem::unixSlashes($file-&gt;getRelativePathname()));
+
+			$this-&gt;descentFilter($filter);
+			if ($end !== &#039;/*&#039;) {
+				$this-&gt;filter($filter);
+			}
+		}
+
+		return $this;
+	}
+
+
+	/**
+	 * Yields only entries which satisfy the given filter.
+	 * @param  callable(FileInfo): bool  $callback
+	 */
+	public function filter(callable $callback): static
+	{
+		$this-&gt;filters[] = $callback(...);
+		return $this;
+	}
+
+
+	/**
+	 * It descends only to directories that match the specified filter.
+	 * @param  callable(FileInfo): bool  $callback
+	 */
+	public function descentFilter(callable $callback): static
+	{
+		$this-&gt;descentFilters[] = $callback(...);
+		return $this;
+	}
+
+
+	/**
+	 * Sets the maximum depth of entries.
+	 */
+	public function limitDepth(?int $depth): static
+	{
+		$this-&gt;maxDepth = $depth ?? -1;
+		return $this;
+	}
+
+
+	/**
+	 * Restricts the search by size. $operator accepts &quot;[operator] [size] [unit]&quot; example: &gt;=10kB
+	 * @param  &#039;&gt;&#039;|&#039;&gt;=&#039;|&#039;&lt;&#039;|&#039;&lt;=&#039;|&#039;=&#039;|&#039;==&#039;|&#039;===&#039;|&#039;!=&#039;|&#039;!==&#039;|&#039;&lt;&gt;&#039;  $operator  or predicate string
+	 */
+	public function size(string $operator, ?int $size = null): static
+	{
+		if (func_num_args() === 1) { // in $operator is predicate
+			if (!preg_match(&#039;#^(?:([=&lt;&gt;!]=?|&lt;&gt;)\s*)?((?:\d*\.)?\d+)\s*(K|M|G|)B?$#Di&#039;, $operator, $matches)) {
+				throw new Nette\InvalidArgumentException(&#039;Invalid size predicate format.&#039;);
+			}
+
+			[, $operator, $size, $unit] = $matches;
+			$units = [&#039;&#039; =&gt; 1, &#039;k&#039; =&gt; 1e3, &#039;m&#039; =&gt; 1e6, &#039;g&#039; =&gt; 1e9];
+			$size = (float) $size * $units[strtolower($unit)];
+			$operator = $operator ?: &#039;=&#039;;
+		}
+
+		return $this-&gt;filter(fn(FileInfo $file): bool =&gt; !$file-&gt;isFile() || Helpers::compare($file-&gt;getSize(), $operator, $size));
+	}
+
+
+	/**
+	 * Restricts the search by modified time. $operator accepts &quot;[operator] [date]&quot; example: &gt;1978-01-23
+	 * @param  &#039;&gt;&#039;|&#039;&gt;=&#039;|&#039;&lt;&#039;|&#039;&lt;=&#039;|&#039;=&#039;|&#039;==&#039;|&#039;===&#039;|&#039;!=&#039;|&#039;!==&#039;|&#039;&lt;&gt;&#039;  $operator  or predicate string
+	 */
+	public function date(string $operator, string|int|\DateTimeInterface|null $date = null): static
+	{
+		if (func_num_args() === 1) { // in $operator is predicate
+			if (!preg_match(&#039;#^(?:([=&lt;&gt;!]=?|&lt;&gt;)\s*)?(.+)$#Di&#039;, $operator, $matches)) {
+				throw new Nette\InvalidArgumentException(&#039;Invalid date predicate format.&#039;);
+			}
+
+			[, $operator, $date] = $matches;
+			$operator = $operator ?: &#039;=&#039;;
+		}
+
+		$date = DateTime::from($date)-&gt;getTimestamp();
+		return $this-&gt;filter(fn(FileInfo $file): bool =&gt; !$file-&gt;isFile() || Helpers::compare($file-&gt;getMTime(), $operator, $date));
+	}
+
+
+	/********************* iterator generator ****************d*g**/
+
+
+	/**
+	 * Returns an array with all found files and directories.
+	 * @return list&lt;FileInfo&gt;
+	 */
+	public function collect(): array
+	{
+		return iterator_to_array($this-&gt;getIterator(), preserve_keys: false);
+	}
+
+
+	/** @return \Generator&lt;string, FileInfo&gt; */
+	public function getIterator(): \Generator
+	{
+		$plan = $this-&gt;buildPlan();
+		foreach ($plan as $dir =&gt; $searches) {
+			yield from $this-&gt;traverseDir($dir, $searches);
+		}
+
+		foreach ($this-&gt;appends as $item) {
+			if ($item instanceof self) {
+				yield from $item-&gt;getIterator();
+			} else {
+				$item = FileSystem::platformSlashes($item);
+				yield $item =&gt; new FileInfo($item);
+			}
+		}
+	}
+
+
+	/**
+	 * @param  array&lt;object{pattern: string, mode: string, recursive: bool}&gt;  $searches
+	 * @param  string[]  $subdirs
+	 * @return \Generator&lt;string, FileInfo&gt;
+	 */
+	private function traverseDir(string $dir, array $searches, array $subdirs = []): \Generator
+	{
+		if ($this-&gt;maxDepth &gt;= 0 &amp;&amp; count($subdirs) &gt; $this-&gt;maxDepth) {
+			return;
+		} elseif (!is_dir($dir)) {
+			throw new Nette\InvalidStateException(sprintf(&quot;Directory &#039;%s&#039; does not exist.&quot;, rtrim($dir, &#039;/\\&#039;)));
+		}
+
+		try {
+			$pathNames = new \FilesystemIterator($dir, \FilesystemIterator::FOLLOW_SYMLINKS | \FilesystemIterator::SKIP_DOTS | \FilesystemIterator::CURRENT_AS_PATHNAME | \FilesystemIterator::UNIX_PATHS);
+		} catch (\UnexpectedValueException $e) {
+			if ($this-&gt;ignoreUnreadableDirs) {
+				return;
+			} else {
+				throw new Nette\InvalidStateException($e-&gt;getMessage());
+			}
+		}
+
+		$files = $this-&gt;convertToFiles($pathNames, implode(&#039;/&#039;, $subdirs), FileSystem::isAbsolute($dir));
+
+		if ($this-&gt;sort) {
+			$files = iterator_to_array($files);
+			usort($files, $this-&gt;sort);
+		}
+
+		foreach ($files as $file) {
+			$pathName = $file-&gt;getPathname();
+			$cache = $subSearch = [];
+
+			if ($file-&gt;isDir()) {
+				foreach ($searches as $search) {
+					if ($search-&gt;recursive &amp;&amp; $this-&gt;proveFilters($this-&gt;descentFilters, $file, $cache)) {
+						$subSearch[] = $search;
+					}
+				}
+			}
+
+			if ($this-&gt;childFirst &amp;&amp; $subSearch) {
+				yield from $this-&gt;traverseDir($pathName, $subSearch, array_merge($subdirs, [$file-&gt;getBasename()]));
+			}
+
+			$relativePathname = FileSystem::unixSlashes($file-&gt;getRelativePathname());
+			foreach ($searches as $search) {
+				if (
+					&quot;is_$search-&gt;mode&quot;(Helpers::IsWindows &amp;&amp; $file-&gt;isLink() ? $file-&gt;getLinkTarget() : $file-&gt;getPathname())
+					&amp;&amp; preg_match($search-&gt;pattern, $relativePathname)
+					&amp;&amp; $this-&gt;proveFilters($this-&gt;filters, $file, $cache)
+				) {
+					yield $pathName =&gt; $file;
+					break;
+				}
+			}
+
+			if (!$this-&gt;childFirst &amp;&amp; $subSearch) {
+				yield from $this-&gt;traverseDir($pathName, $subSearch, array_merge($subdirs, [$file-&gt;getBasename()]));
+			}
+		}
+	}
+
+
+	/** @param  iterable&lt;string&gt;  $pathNames */
+	private function convertToFiles(iterable $pathNames, string $relativePath, bool $absolute): \Generator
+	{
+		foreach ($pathNames as $pathName) {
+			if (!$absolute) {
+				$pathName = preg_replace(&#039;~\.?/~A&#039;, &#039;&#039;, $pathName);
+			}
+			$pathName = FileSystem::platformSlashes($pathName);
+			yield new FileInfo($pathName, $relativePath);
+		}
+	}
+
+
+	/**
+	 * @param  (\Closure(FileInfo): bool)[]  $filters
+	 * @param  array&lt;int, bool&gt;  $cache
+	 */
+	private function proveFilters(array $filters, FileInfo $file, array &amp;$cache): bool
+	{
+		foreach ($filters as $filter) {
+			$res = &amp;$cache[spl_object_id($filter)];
+			$res ??= $filter($file);
+			if (!$res) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+
+	/** @return array&lt;string, array&lt;object{pattern: string, mode: string, recursive: bool}&gt;&gt; */
+	private function buildPlan(): array
+	{
+		$plan = $dirCache = [];
+		foreach ($this-&gt;find as [$mask, $mode]) {
+			$splits = [];
+			if (FileSystem::isAbsolute($mask)) {
+				if ($this-&gt;in) {
+					throw new Nette\InvalidStateException(&quot;You cannot combine the absolute path in the mask &#039;$mask&#039; and the directory to search &#039;{$this-&gt;in[0]}&#039;.&quot;);
+				}
+				$splits[] = self::splitRecursivePart($mask);
+			} else {
+				foreach ($this-&gt;in ?: [&#039;.&#039;] as $in) {
+					$in = strtr($in, [&#039;[&#039; =&gt; &#039;[[]&#039;, &#039;]&#039; =&gt; &#039;[]]&#039;]); // in path, do not treat [ and ] as a pattern by glob()
+					$splits[] = self::splitRecursivePart($in . &#039;/&#039; . $mask);
+				}
+			}
+
+			foreach ($splits as [$base, $rest, $recursive]) {
+				$base = $base === &#039;&#039; ? &#039;.&#039; : $base;
+				$dirs = $dirCache[$base] ??= strpbrk($base, &#039;*?[&#039;)
+					? glob($base, GLOB_NOSORT | GLOB_ONLYDIR | GLOB_NOESCAPE)
+					: [strtr($base, [&#039;[[]&#039; =&gt; &#039;[&#039;, &#039;[]]&#039; =&gt; &#039;]&#039;])]; // unescape [ and ]
+
+				if (!$dirs) {
+					throw new Nette\InvalidStateException(sprintf(&quot;Directory &#039;%s&#039; does not exist.&quot;, rtrim($base, &#039;/\\&#039;)));
+				}
+
+				$search = (object) [&#039;pattern&#039; =&gt; $this-&gt;buildPattern($rest), &#039;mode&#039; =&gt; $mode, &#039;recursive&#039; =&gt; $recursive];
+				foreach ($dirs as $dir) {
+					$plan[$dir][] = $search;
+				}
+			}
+		}
+
+		return $plan;
+	}
+
+
+	/**
+	 * Since glob() does not know ** wildcard, we divide the path into a part for glob and a part for manual traversal.
+	 * @return array{string, string, bool}
+	 */
+	private static function splitRecursivePart(string $path): array
+	{
+		$a = strrpos($path, &#039;/&#039;);
+		$parts = preg_split(&#039;~(?&lt;=^|/)\*\*($|/)~&#039;, substr($path, 0, $a + 1), 2);
+		return isset($parts[1])
+			? [$parts[0], $parts[1] . substr($path, $a + 1), true]
+			: [$parts[0], substr($path, $a + 1), false];
+	}
+
+
+	/**
+	 * Converts wildcards to regular expression.
+	 */
+	private function buildPattern(string $mask): string
+	{
+		if ($mask === &#039;*&#039;) {
+			return &#039;##&#039;;
+		} elseif (str_starts_with($mask, &#039;./&#039;)) {
+			$anchor = &#039;^&#039;;
+			$mask = substr($mask, 2);
+		} else {
+			$anchor = &#039;(?:^|/)&#039;;
+		}
+
+		$pattern = strtr(
+			preg_quote($mask, &#039;#&#039;),
+			[
+				&#039;\*\*/&#039; =&gt; &#039;(.+/)?&#039;,
+				&#039;\*&#039; =&gt; &#039;[^/]*&#039;,
+				&#039;\?&#039; =&gt; &#039;[^/]&#039;,
+				&#039;\[\!&#039; =&gt; &#039;[^&#039;,
+				&#039;\[&#039; =&gt; &#039;[&#039;,
+				&#039;\]&#039; =&gt; &#039;]&#039;,
+				&#039;\-&#039; =&gt; &#039;-&#039;,
+			],
+		);
+		return &#039;#&#039; . $anchor . $pattern . &#039;$#D&#039; . (Helpers::IsWindows ? &#039;i&#039; : &#039;&#039;);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/nette/utils/src/Utils/Floats.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/nikic -->
+
+</body>
+</html>

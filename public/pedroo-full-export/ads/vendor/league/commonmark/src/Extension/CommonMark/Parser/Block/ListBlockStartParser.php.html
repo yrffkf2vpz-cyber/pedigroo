@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/commonmark/src/Extension/CommonMark/Parser/Block/ListBlockStartParser.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the league/commonmark package.
+ *
+ * (c) Colin O&#039;Dell &lt;colinodell@gmail.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace League\CommonMark\Extension\CommonMark\Parser\Block;
+
+use League\CommonMark\Extension\CommonMark\Node\Block\ListBlock;
+use League\CommonMark\Extension\CommonMark\Node\Block\ListData;
+use League\CommonMark\Parser\Block\BlockStart;
+use League\CommonMark\Parser\Block\BlockStartParserInterface;
+use League\CommonMark\Parser\Cursor;
+use League\CommonMark\Parser\MarkdownParserStateInterface;
+use League\CommonMark\Util\RegexHelper;
+use League\Config\ConfigurationAwareInterface;
+use League\Config\ConfigurationInterface;
+
+final class ListBlockStartParser implements BlockStartParserInterface, ConfigurationAwareInterface
+{
+    /** @psalm-readonly-allow-private-mutation */
+    private ?ConfigurationInterface $config = null;
+
+    /**
+     * @psalm-var non-empty-string|null
+     *
+     * @psalm-readonly-allow-private-mutation
+     */
+    private ?string $listMarkerRegex = null;
+
+    public function setConfiguration(ConfigurationInterface $configuration): void
+    {
+        $this-&gt;config = $configuration;
+    }
+
+    public function tryStart(Cursor $cursor, MarkdownParserStateInterface $parserState): ?BlockStart
+    {
+        if ($cursor-&gt;isIndented()) {
+            return BlockStart::none();
+        }
+
+        $listData = $this-&gt;parseList($cursor, $parserState-&gt;getParagraphContent() !== null);
+        if ($listData === null) {
+            return BlockStart::none();
+        }
+
+        $listItemParser = new ListItemParser($listData);
+
+        // prepend the list block if needed
+        $matched = $parserState-&gt;getLastMatchedBlockParser();
+        if (! ($matched instanceof ListBlockParser) || ! $listData-&gt;equals($matched-&gt;getBlock()-&gt;getListData())) {
+            $listBlockParser = new ListBlockParser($listData);
+            // We start out with assuming a list is tight. If we find a blank line, we set it to loose later.
+            // TODO for 3.0: Just make them tight by default in the block so we can remove this call
+            $listBlockParser-&gt;getBlock()-&gt;setTight(true);
+
+            return BlockStart::of($listBlockParser, $listItemParser)-&gt;at($cursor);
+        }
+
+        return BlockStart::of($listItemParser)-&gt;at($cursor);
+    }
+
+    private function parseList(Cursor $cursor, bool $inParagraph): ?ListData
+    {
+        $indent = $cursor-&gt;getIndent();
+
+        $tmpCursor = clone $cursor;
+        $tmpCursor-&gt;advanceToNextNonSpaceOrTab();
+        $rest = $tmpCursor-&gt;getRemainder();
+
+        if (\preg_match($this-&gt;listMarkerRegex ?? $this-&gt;generateListMarkerRegex(), $rest) === 1) {
+            $data               = new ListData();
+            $data-&gt;markerOffset = $indent;
+            $data-&gt;type         = ListBlock::TYPE_BULLET;
+            $data-&gt;delimiter    = null;
+            $data-&gt;bulletChar   = $rest[0];
+            $markerLength       = 1;
+        } elseif (($matches = RegexHelper::matchFirst(&#039;/^(\d{1,9})([.)])/&#039;, $rest)) &amp;&amp; (! $inParagraph || $matches[1] === &#039;1&#039;)) {
+            $data               = new ListData();
+            $data-&gt;markerOffset = $indent;
+            $data-&gt;type         = ListBlock::TYPE_ORDERED;
+            $data-&gt;start        = (int) $matches[1];
+            $data-&gt;delimiter    = $matches[2] === &#039;.&#039; ? ListBlock::DELIM_PERIOD : ListBlock::DELIM_PAREN;
+            $data-&gt;bulletChar   = null;
+            $markerLength       = \strlen($matches[0]);
+        } else {
+            return null;
+        }
+
+        // Make sure we have spaces after
+        $nextChar = $tmpCursor-&gt;peek($markerLength);
+        if (! ($nextChar === null || $nextChar === &quot;\t&quot; || $nextChar === &#039; &#039;)) {
+            return null;
+        }
+
+        // If it interrupts paragraph, make sure first line isn&#039;t blank
+        if ($inParagraph &amp;&amp; ! RegexHelper::matchAt(RegexHelper::REGEX_NON_SPACE, $rest, $markerLength)) {
+            return null;
+        }
+
+        $cursor-&gt;advanceToNextNonSpaceOrTab(); // to start of marker
+        $cursor-&gt;advanceBy($markerLength, true); // to end of marker
+        $data-&gt;padding = self::calculateListMarkerPadding($cursor, $markerLength);
+
+        return $data;
+    }
+
+    private static function calculateListMarkerPadding(Cursor $cursor, int $markerLength): int
+    {
+        $start          = $cursor-&gt;saveState();
+        $spacesStartCol = $cursor-&gt;getColumn();
+
+        while ($cursor-&gt;getColumn() - $spacesStartCol &lt; 5) {
+            if (! $cursor-&gt;advanceBySpaceOrTab()) {
+                break;
+            }
+        }
+
+        $blankItem         = $cursor-&gt;peek() === null;
+        $spacesAfterMarker = $cursor-&gt;getColumn() - $spacesStartCol;
+
+        if ($spacesAfterMarker &gt;= 5 || $spacesAfterMarker &lt; 1 || $blankItem) {
+            $cursor-&gt;restoreState($start);
+            $cursor-&gt;advanceBySpaceOrTab();
+
+            return $markerLength + 1;
+        }
+
+        return $markerLength + $spacesAfterMarker;
+    }
+
+    /**
+     * @psalm-return non-empty-string
+     */
+    private function generateListMarkerRegex(): string
+    {
+        // No configuration given - use the defaults
+        if ($this-&gt;config === null) {
+            return $this-&gt;listMarkerRegex = &#039;/^[*+-]/&#039;;
+        }
+
+        $markers = $this-&gt;config-&gt;get(&#039;commonmark/unordered_list_markers&#039;);
+        \assert(\is_array($markers));
+
+        return $this-&gt;listMarkerRegex = &#039;/^[&#039; . \preg_quote(\implode(&#039;&#039;, $markers), &#039;/&#039;) . &#039;]/&#039;;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/commonmark/src/Extension/CommonMark/Parser/Block/ListItemParser.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/commonmark/src/Extension/CommonMark/Parser/Inline -->
+
+</body>
+</html>

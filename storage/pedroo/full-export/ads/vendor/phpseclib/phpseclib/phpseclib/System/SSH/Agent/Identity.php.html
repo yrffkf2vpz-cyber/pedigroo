@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/System/SSH/Agent/Identity.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Pure-PHP ssh-agent client.
+ *
+ * {@internal See http://api.libssh.org/rfc/PROTOCOL.agent}
+ *
+ * PHP version 5
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2009 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\System\SSH\Agent;
+
+use phpseclib3\Common\Functions\Strings;
+use phpseclib3\Crypt\Common\PrivateKey;
+use phpseclib3\Crypt\Common\PublicKey;
+use phpseclib3\Crypt\DSA;
+use phpseclib3\Crypt\EC;
+use phpseclib3\Crypt\RSA;
+use phpseclib3\Exception\UnsupportedAlgorithmException;
+use phpseclib3\System\SSH\Agent;
+use phpseclib3\System\SSH\Common\Traits\ReadBytes;
+
+/**
+ * Pure-PHP ssh-agent client identity object
+ *
+ * Instantiation should only be performed by \phpseclib3\System\SSH\Agent class.
+ * This could be thought of as implementing an interface that phpseclib3\Crypt\RSA
+ * implements. ie. maybe a Net_SSH_Auth_PublicKey interface or something.
+ * The methods in this interface would be getPublicKey and sign since those are the
+ * methods phpseclib looks for to perform public key authentication.
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @internal
+ */
+class Identity implements PrivateKey
+{
+    use ReadBytes;
+
+    // Signature Flags
+    // See https://tools.ietf.org/html/draft-miller-ssh-agent-00#section-5.3
+    const SSH_AGENT_RSA2_256 = 2;
+    const SSH_AGENT_RSA2_512 = 4;
+
+    /**
+     * Key Object
+     *
+     * @var PublicKey
+     * @see self::getPublicKey()
+     */
+    private $key;
+
+    /**
+     * Key Blob
+     *
+     * @var string
+     * @see self::sign()
+     */
+    private $key_blob;
+
+    /**
+     * Socket Resource
+     *
+     * @var resource
+     * @see self::sign()
+     */
+    private $fsock;
+
+    /**
+     * Signature flags
+     *
+     * @var int
+     * @see self::sign()
+     * @see self::setHash()
+     */
+    private $flags = 0;
+
+    /**
+     * Comment
+     *
+     * @var null|string
+     */
+    private $comment;
+
+    /**
+     * Curve Aliases
+     *
+     * @var array
+     */
+    private static $curveAliases = [
+        &#039;secp256r1&#039; =&gt; &#039;nistp256&#039;,
+        &#039;secp384r1&#039; =&gt; &#039;nistp384&#039;,
+        &#039;secp521r1&#039; =&gt; &#039;nistp521&#039;,
+        &#039;Ed25519&#039; =&gt; &#039;Ed25519&#039;
+    ];
+
+    /**
+     * Default Constructor.
+     *
+     * @param resource $fsock
+     */
+    public function __construct($fsock)
+    {
+        $this-&gt;fsock = $fsock;
+    }
+
+    /**
+     * Set Public Key
+     *
+     * Called by \phpseclib3\System\SSH\Agent::requestIdentities()
+     *
+     * @param PublicKey $key
+     */
+    public function withPublicKey(PublicKey $key)
+    {
+        if ($key instanceof EC) {
+            if (is_array($key-&gt;getCurve()) || !isset(self::$curveAliases[$key-&gt;getCurve()])) {
+                throw new UnsupportedAlgorithmException(&#039;The only supported curves are nistp256, nistp384, nistp512 and Ed25519&#039;);
+            }
+        }
+
+        $new = clone $this;
+        $new-&gt;key = $key;
+        return $new;
+    }
+
+    /**
+     * Set Public Key
+     *
+     * Called by \phpseclib3\System\SSH\Agent::requestIdentities(). The key blob could be extracted from $this-&gt;key
+     * but this saves a small amount of computation.
+     *
+     * @param string $key_blob
+     */
+    public function withPublicKeyBlob($key_blob)
+    {
+        $new = clone $this;
+        $new-&gt;key_blob = $key_blob;
+        return $new;
+    }
+
+    /**
+     * Get Public Key
+     *
+     * Wrapper for $this-&gt;key-&gt;getPublicKey()
+     *
+     * @return mixed
+     */
+    public function getPublicKey()
+    {
+        return $this-&gt;key;
+    }
+
+    /**
+     * Sets the hash
+     *
+     * @param string $hash
+     */
+    public function withHash($hash)
+    {
+        $new = clone $this;
+
+        $hash = strtolower($hash);
+
+        if ($this-&gt;key instanceof RSA) {
+            $new-&gt;flags = 0;
+            switch ($hash) {
+                case &#039;sha1&#039;:
+                    break;
+                case &#039;sha256&#039;:
+                    $new-&gt;flags = self::SSH_AGENT_RSA2_256;
+                    break;
+                case &#039;sha512&#039;:
+                    $new-&gt;flags = self::SSH_AGENT_RSA2_512;
+                    break;
+                default:
+                    throw new UnsupportedAlgorithmException(&#039;The only supported hashes for RSA are sha1, sha256 and sha512&#039;);
+            }
+        }
+        if ($this-&gt;key instanceof EC) {
+            switch ($this-&gt;key-&gt;getCurve()) {
+                case &#039;secp256r1&#039;:
+                    $expectedHash = &#039;sha256&#039;;
+                    break;
+                case &#039;secp384r1&#039;:
+                    $expectedHash = &#039;sha384&#039;;
+                    break;
+                //case &#039;secp521r1&#039;:
+                //case &#039;Ed25519&#039;:
+                default:
+                    $expectedHash = &#039;sha512&#039;;
+            }
+            if ($hash != $expectedHash) {
+                throw new UnsupportedAlgorithmException(&#039;The only supported hash for &#039; . self::$curveAliases[$this-&gt;key-&gt;getCurve()] . &#039; is &#039; . $expectedHash);
+            }
+        }
+        if ($this-&gt;key instanceof DSA) {
+            if ($hash != &#039;sha1&#039;) {
+                throw new UnsupportedAlgorithmException(&#039;The only supported hash for DSA is sha1&#039;);
+            }
+        }
+        return $new;
+    }
+
+    /**
+     * Sets the padding
+     *
+     * Only PKCS1 padding is supported
+     *
+     * @param string $padding
+     */
+    public function withPadding($padding)
+    {
+        if (!$this-&gt;key instanceof RSA) {
+            throw new UnsupportedAlgorithmException(&#039;Only RSA keys support padding&#039;);
+        }
+        if ($padding != RSA::SIGNATURE_PKCS1 &amp;&amp; $padding != RSA::SIGNATURE_RELAXED_PKCS1) {
+            throw new UnsupportedAlgorithmException(&#039;ssh-agent can only create PKCS1 signatures&#039;);
+        }
+        return $this;
+    }
+
+    /**
+     * Determines the signature padding mode
+     *
+     * Valid values are: ASN1, SSH2, Raw
+     *
+     * @param string $format
+     */
+    public function withSignatureFormat($format)
+    {
+        if ($this-&gt;key instanceof RSA) {
+            throw new UnsupportedAlgorithmException(&#039;Only DSA and EC keys support signature format setting&#039;);
+        }
+        if ($format != &#039;SSH2&#039;) {
+            throw new UnsupportedAlgorithmException(&#039;Only SSH2-formatted signatures are currently supported&#039;);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Returns the curve
+     *
+     * Returns a string if it&#039;s a named curve, an array if not
+     *
+     * @return string|array
+     */
+    public function getCurve()
+    {
+        if (!$this-&gt;key instanceof EC) {
+            throw new UnsupportedAlgorithmException(&#039;Only EC keys have curves&#039;);
+        }
+
+        return $this-&gt;key-&gt;getCurve();
+    }
+
+    /**
+     * Create a signature
+     *
+     * See &quot;2.6.2 Protocol 2 private key signature request&quot;
+     *
+     * @param string $message
+     * @return string
+     * @throws \RuntimeException on connection errors
+     * @throws UnsupportedAlgorithmException if the algorithm is unsupported
+     */
+    public function sign($message)
+    {
+        // the last parameter (currently 0) is for flags and ssh-agent only defines one flag (for ssh-dss): SSH_AGENT_OLD_SIGNATURE
+        $packet = Strings::packSSH2(
+            &#039;CssN&#039;,
+            Agent::SSH_AGENTC_SIGN_REQUEST,
+            $this-&gt;key_blob,
+            $message,
+            $this-&gt;flags
+        );
+        $packet = Strings::packSSH2(&#039;s&#039;, $packet);
+        if (strlen($packet) != fputs($this-&gt;fsock, $packet)) {
+            throw new \RuntimeException(&#039;Connection closed during signing&#039;);
+        }
+
+        $length = current(unpack(&#039;N&#039;, $this-&gt;readBytes(4)));
+        $packet = $this-&gt;readBytes($length);
+
+        list($type, $signature_blob) = Strings::unpackSSH2(&#039;Cs&#039;, $packet);
+        if ($type != Agent::SSH_AGENT_SIGN_RESPONSE) {
+            throw new \RuntimeException(&#039;Unable to retrieve signature&#039;);
+        }
+
+        if (!$this-&gt;key instanceof RSA) {
+            return $signature_blob;
+        }
+
+        list($type, $signature_blob) = Strings::unpackSSH2(&#039;ss&#039;, $signature_blob);
+
+        return $signature_blob;
+    }
+
+    /**
+     * Returns the private key
+     *
+     * @param string $type
+     * @param array $options optional
+     * @return string
+     */
+    public function toString($type, array $options = [])
+    {
+        throw new \RuntimeException(&#039;ssh-agent does not provide a mechanism to get the private key&#039;);
+    }
+
+    /**
+     * Sets the password
+     *
+     * @param string|bool $password
+     * @return never
+     */
+    public function withPassword($password = false)
+    {
+        throw new \RuntimeException(&#039;ssh-agent does not provide a mechanism to get the private key&#039;);
+    }
+
+    /**
+     * Sets the comment
+     */
+    public function withComment($comment = null)
+    {
+        $new = clone $this;
+        $new-&gt;comment = $comment;
+        return $new;
+    }
+
+    /**
+     * Returns the comment
+     *
+     * @return null|string
+     */
+    public function getComment()
+    {
+        return $this-&gt;comment;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/System/SSH/Common/Traits/ReadBytes.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/System/SSH/Common -->
+
+</body>
+</html>

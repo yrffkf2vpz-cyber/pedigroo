@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Relations/MorphTo.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+use BadMethodCallException;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\Concerns\InteractsWithDictionary;
+
+/**
+ * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+ * @template TDeclaringModel of \Illuminate\Database\Eloquent\Model
+ *
+ * @extends \Illuminate\Database\Eloquent\Relations\BelongsTo&lt;TRelatedModel, TDeclaringModel&gt;
+ */
+class MorphTo extends BelongsTo
+{
+    use InteractsWithDictionary;
+
+    /**
+     * The type of the polymorphic relation.
+     *
+     * @var string
+     */
+    protected $morphType;
+
+    /**
+     * The associated key on the parent model.
+     *
+     * @var string|null
+     */
+    protected $ownerKey;
+
+    /**
+     * The models whose relations are being eager loaded.
+     *
+     * @var \Illuminate\Database\Eloquent\Collection&lt;int, TDeclaringModel&gt;
+     */
+    protected $models;
+
+    /**
+     * All of the models keyed by ID.
+     *
+     * @var array
+     */
+    protected $dictionary = [];
+
+    /**
+     * A buffer of dynamic calls to query macros.
+     *
+     * @var array
+     */
+    protected $macroBuffer = [];
+
+    /**
+     * A map of relations to load for each individual morph type.
+     *
+     * @var array
+     */
+    protected $morphableEagerLoads = [];
+
+    /**
+     * A map of relationship counts to load for each individual morph type.
+     *
+     * @var array
+     */
+    protected $morphableEagerLoadCounts = [];
+
+    /**
+     * A map of constraints to apply for each individual morph type.
+     *
+     * @var array
+     */
+    protected $morphableConstraints = [];
+
+    /**
+     * Create a new morph to relationship instance.
+     *
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;  $query
+     * @param  TDeclaringModel  $parent
+     * @param  string  $foreignKey
+     * @param  string|null  $ownerKey
+     * @param  string  $type
+     * @param  string  $relation
+     */
+    public function __construct(Builder $query, Model $parent, $foreignKey, $ownerKey, $type, $relation)
+    {
+        $this-&gt;morphType = $type;
+
+        parent::__construct($query, $parent, $foreignKey, $ownerKey, $relation);
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public function addEagerConstraints(array $models)
+    {
+        $this-&gt;buildDictionary($this-&gt;models = new EloquentCollection($models));
+    }
+
+    /**
+     * Build a dictionary with the models.
+     *
+     * @param  \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt;  $models
+     * @return void
+     */
+    protected function buildDictionary(EloquentCollection $models)
+    {
+        foreach ($models as $model) {
+            if ($model-&gt;{$this-&gt;morphType}) {
+                $morphTypeKey = $this-&gt;getDictionaryKey($model-&gt;{$this-&gt;morphType});
+                $foreignKeyKey = $this-&gt;getDictionaryKey($model-&gt;{$this-&gt;foreignKey});
+
+                $this-&gt;dictionary[$morphTypeKey][$foreignKeyKey][] = $model;
+            }
+        }
+    }
+
+    /**
+     * Get the results of the relationship.
+     *
+     * Called via eager load method of Eloquent query builder.
+     *
+     * @return \Illuminate\Database\Eloquent\Collection&lt;int, TDeclaringModel&gt;
+     */
+    public function getEager()
+    {
+        foreach (array_keys($this-&gt;dictionary) as $type) {
+            $this-&gt;matchToMorphParents($type, $this-&gt;getResultsByType($type));
+        }
+
+        return $this-&gt;models;
+    }
+
+    /**
+     * Get all of the relation results for a type.
+     *
+     * @param  string  $type
+     * @return \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt;
+     */
+    protected function getResultsByType($type)
+    {
+        $instance = $this-&gt;createModelByType($type);
+
+        $ownerKey = $this-&gt;ownerKey ?? $instance-&gt;getKeyName();
+
+        $query = $this-&gt;replayMacros($instance-&gt;newQuery())
+            -&gt;mergeConstraintsFrom($this-&gt;getQuery())
+            -&gt;with(array_merge(
+                $this-&gt;getQuery()-&gt;getEagerLoads(),
+                (array) ($this-&gt;morphableEagerLoads[get_class($instance)] ?? [])
+            ))
+            -&gt;withCount(
+                (array) ($this-&gt;morphableEagerLoadCounts[get_class($instance)] ?? [])
+            );
+
+        if ($callback = ($this-&gt;morphableConstraints[get_class($instance)] ?? null)) {
+            $callback($query);
+        }
+
+        $whereIn = $this-&gt;whereInMethod($instance, $ownerKey);
+
+        return $query-&gt;{$whereIn}(
+            $instance-&gt;qualifyColumn($ownerKey), $this-&gt;gatherKeysByType($type, $instance-&gt;getKeyType())
+        )-&gt;get();
+    }
+
+    /**
+     * Gather all of the foreign keys for a given type.
+     *
+     * @param  string  $type
+     * @param  string  $keyType
+     * @return array
+     */
+    protected function gatherKeysByType($type, $keyType)
+    {
+        return $keyType !== &#039;string&#039;
+            ? array_keys($this-&gt;dictionary[$type])
+            : array_map(function ($modelId) {
+                return (string) $modelId;
+            }, array_filter(array_keys($this-&gt;dictionary[$type])));
+    }
+
+    /**
+     * Create a new model instance by type.
+     *
+     * @param  string  $type
+     * @return TRelatedModel
+     */
+    public function createModelByType($type)
+    {
+        $class = Model::getActualClassNameForMorph($type);
+
+        return tap(new $class, function ($instance) {
+            if (! $instance-&gt;getConnectionName()) {
+                $instance-&gt;setConnection($this-&gt;getConnection()-&gt;getName());
+            }
+        });
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public function match(array $models, EloquentCollection $results, $relation)
+    {
+        return $models;
+    }
+
+    /**
+     * Match the results for a given type to their parents.
+     *
+     * @param  string  $type
+     * @param  \Illuminate\Database\Eloquent\Collection&lt;int, TRelatedModel&gt;  $results
+     * @return void
+     */
+    protected function matchToMorphParents($type, EloquentCollection $results)
+    {
+        foreach ($results as $result) {
+            $ownerKey = ! is_null($this-&gt;ownerKey) ? $this-&gt;getDictionaryKey($result-&gt;{$this-&gt;ownerKey}) : $result-&gt;getKey();
+
+            if (isset($this-&gt;dictionary[$type][$ownerKey])) {
+                foreach ($this-&gt;dictionary[$type][$ownerKey] as $model) {
+                    $model-&gt;setRelation($this-&gt;relationName, $result);
+                }
+            }
+        }
+    }
+
+    /**
+     * Associate the model instance to the given parent.
+     *
+     * @param  TRelatedModel|null  $model
+     * @return TDeclaringModel
+     */
+    #[\Override]
+    public function associate($model)
+    {
+        if ($model instanceof Model) {
+            $foreignKey = $this-&gt;ownerKey &amp;&amp; $model-&gt;{$this-&gt;ownerKey}
+                ? $this-&gt;ownerKey
+                : $model-&gt;getKeyName();
+        }
+
+        $this-&gt;parent-&gt;setAttribute(
+            $this-&gt;foreignKey, $model instanceof Model ? $model-&gt;{$foreignKey} : null
+        );
+
+        $this-&gt;parent-&gt;setAttribute(
+            $this-&gt;morphType, $model instanceof Model ? $model-&gt;getMorphClass() : null
+        );
+
+        return $this-&gt;parent-&gt;setRelation($this-&gt;relationName, $model);
+    }
+
+    /**
+     * Dissociate previously associated model from the given parent.
+     *
+     * @return TDeclaringModel
+     */
+    #[\Override]
+    public function dissociate()
+    {
+        $this-&gt;parent-&gt;setAttribute($this-&gt;foreignKey, null);
+
+        $this-&gt;parent-&gt;setAttribute($this-&gt;morphType, null);
+
+        return $this-&gt;parent-&gt;setRelation($this-&gt;relationName, null);
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public function touch()
+    {
+        if (! is_null($this-&gt;getParentKey())) {
+            parent::touch();
+        }
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    protected function newRelatedInstanceFor(Model $parent)
+    {
+        return $parent-&gt;{$this-&gt;getRelationName()}()-&gt;getRelated()-&gt;newInstance();
+    }
+
+    /**
+     * Get the foreign key &quot;type&quot; name.
+     *
+     * @return string
+     */
+    public function getMorphType()
+    {
+        return $this-&gt;morphType;
+    }
+
+    /**
+     * Get the dictionary used by the relationship.
+     *
+     * @return array
+     */
+    public function getDictionary()
+    {
+        return $this-&gt;dictionary;
+    }
+
+    /**
+     * Specify which relations to load for a given morph type.
+     *
+     * @param  array  $with
+     * @return $this
+     */
+    public function morphWith(array $with)
+    {
+        $this-&gt;morphableEagerLoads = array_merge(
+            $this-&gt;morphableEagerLoads, $with
+        );
+
+        return $this;
+    }
+
+    /**
+     * Specify which relationship counts to load for a given morph type.
+     *
+     * @param  array  $withCount
+     * @return $this
+     */
+    public function morphWithCount(array $withCount)
+    {
+        $this-&gt;morphableEagerLoadCounts = array_merge(
+            $this-&gt;morphableEagerLoadCounts, $withCount
+        );
+
+        return $this;
+    }
+
+    /**
+     * Specify constraints on the query for a given morph type.
+     *
+     * @param  array  $callbacks
+     * @return $this
+     */
+    public function constrain(array $callbacks)
+    {
+        $this-&gt;morphableConstraints = array_merge(
+            $this-&gt;morphableConstraints, $callbacks
+        );
+
+        return $this;
+    }
+
+    /**
+     * Indicate that soft deleted models should be included in the results.
+     *
+     * @return $this
+     */
+    public function withTrashed()
+    {
+        $callback = fn ($query) =&gt; $query-&gt;hasMacro(&#039;withTrashed&#039;) ? $query-&gt;withTrashed() : $query;
+
+        $this-&gt;macroBuffer[] = [
+            &#039;method&#039; =&gt; &#039;when&#039;,
+            &#039;parameters&#039; =&gt; [true, $callback],
+        ];
+
+        return $this-&gt;when(true, $callback);
+    }
+
+    /**
+     * Indicate that soft deleted models should not be included in the results.
+     *
+     * @return $this
+     */
+    public function withoutTrashed()
+    {
+        $callback = fn ($query) =&gt; $query-&gt;hasMacro(&#039;withoutTrashed&#039;) ? $query-&gt;withoutTrashed() : $query;
+
+        $this-&gt;macroBuffer[] = [
+            &#039;method&#039; =&gt; &#039;when&#039;,
+            &#039;parameters&#039; =&gt; [true, $callback],
+        ];
+
+        return $this-&gt;when(true, $callback);
+    }
+
+    /**
+     * Indicate that only soft deleted models should be included in the results.
+     *
+     * @return $this
+     */
+    public function onlyTrashed()
+    {
+        $callback = fn ($query) =&gt; $query-&gt;hasMacro(&#039;onlyTrashed&#039;) ? $query-&gt;onlyTrashed() : $query;
+
+        $this-&gt;macroBuffer[] = [
+            &#039;method&#039; =&gt; &#039;when&#039;,
+            &#039;parameters&#039; =&gt; [true, $callback],
+        ];
+
+        return $this-&gt;when(true, $callback);
+    }
+
+    /**
+     * Replay stored macro calls on the actual related instance.
+     *
+     * @param  \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;  $query
+     * @return \Illuminate\Database\Eloquent\Builder&lt;TRelatedModel&gt;
+     */
+    protected function replayMacros(Builder $query)
+    {
+        foreach ($this-&gt;macroBuffer as $macro) {
+            $query-&gt;{$macro[&#039;method&#039;]}(...$macro[&#039;parameters&#039;]);
+        }
+
+        return $query;
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public function getQualifiedOwnerKeyName()
+    {
+        if (is_null($this-&gt;ownerKey)) {
+            return &#039;&#039;;
+        }
+
+        return parent::getQualifiedOwnerKeyName();
+    }
+
+    /**
+     * Handle dynamic method calls to the relationship.
+     *
+     * @param  string  $method
+     * @param  array  $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        try {
+            $result = parent::__call($method, $parameters);
+
+            if (in_array($method, [&#039;select&#039;, &#039;selectRaw&#039;, &#039;selectSub&#039;, &#039;addSelect&#039;, &#039;withoutGlobalScopes&#039;])) {
+                $this-&gt;macroBuffer[] = compact(&#039;method&#039;, &#039;parameters&#039;);
+            }
+
+            return $result;
+        }
+
+        // If we tried to call a method that does not exist on the parent Builder instance,
+        // we&#039;ll assume that we want to call a query macro (e.g. withTrashed) that only
+        // exists on related models. We will just store the call and replay it later.
+        catch (BadMethodCallException) {
+            $this-&gt;macroBuffer[] = compact(&#039;method&#039;, &#039;parameters&#039;);
+
+            return $this;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Relations/MorphToMany.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Relations/Concerns -->
+
+</body>
+</html>

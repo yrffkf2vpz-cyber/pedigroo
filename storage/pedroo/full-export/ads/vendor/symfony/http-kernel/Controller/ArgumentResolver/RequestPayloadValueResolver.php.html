@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-kernel/Controller/ArgumentResolver/RequestPayloadValueResolver.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpKernel\Controller\ArgumentResolver;
+
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpKernel\Attribute\MapQueryString;
+use Symfony\Component\HttpKernel\Attribute\MapRequestPayload;
+use Symfony\Component\HttpKernel\Attribute\MapUploadedFile;
+use Symfony\Component\HttpKernel\Controller\ValueResolverInterface;
+use Symfony\Component\HttpKernel\ControllerMetadata\ArgumentMetadata;
+use Symfony\Component\HttpKernel\Event\ControllerArgumentsEvent;
+use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+use Symfony\Component\HttpKernel\Exception\NearMissValueResolverException;
+use Symfony\Component\HttpKernel\Exception\UnsupportedMediaTypeHttpException;
+use Symfony\Component\HttpKernel\KernelEvents;
+use Symfony\Component\Serializer\Exception\NotEncodableValueException;
+use Symfony\Component\Serializer\Exception\PartialDenormalizationException;
+use Symfony\Component\Serializer\Exception\UnexpectedPropertyException;
+use Symfony\Component\Serializer\Exception\UnsupportedFormatException;
+use Symfony\Component\Serializer\Normalizer\DenormalizerInterface;
+use Symfony\Component\Serializer\SerializerInterface;
+use Symfony\Component\Validator\Constraints as Assert;
+use Symfony\Component\Validator\ConstraintViolation;
+use Symfony\Component\Validator\ConstraintViolationList;
+use Symfony\Component\Validator\Exception\ValidationFailedException;
+use Symfony\Component\Validator\Validator\ValidatorInterface;
+use Symfony\Contracts\Translation\TranslatorInterface;
+
+/**
+ * @author Konstantin Myakshin &lt;molodchick@gmail.com&gt;
+ *
+ * @final
+ */
+class RequestPayloadValueResolver implements ValueResolverInterface, EventSubscriberInterface
+{
+    /**
+     * @see DenormalizerInterface::COLLECT_DENORMALIZATION_ERRORS
+     */
+    private const CONTEXT_DENORMALIZE = [
+        &#039;collect_denormalization_errors&#039; =&gt; true,
+    ];
+
+    /**
+     * @see DenormalizerInterface::COLLECT_DENORMALIZATION_ERRORS
+     */
+    private const CONTEXT_DESERIALIZE = [
+        &#039;collect_denormalization_errors&#039; =&gt; true,
+    ];
+
+    public function __construct(
+        private readonly SerializerInterface&amp;DenormalizerInterface $serializer,
+        private readonly ?ValidatorInterface $validator = null,
+        private readonly ?TranslatorInterface $translator = null,
+        private string $translationDomain = &#039;validators&#039;,
+    ) {
+    }
+
+    public function resolve(Request $request, ArgumentMetadata $argument): iterable
+    {
+        $attribute = $argument-&gt;getAttributesOfType(MapQueryString::class, ArgumentMetadata::IS_INSTANCEOF)[0]
+            ?? $argument-&gt;getAttributesOfType(MapRequestPayload::class, ArgumentMetadata::IS_INSTANCEOF)[0]
+            ?? $argument-&gt;getAttributesOfType(MapUploadedFile::class, ArgumentMetadata::IS_INSTANCEOF)[0]
+            ?? null;
+
+        if (!$attribute) {
+            return [];
+        }
+
+        if (!$attribute instanceof MapUploadedFile &amp;&amp; $argument-&gt;isVariadic()) {
+            throw new \LogicException(\sprintf(&#039;Mapping variadic argument &quot;$%s&quot; is not supported.&#039;, $argument-&gt;getName()));
+        }
+
+        if ($attribute instanceof MapRequestPayload) {
+            if (&#039;array&#039; === $argument-&gt;getType()) {
+                if (!$attribute-&gt;type) {
+                    throw new NearMissValueResolverException(\sprintf(&#039;Please set the $type argument of the #[%s] attribute to the type of the objects in the expected array.&#039;, MapRequestPayload::class));
+                }
+            } elseif ($attribute-&gt;type) {
+                throw new NearMissValueResolverException(\sprintf(&#039;Please set its type to &quot;array&quot; when using argument $type of #[%s].&#039;, MapRequestPayload::class));
+            }
+        }
+
+        $attribute-&gt;metadata = $argument;
+
+        return [$attribute];
+    }
+
+    public function onKernelControllerArguments(ControllerArgumentsEvent $event): void
+    {
+        $arguments = $event-&gt;getArguments();
+
+        foreach ($arguments as $i =&gt; $argument) {
+            if ($argument instanceof MapQueryString) {
+                $payloadMapper = $this-&gt;mapQueryString(...);
+                $validationFailedCode = $argument-&gt;validationFailedStatusCode;
+            } elseif ($argument instanceof MapRequestPayload) {
+                $payloadMapper = $this-&gt;mapRequestPayload(...);
+                $validationFailedCode = $argument-&gt;validationFailedStatusCode;
+            } elseif ($argument instanceof MapUploadedFile) {
+                $payloadMapper = $this-&gt;mapUploadedFile(...);
+                $validationFailedCode = $argument-&gt;validationFailedStatusCode;
+            } else {
+                continue;
+            }
+            $request = $event-&gt;getRequest();
+
+            if (!$argument-&gt;metadata-&gt;getType()) {
+                throw new \LogicException(\sprintf(&#039;Could not resolve the &quot;$%s&quot; controller argument: argument should be typed.&#039;, $argument-&gt;metadata-&gt;getName()));
+            }
+
+            if ($this-&gt;validator) {
+                $violations = new ConstraintViolationList();
+                try {
+                    $payload = $payloadMapper($request, $argument-&gt;metadata, $argument);
+                } catch (PartialDenormalizationException $e) {
+                    $trans = $this-&gt;translator ? $this-&gt;translator-&gt;trans(...) : fn ($m, $p) =&gt; strtr($m, $p);
+                    foreach ($e-&gt;getErrors() as $error) {
+                        $parameters = [];
+                        $template = &#039;This value was of an unexpected type.&#039;;
+                        if ($expectedTypes = $error-&gt;getExpectedTypes()) {
+                            $template = &#039;This value should be of type {{ type }}.&#039;;
+                            $parameters[&#039;{{ type }}&#039;] = implode(&#039;|&#039;, $expectedTypes);
+                        }
+                        if ($error-&gt;canUseMessageForUser()) {
+                            $parameters[&#039;hint&#039;] = $error-&gt;getMessage();
+                        }
+                        $message = $trans($template, $parameters, $this-&gt;translationDomain);
+                        $violations-&gt;add(new ConstraintViolation($message, $template, $parameters, null, $error-&gt;getPath(), null));
+                    }
+                    $payload = $e-&gt;getData();
+                }
+
+                if (null !== $payload &amp;&amp; !\count($violations)) {
+                    $constraints = $argument-&gt;constraints ?? null;
+                    if (\is_array($payload) &amp;&amp; !empty($constraints) &amp;&amp; !$constraints instanceof Assert\All) {
+                        $constraints = new Assert\All($constraints);
+                    }
+                    $violations-&gt;addAll($this-&gt;validator-&gt;validate($payload, $constraints, $argument-&gt;validationGroups ?? null));
+                }
+
+                if (\count($violations)) {
+                    throw HttpException::fromStatusCode($validationFailedCode, implode(&quot;\n&quot;, array_map(static fn ($e) =&gt; $e-&gt;getMessage(), iterator_to_array($violations))), new ValidationFailedException($payload, $violations));
+                }
+            } else {
+                try {
+                    $payload = $payloadMapper($request, $argument-&gt;metadata, $argument);
+                } catch (PartialDenormalizationException $e) {
+                    throw HttpException::fromStatusCode($validationFailedCode, implode(&quot;\n&quot;, array_map(static fn ($e) =&gt; $e-&gt;getMessage(), $e-&gt;getErrors())), $e);
+                }
+            }
+
+            if (null === $payload) {
+                $payload = match (true) {
+                    $argument-&gt;metadata-&gt;hasDefaultValue() =&gt; $argument-&gt;metadata-&gt;getDefaultValue(),
+                    $argument-&gt;metadata-&gt;isNullable() =&gt; null,
+                    default =&gt; throw HttpException::fromStatusCode($validationFailedCode),
+                };
+            }
+
+            $arguments[$i] = $payload;
+        }
+
+        $event-&gt;setArguments($arguments);
+    }
+
+    public static function getSubscribedEvents(): array
+    {
+        return [
+            KernelEvents::CONTROLLER_ARGUMENTS =&gt; &#039;onKernelControllerArguments&#039;,
+        ];
+    }
+
+    private function mapQueryString(Request $request, ArgumentMetadata $argument, MapQueryString $attribute): ?object
+    {
+        if (!($data = $request-&gt;query-&gt;all($attribute-&gt;key)) &amp;&amp; ($argument-&gt;isNullable() || $argument-&gt;hasDefaultValue())) {
+            return null;
+        }
+
+        return $this-&gt;serializer-&gt;denormalize($data, $argument-&gt;getType(), &#039;csv&#039;, $attribute-&gt;serializationContext + self::CONTEXT_DENORMALIZE + [&#039;filter_bool&#039; =&gt; true]);
+    }
+
+    private function mapRequestPayload(Request $request, ArgumentMetadata $argument, MapRequestPayload $attribute): object|array|null
+    {
+        if (&#039;&#039; === ($data = $request-&gt;request-&gt;all() ?: $request-&gt;getContent()) &amp;&amp; ($argument-&gt;isNullable() || $argument-&gt;hasDefaultValue())) {
+            return null;
+        }
+
+        if (null === $format = $request-&gt;getContentTypeFormat()) {
+            throw new UnsupportedMediaTypeHttpException(&#039;Unsupported format.&#039;);
+        }
+
+        if ($attribute-&gt;acceptFormat &amp;&amp; !\in_array($format, (array) $attribute-&gt;acceptFormat, true)) {
+            throw new UnsupportedMediaTypeHttpException(\sprintf(&#039;Unsupported format, expects &quot;%s&quot;, but &quot;%s&quot; given.&#039;, implode(&#039;&quot;, &quot;&#039;, (array) $attribute-&gt;acceptFormat), $format));
+        }
+
+        if (&#039;array&#039; === $argument-&gt;getType() &amp;&amp; null !== $attribute-&gt;type) {
+            $type = $attribute-&gt;type.&#039;[]&#039;;
+        } else {
+            $type = $argument-&gt;getType();
+        }
+
+        if (\is_array($data)) {
+            return $this-&gt;serializer-&gt;denormalize($data, $type, &#039;csv&#039;, $attribute-&gt;serializationContext + self::CONTEXT_DENORMALIZE + (&#039;form&#039; === $format ? [&#039;filter_bool&#039; =&gt; true] : []));
+        }
+
+        if (&#039;form&#039; === $format) {
+            throw new BadRequestHttpException(&#039;Request payload contains invalid &quot;form&quot; data.&#039;);
+        }
+
+        try {
+            return $this-&gt;serializer-&gt;deserialize($data, $type, $format, self::CONTEXT_DESERIALIZE + $attribute-&gt;serializationContext);
+        } catch (UnsupportedFormatException $e) {
+            throw new UnsupportedMediaTypeHttpException(\sprintf(&#039;Unsupported format: &quot;%s&quot;.&#039;, $format), $e);
+        } catch (NotEncodableValueException $e) {
+            throw new BadRequestHttpException(\sprintf(&#039;Request payload contains invalid &quot;%s&quot; data.&#039;, $format), $e);
+        } catch (UnexpectedPropertyException $e) {
+            throw new BadRequestHttpException(\sprintf(&#039;Request payload contains invalid &quot;%s&quot; property.&#039;, $e-&gt;property), $e);
+        }
+    }
+
+    private function mapUploadedFile(Request $request, ArgumentMetadata $argument, MapUploadedFile $attribute): UploadedFile|array|null
+    {
+        if (!($files = $request-&gt;files-&gt;get($attribute-&gt;name ?? $argument-&gt;getName())) &amp;&amp; ($argument-&gt;isNullable() || $argument-&gt;hasDefaultValue())) {
+            return null;
+        }
+
+        return $files ?? (&#039;array&#039; === $argument-&gt;getType() ? [] : null);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-kernel/Controller/ArgumentResolver/RequestValueResolver.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-kernel/ControllerMetadata -->
+
+</body>
+</html>

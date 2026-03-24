@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/psy/psysh/src/ManualUpdater/ManualUpdate.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\ManualUpdater;
+
+use Psy\ConfigPaths;
+use Psy\Configuration;
+use Psy\Exception\ErrorException;
+use Psy\Exception\InvalidManualException;
+use Psy\VersionUpdater\Downloader;
+use Symfony\Component\Console\Helper\QuestionHelper;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Question\ConfirmationQuestion;
+
+/**
+ * Manual update command.
+ *
+ * If a new manual version is available, this command will download and install it.
+ */
+class ManualUpdate
+{
+    const SUCCESS = 0;
+    const FAILURE = 1;
+
+    /** @var array{checker: Checker, installer: Installer}[] */
+    private array $updates;
+    private ?Downloader $downloader = null;
+
+    /**
+     * @param array{checker: Checker, installer: Installer} ...$updates Update configuration(s)
+     */
+    public function __construct(array ...$updates)
+    {
+        $this-&gt;updates = $updates;
+    }
+
+    /**
+     * Create a ManualUpdate instance from Configuration and command-line input.
+     *
+     * @param Configuration   $config Configuration instance
+     * @param InputInterface  $input  Input interface
+     * @param OutputInterface $output Output interface
+     *
+     * @return self
+     */
+    public static function fromConfig(Configuration $config, InputInterface $input, OutputInterface $output): self
+    {
+        $lang = $input-&gt;getOption(&#039;update-manual&#039;) ?: null;
+
+        // Clear the manual update cache when explicitly running --update-manual
+        $cacheFile = $config-&gt;getManualUpdateCheckCacheFile();
+        if ($cacheFile &amp;&amp; \file_exists($cacheFile)) {
+            @\unlink($cacheFile);
+        }
+
+        // Get current manual language before potentially deleting files
+        $currentLang = null;
+        $removedInvalidSqlite = false;
+        $manualFile = $config-&gt;getManualDbFile();
+        if ($manualFile &amp;&amp; \file_exists($manualFile)) {
+            try {
+                $manual = $config-&gt;getManual();
+                if ($manual) {
+                    $currentMeta = $manual-&gt;getMeta();
+                    $currentLang = $currentMeta[&#039;lang&#039;] ?? null;
+                }
+            } catch (InvalidManualException $e) {
+                $removedInvalidSqlite = \substr($e-&gt;getManualFile(), -7) === &#039;.sqlite&#039;;
+                self::handleInvalidManual($e, $input, $output);
+            }
+        }
+
+        $dataDir = $config-&gt;getManualInstallDir();
+        if ($dataDir === false) {
+            throw new \RuntimeException(&#039;Unable to find a writable data directory for manual installation&#039;);
+        }
+
+        $phpManualPath = $dataDir.&#039;/php_manual.php&#039;;
+        $sqliteManualPath = $dataDir.&#039;/php_manual.sqlite&#039;;
+
+        $formats = self::getFormatsToUpdate(
+            $input,
+            $output,
+            \file_exists($phpManualPath),
+            \file_exists($sqliteManualPath),
+            $removedInvalidSqlite,
+            $sqliteManualPath
+        );
+
+        // Build update configurations for selected formats
+        $checkerLang = $lang ?: $currentLang ?: &#039;en&#039;;
+        $updates = [];
+
+        foreach ($formats as $format) {
+            $path = $format === &#039;php&#039; ? $phpManualPath : $sqliteManualPath;
+            $meta = self::getManualMeta($path);
+
+            $updates[] = [
+                &#039;checker&#039;   =&gt; new GitHubChecker($checkerLang, $format, $meta[&#039;version&#039;] ?? null, $meta[&#039;lang&#039;] ?? null),
+                &#039;installer&#039; =&gt; new Installer($dataDir, $format),
+            ];
+        }
+
+        return new self(...$updates);
+    }
+
+    /**
+     * Allow the downloader to be injected for testing.
+     *
+     * @return void
+     */
+    public function setDownloader(Downloader $downloader)
+    {
+        $this-&gt;downloader = $downloader;
+    }
+
+    /**
+     * Get the currently set Downloader or create one based on the capabilities of the php environment.
+     *
+     * @throws ErrorException if a downloader cannot be created for the php environment
+     */
+    private function getDownloader(): Downloader
+    {
+        if (!isset($this-&gt;downloader)) {
+            return Downloader\Factory::getDownloader();
+        }
+
+        return $this-&gt;downloader;
+    }
+
+    /**
+     * Update the manual installation.
+     */
+    public function run(InputInterface $input, OutputInterface $output): int
+    {
+        foreach ($this-&gt;updates as $update) {
+            if (!$update[&#039;installer&#039;]-&gt;isDataDirWritable()) {
+                $output-&gt;writeln(&#039;&lt;error&gt;Data directory is not writable.&lt;/error&gt;&#039;);
+
+                return self::FAILURE;
+            }
+        }
+
+        $downloader = $this-&gt;getDownloader();
+        $downloader-&gt;setTempDir(\sys_get_temp_dir());
+        $installed = [];
+
+        // Download and install each format
+        foreach ($this-&gt;updates as $update) {
+            $checker = $update[&#039;checker&#039;];
+            $installer = $update[&#039;installer&#039;];
+
+            if ($checker-&gt;isLatest()) {
+                continue;
+            }
+
+            $latestVersion = $checker-&gt;getLatest();
+            $downloadUrl = $checker-&gt;getDownloadUrl();
+
+            $output-&gt;write(&quot;Downloading manual v{$latestVersion}...&quot;);
+
+            try {
+                $downloaded = $downloader-&gt;download($downloadUrl);
+            } catch (ErrorException $e) {
+                $output-&gt;write(&#039; &lt;error&gt;Failed.&lt;/error&gt;&#039;);
+                $output-&gt;writeln(\sprintf(&#039;&lt;error&gt;%s&lt;/error&gt;&#039;, $e-&gt;getMessage()));
+                $downloader-&gt;cleanup();
+
+                return self::FAILURE;
+            }
+
+            if (!$downloaded) {
+                $output-&gt;writeln(&#039; &lt;error&gt;Download failed.&lt;/error&gt;&#039;);
+                $downloader-&gt;cleanup();
+
+                return self::FAILURE;
+            }
+
+            $output-&gt;write(&#039; &lt;info&gt;OK&lt;/info&gt;&#039;.\PHP_EOL);
+
+            $downloadedFile = $downloader-&gt;getFilename();
+
+            if (!$installer-&gt;install($downloadedFile)) {
+                $downloader-&gt;cleanup();
+                $output-&gt;writeln(&#039;&lt;error&gt;Failed to install manual.&lt;/error&gt;&#039;);
+
+                return self::FAILURE;
+            }
+
+            $installed[] = [$installer-&gt;getInstallPath(), $latestVersion];
+
+            $downloader-&gt;cleanup();
+        }
+
+        if (empty($installed)) {
+            $output-&gt;writeln(&#039;&lt;info&gt;Manual is up-to-date.&lt;/info&gt;&#039;);
+        } else {
+            foreach ($installed as [$installPath, $version]) {
+                $prettyPath = ConfigPaths::prettyPath($installPath);
+                $output-&gt;writeln(&quot;Installed manual v{$version} to &lt;info&gt;{$prettyPath}&lt;/info&gt;&quot;);
+            }
+        }
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * Handle an invalid manual file by prompting the user to remove it.
+     *
+     * @param InvalidManualException $e      The exception containing invalid manual details
+     * @param InputInterface         $input  Input interface
+     * @param OutputInterface        $output Output interface
+     *
+     * @throws \RuntimeException if user declines to remove the file or removal fails
+     */
+    private static function handleInvalidManual(InvalidManualException $e, InputInterface $input, OutputInterface $output): void
+    {
+        $prettyPath = ConfigPaths::prettyPath($e-&gt;getManualFile());
+        $output-&gt;writeln(\sprintf(&#039;&lt;error&gt;Invalid manual file detected:&lt;/error&gt; &lt;info&gt;%s&lt;/info&gt;&#039;, $prettyPath));
+        $output-&gt;writeln(&#039;&#039;);
+
+        $helper = new QuestionHelper();
+        $question = new ConfirmationQuestion(&#039;Remove this file and continue? [Y/n] &#039;, true);
+
+        if (!$helper-&gt;ask($input, $output, $question)) {
+            throw new \RuntimeException(&#039;Manual update cancelled.&#039;);
+        }
+
+        if (!\unlink($e-&gt;getManualFile())) {
+            throw new \RuntimeException(\sprintf(&#039;Failed to remove file: %s&#039;, $prettyPath));
+        }
+
+        $output-&gt;writeln(&#039;&lt;info&gt;Invalid manual file removed.&lt;/info&gt;&#039;);
+        $output-&gt;writeln(&#039;&#039;);
+    }
+
+    /**
+     * Prompt user to download PHP format manual when they have/had legacy SQLite.
+     *
+     * @param InputInterface  $input      Input interface
+     * @param OutputInterface $output     Output interface
+     * @param string          $manualFile Path to current/former SQLite manual file
+     * @param bool            $wasRemoved Whether the file was already removed
+     *
+     * @return bool True if user wants to download PHP format
+     */
+    private static function promptMigrateToV3(InputInterface $input, OutputInterface $output, string $manualFile, bool $wasRemoved): bool
+    {
+        $prettyPath = ConfigPaths::prettyPath($manualFile);
+        $verb = $wasRemoved ? &#039;had&#039; : &#039;have&#039;;
+        $output-&gt;writeln(\sprintf(&#039;You %s a legacy SQLite manual: &lt;info&gt;%s&lt;/info&gt;&#039;, $verb, $prettyPath));
+        $output-&gt;writeln(&#039;&#039;);
+
+        $helper = new QuestionHelper();
+        $question = new ConfirmationQuestion(&#039;Download the current manual format? [Y/n] &#039;, true);
+
+        return $helper-&gt;ask($input, $output, $question);
+    }
+
+    /**
+     * Determine which manual formats should be updated.
+     *
+     * @param InputInterface  $input                Input interface
+     * @param OutputInterface $output               Output interface
+     * @param bool            $hasPhpManual         Whether PHP manual exists
+     * @param bool            $hasSqliteManual      Whether SQLite manual exists
+     * @param bool            $removedInvalidSqlite Whether we just removed an invalid SQLite manual
+     * @param string          $sqliteManualPath     Path to SQLite manual file
+     *
+     * @return string[] Array of format names to update (&#039;php&#039;, &#039;sqlite&#039;)
+     */
+    private static function getFormatsToUpdate(
+        InputInterface $input,
+        OutputInterface $output,
+        bool $hasPhpManual,
+        bool $hasSqliteManual,
+        bool $removedInvalidSqlite,
+        string $sqliteManualPath
+    ): array {
+        // Only SQLite exists (or just removed invalid SQLite): offer to add PHP format
+        if (!$hasPhpManual &amp;&amp; ($hasSqliteManual || $removedInvalidSqlite)) {
+            if (self::promptMigrateToV3($input, $output, $sqliteManualPath, $removedInvalidSqlite)) {
+                return [&#039;php&#039;, &#039;sqlite&#039;];
+            }
+
+            return [&#039;sqlite&#039;];
+        }
+
+        // PHP exists, or neither exist: default to PHP, and include SQLite if it exists
+        $formats = [&#039;php&#039;];
+        if ($hasSqliteManual) {
+            $formats[] = &#039;sqlite&#039;;
+        }
+
+        return $formats;
+    }
+
+    /**
+     * Get manual metadata from a file.
+     *
+     * @param string $path Path to manual file
+     *
+     * @return array|null Metadata array with &#039;version&#039; and &#039;lang&#039; keys, or null if unavailable
+     */
+    private static function getManualMeta(string $path): ?array
+    {
+        if (!\file_exists($path)) {
+            return null;
+        }
+
+        try {
+            if (\substr($path, -4) === &#039;.php&#039;) {
+                $manual = new \Psy\Manual\V3Manual($path);
+
+                return $manual-&gt;getMeta();
+            }
+
+            if (\substr($path, -7) === &#039;.sqlite&#039;) {
+                $pdo = new \PDO(&#039;sqlite:&#039;.$path);
+                $manual = new \Psy\Manual\V2Manual($pdo);
+
+                return $manual-&gt;getMeta();
+            }
+        } catch (\Exception $e) {
+            // Ignore errors reading manual metadata
+        }
+
+        return null;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/psy/psysh/src/Output/OutputPager.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/psy/psysh/src/Output -->
+
+</body>
+</html>

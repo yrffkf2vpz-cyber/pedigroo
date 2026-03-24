@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/storage/old_laravel/app/Services/Normalizers/NormalizePipelineService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Services\Normalizers;
+
+use App\Services\Ingest\DogRecordBuilder;
+
+// Normalize modules
+use App\Services\Normalizers\NormalizeDogService;
+use App\Services\Normalizers\NormalizeParentService;
+use App\Services\Normalizers\NormalizeResultsService;
+use App\Services\Normalizers\NormalizeHealthService;
+use App\Services\Normalizers\NormalizeBreederService;
+use App\Services\Normalizers\NormalizeOwnerService;
+use App\Services\Normalizers\NormalizeKennelService;
+use App\Services\Normalizers\NormalizeColorService;
+use App\Services\Normalizers\NormalizeBreedService;
+use App\Services\Normalizers\NormalizeCountryService;
+use App\Services\Normalizers\RegNo\RegNoService;
+use App\Services\Normalizers\Name\NameParser;
+
+// Promotion modules
+use App\Services\Normalizers\PromotionNormalizer;
+use App\Services\Normalizers\TitleNormalizer;
+use App\Services\Normalizers\ChampionPointCalculator;
+
+// Archive modules
+use App\Services\Normalizers\HistoryWriter;
+use App\Services\Normalizers\ChangeDetector;
+use App\Services\Normalizers\DuplicateResolver;
+
+class NormalizePipelineService
+{
+    public function __construct(
+        // INGEST
+        protected DogRecordBuilder $builder,
+
+        // NORMALIZE
+        protected NormalizeDogService $normalizeDog,
+        protected NormalizeParentService $normalizeParents,
+        protected NormalizeResultsService $normalizeResults,
+        protected ParentMatchingService $parentMatcher,
+        protected NormalizeHealthService $normalizeHealth,
+        protected NormalizeBreederService $normalizeBreeder,
+        protected NormalizeOwnerService $normalizeOwner,
+        protected NormalizeKennelService $normalizeKennel,
+        protected NormalizeColorService $normalizeColor,
+        protected NormalizeBreedService $normalizeBreed,
+        protected NormalizeCountryService $normalizeCountry,
+        protected RegNoService $regNoService,
+
+        // PROMOTION
+        protected PromotionNormalizer $promotionNormalizer,
+        protected TitleNormalizer $titleNormalizer,
+        protected ChampionPointCalculator $championPoints,
+
+        // ARCHIVE
+        protected HistoryWriter $historyWriter,
+        protected ChangeDetector $changeDetector,
+        protected DuplicateResolver $duplicateResolver,
+    ) {}
+
+    /**
+     * Teljes ingest → normalize → promote → archive pipeline.
+     */
+    public function process(array $rawDogRecord, bool $debug = false): array
+    {
+        // ---------------------------------------------------------
+        // 1) INGEST – egységes raw rekord
+        // ---------------------------------------------------------
+        $raw = $this-&gt;builder-&gt;fromExcelRow($rawDogRecord);
+
+        // ---------------------------------------------------------
+        // 2) NORMALIZE – minden modul külön
+        // ---------------------------------------------------------
+        $dog = $this-&gt;normalizeDog-&gt;normalize($raw, $debug);
+
+        // PARENTS – normalizálás
+        $father = $this-&gt;normalizeParents-&gt;normalize($raw[&#039;raw_father&#039;] ?? null);
+        $mother = $this-&gt;normalizeParents-&gt;normalize($raw[&#039;raw_mother&#039;] ?? null);
+
+        // PARENTS – matching
+        $fatherMatch = $this-&gt;parentMatcher-&gt;match($father);
+        $motherMatch = $this-&gt;parentMatcher-&gt;match($mother);
+
+        // DOG rekordba beírjuk a szülő ID-ket
+        $dog[&#039;father_id&#039;] = $fatherMatch[&#039;matched_id&#039;] ?? null;
+        $dog[&#039;mother_id&#039;] = $motherMatch[&#039;matched_id&#039;] ?? null;
+
+        // További normalizálások
+        $results  = $this-&gt;normalizeResults-&gt;normalize($raw);
+        $health   = $this-&gt;normalizeHealth-&gt;normalize($raw[&#039;health&#039;] ?? [], $debug);
+        $breeder  = $this-&gt;normalizeBreeder-&gt;normalize($raw);
+        $owner    = $this-&gt;normalizeOwner-&gt;normalize($raw);
+        $kennel   = $this-&gt;normalizeKennel-&gt;normalize($raw);
+        $color    = $this-&gt;normalizeColor-&gt;normalize($raw);
+        $breed    = $this-&gt;normalizeBreed-&gt;normalize($raw);
+        $country  = $this-&gt;normalizeCountry-&gt;normalize($raw);
+        $regno    = $this-&gt;regNoService-&gt;process($raw[&#039;raw_reg_no&#039;] ?? null);
+
+        // ---------------------------------------------------------
+        // SZÍNEK ÁTVÉTELE A DOG REKORDBA
+        // ---------------------------------------------------------
+        $dog[&#039;color&#039;]          = $color[&#039;color&#039;] ?? null;
+        $dog[&#039;official_color&#039;] = $color[&#039;official_color&#039;] ?? null;
+        $dog[&#039;birth_color&#039;]    = $color[&#039;birth_color&#039;] ?? null;
+
+        // ---------------------------------------------------------
+        // 3) PROMOTION – címek, pontok, rangok
+        // ---------------------------------------------------------
+        $promotions = $this-&gt;promotionNormalizer-&gt;normalize($results);
+        $titles     = $this-&gt;titleNormalizer-&gt;normalize($promotions);
+        $points     = $this-&gt;championPoints-&gt;calculate($results);
+
+        // ---------------------------------------------------------
+        // 4) ARCHIVE – történet, változás, duplikáció
+        // ---------------------------------------------------------
+        $parents = [
+            &#039;father&#039; =&gt; $father,
+            &#039;mother&#039; =&gt; $mother,
+        ];
+
+        $history    = $this-&gt;historyWriter-&gt;write($dog, $parents, $results);
+        $changes    = $this-&gt;changeDetector-&gt;detect($dog);
+        $duplicates = $this-&gt;duplicateResolver-&gt;resolve($dog);
+
+        // ---------------------------------------------------------
+        // 5) VÉGSŐ ÖSSZEÁLLÍTOTT REKORD + DEBUG
+        // ---------------------------------------------------------
+        return [
+            &#039;dog&#039; =&gt; $dog,
+
+            &#039;parents&#039; =&gt; $parents,
+            &#039;parent_matches&#039; =&gt; [
+                &#039;father&#039; =&gt; $fatherMatch,
+                &#039;mother&#039; =&gt; $motherMatch,
+            ],
+
+            &#039;results&#039;    =&gt; $results,
+            &#039;health&#039;     =&gt; $health,
+            &#039;breeder&#039;    =&gt; $breeder,
+            &#039;owner&#039;      =&gt; $owner,
+            &#039;kennel&#039;     =&gt; $kennel,
+            &#039;color&#039;      =&gt; $color,
+            &#039;breed&#039;      =&gt; $breed,
+            &#039;country&#039;    =&gt; $country,
+            &#039;regno&#039;      =&gt; $regno,
+
+            &#039;promotions&#039; =&gt; $promotions,
+            &#039;titles&#039;     =&gt; $titles,
+            &#039;points&#039;     =&gt; $points,
+
+            &#039;history&#039;    =&gt; $history,
+            &#039;changes&#039;    =&gt; $changes,
+            &#039;duplicates&#039; =&gt; $duplicates,
+
+            &#039;debug&#039; =&gt; $debug ? [
+                &#039;ingest&#039; =&gt; [
+                    &#039;raw_input&#039;      =&gt; $rawDogRecord,
+                    &#039;builder_output&#039; =&gt; $raw,
+                ],
+
+                &#039;normalize&#039; =&gt; [
+                    &#039;dog&#039;      =&gt; $dog[&#039;debug&#039;]      ?? null,
+                    &#039;parents&#039;  =&gt; [
+                        &#039;father&#039; =&gt; $father[&#039;debug&#039;] ?? null,
+                        &#039;mother&#039; =&gt; $mother[&#039;debug&#039;] ?? null,
+                    ],
+                    &#039;parent_matches&#039; =&gt; [
+                        &#039;father&#039; =&gt; $fatherMatch[&#039;debug&#039;] ?? null,
+                        &#039;mother&#039; =&gt; $motherMatch[&#039;debug&#039;] ?? null,
+                    ],
+                    &#039;results&#039;  =&gt; $results[&#039;debug&#039;]  ?? null,
+                    &#039;health&#039;   =&gt; $health[&#039;debug&#039;]   ?? null,
+                    &#039;breeder&#039;  =&gt; $breeder[&#039;debug&#039;]  ?? null,
+                    &#039;owner&#039;    =&gt; $owner[&#039;debug&#039;]    ?? null,
+                    &#039;kennel&#039;   =&gt; $kennel[&#039;debug&#039;]   ?? null,
+                    &#039;color&#039;    =&gt; $color[&#039;debug&#039;]    ?? null,
+                    &#039;breed&#039;    =&gt; $breed[&#039;debug&#039;]    ?? null,
+                    &#039;country&#039;  =&gt; $country[&#039;debug&#039;]  ?? null,
+                    &#039;regno&#039;    =&gt; $regno[&#039;debug&#039;]    ?? null,
+                ],
+
+                &#039;promotion&#039; =&gt; [
+                    &#039;promotions&#039; =&gt; $promotions[&#039;debug&#039;] ?? null,
+                    &#039;titles&#039;     =&gt; $titles[&#039;debug&#039;]     ?? null,
+                    &#039;points&#039;     =&gt; $points[&#039;debug&#039;]     ?? null,
+                ],
+
+                &#039;archive&#039; =&gt; [
+                    &#039;history&#039;    =&gt; $history[&#039;debug&#039;]    ?? null,
+                    &#039;changes&#039;    =&gt; $changes[&#039;debug&#039;]    ?? null,
+                    &#039;duplicates&#039; =&gt; $duplicates[&#039;debug&#039;] ?? null,
+                ],
+            ] : null,
+        ];
+    }
+}
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /storage/old_laravel/app/Services/Normalizers/NormalizeResultsService.php -->
+<!-- PEDROO_NEXT_DIR: /storage/old_laravel/app/Services/Normalizers/Jobs -->
+
+</body>
+</html>

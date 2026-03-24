@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-kernel/Profiler/FileProfilerStorage.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpKernel\Profiler;
+
+/**
+ * Storage for profiler using files.
+ *
+ * @author Alexandre Salomé &lt;alexandre.salome@gmail.com&gt;
+ */
+class FileProfilerStorage implements ProfilerStorageInterface
+{
+    /**
+     * Folder where profiler data are stored.
+     */
+    private string $folder;
+
+    /**
+     * Constructs the file storage using a &quot;dsn-like&quot; path.
+     *
+     * Example : &quot;file:/path/to/the/storage/folder&quot;
+     *
+     * @throws \RuntimeException
+     */
+    public function __construct(string $dsn)
+    {
+        if (!str_starts_with($dsn, &#039;file:&#039;)) {
+            throw new \RuntimeException(\sprintf(&#039;Please check your configuration. You are trying to use FileStorage with an invalid dsn &quot;%s&quot;. The expected format is &quot;file:/path/to/the/storage/folder&quot;.&#039;, $dsn));
+        }
+        $this-&gt;folder = substr($dsn, 5);
+
+        if (!is_dir($this-&gt;folder) &amp;&amp; false === @mkdir($this-&gt;folder, 0o777, true) &amp;&amp; !is_dir($this-&gt;folder)) {
+            throw new \RuntimeException(\sprintf(&#039;Unable to create the storage directory (%s).&#039;, $this-&gt;folder));
+        }
+    }
+
+    public function find(?string $ip, ?string $url, ?int $limit, ?string $method, ?int $start = null, ?int $end = null, ?string $statusCode = null, ?\Closure $filter = null): array
+    {
+        $file = $this-&gt;getIndexFilename();
+
+        if (!file_exists($file)) {
+            return [];
+        }
+
+        $file = fopen($file, &#039;r&#039;);
+        fseek($file, 0, \SEEK_END);
+
+        $result = [];
+        while (\count($result) &lt; $limit &amp;&amp; $line = $this-&gt;readLineFromFile($file)) {
+            $values = str_getcsv($line, &#039;,&#039;, &#039;&quot;&#039;, &#039;\\&#039;);
+
+            if (7 &gt; \count($values)) {
+                // skip invalid lines
+                continue;
+            }
+
+            [$csvToken, $csvIp, $csvMethod, $csvUrl, $csvTime, $csvParent, $csvStatusCode, $csvVirtualType] = $values + [7 =&gt; null];
+            $csvTime = (int) $csvTime;
+
+            $urlFilter = false;
+            if ($url) {
+                $urlFilter = str_starts_with($url, &#039;!&#039;) ? str_contains($csvUrl, substr($url, 1)) : !str_contains($csvUrl, $url);
+            }
+
+            if ($ip &amp;&amp; !str_contains($csvIp, $ip) || $urlFilter || $method &amp;&amp; !str_contains($csvMethod, $method) || $statusCode &amp;&amp; !str_contains($csvStatusCode, $statusCode)) {
+                continue;
+            }
+
+            if ($start &amp;&amp; $csvTime &lt; $start) {
+                continue;
+            }
+
+            if ($end &amp;&amp; $csvTime &gt; $end) {
+                continue;
+            }
+
+            $profile = [
+                &#039;token&#039; =&gt; $csvToken,
+                &#039;ip&#039; =&gt; $csvIp,
+                &#039;method&#039; =&gt; $csvMethod,
+                &#039;url&#039; =&gt; $csvUrl,
+                &#039;time&#039; =&gt; $csvTime,
+                &#039;parent&#039; =&gt; $csvParent,
+                &#039;status_code&#039; =&gt; $csvStatusCode,
+                &#039;virtual_type&#039; =&gt; $csvVirtualType ?: &#039;request&#039;,
+            ];
+
+            if ($filter &amp;&amp; !$filter($profile)) {
+                continue;
+            }
+
+            $result[$csvToken] = $profile;
+        }
+
+        fclose($file);
+
+        return array_values($result);
+    }
+
+    public function purge(): void
+    {
+        $flags = \FilesystemIterator::SKIP_DOTS;
+        $iterator = new \RecursiveDirectoryIterator($this-&gt;folder, $flags);
+        $iterator = new \RecursiveIteratorIterator($iterator, \RecursiveIteratorIterator::CHILD_FIRST);
+
+        foreach ($iterator as $file) {
+            if (is_file($file)) {
+                unlink($file);
+            } else {
+                rmdir($file);
+            }
+        }
+    }
+
+    public function read(string $token): ?Profile
+    {
+        return $this-&gt;doRead($token);
+    }
+
+    /**
+     * @throws \RuntimeException
+     */
+    public function write(Profile $profile): bool
+    {
+        $file = $this-&gt;getFilename($profile-&gt;getToken());
+
+        $profileIndexed = is_file($file);
+        if (!$profileIndexed) {
+            // Create directory
+            $dir = \dirname($file);
+            if (!is_dir($dir) &amp;&amp; false === @mkdir($dir, 0o777, true) &amp;&amp; !is_dir($dir)) {
+                throw new \RuntimeException(\sprintf(&#039;Unable to create the storage directory (%s).&#039;, $dir));
+            }
+        }
+
+        $profileToken = $profile-&gt;getToken();
+        // when there are errors in sub-requests, the parent and/or children tokens
+        // may equal the profile token, resulting in infinite loops
+        $parentToken = $profile-&gt;getParentToken() !== $profileToken ? $profile-&gt;getParentToken() : null;
+        $childrenToken = array_filter(array_map(fn (Profile $p) =&gt; $profileToken !== $p-&gt;getToken() ? $p-&gt;getToken() : null, $profile-&gt;getChildren()));
+
+        // Store profile
+        $data = [
+            &#039;token&#039; =&gt; $profileToken,
+            &#039;parent&#039; =&gt; $parentToken,
+            &#039;children&#039; =&gt; $childrenToken,
+            &#039;data&#039; =&gt; $profile-&gt;getCollectors(),
+            &#039;ip&#039; =&gt; $profile-&gt;getIp(),
+            &#039;method&#039; =&gt; $profile-&gt;getMethod(),
+            &#039;url&#039; =&gt; $profile-&gt;getUrl(),
+            &#039;time&#039; =&gt; $profile-&gt;getTime(),
+            &#039;status_code&#039; =&gt; $profile-&gt;getStatusCode(),
+            &#039;virtual_type&#039; =&gt; $profile-&gt;getVirtualType() ?? &#039;request&#039;,
+        ];
+
+        $data = serialize($data);
+
+        if (\function_exists(&#039;gzencode&#039;)) {
+            $data = gzencode($data, 3);
+        }
+
+        if (false === file_put_contents($file, $data, \LOCK_EX)) {
+            return false;
+        }
+
+        if (!$profileIndexed) {
+            // Add to index
+            if (false === $file = fopen($this-&gt;getIndexFilename(), &#039;a&#039;)) {
+                return false;
+            }
+
+            fputcsv($file, [
+                $profile-&gt;getToken(),
+                $profile-&gt;getIp(),
+                $profile-&gt;getMethod(),
+                $profile-&gt;getUrl(),
+                $profile-&gt;getTime() ?: time(),
+                $profile-&gt;getParentToken(),
+                $profile-&gt;getStatusCode(),
+                $profile-&gt;getVirtualType() ?? &#039;request&#039;,
+            ], &#039;,&#039;, &#039;&quot;&#039;, &#039;\\&#039;);
+            fclose($file);
+
+            if (1 === mt_rand(1, 10)) {
+                $this-&gt;removeExpiredProfiles();
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Gets filename to store data, associated to the token.
+     */
+    protected function getFilename(string $token): string
+    {
+        // Uses 4 last characters, because first are mostly the same.
+        $folderA = substr($token, -2, 2);
+        $folderB = substr($token, -4, 2);
+
+        return $this-&gt;folder.&#039;/&#039;.$folderA.&#039;/&#039;.$folderB.&#039;/&#039;.$token;
+    }
+
+    /**
+     * Gets the index filename.
+     */
+    protected function getIndexFilename(): string
+    {
+        return $this-&gt;folder.&#039;/index.csv&#039;;
+    }
+
+    /**
+     * Reads a line in the file, backward.
+     *
+     * This function automatically skips the empty lines and do not include the line return in result value.
+     *
+     * @param resource $file The file resource, with the pointer placed at the end of the line to read
+     */
+    protected function readLineFromFile($file): mixed
+    {
+        $line = &#039;&#039;;
+        $position = ftell($file);
+
+        if (0 === $position) {
+            return null;
+        }
+
+        while (true) {
+            $chunkSize = min($position, 1024);
+            $position -= $chunkSize;
+            fseek($file, $position);
+
+            if (0 === $chunkSize) {
+                // bof reached
+                break;
+            }
+
+            $buffer = fread($file, $chunkSize);
+
+            if (false === ($upTo = strrpos($buffer, &quot;\n&quot;))) {
+                $line = $buffer.$line;
+                continue;
+            }
+
+            $position += $upTo;
+            $line = substr($buffer, $upTo + 1).$line;
+            fseek($file, max(0, $position), \SEEK_SET);
+
+            if (&#039;&#039; !== $line) {
+                break;
+            }
+        }
+
+        return &#039;&#039; === $line ? null : $line;
+    }
+
+    protected function createProfileFromData(string $token, array $data, ?Profile $parent = null): Profile
+    {
+        $profile = new Profile($token);
+        $profile-&gt;setIp($data[&#039;ip&#039;]);
+        $profile-&gt;setMethod($data[&#039;method&#039;]);
+        $profile-&gt;setUrl($data[&#039;url&#039;]);
+        $profile-&gt;setTime($data[&#039;time&#039;]);
+        $profile-&gt;setStatusCode($data[&#039;status_code&#039;]);
+        $profile-&gt;setVirtualType($data[&#039;virtual_type&#039;] ?: &#039;request&#039;);
+        $profile-&gt;setCollectors($data[&#039;data&#039;]);
+
+        if (!$parent &amp;&amp; $data[&#039;parent&#039;]) {
+            $parent = $this-&gt;read($data[&#039;parent&#039;]);
+        }
+
+        if ($parent) {
+            $profile-&gt;setParent($parent);
+        }
+
+        foreach ($data[&#039;children&#039;] as $token) {
+            if (null !== $childProfile = $this-&gt;doRead($token, $profile)) {
+                $profile-&gt;addChild($childProfile);
+            }
+        }
+
+        return $profile;
+    }
+
+    private function doRead($token, ?Profile $profile = null): ?Profile
+    {
+        if (!$token || !file_exists($file = $this-&gt;getFilename($token))) {
+            return null;
+        }
+
+        $h = fopen($file, &#039;r&#039;);
+        flock($h, \LOCK_SH);
+        $data = stream_get_contents($h);
+        flock($h, \LOCK_UN);
+        fclose($h);
+
+        if (\function_exists(&#039;gzdecode&#039;)) {
+            $data = @gzdecode($data) ?: $data;
+        }
+
+        if (!$data = unserialize($data)) {
+            return null;
+        }
+
+        return $this-&gt;createProfileFromData($token, $data, $profile);
+    }
+
+    private function removeExpiredProfiles(): void
+    {
+        $minimalProfileTimestamp = time() - 2 * 86400;
+        $file = $this-&gt;getIndexFilename();
+        $handle = fopen($file, &#039;r&#039;);
+
+        if ($offset = is_file($file.&#039;.offset&#039;) ? (int) file_get_contents($file.&#039;.offset&#039;) : 0) {
+            fseek($handle, $offset);
+        }
+
+        while ($line = fgets($handle)) {
+            $values = str_getcsv($line, &#039;,&#039;, &#039;&quot;&#039;, &#039;\\&#039;);
+
+            if (7 &gt; \count($values)) {
+                // skip invalid lines
+                $offset += \strlen($line);
+                continue;
+            }
+
+            [$csvToken, , , , $csvTime] = $values;
+
+            if ($csvTime &gt;= $minimalProfileTimestamp) {
+                break;
+            }
+
+            @unlink($this-&gt;getFilename($csvToken));
+            $offset += \strlen($line);
+        }
+        fclose($handle);
+
+        file_put_contents($file.&#039;.offset&#039;, $offset);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-kernel/Profiler/Profile.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-kernel/Resources -->
+
+</body>
+</html>

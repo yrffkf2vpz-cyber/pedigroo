@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Connection/Cluster/RedisCluster.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Connection\Cluster;
+
+use ArrayIterator;
+use Countable;
+use IteratorAggregate;
+use OutOfBoundsException;
+use Predis\ClientException;
+use Predis\Cluster\RedisStrategy as RedisClusterStrategy;
+use Predis\Cluster\SlotMap;
+use Predis\Cluster\StrategyInterface;
+use Predis\Command\CommandInterface;
+use Predis\Command\RawCommand;
+use Predis\Connection\ConnectionException;
+use Predis\Connection\FactoryInterface;
+use Predis\Connection\NodeConnectionInterface;
+use Predis\NotSupportedException;
+use Predis\Response\Error as ErrorResponse;
+use Predis\Response\ErrorInterface as ErrorResponseInterface;
+use Predis\Response\ServerException;
+use ReturnTypeWillChange;
+use Throwable;
+use Traversable;
+
+/**
+ * Abstraction for a Redis-backed cluster of nodes (Redis &gt;= 3.0.0).
+ *
+ * This connection backend offers smart support for redis-cluster by handling
+ * automatic slots map (re)generation upon -MOVED or -ASK responses returned by
+ * Redis when redirecting a client to a different node.
+ *
+ * The cluster can be pre-initialized using only a subset of the actual nodes in
+ * the cluster, Predis will do the rest by adjusting the slots map and creating
+ * the missing underlying connection instances on the fly.
+ *
+ * It is possible to pre-associate connections to a slots range with the &quot;slots&quot;
+ * parameter in the form &quot;$first-$last&quot;. This can greatly reduce runtime node
+ * guessing and redirections.
+ *
+ * It is also possible to ask for the full and updated slots map directly to one
+ * of the nodes and optionally enable such a behaviour upon -MOVED redirections.
+ * Asking for the cluster configuration to Redis is actually done by issuing a
+ * CLUSTER SLOTS command to a random node in the pool.
+ */
+class RedisCluster implements ClusterInterface, IteratorAggregate, Countable
+{
+    private $useClusterSlots = true;
+    private $pool = [];
+    private $slots = [];
+    private $slotmap;
+    private $strategy;
+    private $connections;
+    private $retryLimit = 5;
+    private $retryInterval = 10;
+
+    /**
+     * @param FactoryInterface       $connections Optional connection factory.
+     * @param StrategyInterface|null $strategy    Optional cluster strategy.
+     */
+    public function __construct(
+        FactoryInterface $connections,
+        ?StrategyInterface $strategy = null
+    ) {
+        $this-&gt;connections = $connections;
+        $this-&gt;strategy = $strategy ?: new RedisClusterStrategy();
+        $this-&gt;slotmap = new SlotMap();
+    }
+
+    /**
+     * Sets the maximum number of retries for commands upon server failure.
+     *
+     * -1 = unlimited retry attempts
+     *  0 = no retry attempts (fails immediately)
+     *  n = fail only after n retry attempts
+     *
+     * @param int $retry Number of retry attempts.
+     */
+    public function setRetryLimit($retry)
+    {
+        $this-&gt;retryLimit = (int) $retry;
+    }
+
+    /**
+     * Sets the initial retry interval (milliseconds).
+     *
+     * @param int $retryInterval Milliseconds between retries.
+     */
+    public function setRetryInterval($retryInterval)
+    {
+        $this-&gt;retryInterval = (int) $retryInterval;
+    }
+
+    /**
+     * Returns the retry interval (milliseconds).
+     *
+     * @return int Milliseconds between retries.
+     */
+    public function getRetryInterval()
+    {
+        return (int) $this-&gt;retryInterval;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function isConnected()
+    {
+        foreach ($this-&gt;pool as $connection) {
+            if ($connection-&gt;isConnected()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function connect()
+    {
+        if ($connection = $this-&gt;getRandomConnection()) {
+            $connection-&gt;connect();
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function disconnect()
+    {
+        foreach ($this-&gt;pool as $connection) {
+            $connection-&gt;disconnect();
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function add(NodeConnectionInterface $connection)
+    {
+        $this-&gt;pool[(string) $connection] = $connection;
+        $this-&gt;slotmap-&gt;reset();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function remove(NodeConnectionInterface $connection)
+    {
+        if (false !== $id = array_search($connection, $this-&gt;pool, true)) {
+            $this-&gt;slotmap-&gt;reset();
+            $this-&gt;slots = array_diff($this-&gt;slots, [$connection]);
+            unset($this-&gt;pool[$id]);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Removes a connection instance by using its identifier.
+     *
+     * @param string $connectionID Connection identifier.
+     *
+     * @return bool True if the connection was in the pool.
+     */
+    public function removeById($connectionID)
+    {
+        if (isset($this-&gt;pool[$connectionID])) {
+            $this-&gt;slotmap-&gt;reset();
+            $this-&gt;slots = array_diff($this-&gt;slots, [$connectionID]);
+            unset($this-&gt;pool[$connectionID]);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Generates the current slots map by guessing the cluster configuration out
+     * of the connection parameters of the connections in the pool.
+     *
+     * Generation is based on the same algorithm used by Redis to generate the
+     * cluster, so it is most effective when all of the connections supplied on
+     * initialization have the &quot;slots&quot; parameter properly set accordingly to the
+     * current cluster configuration.
+     */
+    public function buildSlotMap()
+    {
+        $this-&gt;slotmap-&gt;reset();
+
+        foreach ($this-&gt;pool as $connectionID =&gt; $connection) {
+            $parameters = $connection-&gt;getParameters();
+
+            if (!isset($parameters-&gt;slots)) {
+                continue;
+            }
+
+            foreach (explode(&#039;,&#039;, $parameters-&gt;slots) as $slotRange) {
+                $slots = explode(&#039;-&#039;, $slotRange, 2);
+
+                if (!isset($slots[1])) {
+                    $slots[1] = $slots[0];
+                }
+
+                $this-&gt;slotmap-&gt;setSlots($slots[0], $slots[1], $connectionID);
+            }
+        }
+    }
+
+    /**
+     * Queries the specified node of the cluster to fetch the updated slots map.
+     *
+     * When the connection fails, this method tries to execute the same command
+     * on a different connection picked at random from the pool of known nodes,
+     * up until the retry limit is reached.
+     *
+     * @param NodeConnectionInterface $connection Connection to a node of the cluster.
+     *
+     * @return mixed
+     */
+    private function queryClusterNodeForSlotMap(NodeConnectionInterface $connection)
+    {
+        $retries = 0;
+        $retryAfter = $this-&gt;retryInterval;
+        $command = RawCommand::create(&#039;CLUSTER&#039;, &#039;SLOTS&#039;);
+
+        while ($retries &lt;= $this-&gt;retryLimit) {
+            try {
+                $response = $connection-&gt;executeCommand($command);
+                break;
+            } catch (ConnectionException $exception) {
+                $connection = $exception-&gt;getConnection();
+                $connection-&gt;disconnect();
+
+                $this-&gt;remove($connection);
+
+                if ($retries === $this-&gt;retryLimit) {
+                    throw $exception;
+                }
+
+                if (!$connection = $this-&gt;getRandomConnection()) {
+                    throw new ClientException(&#039;No connections left in the pool for `CLUSTER SLOTS` (&#039; . $exception-&gt;getMessage() . &#039;)&#039;);
+                }
+
+                usleep($retryAfter * 1000);
+                $retryAfter *= 2;
+                ++$retries;
+            }
+        }
+
+        return $response;
+    }
+
+    /**
+     * Generates an updated slots map fetching the cluster configuration using
+     * the CLUSTER SLOTS command against the specified node or a random one from
+     * the pool.
+     *
+     * @param NodeConnectionInterface|null $connection Optional connection instance.
+     */
+    public function askSlotMap(?NodeConnectionInterface $connection = null)
+    {
+        if (!$connection &amp;&amp; !$connection = $this-&gt;getRandomConnection()) {
+            return;
+        }
+
+        $this-&gt;slotmap-&gt;reset();
+
+        $response = $this-&gt;queryClusterNodeForSlotMap($connection);
+
+        foreach ($response as $slots) {
+            // We only support master servers for now, so we ignore subsequent
+            // elements in the $slots array identifying slaves.
+            [$start, $end, $master] = $slots;
+
+            if ($master[0] === &#039;&#039;) {
+                $this-&gt;slotmap-&gt;setSlots($start, $end, (string) $connection);
+            } else {
+                $this-&gt;slotmap-&gt;setSlots($start, $end, &quot;{$master[0]}:{$master[1]}&quot;);
+            }
+        }
+    }
+
+    /**
+     * Guesses the correct node associated to a given slot using a precalculated
+     * slots map, falling back to the same logic used by Redis to initialize a
+     * cluster (best-effort).
+     *
+     * @param int $slot Slot index.
+     *
+     * @return string Connection ID.
+     */
+    protected function guessNode($slot)
+    {
+        if (!$this-&gt;pool) {
+            throw new ClientException(&#039;No connections available in the pool&#039;);
+        }
+
+        if ($this-&gt;slotmap-&gt;isEmpty()) {
+            $this-&gt;buildSlotMap();
+        }
+
+        if ($node = $this-&gt;slotmap[$slot]) {
+            return $node;
+        }
+
+        $count = count($this-&gt;pool);
+        $index = min((int) ($slot / (int) (16384 / $count)), $count - 1);
+        $nodes = array_keys($this-&gt;pool);
+
+        return $nodes[$index];
+    }
+
+    /**
+     * Creates a new connection instance from the given connection ID.
+     *
+     * @param string $connectionID Identifier for the connection.
+     *
+     * @return NodeConnectionInterface
+     */
+    protected function createConnection($connectionID)
+    {
+        $separator = strrpos($connectionID, &#039;:&#039;);
+
+        $parameters = [
+            &#039;host&#039; =&gt; substr($connectionID, 0, $separator),
+            &#039;port&#039; =&gt; substr($connectionID, $separator + 1),
+        ];
+
+        $existConnection = current($this-&gt;pool);
+        if ($existConnection instanceof NodeConnectionInterface) {
+            $existParameters = $existConnection-&gt;getParameters()-&gt;toArray();
+            unset($existParameters[&#039;alias&#039;], $existParameters[&#039;slots&#039;]);
+            $parameters = array_merge($existParameters, $parameters);
+        }
+
+        return $this-&gt;connections-&gt;create($parameters);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getConnectionByCommand(CommandInterface $command)
+    {
+        $slot = $this-&gt;strategy-&gt;getSlot($command);
+
+        if (!isset($slot)) {
+            throw new NotSupportedException(
+                &quot;Cannot use &#039;{$command-&gt;getId()}&#039; with redis-cluster.&quot;
+            );
+        }
+
+        if (isset($this-&gt;slots[$slot])) {
+            return $this-&gt;slots[$slot];
+        } else {
+            return $this-&gt;getConnectionBySlot($slot);
+        }
+    }
+
+    /**
+     * Returns the connection currently associated to a given slot.
+     *
+     * @param int $slot Slot index.
+     *
+     * @return NodeConnectionInterface
+     * @throws OutOfBoundsException
+     */
+    public function getConnectionBySlot($slot)
+    {
+        if (!SlotMap::isValid($slot)) {
+            throw new OutOfBoundsException(&quot;Invalid slot [$slot].&quot;);
+        }
+
+        if (isset($this-&gt;slots[$slot])) {
+            return $this-&gt;slots[$slot];
+        }
+
+        $connectionID = $this-&gt;guessNode($slot);
+
+        if (!$connection = $this-&gt;getConnectionById($connectionID)) {
+            $connection = $this-&gt;createConnection($connectionID);
+            $this-&gt;pool[$connectionID] = $connection;
+        }
+
+        return $this-&gt;slots[$slot] = $connection;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getConnectionById($connectionID)
+    {
+        return $this-&gt;pool[$connectionID] ?? null;
+    }
+
+    /**
+     * Returns a random connection from the pool.
+     *
+     * @return NodeConnectionInterface|null
+     */
+    protected function getRandomConnection()
+    {
+        if (!$this-&gt;pool) {
+            return null;
+        }
+
+        return $this-&gt;pool[array_rand($this-&gt;pool)];
+    }
+
+    /**
+     * Permanently associates the connection instance to a new slot.
+     * The connection is added to the connections pool if not yet included.
+     *
+     * @param NodeConnectionInterface $connection Connection instance.
+     * @param int                     $slot       Target slot index.
+     */
+    protected function move(NodeConnectionInterface $connection, $slot)
+    {
+        $this-&gt;pool[(string) $connection] = $connection;
+        $this-&gt;slots[(int) $slot] = $connection;
+        $this-&gt;slotmap[(int) $slot] = $connection;
+    }
+
+    /**
+     * Handles -ERR responses returned by Redis.
+     *
+     * @param CommandInterface       $command Command that generated the -ERR response.
+     * @param ErrorResponseInterface $error   Redis error response object.
+     *
+     * @return mixed
+     */
+    protected function onErrorResponse(CommandInterface $command, ErrorResponseInterface $error)
+    {
+        $details = explode(&#039; &#039;, $error-&gt;getMessage(), 2);
+
+        switch ($details[0]) {
+            case &#039;MOVED&#039;:
+                return $this-&gt;onMovedResponse($command, $details[1]);
+
+            case &#039;ASK&#039;:
+                return $this-&gt;onAskResponse($command, $details[1]);
+
+            default:
+                return $error;
+        }
+    }
+
+    /**
+     * Handles -MOVED responses by executing again the command against the node
+     * indicated by the Redis response.
+     *
+     * @param CommandInterface $command Command that generated the -MOVED response.
+     * @param string           $details Parameters of the -MOVED response.
+     *
+     * @return mixed
+     */
+    protected function onMovedResponse(CommandInterface $command, $details)
+    {
+        [$slot, $connectionID] = explode(&#039; &#039;, $details, 2);
+
+        // Handle connection ID in the form of &quot;IP:port (details about exception)&quot;
+        // by trimming everything after first space (including the space)
+        $startPositionOfExtraDetails = strpos($connectionID, &#039; &#039;);
+
+        if ($startPositionOfExtraDetails !== false) {
+            $connectionID = substr($connectionID, 0, $startPositionOfExtraDetails);
+        }
+
+        if (!$connection = $this-&gt;getConnectionById($connectionID)) {
+            $connection = $this-&gt;createConnection($connectionID);
+        }
+
+        if ($this-&gt;useClusterSlots) {
+            $this-&gt;askSlotMap($connection);
+        }
+
+        $this-&gt;move($connection, $slot);
+
+        return $this-&gt;executeCommand($command);
+    }
+
+    /**
+     * Handles -ASK responses by executing again the command against the node
+     * indicated by the Redis response.
+     *
+     * @param CommandInterface $command Command that generated the -ASK response.
+     * @param string           $details Parameters of the -ASK response.
+     *
+     * @return mixed
+     */
+    protected function onAskResponse(CommandInterface $command, $details)
+    {
+        [$slot, $connectionID] = explode(&#039; &#039;, $details, 2);
+
+        if (!$connection = $this-&gt;getConnectionById($connectionID)) {
+            $connection = $this-&gt;createConnection($connectionID);
+        }
+
+        $connection-&gt;executeCommand(RawCommand::create(&#039;ASKING&#039;));
+
+        return $connection-&gt;executeCommand($command);
+    }
+
+    /**
+     * Ensures that a command is executed one more time on connection failure.
+     *
+     * The connection to the node that generated the error is evicted from the
+     * pool before trying to fetch an updated slots map from another node. If
+     * the new slots map points to an unreachable server the client gives up and
+     * throws the exception as the nodes participating in the cluster may still
+     * have to agree that something changed in the configuration of the cluster.
+     *
+     * @param CommandInterface $command Command instance.
+     * @param string           $method  Actual method.
+     *
+     * @return mixed
+     */
+    private function retryCommandOnFailure(CommandInterface $command, $method)
+    {
+        $retries = 0;
+        $retryAfter = $this-&gt;retryInterval;
+
+        while ($retries &lt;= $this-&gt;retryLimit) {
+            try {
+                $response = $this-&gt;getConnectionByCommand($command)-&gt;$method($command);
+
+                if ($response instanceof ErrorResponse) {
+                    $message = $response-&gt;getMessage();
+
+                    if (strpos($message, &#039;CLUSTERDOWN&#039;) !== false) {
+                        throw new ServerException($message);
+                    }
+                }
+
+                break;
+            } catch (Throwable $exception) {
+                usleep($retryAfter * 1000);
+                $retryAfter *= 2;
+
+                if ($exception instanceof ConnectionException) {
+                    $connection = $exception-&gt;getConnection();
+
+                    if ($connection) {
+                        $connection-&gt;disconnect();
+                        $this-&gt;remove($connection);
+                    }
+                }
+
+                if ($retries === $this-&gt;retryLimit) {
+                    throw $exception;
+                }
+
+                if ($this-&gt;useClusterSlots) {
+                    $this-&gt;askSlotMap();
+                }
+
+                ++$retries;
+            }
+        }
+
+        return $response;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function writeRequest(CommandInterface $command)
+    {
+        $this-&gt;retryCommandOnFailure($command, __FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function readResponse(CommandInterface $command)
+    {
+        return $this-&gt;retryCommandOnFailure($command, __FUNCTION__);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function executeCommand(CommandInterface $command)
+    {
+        $response = $this-&gt;retryCommandOnFailure($command, __FUNCTION__);
+
+        if ($response instanceof ErrorResponseInterface) {
+            return $this-&gt;onErrorResponse($command, $response);
+        }
+
+        return $response;
+    }
+
+    /**
+     * @return int
+     */
+    #[ReturnTypeWillChange]
+    public function count()
+    {
+        return count($this-&gt;pool);
+    }
+
+    /**
+     * @return Traversable&lt;string, NodeConnectionInterface&gt;
+     */
+    #[ReturnTypeWillChange]
+    public function getIterator()
+    {
+        if ($this-&gt;slotmap-&gt;isEmpty()) {
+            $this-&gt;useClusterSlots ? $this-&gt;askSlotMap() : $this-&gt;buildSlotMap();
+        }
+
+        $connections = [];
+
+        foreach ($this-&gt;slotmap-&gt;getNodes() as $node) {
+            if (!$connection = $this-&gt;getConnectionById($node)) {
+                $this-&gt;add($connection = $this-&gt;createConnection($node));
+            }
+
+            $connections[] = $connection;
+        }
+
+        return new ArrayIterator($connections);
+    }
+
+    /**
+     * Returns the underlying slot map.
+     *
+     * @return SlotMap
+     */
+    public function getSlotMap()
+    {
+        return $this-&gt;slotmap;
+    }
+
+    /**
+     * Returns the underlying command hash strategy used to hash commands by
+     * using keys found in their arguments.
+     *
+     * @return StrategyInterface
+     */
+    public function getClusterStrategy()
+    {
+        return $this-&gt;strategy;
+    }
+
+    /**
+     * Returns the underlying connection factory used to create new connection
+     * instances to Redis nodes indicated by redis-cluster.
+     *
+     * @return FactoryInterface
+     */
+    public function getConnectionFactory()
+    {
+        return $this-&gt;connections;
+    }
+
+    /**
+     * Enables automatic fetching of the current slots map from one of the nodes
+     * using the CLUSTER SLOTS command. This option is enabled by default as
+     * asking the current slots map to Redis upon -MOVED responses may reduce
+     * overhead by eliminating the trial-and-error nature of the node guessing
+     * procedure, mostly when targeting many keys that would end up in a lot of
+     * redirections.
+     *
+     * The slots map can still be manually fetched using the askSlotMap()
+     * method whether or not this option is enabled.
+     *
+     * @param bool $value Enable or disable the use of CLUSTER SLOTS.
+     */
+    public function useClusterSlots($value)
+    {
+        $this-&gt;useClusterSlots = (bool) $value;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Connection/CompositeConnectionInterface.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Connection/Replication -->
+
+</body>
+</html>

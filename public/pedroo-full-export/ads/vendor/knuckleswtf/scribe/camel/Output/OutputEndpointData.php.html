@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/camel/Output/OutputEndpointData.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Camel\Output;
+
+use Illuminate\Http\UploadedFile;
+use Illuminate\Routing\Route;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Knuckles\Camel\BaseDTO;
+use Knuckles\Camel\Extraction\Metadata;
+use Knuckles\Camel\Extraction\ResponseCollection;
+use Knuckles\Camel\Extraction\ResponseField;
+use Knuckles\Scribe\Extracting\Extractor;
+use Knuckles\Scribe\Tools\Utils as u;
+use Knuckles\Scribe\Tools\WritingUtils;
+
+
+/**
+ * Endpoint DTO, optimized for generating HTML output.
+ * Unneeded properties removed, extra properties and helper methods added.
+ */
+class OutputEndpointData extends BaseDTO
+{
+    /**
+     * @var array&lt;string&gt;
+     */
+    public array $httpMethods;
+
+    public string $uri;
+
+    public Metadata $metadata;
+
+    /**
+     * @var array&lt;string,string&gt;
+     */
+    public array $headers = [];
+
+    /**
+     * @var array&lt;string,\Knuckles\Camel\Output\Parameter&gt;
+     */
+    public array $urlParameters = [];
+
+    /**
+     * @var array&lt;string,mixed&gt;
+     */
+    public array $cleanUrlParameters = [];
+
+    /**
+     * @var array&lt;string,\Knuckles\Camel\Output\Parameter&gt;
+     */
+    public array $queryParameters = [];
+
+    /**
+     * @var array&lt;string,mixed&gt;
+     */
+    public array $cleanQueryParameters = [];
+
+    /**
+     * @var array&lt;string, \Knuckles\Camel\Output\Parameter&gt;
+     */
+    public array $bodyParameters = [];
+
+    /**
+     * @var array&lt;string,mixed&gt;
+     */
+    public array $cleanBodyParameters = [];
+
+    /**
+     * @var array&lt;string,\Illuminate\Http\UploadedFile&gt;
+     */
+    public array $fileParameters = [];
+
+    public ResponseCollection $responses;
+
+    /**
+     * @var array&lt;string,\Knuckles\Camel\Extraction\ResponseField&gt;
+     */
+    public array $responseFields = [];
+
+    /**
+     * The same as bodyParameters, but organized in a hierarchy.
+     * So, top-level items first, with a __fields property containing their children, and so on.
+     * Useful so we can easily render and nest on the frontend.
+     * @var array&lt;string, array&gt;
+     */
+    public array $nestedBodyParameters = [];
+
+    /**
+     * @var array&lt;string, array&gt;
+     */
+    public array $nestedResponseFields = [];
+
+    public ?string $boundUri;
+
+    public function __construct(array $parameters = [])
+    {
+        // spatie/dto currently doesn&#039;t auto-cast nested DTOs like that
+        $parameters[&#039;responses&#039;] = new ResponseCollection($parameters[&#039;responses&#039;] ?? []);
+        $parameters[&#039;bodyParameters&#039;] = array_map(fn($param) =&gt; new Parameter($param), $parameters[&#039;bodyParameters&#039;] ?? []);
+        $parameters[&#039;queryParameters&#039;] = array_map(fn($param) =&gt; new Parameter($param), $parameters[&#039;queryParameters&#039;] ?? []);
+        $parameters[&#039;urlParameters&#039;] = array_map(fn($param) =&gt; new Parameter($param), $parameters[&#039;urlParameters&#039;] ?? []);
+        $parameters[&#039;responseFields&#039;] = array_map(fn($param) =&gt; new ResponseField($param), $parameters[&#039;responseFields&#039;] ?? []);
+
+        parent::__construct($parameters);
+
+        $this-&gt;cleanBodyParameters = Extractor::cleanParams($this-&gt;bodyParameters);
+        $this-&gt;cleanQueryParameters = Extractor::cleanParams($this-&gt;queryParameters);
+        $this-&gt;cleanUrlParameters = Extractor::cleanParams($this-&gt;urlParameters);
+        $this-&gt;nestedBodyParameters = self::nestArrayAndObjectFields($this-&gt;bodyParameters, $this-&gt;cleanBodyParameters);
+        $this-&gt;nestedResponseFields = self::nestArrayAndObjectFields($this-&gt;responseFields);
+
+        $this-&gt;boundUri = u::getUrlWithBoundParameters($this-&gt;uri, $this-&gt;cleanUrlParameters);
+
+        [$files, $regularParameters] = static::splitIntoFileAndRegularParameters($this-&gt;cleanBodyParameters);
+
+        if (count($files)) {
+            $this-&gt;headers[&#039;Content-Type&#039;] = &#039;multipart/form-data&#039;;
+        }
+        $this-&gt;fileParameters = $files;
+        $this-&gt;cleanBodyParameters = $regularParameters;
+    }
+
+    /**
+     * @param Route $route
+     *
+     * @return array&lt;string&gt;
+     */
+    public static function getMethods(Route $route): array
+    {
+        $methods = $route-&gt;methods();
+
+        // Laravel adds an automatic &quot;HEAD&quot; endpoint for each GET request, so we&#039;ll strip that out,
+        // but not if there&#039;s only one method (means it was intentional)
+        if (count($methods) === 1) {
+            return $methods;
+        }
+
+        return array_diff($methods, [&#039;HEAD&#039;]);
+    }
+
+    public static function fromExtractedEndpointArray(array $endpoint): OutputEndpointData
+    {
+        return new self($endpoint);
+    }
+
+    /**
+     * Transform body parameters such that object fields have a `fields` property containing a list of all subfields
+     * Subfields will be removed from the main parameter map
+     * For instance, if $parameters is [
+     *   &#039;dad&#039; =&gt; new Parameter(...),
+     *   &#039;dad.age&#039; =&gt; new Parameter(...),
+     *   &#039;dad.cars[]&#039; =&gt; new Parameter(...),
+     *   &#039;dad.cars[].model&#039; =&gt; new Parameter(...),
+     *   &#039;dad.cars[].price&#039; =&gt; new Parameter(...),
+     * ],
+     * normalise this into [
+     *   &#039;dad&#039; =&gt; [
+     *     ...,
+     *     &#039;__fields&#039; =&gt; [
+     *       &#039;dad.age&#039; =&gt; [...],
+     *       &#039;dad.cars&#039; =&gt; [
+     *         ...,
+     *         &#039;__fields&#039; =&gt; [
+     *           &#039;model&#039; =&gt; [...],
+     *           &#039;price&#039; =&gt; [...],
+     *         ],
+     *       ],
+     *   ],
+     * ]]
+     *
+     * @param array $parameters
+     *
+     * @return array
+     */
+    public static function nestArrayAndObjectFields(array $parameters, array $cleanParameters = []): array
+    {
+        // First, we&#039;ll make sure all object fields have parent fields properly set
+        $normalisedParameters = [];
+        foreach ($parameters as $name =&gt; $parameter) {
+            if (Str::contains($name, &#039;.&#039;)) {
+                // If the user didn&#039;t add a parent field, we&#039;ll helpfully add it for them
+                $ancestors = [];
+
+                $parts = explode(&#039;.&#039;, $name);
+                $fieldName = array_pop($parts);
+                $parentName = rtrim(join(&#039;.&#039;, $parts), &#039;[]&#039;);
+
+                // When the body is an array, param names will be &quot;[].paramname&quot;,
+                // so $parentName is empty. Let&#039;s fix that.
+                if (empty($parentName)) {
+                    $parentName = &#039;[]&#039;;
+                }
+
+                while ($parentName) {
+                    if (!empty($normalisedParameters[$parentName])) {
+                        break;
+                    }
+
+                    $details = [
+                        &quot;name&quot; =&gt; $parentName,
+                        &quot;type&quot; =&gt; $parentName === &#039;[]&#039; ? &quot;object[]&quot; : &quot;object&quot;,
+                        &quot;description&quot; =&gt; &quot;&quot;,
+                        &quot;required&quot; =&gt; false,
+                    ];
+
+                    if ($parameter instanceof ResponseField) {
+                        $ancestors[] = [$parentName, new ResponseField($details)];
+                    } else {
+                        $lastParentExample = $details[&quot;example&quot;] =
+                            [$fieldName =&gt; $lastParentExample ?? $parameter-&gt;example];
+                        $ancestors[] = [$parentName, new Parameter($details)];
+                    }
+
+                    $fieldName = array_pop($parts);
+                    $parentName = rtrim(join(&#039;.&#039;, $parts), &#039;[]&#039;);
+                }
+
+                // We add ancestors in reverse so we can iterate over parents first in the next section
+                foreach (array_reverse($ancestors) as [$ancestorName, $ancestor]) {
+                    $normalisedParameters[$ancestorName] = $ancestor;
+                }
+            }
+
+            $normalisedParameters[$name] = $parameter;
+            unset($lastParentExample);
+        }
+
+        $finalParameters = [];
+        foreach ($normalisedParameters as $name =&gt; $parameter) {
+            $parameter = $parameter-&gt;toArray();
+            if (Str::contains($name, &#039;.&#039;)) { // An object field
+                // Get the various pieces of the name
+                $parts = explode(&#039;.&#039;, $name);
+                $fieldName = array_pop($parts);
+                $baseName = join(&#039;.__fields.&#039;, $parts);
+
+                // For subfields, the type is indicated in the source object
+                // eg test.items[].more and test.items.more would both have parent field with name `items` and containing __fields =&gt; more
+                // The difference would be in the parent field&#039;s `type` property (object[] vs object)
+                // So we can get rid of all [] to get the parent name
+                $dotPathToParent = str_replace(&#039;[]&#039;, &#039;&#039;, $baseName);
+                // When the body is an array, param names will be  &quot;[].paramname&quot;,
+                // so $parts is [&#039;[]&#039;]
+                if ($parts[0] == &#039;[]&#039;) {
+                    $dotPathToParent = &#039;[]&#039; . $dotPathToParent;
+                }
+
+                $dotPath = $dotPathToParent . &#039;.__fields.&#039; . $fieldName;
+                Arr::set($finalParameters, $dotPath, $parameter);
+            } else { // A regular field, not a subfield of anything
+                // Note: we&#039;re assuming any subfields of this field are listed *after* it,
+                // and will set __fields correctly when we iterate over them
+                // Hence why we create a new &quot;normalisedParameters&quot; array above and push the parent to that first
+                $parameter[&#039;__fields&#039;] = [];
+                $finalParameters[$name] = $parameter;
+            }
+
+        }
+
+        // Finally, if the body is an array, remove any other items.
+        if (isset($finalParameters[&#039;[]&#039;])) {
+            $finalParameters = [&quot;[]&quot; =&gt; $finalParameters[&#039;[]&#039;]];
+            // At this point, the examples are likely [[], []],
+            // but have been correctly set in clean parameters, so let&#039;s update them
+            if ($finalParameters[&quot;[]&quot;][&quot;example&quot;][0] == [] &amp;&amp; !empty($cleanParameters)) {
+                $finalParameters[&quot;[]&quot;][&quot;example&quot;] = $cleanParameters;
+            }
+        }
+
+        return $finalParameters;
+    }
+
+    public function endpointId(): string
+    {
+        return $this-&gt;httpMethods[0] . str_replace([&#039;/&#039;, &#039;?&#039;, &#039;{&#039;, &#039;}&#039;, &#039;:&#039;, &#039;\\&#039;, &#039;+&#039;, &#039;|&#039;, &#039;.&#039;], &#039;-&#039;, $this-&gt;uri);
+    }
+
+    public function name(): string
+    {
+        return $this-&gt;metadata-&gt;title ?: ($this-&gt;httpMethods[0] . &quot; &quot; . $this-&gt;uri);
+    }
+
+    public function fullSlug(): string
+    {
+        $groupSlug = Str::slug($this-&gt;metadata-&gt;groupName);
+        $endpointId = $this-&gt;endpointId();
+        return &quot;$groupSlug-$endpointId&quot;;
+    }
+
+    public function hasResponses(): bool
+    {
+        return count($this-&gt;responses) &gt; 0;
+    }
+
+    public function hasFiles(): bool
+    {
+        return count($this-&gt;fileParameters) &gt; 0;
+    }
+
+    public function isArrayBody(): bool
+    {
+        return count($this-&gt;nestedBodyParameters) === 1
+            &amp;&amp; array_keys($this-&gt;nestedBodyParameters)[0] === &quot;[]&quot;;
+    }
+
+    public function isGet(): bool
+    {
+        return in_array(&#039;GET&#039;, $this-&gt;httpMethods);
+    }
+
+    public function isAuthed(): bool
+    {
+        return $this-&gt;metadata-&gt;authenticated;
+    }
+
+    public function hasJsonBody(): bool
+    {
+        if ($this-&gt;hasFiles() || empty($this-&gt;nestedBodyParameters))
+            return false;
+
+        $contentType = data_get($this-&gt;headers, &quot;Content-Type&quot;, data_get($this-&gt;headers, &quot;content-type&quot;, &quot;&quot;));
+        return str_contains($contentType, &quot;json&quot;);
+    }
+
+    public function getSampleBody()
+    {
+        return WritingUtils::getSampleBody($this-&gt;nestedBodyParameters);
+    }
+
+    public function hasHeadersOrQueryOrBodyParams(): bool
+    {
+        return !empty($this-&gt;headers)
+            || !empty($this-&gt;cleanQueryParameters)
+            || !empty($this-&gt;cleanBodyParameters);
+    }
+
+    public static function splitIntoFileAndRegularParameters(array $parameters): array
+    {
+        $files = [];
+        $regularParameters = [];
+        foreach ($parameters as $name =&gt; $example) {
+            if ($example instanceof UploadedFile) {
+                $files[$name] = $example;
+            } else if (is_array($example) &amp;&amp; !empty($example)) {
+                [$subFiles, $subRegulars] = static::splitIntoFileAndRegularParameters($example);
+                foreach ($subFiles as $subName =&gt; $subExample) {
+                    $files[$name][$subName] = $subExample;
+                }
+                foreach ($subRegulars as $subName =&gt; $subExample) {
+                    $regularParameters[$name][$subName] = $subExample;
+                }
+            } else {
+                $regularParameters[$name] = $example;
+            }
+        }
+        return [$files, $regularParameters];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/camel/Output/Parameter.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/config -->
+
+</body>
+</html>

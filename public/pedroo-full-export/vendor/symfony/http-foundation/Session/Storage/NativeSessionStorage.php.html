@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-foundation/Session/Storage/NativeSessionStorage.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpFoundation\Session\Storage;
+
+use Symfony\Component\HttpFoundation\Session\SessionBagInterface;
+use Symfony\Component\HttpFoundation\Session\Storage\Handler\StrictSessionHandler;
+use Symfony\Component\HttpFoundation\Session\Storage\Proxy\AbstractProxy;
+use Symfony\Component\HttpFoundation\Session\Storage\Proxy\SessionHandlerProxy;
+
+// Help opcache.preload discover always-needed symbols
+class_exists(MetadataBag::class);
+class_exists(StrictSessionHandler::class);
+class_exists(SessionHandlerProxy::class);
+
+/**
+ * This provides a base class for session attribute storage.
+ *
+ * @author Drak &lt;drak@zikula.org&gt;
+ */
+class NativeSessionStorage implements SessionStorageInterface
+{
+    /**
+     * @var SessionBagInterface[]
+     */
+    protected array $bags = [];
+    protected bool $started = false;
+    protected bool $closed = false;
+    protected AbstractProxy|\SessionHandlerInterface $saveHandler;
+    protected MetadataBag $metadataBag;
+
+    /**
+     * Depending on how you want the storage driver to behave you probably
+     * want to override this constructor entirely.
+     *
+     * List of options for $options array with their defaults.
+     *
+     * @see https://php.net/session.configuration for options
+     * but we omit &#039;session.&#039; from the beginning of the keys for convenience.
+     *
+     * (&quot;auto_start&quot;, is not supported as it tells PHP to start a session before
+     * PHP starts to execute user-land code. Setting during runtime has no effect).
+     *
+     * cache_limiter, &quot;&quot; (use &quot;0&quot; to prevent headers from being sent entirely).
+     * cache_expire, &quot;0&quot;
+     * cookie_domain, &quot;&quot;
+     * cookie_httponly, &quot;&quot;
+     * cookie_lifetime, &quot;0&quot;
+     * cookie_path, &quot;/&quot;
+     * cookie_secure, &quot;&quot;
+     * cookie_samesite, null
+     * gc_divisor, &quot;100&quot;
+     * gc_maxlifetime, &quot;1440&quot;
+     * gc_probability, &quot;1&quot;
+     * lazy_write, &quot;1&quot;
+     * name, &quot;PHPSESSID&quot;
+     * referer_check, &quot;&quot; (deprecated since Symfony 7.2, to be removed in Symfony 8.0)
+     * serialize_handler, &quot;php&quot;
+     * use_strict_mode, &quot;1&quot;
+     * use_cookies, &quot;1&quot;
+     * use_only_cookies, &quot;1&quot; (deprecated since Symfony 7.2, to be removed in Symfony 8.0)
+     * use_trans_sid, &quot;0&quot; (deprecated since Symfony 7.2, to be removed in Symfony 8.0)
+     * sid_length, &quot;32&quot; (@deprecated since Symfony 7.2, to be removed in 8.0)
+     * sid_bits_per_character, &quot;5&quot; (@deprecated since Symfony 7.2, to be removed in 8.0)
+     * trans_sid_hosts, $_SERVER[&#039;HTTP_HOST&#039;] (deprecated since Symfony 7.2, to be removed in Symfony 8.0)
+     * trans_sid_tags, &quot;a=href,area=href,frame=src,form=&quot; (deprecated since Symfony 7.2, to be removed in Symfony 8.0)
+     */
+    public function __construct(array $options = [], AbstractProxy|\SessionHandlerInterface|null $handler = null, ?MetadataBag $metaBag = null)
+    {
+        if (!\extension_loaded(&#039;session&#039;)) {
+            throw new \LogicException(&#039;PHP extension &quot;session&quot; is required.&#039;);
+        }
+
+        $options += [
+            &#039;cache_limiter&#039; =&gt; &#039;&#039;,
+            &#039;cache_expire&#039; =&gt; 0,
+            &#039;use_cookies&#039; =&gt; 1,
+            &#039;lazy_write&#039; =&gt; 1,
+            &#039;use_strict_mode&#039; =&gt; 1,
+        ];
+
+        session_register_shutdown();
+
+        $this-&gt;setMetadataBag($metaBag);
+        $this-&gt;setOptions($options);
+        $this-&gt;setSaveHandler($handler);
+    }
+
+    /**
+     * Gets the save handler instance.
+     */
+    public function getSaveHandler(): AbstractProxy|\SessionHandlerInterface
+    {
+        return $this-&gt;saveHandler;
+    }
+
+    public function start(): bool
+    {
+        if ($this-&gt;started) {
+            return true;
+        }
+
+        if (\PHP_SESSION_ACTIVE === session_status()) {
+            throw new \RuntimeException(&#039;Failed to start the session: already started by PHP.&#039;);
+        }
+
+        if (filter_var(\ini_get(&#039;session.use_cookies&#039;), \FILTER_VALIDATE_BOOL) &amp;&amp; headers_sent($file, $line)) {
+            throw new \RuntimeException(\sprintf(&#039;Failed to start the session because headers have already been sent by &quot;%s&quot; at line %d.&#039;, $file, $line));
+        }
+
+        $sessionId = $_COOKIE[session_name()] ?? null;
+        /*
+         * Explanation of the session ID regular expression: `/^[a-zA-Z0-9,-]{22,250}$/`.
+         *
+         * ---------- Part 1
+         *
+         * The part `[a-zA-Z0-9,-]` is related to the PHP ini directive `session.sid_bits_per_character` defined as 6.
+         * See https://php.net/session.configuration#ini.session.sid-bits-per-character
+         * Allowed values are integers such as:
+         * - 4 for range `a-f0-9`
+         * - 5 for range `a-v0-9` (@deprecated since Symfony 7.2, it will default to 4 and the option will be ignored in Symfony 8.0)
+         * - 6 for range `a-zA-Z0-9,-` (@deprecated since Symfony 7.2, it will default to 4 and the option will be ignored in Symfony 8.0)
+         *
+         * ---------- Part 2
+         *
+         * The part `{22,250}` is related to the PHP ini directive `session.sid_length`.
+         * See https://php.net/session.configuration#ini.session.sid-length
+         * Allowed values are integers between 22 and 256, but we use 250 for the max.
+         *
+         * Where does the 250 come from?
+         * - The length of Windows and Linux filenames is limited to 255 bytes. Then the max must not exceed 255.
+         * - The session filename prefix is `sess_`, a 5 bytes string. Then the max must not exceed 255 - 5 = 250.
+         *
+         * This is @deprecated since Symfony 7.2, the sid length will default to 32 and the option will be ignored in Symfony 8.0.
+         *
+         * ---------- Conclusion
+         *
+         * The parts 1 and 2 prevent the warning below:
+         * `PHP Warning: SessionHandler::read(): Session ID is too long or contains illegal characters. Only the A-Z, a-z, 0-9, &quot;-&quot;, and &quot;,&quot; characters are allowed.`
+         *
+         * The part 2 prevents the warning below:
+         * `PHP Warning: SessionHandler::read(): open(filepath, O_RDWR) failed: No such file or directory (2).`
+         */
+        if ($sessionId &amp;&amp; $this-&gt;saveHandler instanceof AbstractProxy &amp;&amp; &#039;files&#039; === $this-&gt;saveHandler-&gt;getSaveHandlerName() &amp;&amp; !preg_match(&#039;/^[a-zA-Z0-9,-]{22,250}$/&#039;, $sessionId)) {
+            // the session ID in the header is invalid, create a new one
+            session_id(session_create_id());
+        }
+
+        // ok to try and start the session
+        if (!session_start()) {
+            throw new \RuntimeException(&#039;Failed to start the session.&#039;);
+        }
+
+        $this-&gt;loadSession();
+
+        return true;
+    }
+
+    public function getId(): string
+    {
+        return $this-&gt;saveHandler-&gt;getId();
+    }
+
+    public function setId(string $id): void
+    {
+        $this-&gt;saveHandler-&gt;setId($id);
+    }
+
+    public function getName(): string
+    {
+        return $this-&gt;saveHandler-&gt;getName();
+    }
+
+    public function setName(string $name): void
+    {
+        $this-&gt;saveHandler-&gt;setName($name);
+    }
+
+    public function regenerate(bool $destroy = false, ?int $lifetime = null): bool
+    {
+        // Cannot regenerate the session ID for non-active sessions.
+        if (\PHP_SESSION_ACTIVE !== session_status()) {
+            return false;
+        }
+
+        if (headers_sent()) {
+            return false;
+        }
+
+        if (null !== $lifetime &amp;&amp; $lifetime != \ini_get(&#039;session.cookie_lifetime&#039;)) {
+            $this-&gt;save();
+            ini_set(&#039;session.cookie_lifetime&#039;, $lifetime);
+            $this-&gt;start();
+        }
+
+        if ($destroy) {
+            $this-&gt;metadataBag-&gt;stampNew();
+        }
+
+        return session_regenerate_id($destroy);
+    }
+
+    public function save(): void
+    {
+        // Store a copy so we can restore the bags in case the session was not left empty
+        $session = $_SESSION;
+
+        foreach ($this-&gt;bags as $bag) {
+            if (empty($_SESSION[$key = $bag-&gt;getStorageKey()])) {
+                unset($_SESSION[$key]);
+            }
+        }
+        if ($_SESSION &amp;&amp; [$key = $this-&gt;metadataBag-&gt;getStorageKey()] === array_keys($_SESSION)) {
+            unset($_SESSION[$key]);
+        }
+
+        // Register error handler to add information about the current save handler
+        $previousHandler = set_error_handler(function ($type, $msg, $file, $line) use (&amp;$previousHandler) {
+            if (\E_WARNING === $type &amp;&amp; str_starts_with($msg, &#039;session_write_close():&#039;)) {
+                $handler = $this-&gt;saveHandler instanceof SessionHandlerProxy ? $this-&gt;saveHandler-&gt;getHandler() : $this-&gt;saveHandler;
+                $msg = \sprintf(&#039;session_write_close(): Failed to write session data with &quot;%s&quot; handler&#039;, $handler::class);
+            }
+
+            return $previousHandler ? $previousHandler($type, $msg, $file, $line) : false;
+        });
+
+        try {
+            session_write_close();
+        } finally {
+            restore_error_handler();
+
+            // Restore only if not empty
+            if ($_SESSION) {
+                $_SESSION = $session;
+            }
+        }
+
+        $this-&gt;closed = true;
+        $this-&gt;started = false;
+    }
+
+    public function clear(): void
+    {
+        // clear out the bags
+        foreach ($this-&gt;bags as $bag) {
+            $bag-&gt;clear();
+        }
+
+        // clear out the session
+        $_SESSION = [];
+
+        // reconnect the bags to the session
+        $this-&gt;loadSession();
+    }
+
+    public function registerBag(SessionBagInterface $bag): void
+    {
+        if ($this-&gt;started) {
+            throw new \LogicException(&#039;Cannot register a bag when the session is already started.&#039;);
+        }
+
+        $this-&gt;bags[$bag-&gt;getName()] = $bag;
+    }
+
+    public function getBag(string $name): SessionBagInterface
+    {
+        if (!isset($this-&gt;bags[$name])) {
+            throw new \InvalidArgumentException(\sprintf(&#039;The SessionBagInterface &quot;%s&quot; is not registered.&#039;, $name));
+        }
+
+        if (!$this-&gt;started &amp;&amp; $this-&gt;saveHandler-&gt;isActive()) {
+            $this-&gt;loadSession();
+        } elseif (!$this-&gt;started) {
+            $this-&gt;start();
+        }
+
+        return $this-&gt;bags[$name];
+    }
+
+    public function setMetadataBag(?MetadataBag $metaBag): void
+    {
+        $this-&gt;metadataBag = $metaBag ?? new MetadataBag();
+    }
+
+    /**
+     * Gets the MetadataBag.
+     */
+    public function getMetadataBag(): MetadataBag
+    {
+        return $this-&gt;metadataBag;
+    }
+
+    public function isStarted(): bool
+    {
+        return $this-&gt;started;
+    }
+
+    /**
+     * Sets session.* ini variables.
+     *
+     * For convenience we omit &#039;session.&#039; from the beginning of the keys.
+     * Explicitly ignores other ini keys.
+     *
+     * @param array $options Session ini directives [key =&gt; value]
+     *
+     * @see https://php.net/session.configuration
+     */
+    public function setOptions(array $options): void
+    {
+        if (headers_sent() || \PHP_SESSION_ACTIVE === session_status()) {
+            return;
+        }
+
+        $validOptions = array_flip([
+            &#039;cache_expire&#039;, &#039;cache_limiter&#039;, &#039;cookie_domain&#039;, &#039;cookie_httponly&#039;,
+            &#039;cookie_lifetime&#039;, &#039;cookie_path&#039;, &#039;cookie_secure&#039;, &#039;cookie_samesite&#039;,
+            &#039;gc_divisor&#039;, &#039;gc_maxlifetime&#039;, &#039;gc_probability&#039;,
+            &#039;lazy_write&#039;, &#039;name&#039;, &#039;referer_check&#039;,
+            &#039;serialize_handler&#039;, &#039;use_strict_mode&#039;, &#039;use_cookies&#039;,
+            &#039;use_only_cookies&#039;, &#039;use_trans_sid&#039;,
+            &#039;sid_length&#039;, &#039;sid_bits_per_character&#039;, &#039;trans_sid_hosts&#039;, &#039;trans_sid_tags&#039;,
+        ]);
+
+        foreach ($options as $key =&gt; $value) {
+            if (\in_array($key, [&#039;referer_check&#039;, &#039;use_only_cookies&#039;, &#039;use_trans_sid&#039;, &#039;trans_sid_hosts&#039;, &#039;trans_sid_tags&#039;, &#039;sid_length&#039;, &#039;sid_bits_per_character&#039;], true)) {
+                trigger_deprecation(&#039;symfony/http-foundation&#039;, &#039;7.2&#039;, &#039;NativeSessionStorage\&#039;s &quot;%s&quot; option is deprecated and will be ignored in Symfony 8.0.&#039;, $key);
+            }
+
+            if (isset($validOptions[$key])) {
+                if (&#039;cookie_secure&#039; === $key &amp;&amp; &#039;auto&#039; === $value) {
+                    continue;
+                }
+                ini_set(&#039;session.&#039;.$key, $value);
+            }
+        }
+    }
+
+    /**
+     * Registers session save handler as a PHP session handler.
+     *
+     * To use internal PHP session save handlers, override this method using ini_set with
+     * session.save_handler and session.save_path e.g.
+     *
+     *     ini_set(&#039;session.save_handler&#039;, &#039;files&#039;);
+     *     ini_set(&#039;session.save_path&#039;, &#039;/tmp&#039;);
+     *
+     * or pass in a \SessionHandler instance which configures session.save_handler in the
+     * constructor, for a template see NativeFileSessionHandler.
+     *
+     * @see https://php.net/session-set-save-handler
+     * @see https://php.net/sessionhandlerinterface
+     * @see https://php.net/sessionhandler
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function setSaveHandler(AbstractProxy|\SessionHandlerInterface|null $saveHandler): void
+    {
+        // Wrap $saveHandler in proxy and prevent double wrapping of proxy
+        if (!$saveHandler instanceof AbstractProxy &amp;&amp; $saveHandler instanceof \SessionHandlerInterface) {
+            $saveHandler = new SessionHandlerProxy($saveHandler);
+        } elseif (!$saveHandler instanceof AbstractProxy) {
+            $saveHandler = new SessionHandlerProxy(new StrictSessionHandler(new \SessionHandler()));
+        }
+        $this-&gt;saveHandler = $saveHandler;
+
+        if (headers_sent() || \PHP_SESSION_ACTIVE === session_status()) {
+            return;
+        }
+
+        if ($this-&gt;saveHandler instanceof SessionHandlerProxy) {
+            session_set_save_handler($this-&gt;saveHandler, false);
+        }
+    }
+
+    /**
+     * Load the session with attributes.
+     *
+     * After starting the session, PHP retrieves the session from whatever handlers
+     * are set to (either PHP&#039;s internal, or a custom save handler set with session_set_save_handler()).
+     * PHP takes the return value from the read() handler, unserializes it
+     * and populates $_SESSION with the result automatically.
+     */
+    protected function loadSession(?array &amp;$session = null): void
+    {
+        if (null === $session) {
+            $session = &amp;$_SESSION;
+        }
+
+        $bags = array_merge($this-&gt;bags, [$this-&gt;metadataBag]);
+
+        foreach ($bags as $bag) {
+            $key = $bag-&gt;getStorageKey();
+            $session[$key] = isset($session[$key]) &amp;&amp; \is_array($session[$key]) ? $session[$key] : [];
+            $bag-&gt;initialize($session[$key]);
+        }
+
+        $this-&gt;started = true;
+        $this-&gt;closed = false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-foundation/Session/Storage/NativeSessionStorageFactory.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-foundation/Session/Storage/Handler -->
+
+</body>
+</html>

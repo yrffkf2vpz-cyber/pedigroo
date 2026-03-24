@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/ResultPaginator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws;
+
+use GuzzleHttp\Promise;
+
+/**
+ * Iterator that yields each page of results of a pageable operation.
+ */
+class ResultPaginator implements \Iterator
+{
+    /** @var AwsClientInterface Client performing operations. */
+    private $client;
+
+    /** @var string Name of the operation being paginated. */
+    private $operation;
+
+    /** @var array Args for the operation. */
+    private $args;
+
+    /** @var array Configuration for the paginator. */
+    private $config;
+
+    /** @var Result Most recent result from the client. */
+    private $result;
+
+    /** @var string|array Next token to use for pagination. */
+    private $nextToken;
+
+    /** @var int Number of operations/requests performed. */
+    private $requestCount = 0;
+
+    /**
+     * @param AwsClientInterface $client
+     * @param string             $operation
+     * @param array              $args
+     * @param array              $config
+     */
+    public function __construct(
+        AwsClientInterface $client,
+        $operation,
+        array $args,
+        array $config
+    ) {
+        $this-&gt;client = $client;
+        $this-&gt;operation = $operation;
+        $this-&gt;args = $args;
+        $this-&gt;config = $config;
+        MetricsBuilder::appendMetricsCaptureMiddleware(
+            $this-&gt;client-&gt;getHandlerList(),
+            MetricsBuilder::PAGINATOR
+        );
+    }
+
+    /**
+     * Runs a paginator asynchronously and uses a callback to handle results.
+     *
+     * The callback should have the signature: function (Aws\Result $result).
+     * A non-null return value from the callback will be yielded by the
+     * promise. This means that you can return promises from the callback that
+     * will need to be resolved before continuing iteration over the remaining
+     * items, essentially merging in other promises to the iteration. The last
+     * non-null value returned by the callback will be the result that fulfills
+     * the promise to any downstream promises.
+     *
+     * @param callable $handleResult Callback for handling each page of results.
+     *                               The callback accepts the result that was
+     *                               yielded as a single argument. If the
+     *                               callback returns a promise, the promise
+     *                               will be merged into the coroutine.
+     *
+     * @return Promise\Promise
+     */
+    public function each(callable $handleResult)
+    {
+        return Promise\Coroutine::of(function () use ($handleResult) {
+            $nextToken = null;
+            do {
+                $command = $this-&gt;createNextCommand($this-&gt;args, $nextToken);
+                $result = (yield $this-&gt;client-&gt;executeAsync($command));
+                $nextToken = $this-&gt;determineNextToken($result);
+                $retVal = $handleResult($result);
+                if ($retVal !== null) {
+                    yield Promise\Create::promiseFor($retVal);
+                }
+            } while ($nextToken);
+        });
+    }
+
+    /**
+     * Returns an iterator that iterates over the values of applying a JMESPath
+     * search to each result yielded by the iterator as a flat sequence.
+     *
+     * @param string $expression JMESPath expression to apply to each result.
+     *
+     * @return \Iterator
+     */
+    public function search($expression)
+    {
+        // Apply JMESPath expression on each result, but as a flat sequence.
+        return flatmap($this, function (Result $result) use ($expression) {
+            return (array) $result-&gt;search($expression);
+        });
+    }
+
+    /**
+     * @return Result
+     */
+    #[\ReturnTypeWillChange]
+    public function current()
+    {
+        return $this-&gt;valid() ? $this-&gt;result : false;
+    }
+
+    /**
+     * @return mixed
+     */
+    #[\ReturnTypeWillChange]
+    public function key()
+    {
+        return $this-&gt;valid() ? $this-&gt;requestCount - 1 : null;
+    }
+
+    /**
+     * @return void
+     */
+    #[\ReturnTypeWillChange]
+    public function next()
+    {
+        $this-&gt;result = null;
+    }
+
+    /**
+     * @return bool
+     */
+    #[\ReturnTypeWillChange]
+    public function valid()
+    {
+        if ($this-&gt;result) {
+            return true;
+        }
+
+        if ($this-&gt;nextToken || !$this-&gt;requestCount) {
+            //Forward/backward paging can result in a case where the last page&#039;s nextforwardtoken
+            //is the same as the one that came before it.  This can cause an infinite loop.
+            $hasBidirectionalPaging = $this-&gt;config[&#039;output_token&#039;] === &#039;nextForwardToken&#039;;
+            if ($hasBidirectionalPaging &amp;&amp; $this-&gt;nextToken) {
+                $tokenKey = $this-&gt;config[&#039;input_token&#039;];
+                $previousToken = $this-&gt;nextToken[$tokenKey];
+            }
+
+            $this-&gt;result = $this-&gt;client-&gt;execute(
+                $this-&gt;createNextCommand($this-&gt;args, $this-&gt;nextToken)
+            );
+
+            $this-&gt;nextToken = $this-&gt;determineNextToken($this-&gt;result);
+
+            if (isset($previousToken)
+                &amp;&amp; $previousToken === $this-&gt;nextToken[$tokenKey]
+            ) {
+                return false;
+            }
+
+            $this-&gt;requestCount++;
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @return void
+     */
+    #[\ReturnTypeWillChange]
+    public function rewind()
+    {
+        $this-&gt;requestCount = 0;
+        $this-&gt;nextToken = null;
+        $this-&gt;result = null;
+    }
+
+    private function createNextCommand(array $args, ?array $nextToken = null)
+    {
+        return $this-&gt;client-&gt;getCommand($this-&gt;operation, array_merge($args, ($nextToken ?: [])));
+    }
+
+    private function determineNextToken(Result $result)
+    {
+        if (!$this-&gt;config[&#039;output_token&#039;]) {
+            return null;
+        }
+
+        if ($this-&gt;config[&#039;more_results&#039;]
+            &amp;&amp; !$result-&gt;search($this-&gt;config[&#039;more_results&#039;])
+        ) {
+            return null;
+        }
+
+        $nextToken = is_scalar($this-&gt;config[&#039;output_token&#039;])
+            ? [$this-&gt;config[&#039;input_token&#039;] =&gt; $this-&gt;config[&#039;output_token&#039;]]
+            : array_combine($this-&gt;config[&#039;input_token&#039;], $this-&gt;config[&#039;output_token&#039;]);
+
+        return array_filter(array_map(function ($outputToken) use ($result) {
+            return $result-&gt;search($outputToken);
+        }, $nextToken));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Retry/Configuration.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/ACMPCA -->
+
+</body>
+</html>

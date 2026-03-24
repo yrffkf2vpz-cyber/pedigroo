@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-kernel/HttpCache/ResponseCacheStrategy.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpKernel\HttpCache;
+
+use Symfony\Component\HttpFoundation\Response;
+
+/**
+ * ResponseCacheStrategy knows how to compute the Response cache HTTP header
+ * based on the different response cache headers.
+ *
+ * This implementation changes the main response TTL to the smallest TTL received
+ * or force validation if one of the surrogates has validation cache strategy.
+ *
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ */
+class ResponseCacheStrategy implements ResponseCacheStrategyInterface
+{
+    /**
+     * Cache-Control headers that are sent to the final response if they appear in ANY of the responses.
+     */
+    private const OVERRIDE_DIRECTIVES = [&#039;private&#039;, &#039;no-cache&#039;, &#039;no-store&#039;, &#039;no-transform&#039;, &#039;must-revalidate&#039;, &#039;proxy-revalidate&#039;];
+
+    /**
+     * Cache-Control headers that are sent to the final response if they appear in ALL of the responses.
+     */
+    private const INHERIT_DIRECTIVES = [&#039;public&#039;, &#039;immutable&#039;];
+
+    private int $embeddedResponses = 0;
+    private bool $isNotCacheableResponseEmbedded = false;
+    private int $age = 0;
+    private \DateTimeInterface|false|null $lastModified = null;
+    private array $flagDirectives = [
+        &#039;no-cache&#039; =&gt; null,
+        &#039;no-store&#039; =&gt; null,
+        &#039;no-transform&#039; =&gt; null,
+        &#039;must-revalidate&#039; =&gt; null,
+        &#039;proxy-revalidate&#039; =&gt; null,
+        &#039;public&#039; =&gt; null,
+        &#039;private&#039; =&gt; null,
+        &#039;immutable&#039; =&gt; null,
+    ];
+    private array $ageDirectives = [
+        &#039;max-age&#039; =&gt; null,
+        &#039;s-maxage&#039; =&gt; null,
+        &#039;expires&#039; =&gt; false,
+    ];
+
+    public function add(Response $response): void
+    {
+        ++$this-&gt;embeddedResponses;
+
+        foreach (self::OVERRIDE_DIRECTIVES as $directive) {
+            if ($response-&gt;headers-&gt;hasCacheControlDirective($directive)) {
+                $this-&gt;flagDirectives[$directive] = true;
+            }
+        }
+
+        foreach (self::INHERIT_DIRECTIVES as $directive) {
+            if (false !== $this-&gt;flagDirectives[$directive]) {
+                $this-&gt;flagDirectives[$directive] = $response-&gt;headers-&gt;hasCacheControlDirective($directive);
+            }
+        }
+
+        $age = $response-&gt;getAge();
+        $this-&gt;age = max($this-&gt;age, $age);
+
+        if ($this-&gt;willMakeFinalResponseUncacheable($response)) {
+            $this-&gt;isNotCacheableResponseEmbedded = true;
+
+            return;
+        }
+
+        $maxAge = $response-&gt;headers-&gt;hasCacheControlDirective(&#039;max-age&#039;) ? (int) $response-&gt;headers-&gt;getCacheControlDirective(&#039;max-age&#039;) : null;
+        $sharedMaxAge = $response-&gt;headers-&gt;hasCacheControlDirective(&#039;s-maxage&#039;) ? (int) $response-&gt;headers-&gt;getCacheControlDirective(&#039;s-maxage&#039;) : $maxAge;
+        $expires = $response-&gt;getExpires();
+        $expires = null !== $expires ? (int) $expires-&gt;format(&#039;U&#039;) - (int) $response-&gt;getDate()-&gt;format(&#039;U&#039;) : null;
+
+        // See https://datatracker.ietf.org/doc/html/rfc7234#section-4.2.2
+        // If a response is &quot;public&quot; but does not have maximum lifetime, heuristics might be applied.
+        // Do not store NULL values so the final response can have more limiting value from other responses.
+        $isHeuristicallyCacheable = $response-&gt;headers-&gt;hasCacheControlDirective(&#039;public&#039;)
+            &amp;&amp; null === $maxAge
+            &amp;&amp; null === $sharedMaxAge
+            &amp;&amp; null === $expires;
+
+        if (!$isHeuristicallyCacheable || null !== $maxAge || null !== $expires) {
+            $this-&gt;storeRelativeAgeDirective(&#039;max-age&#039;, $maxAge, $expires, $age);
+        }
+
+        if (!$isHeuristicallyCacheable || null !== $sharedMaxAge || null !== $expires) {
+            $this-&gt;storeRelativeAgeDirective(&#039;s-maxage&#039;, $sharedMaxAge, $expires, $age);
+        }
+
+        if (null !== $expires) {
+            $this-&gt;ageDirectives[&#039;expires&#039;] = true;
+        }
+
+        if (false !== $this-&gt;lastModified) {
+            $lastModified = $response-&gt;getLastModified();
+            $this-&gt;lastModified = $lastModified ? max($this-&gt;lastModified, $lastModified) : false;
+        }
+    }
+
+    public function update(Response $response): void
+    {
+        // if we have no embedded Response, do nothing
+        if (0 === $this-&gt;embeddedResponses) {
+            return;
+        }
+
+        // Remove Etag since it cannot be merged from embedded responses.
+        $response-&gt;setEtag(null);
+
+        $this-&gt;add($response);
+
+        $response-&gt;headers-&gt;set(&#039;Age&#039;, $this-&gt;age);
+
+        if ($this-&gt;isNotCacheableResponseEmbedded) {
+            $response-&gt;setLastModified(null);
+
+            if ($this-&gt;flagDirectives[&#039;no-store&#039;]) {
+                $response-&gt;headers-&gt;set(&#039;Cache-Control&#039;, &#039;no-cache, no-store, must-revalidate&#039;);
+            } else {
+                $response-&gt;headers-&gt;set(&#039;Cache-Control&#039;, &#039;no-cache, must-revalidate&#039;);
+            }
+
+            return;
+        }
+
+        $response-&gt;setLastModified($this-&gt;lastModified ?: null);
+
+        $flags = array_filter($this-&gt;flagDirectives);
+
+        if (isset($flags[&#039;must-revalidate&#039;])) {
+            $flags[&#039;no-cache&#039;] = true;
+        }
+
+        $response-&gt;headers-&gt;set(&#039;Cache-Control&#039;, implode(&#039;, &#039;, array_keys($flags)));
+
+        $maxAge = null;
+
+        if (is_numeric($this-&gt;ageDirectives[&#039;max-age&#039;])) {
+            $maxAge = $this-&gt;ageDirectives[&#039;max-age&#039;] + $this-&gt;age;
+            $response-&gt;headers-&gt;addCacheControlDirective(&#039;max-age&#039;, $maxAge);
+        }
+
+        if (is_numeric($this-&gt;ageDirectives[&#039;s-maxage&#039;])) {
+            $sMaxage = $this-&gt;ageDirectives[&#039;s-maxage&#039;] + $this-&gt;age;
+
+            if ($maxAge !== $sMaxage) {
+                $response-&gt;headers-&gt;addCacheControlDirective(&#039;s-maxage&#039;, $sMaxage);
+            }
+        }
+
+        if ($this-&gt;ageDirectives[&#039;expires&#039;] &amp;&amp; null !== $maxAge) {
+            $date = clone $response-&gt;getDate();
+            $date = $date-&gt;modify(&#039;+&#039;.$maxAge.&#039; seconds&#039;);
+            $response-&gt;setExpires($date);
+        }
+    }
+
+    /**
+     * RFC2616, Section 13.4.
+     *
+     * @see https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.4
+     */
+    private function willMakeFinalResponseUncacheable(Response $response): bool
+    {
+        // RFC2616: A response received with a status code of 200, 203, 300, 301 or 410
+        // MAY be stored by a cache […] unless a cache-control directive prohibits caching.
+        if ($response-&gt;headers-&gt;hasCacheControlDirective(&#039;no-cache&#039;)
+            || $response-&gt;headers-&gt;hasCacheControlDirective(&#039;no-store&#039;)
+        ) {
+            return true;
+        }
+
+        // Etag headers cannot be merged, they render the response uncacheable
+        // by default (except if the response also has max-age etc.).
+        if (null === $response-&gt;getEtag() &amp;&amp; \in_array($response-&gt;getStatusCode(), [200, 203, 300, 301, 410], true)) {
+            return false;
+        }
+
+        // RFC2616: A response received with any other status code (e.g. status codes 302 and 307)
+        // MUST NOT be returned in a reply to a subsequent request unless there are
+        // cache-control directives or another header(s) that explicitly allow it.
+        $cacheControl = [&#039;max-age&#039;, &#039;s-maxage&#039;, &#039;must-revalidate&#039;, &#039;proxy-revalidate&#039;, &#039;public&#039;, &#039;private&#039;];
+        foreach ($cacheControl as $key) {
+            if ($response-&gt;headers-&gt;hasCacheControlDirective($key)) {
+                return false;
+            }
+        }
+
+        if ($response-&gt;headers-&gt;has(&#039;Expires&#039;)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Store lowest max-age/s-maxage/expires for the final response.
+     *
+     * The response might have been stored in cache a while ago. To keep things comparable,
+     * we have to subtract the age so that the value is normalized for an age of 0.
+     *
+     * If the value is lower than the currently stored value, we update the value, to keep a rolling
+     * minimal value of each instruction. If the value is NULL, the directive will not be set on the final response.
+     */
+    private function storeRelativeAgeDirective(string $directive, ?int $value, ?int $expires, int $age): void
+    {
+        if (null === $value &amp;&amp; null === $expires) {
+            $this-&gt;ageDirectives[$directive] = false;
+        }
+
+        if (false !== $this-&gt;ageDirectives[$directive]) {
+            $value = min($value ?? \PHP_INT_MAX, $expires ?? \PHP_INT_MAX);
+            $value -= $age;
+            $this-&gt;ageDirectives[$directive] = null !== $this-&gt;ageDirectives[$directive] ? min($this-&gt;ageDirectives[$directive], $value) : $value;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-kernel/HttpCache/ResponseCacheStrategyInterface.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-kernel/Log -->
+
+</body>
+</html>

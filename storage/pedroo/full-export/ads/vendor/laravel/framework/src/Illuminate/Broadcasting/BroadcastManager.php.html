@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Broadcasting/BroadcastManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Broadcasting;
+
+use Ably\AblyRest;
+use Closure;
+use GuzzleHttp\Client as GuzzleClient;
+use Illuminate\Broadcasting\Broadcasters\AblyBroadcaster;
+use Illuminate\Broadcasting\Broadcasters\LogBroadcaster;
+use Illuminate\Broadcasting\Broadcasters\NullBroadcaster;
+use Illuminate\Broadcasting\Broadcasters\PusherBroadcaster;
+use Illuminate\Broadcasting\Broadcasters\RedisBroadcaster;
+use Illuminate\Bus\UniqueLock;
+use Illuminate\Contracts\Broadcasting\Factory as FactoryContract;
+use Illuminate\Contracts\Broadcasting\ShouldBeUnique;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
+use Illuminate\Contracts\Broadcasting\ShouldRescue;
+use Illuminate\Contracts\Bus\Dispatcher as BusDispatcherContract;
+use Illuminate\Contracts\Cache\Repository as Cache;
+use Illuminate\Contracts\Foundation\CachesRoutes;
+use InvalidArgumentException;
+use Psr\Log\LoggerInterface;
+use Pusher\Pusher;
+use RuntimeException;
+use Throwable;
+
+/**
+ * @mixin \Illuminate\Contracts\Broadcasting\Broadcaster
+ */
+class BroadcastManager implements FactoryContract
+{
+    /**
+     * The application instance.
+     *
+     * @var \Illuminate\Contracts\Container\Container
+     */
+    protected $app;
+
+    /**
+     * The array of resolved broadcast drivers.
+     *
+     * @var array
+     */
+    protected $drivers = [];
+
+    /**
+     * The registered custom driver creators.
+     *
+     * @var array
+     */
+    protected $customCreators = [];
+
+    /**
+     * Create a new manager instance.
+     *
+     * @param  \Illuminate\Contracts\Container\Container  $app
+     */
+    public function __construct($app)
+    {
+        $this-&gt;app = $app;
+    }
+
+    /**
+     * Register the routes for handling broadcast channel authentication and sockets.
+     *
+     * @param  array|null  $attributes
+     * @return void
+     */
+    public function routes(?array $attributes = null)
+    {
+        if ($this-&gt;app instanceof CachesRoutes &amp;&amp; $this-&gt;app-&gt;routesAreCached()) {
+            return;
+        }
+
+        $attributes = $attributes ?: [&#039;middleware&#039; =&gt; [&#039;web&#039;]];
+
+        $this-&gt;app[&#039;router&#039;]-&gt;group($attributes, function ($router) {
+            $router-&gt;match(
+                [&#039;get&#039;, &#039;post&#039;], &#039;/broadcasting/auth&#039;,
+                &#039;\\&#039;.BroadcastController::class.&#039;@authenticate&#039;
+            )-&gt;withoutMiddleware([\Illuminate\Foundation\Http\Middleware\VerifyCsrfToken::class]);
+        });
+    }
+
+    /**
+     * Register the routes for handling broadcast user authentication.
+     *
+     * @param  array|null  $attributes
+     * @return void
+     */
+    public function userRoutes(?array $attributes = null)
+    {
+        if ($this-&gt;app instanceof CachesRoutes &amp;&amp; $this-&gt;app-&gt;routesAreCached()) {
+            return;
+        }
+
+        $attributes = $attributes ?: [&#039;middleware&#039; =&gt; [&#039;web&#039;]];
+
+        $this-&gt;app[&#039;router&#039;]-&gt;group($attributes, function ($router) {
+            $router-&gt;match(
+                [&#039;get&#039;, &#039;post&#039;], &#039;/broadcasting/user-auth&#039;,
+                &#039;\\&#039;.BroadcastController::class.&#039;@authenticateUser&#039;
+            )-&gt;withoutMiddleware([\Illuminate\Foundation\Http\Middleware\VerifyCsrfToken::class]);
+        });
+    }
+
+    /**
+     * Register the routes for handling broadcast authentication and sockets.
+     *
+     * Alias of &quot;routes&quot; method.
+     *
+     * @param  array|null  $attributes
+     * @return void
+     */
+    public function channelRoutes(?array $attributes = null)
+    {
+        $this-&gt;routes($attributes);
+    }
+
+    /**
+     * Get the socket ID for the given request.
+     *
+     * @param  \Illuminate\Http\Request|null  $request
+     * @return string|null
+     */
+    public function socket($request = null)
+    {
+        if (! $request &amp;&amp; ! $this-&gt;app-&gt;bound(&#039;request&#039;)) {
+            return;
+        }
+
+        $request = $request ?: $this-&gt;app[&#039;request&#039;];
+
+        return $request-&gt;header(&#039;X-Socket-ID&#039;);
+    }
+
+    /**
+     * Begin sending an anonymous broadcast to the given channels.
+     */
+    public function on(Channel|string|array $channels): AnonymousEvent
+    {
+        return new AnonymousEvent($channels);
+    }
+
+    /**
+     * Begin sending an anonymous broadcast to the given private channels.
+     */
+    public function private(string $channel): AnonymousEvent
+    {
+        return $this-&gt;on(new PrivateChannel($channel));
+    }
+
+    /**
+     * Begin sending an anonymous broadcast to the given presence channels.
+     */
+    public function presence(string $channel): AnonymousEvent
+    {
+        return $this-&gt;on(new PresenceChannel($channel));
+    }
+
+    /**
+     * Begin broadcasting an event.
+     *
+     * @param  mixed  $event
+     * @return \Illuminate\Broadcasting\PendingBroadcast
+     */
+    public function event($event = null)
+    {
+        return new PendingBroadcast($this-&gt;app-&gt;make(&#039;events&#039;), $event);
+    }
+
+    /**
+     * Queue the given event for broadcast.
+     *
+     * @param  mixed  $event
+     * @return void
+     */
+    public function queue($event)
+    {
+        if ($event instanceof ShouldBroadcastNow ||
+            (is_object($event) &amp;&amp;
+             method_exists($event, &#039;shouldBroadcastNow&#039;) &amp;&amp;
+             $event-&gt;shouldBroadcastNow())) {
+            $dispatch = fn () =&gt; $this-&gt;app-&gt;make(BusDispatcherContract::class)
+                -&gt;dispatchNow(new BroadcastEvent(clone $event));
+
+            return $event instanceof ShouldRescue
+                ? $this-&gt;rescue($dispatch)
+                : $dispatch();
+        }
+
+        $queue = null;
+
+        if (method_exists($event, &#039;broadcastQueue&#039;)) {
+            $queue = $event-&gt;broadcastQueue();
+        } elseif (isset($event-&gt;broadcastQueue)) {
+            $queue = $event-&gt;broadcastQueue;
+        } elseif (isset($event-&gt;queue)) {
+            $queue = $event-&gt;queue;
+        }
+
+        $broadcastEvent = new BroadcastEvent(clone $event);
+
+        if ($event instanceof ShouldBeUnique) {
+            $broadcastEvent = new UniqueBroadcastEvent(clone $event);
+
+            if ($this-&gt;mustBeUniqueAndCannotAcquireLock($broadcastEvent)) {
+                return;
+            }
+        }
+
+        $push = fn () =&gt; $this-&gt;app-&gt;make(&#039;queue&#039;)
+            -&gt;connection($event-&gt;connection ?? null)
+            -&gt;pushOn($queue, $broadcastEvent);
+
+        $event instanceof ShouldRescue
+            ? $this-&gt;rescue($push)
+            : $push();
+    }
+
+    /**
+     * Determine if the broadcastable event must be unique and determine if we can acquire the necessary lock.
+     *
+     * @param  mixed  $event
+     * @return bool
+     */
+    protected function mustBeUniqueAndCannotAcquireLock($event)
+    {
+        return ! (new UniqueLock(
+            method_exists($event, &#039;uniqueVia&#039;)
+                ? $event-&gt;uniqueVia()
+                : $this-&gt;app-&gt;make(Cache::class)
+        ))-&gt;acquire($event);
+    }
+
+    /**
+     * Get a driver instance.
+     *
+     * @param  string|null  $driver
+     * @return mixed
+     */
+    public function connection($driver = null)
+    {
+        return $this-&gt;driver($driver);
+    }
+
+    /**
+     * Get a driver instance.
+     *
+     * @param  string|null  $name
+     * @return mixed
+     */
+    public function driver($name = null)
+    {
+        $name = $name ?: $this-&gt;getDefaultDriver();
+
+        return $this-&gt;drivers[$name] = $this-&gt;get($name);
+    }
+
+    /**
+     * Attempt to get the connection from the local cache.
+     *
+     * @param  string  $name
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     */
+    protected function get($name)
+    {
+        return $this-&gt;drivers[$name] ?? $this-&gt;resolve($name);
+    }
+
+    /**
+     * Resolve the given broadcaster.
+     *
+     * @param  string  $name
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function resolve($name)
+    {
+        $config = $this-&gt;getConfig($name);
+
+        if (is_null($config)) {
+            throw new InvalidArgumentException(&quot;Broadcast connection [{$name}] is not defined.&quot;);
+        }
+
+        if (isset($this-&gt;customCreators[$config[&#039;driver&#039;]])) {
+            return $this-&gt;callCustomCreator($config);
+        }
+
+        $driverMethod = &#039;create&#039;.ucfirst($config[&#039;driver&#039;]).&#039;Driver&#039;;
+
+        if (! method_exists($this, $driverMethod)) {
+            throw new InvalidArgumentException(&quot;Driver [{$config[&#039;driver&#039;]}] is not supported.&quot;);
+        }
+
+        try {
+            return $this-&gt;{$driverMethod}($config);
+        } catch (Throwable $e) {
+            throw new RuntimeException(&quot;Failed to create broadcaster for connection \&quot;{$name}\&quot; with error: {$e-&gt;getMessage()}.&quot;, 0, $e);
+        }
+    }
+
+    /**
+     * Call a custom driver creator.
+     *
+     * @param  array  $config
+     * @return mixed
+     */
+    protected function callCustomCreator(array $config)
+    {
+        return $this-&gt;customCreators[$config[&#039;driver&#039;]]($this-&gt;app, $config);
+    }
+
+    /**
+     * Create an instance of the driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     */
+    protected function createReverbDriver(array $config)
+    {
+        return $this-&gt;createPusherDriver($config);
+    }
+
+    /**
+     * Create an instance of the driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     */
+    protected function createPusherDriver(array $config)
+    {
+        return new PusherBroadcaster($this-&gt;pusher($config));
+    }
+
+    /**
+     * Get a Pusher instance for the given configuration.
+     *
+     * @param  array  $config
+     * @return \Pusher\Pusher
+     */
+    public function pusher(array $config)
+    {
+        $guzzleClient = new GuzzleClient(
+            array_merge(
+                [
+                    &#039;connect_timeout&#039; =&gt; 10,
+                    &#039;crypto_method&#039; =&gt; STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT,
+                    &#039;timeout&#039; =&gt; 30,
+                ],
+                $config[&#039;client_options&#039;] ?? [],
+            ),
+        );
+
+        $pusher = new Pusher(
+            $config[&#039;key&#039;],
+            $config[&#039;secret&#039;],
+            $config[&#039;app_id&#039;],
+            $config[&#039;options&#039;] ?? [],
+            $guzzleClient,
+        );
+
+        if ($config[&#039;log&#039;] ?? false) {
+            $pusher-&gt;setLogger($this-&gt;app-&gt;make(LoggerInterface::class));
+        }
+
+        return $pusher;
+    }
+
+    /**
+     * Create an instance of the driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     */
+    protected function createAblyDriver(array $config)
+    {
+        return new AblyBroadcaster($this-&gt;ably($config));
+    }
+
+    /**
+     * Get an Ably instance for the given configuration.
+     *
+     * @param  array  $config
+     * @return \Ably\AblyRest
+     */
+    public function ably(array $config)
+    {
+        return new AblyRest($config);
+    }
+
+    /**
+     * Create an instance of the driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     */
+    protected function createRedisDriver(array $config)
+    {
+        return new RedisBroadcaster(
+            $this-&gt;app-&gt;make(&#039;redis&#039;), $config[&#039;connection&#039;] ?? null,
+            $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;database.redis.options.prefix&#039;, &#039;&#039;)
+        );
+    }
+
+    /**
+     * Create an instance of the driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     */
+    protected function createLogDriver(array $config)
+    {
+        return new LogBroadcaster(
+            $this-&gt;app-&gt;make(LoggerInterface::class)
+        );
+    }
+
+    /**
+     * Create an instance of the driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Contracts\Broadcasting\Broadcaster
+     */
+    protected function createNullDriver(array $config)
+    {
+        return new NullBroadcaster;
+    }
+
+    /**
+     * Get the connection configuration.
+     *
+     * @param  string  $name
+     * @return array
+     */
+    protected function getConfig($name)
+    {
+        if (! is_null($name) &amp;&amp; $name !== &#039;null&#039;) {
+            return $this-&gt;app[&#039;config&#039;][&quot;broadcasting.connections.{$name}&quot;];
+        }
+
+        return [&#039;driver&#039; =&gt; &#039;null&#039;];
+    }
+
+    /**
+     * Get the default driver name.
+     *
+     * @return string
+     */
+    public function getDefaultDriver()
+    {
+        return $this-&gt;app[&#039;config&#039;][&#039;broadcasting.default&#039;];
+    }
+
+    /**
+     * Set the default driver name.
+     *
+     * @param  string  $name
+     * @return void
+     */
+    public function setDefaultDriver($name)
+    {
+        $this-&gt;app[&#039;config&#039;][&#039;broadcasting.default&#039;] = $name;
+    }
+
+    /**
+     * Disconnect the given driver / connection and remove it from local cache.
+     *
+     * @param  string|null  $name
+     * @return void
+     */
+    public function purge($name = null)
+    {
+        $name ??= $this-&gt;getDefaultDriver();
+
+        unset($this-&gt;drivers[$name]);
+    }
+
+    /**
+     * Register a custom driver creator Closure.
+     *
+     * @param  string  $driver
+     * @param  \Closure  $callback
+     * @return $this
+     */
+    public function extend($driver, Closure $callback)
+    {
+        $this-&gt;customCreators[$driver] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Execute the given callback using &quot;rescue&quot; if possible.
+     *
+     * @param  \Closure  $callback
+     * @return mixed
+     */
+    protected function rescue(Closure $callback)
+    {
+        if (function_exists(&#039;rescue&#039;)) {
+            return rescue($callback);
+        }
+
+        return $callback();
+    }
+
+    /**
+     * Get the application instance used by the manager.
+     *
+     * @return \Illuminate\Contracts\Foundation\Application
+     */
+    public function getApplication()
+    {
+        return $this-&gt;app;
+    }
+
+    /**
+     * Set the application instance used by the manager.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     * @return $this
+     */
+    public function setApplication($app)
+    {
+        $this-&gt;app = $app;
+
+        return $this;
+    }
+
+    /**
+     * Forget all of the resolved driver instances.
+     *
+     * @return $this
+     */
+    public function forgetDrivers()
+    {
+        $this-&gt;drivers = [];
+
+        return $this;
+    }
+
+    /**
+     * Dynamically call the default driver instance.
+     *
+     * @param  string  $method
+     * @param  array  $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        return $this-&gt;driver()-&gt;$method(...$parameters);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Broadcasting/BroadcastServiceProvider.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Broadcasting/Broadcasters -->
+
+</body>
+</html>

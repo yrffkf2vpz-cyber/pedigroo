@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/console/Command/InvokableCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Console\Command;
+
+use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Attribute\Argument;
+use Symfony\Component\Console\Attribute\Interact;
+use Symfony\Component\Console\Attribute\MapInput;
+use Symfony\Component\Console\Attribute\Option;
+use Symfony\Component\Console\Cursor;
+use Symfony\Component\Console\Exception\LogicException;
+use Symfony\Component\Console\Exception\RuntimeException;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputDefinition;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Interaction\Interaction;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Style\SymfonyStyle;
+
+/**
+ * Represents an invokable command.
+ *
+ * @author Yonel Ceruto &lt;open@yceruto.dev&gt;
+ *
+ * @internal
+ */
+class InvokableCommand implements SignalableCommandInterface
+{
+    private readonly ?SignalableCommandInterface $signalableCommand;
+    private readonly \ReflectionFunction $invokable;
+    /**
+     * @var list&lt;Interaction&gt;|null
+     */
+    private ?array $interactions = null;
+    private bool $triggerDeprecations = false;
+    private $code;
+
+    public function __construct(
+        private readonly Command $command,
+        callable $code,
+    ) {
+        $this-&gt;code = $code;
+        $this-&gt;signalableCommand = $code instanceof SignalableCommandInterface ? $code : null;
+        $this-&gt;invokable = new \ReflectionFunction($this-&gt;getClosure($code));
+    }
+
+    /**
+     * Invokes a callable with parameters generated from the input interface.
+     */
+    public function __invoke(InputInterface $input, OutputInterface $output): int
+    {
+        $statusCode = $this-&gt;invokable-&gt;invoke(...$this-&gt;getParameters($this-&gt;invokable, $input, $output));
+
+        if (!\is_int($statusCode)) {
+            if ($this-&gt;triggerDeprecations) {
+                trigger_deprecation(&#039;symfony/console&#039;, &#039;7.3&#039;, \sprintf(&#039;Returning a non-integer value from the command &quot;%s&quot; is deprecated and will throw an exception in Symfony 8.0.&#039;, $this-&gt;command-&gt;getName()));
+
+                return 0;
+            }
+
+            throw new \TypeError(\sprintf(&#039;The command &quot;%s&quot; must return an integer value in the &quot;%s&quot; method, but &quot;%s&quot; was returned.&#039;, $this-&gt;command-&gt;getName(), $this-&gt;invokable-&gt;getName(), get_debug_type($statusCode)));
+        }
+
+        return $statusCode;
+    }
+
+    /**
+     * Configures the input definition from an invokable-defined function.
+     *
+     * Processes the parameters of the reflection function to extract and
+     * add arguments or options to the provided input definition.
+     */
+    public function configure(InputDefinition $definition): void
+    {
+        foreach ($this-&gt;invokable-&gt;getParameters() as $parameter) {
+            if ($argument = Argument::tryFrom($parameter)) {
+                $definition-&gt;addArgument($argument-&gt;toInputArgument());
+                continue;
+            }
+
+            if ($option = Option::tryFrom($parameter)) {
+                $definition-&gt;addOption($option-&gt;toInputOption());
+                continue;
+            }
+
+            if ($input = MapInput::tryFrom($parameter)) {
+                $inputArguments = array_map(fn (Argument $a) =&gt; $a-&gt;toInputArgument(), iterator_to_array($input-&gt;getArguments(), false));
+
+                // make sure optional arguments are defined after required ones
+                usort($inputArguments, fn (InputArgument $a, InputArgument $b) =&gt; (int) $b-&gt;isRequired() - (int) $a-&gt;isRequired());
+
+                foreach ($inputArguments as $inputArgument) {
+                    $definition-&gt;addArgument($inputArgument);
+                }
+
+                foreach ($input-&gt;getOptions() as $option) {
+                    $definition-&gt;addOption($option-&gt;toInputOption());
+                }
+            }
+        }
+    }
+
+    public function getCode(): callable
+    {
+        return $this-&gt;code;
+    }
+
+    private function getClosure(callable $code): \Closure
+    {
+        if (!$code instanceof \Closure) {
+            return $code(...);
+        }
+
+        $this-&gt;triggerDeprecations = true;
+
+        if (null !== (new \ReflectionFunction($code))-&gt;getClosureThis()) {
+            return $code;
+        }
+
+        set_error_handler(static function () {});
+        try {
+            if ($c = \Closure::bind($code, $this-&gt;command)) {
+                $code = $c;
+            }
+        } finally {
+            restore_error_handler();
+        }
+
+        return $code;
+    }
+
+    private function getParameters(\ReflectionFunction $function, InputInterface $input, OutputInterface $output): array
+    {
+        $parameters = [];
+        foreach ($function-&gt;getParameters() as $parameter) {
+            if ($argument = Argument::tryFrom($parameter)) {
+                $parameters[] = $argument-&gt;resolveValue($input);
+
+                continue;
+            }
+
+            if ($option = Option::tryFrom($parameter)) {
+                $parameters[] = $option-&gt;resolveValue($input);
+
+                continue;
+            }
+
+            if ($in = MapInput::tryFrom($parameter)) {
+                $parameters[] = $in-&gt;resolveValue($input);
+
+                continue;
+            }
+
+            $type = $parameter-&gt;getType();
+
+            if (!$type instanceof \ReflectionNamedType) {
+                if ($this-&gt;triggerDeprecations) {
+                    trigger_deprecation(&#039;symfony/console&#039;, &#039;7.3&#039;, \sprintf(&#039;Omitting the type declaration for the parameter &quot;$%s&quot; is deprecated and will throw an exception in Symfony 8.0.&#039;, $parameter-&gt;getName()));
+
+                    continue;
+                }
+
+                throw new LogicException(\sprintf(&#039;The parameter &quot;$%s&quot; must have a named type. Untyped, Union or Intersection types are not supported.&#039;, $parameter-&gt;getName()));
+            }
+
+            $parameters[] = match ($type-&gt;getName()) {
+                InputInterface::class =&gt; $input,
+                OutputInterface::class =&gt; $output,
+                Cursor::class =&gt; new Cursor($output),
+                SymfonyStyle::class =&gt; new SymfonyStyle($input, $output),
+                Application::class =&gt; $this-&gt;command-&gt;getApplication(),
+                default =&gt; throw new RuntimeException(\sprintf(&#039;Unsupported type &quot;%s&quot; for parameter &quot;$%s&quot;.&#039;, $type-&gt;getName(), $parameter-&gt;getName())),
+            };
+        }
+
+        return $parameters ?: [$input, $output];
+    }
+
+    public function getSubscribedSignals(): array
+    {
+        return $this-&gt;signalableCommand?-&gt;getSubscribedSignals() ?? [];
+    }
+
+    public function handleSignal(int $signal, int|false $previousExitCode = 0): int|false
+    {
+        return $this-&gt;signalableCommand?-&gt;handleSignal($signal, $previousExitCode) ?? false;
+    }
+
+    public function isInteractive(): bool
+    {
+        if (null === $this-&gt;interactions) {
+            $this-&gt;collectInteractions();
+        }
+
+        return [] !== $this-&gt;interactions;
+    }
+
+    public function interact(InputInterface $input, OutputInterface $output): void
+    {
+        if (null === $this-&gt;interactions) {
+            $this-&gt;collectInteractions();
+        }
+
+        foreach ($this-&gt;interactions as $interaction) {
+            $interaction-&gt;interact($input, $output, $this-&gt;getParameters(...));
+        }
+    }
+
+    private function collectInteractions(): void
+    {
+        $invokableThis = $this-&gt;invokable-&gt;getClosureThis();
+
+        $this-&gt;interactions = [];
+        foreach ($this-&gt;invokable-&gt;getParameters() as $parameter) {
+            if ($spec = Argument::tryFrom($parameter)) {
+                if ($attribute = $spec-&gt;getInteractiveAttribute()) {
+                    $this-&gt;interactions[] = new Interaction($invokableThis, $attribute);
+                }
+
+                continue;
+            }
+
+            if ($spec = MapInput::tryFrom($parameter)) {
+                $this-&gt;interactions = [...$this-&gt;interactions, ...$spec-&gt;getPropertyInteractions(), ...$spec-&gt;getMethodInteractions()];
+            }
+        }
+
+        if (!$class = $this-&gt;invokable-&gt;getClosureCalledClass()) {
+            return;
+        }
+
+        foreach ($class-&gt;getMethods() as $method) {
+            if ($attribute = Interact::tryFrom($method)) {
+                $this-&gt;interactions[] = new Interaction($invokableThis, $attribute);
+            }
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/console/Command/LazyCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/console/CommandLoader -->
+
+</body>
+</html>

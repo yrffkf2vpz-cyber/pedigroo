@@ -1,0 +1,882 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/HttpClientTrait.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient;
+
+use Symfony\Component\HttpClient\Exception\InvalidArgumentException;
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Response\StreamableInterface;
+use Symfony\Component\HttpClient\Response\StreamWrapper;
+use Symfony\Component\Mime\MimeTypes;
+
+/**
+ * Provides the common logic from writing HttpClientInterface implementations.
+ *
+ * All private methods are static to prevent implementers from creating memory leaks via circular references.
+ *
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ */
+trait HttpClientTrait
+{
+    private static int $CHUNK_SIZE = 16372;
+
+    public function withOptions(array $options): static
+    {
+        $clone = clone $this;
+        $clone-&gt;defaultOptions = self::mergeDefaultOptions($options, $this-&gt;defaultOptions);
+
+        return $clone;
+    }
+
+    /**
+     * Validates and normalizes method, URL and options, and merges them with defaults.
+     *
+     * @throws InvalidArgumentException When a not-supported option is found
+     */
+    private static function prepareRequest(?string $method, ?string $url, array $options, array $defaultOptions = [], bool $allowExtraOptions = false): array
+    {
+        if (null !== $method) {
+            if (\strlen($method) !== strspn($method, &#039;ABCDEFGHIJKLMNOPQRSTUVWXYZ&#039;)) {
+                throw new InvalidArgumentException(\sprintf(&#039;Invalid HTTP method &quot;%s&quot;, only uppercase letters are accepted.&#039;, $method));
+            }
+            if (!$method) {
+                throw new InvalidArgumentException(&#039;The HTTP method cannot be empty.&#039;);
+            }
+        }
+
+        $options = self::mergeDefaultOptions($options, $defaultOptions, $allowExtraOptions);
+
+        $buffer = $options[&#039;buffer&#039;] ?? true;
+
+        if ($buffer instanceof \Closure) {
+            $options[&#039;buffer&#039;] = static function (array $headers) use ($buffer) {
+                if (!\is_bool($buffer = $buffer($headers))) {
+                    if (!\is_array($bufferInfo = @stream_get_meta_data($buffer))) {
+                        throw new \LogicException(\sprintf(&#039;The closure passed as option &quot;buffer&quot; must return bool or stream resource, got &quot;%s&quot;.&#039;, get_debug_type($buffer)));
+                    }
+
+                    if (false === strpbrk($bufferInfo[&#039;mode&#039;], &#039;acew+&#039;)) {
+                        throw new \LogicException(\sprintf(&#039;The stream returned by the closure passed as option &quot;buffer&quot; must be writeable, got mode &quot;%s&quot;.&#039;, $bufferInfo[&#039;mode&#039;]));
+                    }
+                }
+
+                return $buffer;
+            };
+        } elseif (!\is_bool($buffer)) {
+            if (!\is_array($bufferInfo = @stream_get_meta_data($buffer))) {
+                throw new InvalidArgumentException(\sprintf(&#039;Option &quot;buffer&quot; must be bool, stream resource or Closure, &quot;%s&quot; given.&#039;, get_debug_type($buffer)));
+            }
+
+            if (false === strpbrk($bufferInfo[&#039;mode&#039;], &#039;acew+&#039;)) {
+                throw new InvalidArgumentException(\sprintf(&#039;The stream in option &quot;buffer&quot; must be writeable, mode &quot;%s&quot; given.&#039;, $bufferInfo[&#039;mode&#039;]));
+            }
+        }
+
+        if (isset($options[&#039;json&#039;])) {
+            if (isset($options[&#039;body&#039;]) &amp;&amp; &#039;&#039; !== $options[&#039;body&#039;]) {
+                throw new InvalidArgumentException(&#039;Define either the &quot;json&quot; or the &quot;body&quot; option, setting both is not supported.&#039;);
+            }
+            $options[&#039;body&#039;] = self::jsonEncode($options[&#039;json&#039;]);
+            unset($options[&#039;json&#039;]);
+
+            if (!isset($options[&#039;normalized_headers&#039;][&#039;content-type&#039;])) {
+                $options[&#039;normalized_headers&#039;][&#039;content-type&#039;] = [&#039;Content-Type: application/json&#039;];
+            }
+        }
+
+        if (!isset($options[&#039;normalized_headers&#039;][&#039;accept&#039;])) {
+            $options[&#039;normalized_headers&#039;][&#039;accept&#039;] = [&#039;Accept: */*&#039;];
+        }
+
+        if (isset($options[&#039;body&#039;])) {
+            $options[&#039;body&#039;] = self::normalizeBody($options[&#039;body&#039;], $options[&#039;normalized_headers&#039;]);
+
+            if (\is_string($options[&#039;body&#039;])
+                &amp;&amp; (string) \strlen($options[&#039;body&#039;]) !== substr($h = $options[&#039;normalized_headers&#039;][&#039;content-length&#039;][0] ?? &#039;&#039;, 16)
+                &amp;&amp; (&#039;&#039; !== $h || &#039;&#039; !== $options[&#039;body&#039;])
+            ) {
+                if (&#039;chunked&#039; === substr($options[&#039;normalized_headers&#039;][&#039;transfer-encoding&#039;][0] ?? &#039;&#039;, \strlen(&#039;Transfer-Encoding: &#039;))) {
+                    unset($options[&#039;normalized_headers&#039;][&#039;transfer-encoding&#039;]);
+                    $options[&#039;body&#039;] = self::dechunk($options[&#039;body&#039;]);
+                }
+
+                $options[&#039;normalized_headers&#039;][&#039;content-length&#039;] = [substr_replace($h ?: &#039;Content-Length: &#039;, \strlen($options[&#039;body&#039;]), 16)];
+            }
+        }
+
+        if (isset($options[&#039;peer_fingerprint&#039;])) {
+            $options[&#039;peer_fingerprint&#039;] = self::normalizePeerFingerprint($options[&#039;peer_fingerprint&#039;]);
+        }
+
+        if (isset($options[&#039;crypto_method&#039;]) &amp;&amp; !\in_array($options[&#039;crypto_method&#039;], [
+            \STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT,
+            \STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT,
+            \STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT,
+            \STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT,
+        ], true)) {
+            throw new InvalidArgumentException(&#039;Option &quot;crypto_method&quot; must be one of &quot;STREAM_CRYPTO_METHOD_TLSv1_*_CLIENT&quot;.&#039;);
+        }
+
+        // Validate on_progress
+        if (isset($options[&#039;on_progress&#039;]) &amp;&amp; !\is_callable($onProgress = $options[&#039;on_progress&#039;])) {
+            throw new InvalidArgumentException(\sprintf(&#039;Option &quot;on_progress&quot; must be callable, &quot;%s&quot; given.&#039;, get_debug_type($onProgress)));
+        }
+
+        if (\is_array($options[&#039;auth_basic&#039;] ?? null)) {
+            $count = \count($options[&#039;auth_basic&#039;]);
+            if ($count &lt;= 0 || $count &gt; 2) {
+                throw new InvalidArgumentException(\sprintf(&#039;Option &quot;auth_basic&quot; must contain 1 or 2 elements, &quot;%s&quot; given.&#039;, $count));
+            }
+
+            $options[&#039;auth_basic&#039;] = implode(&#039;:&#039;, $options[&#039;auth_basic&#039;]);
+        }
+
+        if (!\is_string($options[&#039;auth_basic&#039;] ?? &#039;&#039;)) {
+            throw new InvalidArgumentException(\sprintf(&#039;Option &quot;auth_basic&quot; must be string or an array, &quot;%s&quot; given.&#039;, get_debug_type($options[&#039;auth_basic&#039;])));
+        }
+
+        if (isset($options[&#039;auth_bearer&#039;])) {
+            if (!\is_string($options[&#039;auth_bearer&#039;])) {
+                throw new InvalidArgumentException(\sprintf(&#039;Option &quot;auth_bearer&quot; must be a string, &quot;%s&quot; given.&#039;, get_debug_type($options[&#039;auth_bearer&#039;])));
+            }
+            if (preg_match(&#039;{[^\x21-\x7E]}&#039;, $options[&#039;auth_bearer&#039;])) {
+                throw new InvalidArgumentException(&#039;Invalid character found in option &quot;auth_bearer&quot;: &#039;.json_encode($options[&#039;auth_bearer&#039;]).&#039;.&#039;);
+            }
+        }
+
+        if (isset($options[&#039;auth_basic&#039;], $options[&#039;auth_bearer&#039;])) {
+            throw new InvalidArgumentException(&#039;Define either the &quot;auth_basic&quot; or the &quot;auth_bearer&quot; option, setting both is not supported.&#039;);
+        }
+
+        if (null !== $url) {
+            // Merge auth with headers
+            if (($options[&#039;auth_basic&#039;] ?? false) &amp;&amp; !($options[&#039;normalized_headers&#039;][&#039;authorization&#039;] ?? false)) {
+                $options[&#039;normalized_headers&#039;][&#039;authorization&#039;] = [&#039;Authorization: Basic &#039;.base64_encode($options[&#039;auth_basic&#039;])];
+            }
+            // Merge bearer with headers
+            if (($options[&#039;auth_bearer&#039;] ?? false) &amp;&amp; !($options[&#039;normalized_headers&#039;][&#039;authorization&#039;] ?? false)) {
+                $options[&#039;normalized_headers&#039;][&#039;authorization&#039;] = [&#039;Authorization: Bearer &#039;.$options[&#039;auth_bearer&#039;]];
+            }
+
+            unset($options[&#039;auth_basic&#039;], $options[&#039;auth_bearer&#039;]);
+
+            // Parse base URI
+            if (\is_string($baseUri = $options[&#039;base_uri&#039;] ?? null)) {
+                $baseUri = self::parseUrl($baseUri);
+            }
+            unset($options[&#039;base_uri&#039;]);
+
+            // Validate and resolve URL
+            $url = self::parseUrl($url, $options[&#039;query&#039;]);
+            $url = self::resolveUrl($url, $baseUri, $defaultOptions[&#039;query&#039;] ?? []);
+        }
+
+        // Finalize normalization of options
+        $options[&#039;http_version&#039;] = (string) ($options[&#039;http_version&#039;] ?? &#039;&#039;) ?: null;
+        if (0 &gt; $options[&#039;timeout&#039;] = (float) ($options[&#039;timeout&#039;] ?? \ini_get(&#039;default_socket_timeout&#039;))) {
+            $options[&#039;timeout&#039;] = 172800.0; // 2 days
+        }
+
+        $options[&#039;max_duration&#039;] = isset($options[&#039;max_duration&#039;]) ? (float) $options[&#039;max_duration&#039;] : 0;
+        $options[&#039;headers&#039;] = array_merge(...array_values($options[&#039;normalized_headers&#039;]));
+
+        return [$url, $options];
+    }
+
+    /**
+     * @throws InvalidArgumentException When an invalid option is found
+     */
+    private static function mergeDefaultOptions(array $options, array $defaultOptions, bool $allowExtraOptions = false): array
+    {
+        $options[&#039;normalized_headers&#039;] = self::normalizeHeaders($options[&#039;headers&#039;] ?? []);
+
+        if ($defaultOptions[&#039;headers&#039;] ?? false) {
+            $options[&#039;normalized_headers&#039;] += self::normalizeHeaders($defaultOptions[&#039;headers&#039;]);
+        }
+
+        $options[&#039;headers&#039;] = array_merge(...array_values($options[&#039;normalized_headers&#039;]) ?: [[]]);
+
+        if ($resolve = $options[&#039;resolve&#039;] ?? false) {
+            $options[&#039;resolve&#039;] = [];
+            foreach ($resolve as $k =&gt; $v) {
+                if (&#039;&#039; === $v = (string) $v) {
+                    $v = null;
+                } elseif (&#039;[&#039; === $v[0] &amp;&amp; &#039;]&#039; === substr($v, -1) &amp;&amp; str_contains($v, &#039;:&#039;)) {
+                    $v = substr($v, 1, -1);
+                }
+
+                $options[&#039;resolve&#039;][substr(self::parseUrl(&#039;http://&#039;.$k)[&#039;authority&#039;], 2)] = $v;
+            }
+        }
+
+        // Option &quot;query&quot; is never inherited from defaults
+        $options[&#039;query&#039;] ??= [];
+
+        $options += $defaultOptions;
+
+        if (isset(self::$emptyDefaults)) {
+            foreach (self::$emptyDefaults as $k =&gt; $v) {
+                if (!isset($options[$k])) {
+                    $options[$k] = $v;
+                }
+            }
+        }
+
+        if (isset($defaultOptions[&#039;extra&#039;])) {
+            $options[&#039;extra&#039;] += $defaultOptions[&#039;extra&#039;];
+        }
+
+        if ($resolve = $defaultOptions[&#039;resolve&#039;] ?? false) {
+            foreach ($resolve as $k =&gt; $v) {
+                if (&#039;&#039; === $v = (string) $v) {
+                    $v = null;
+                } elseif (&#039;[&#039; === $v[0] &amp;&amp; &#039;]&#039; === substr($v, -1) &amp;&amp; str_contains($v, &#039;:&#039;)) {
+                    $v = substr($v, 1, -1);
+                }
+
+                $options[&#039;resolve&#039;] += [substr(self::parseUrl(&#039;http://&#039;.$k)[&#039;authority&#039;], 2) =&gt; $v];
+            }
+        }
+
+        if ($allowExtraOptions || !$defaultOptions) {
+            return $options;
+        }
+
+        // Look for unsupported options
+        foreach ($options as $name =&gt; $v) {
+            if (\array_key_exists($name, $defaultOptions) || &#039;normalized_headers&#039; === $name) {
+                continue;
+            }
+
+            if (&#039;auth_ntlm&#039; === $name) {
+                if (!\extension_loaded(&#039;curl&#039;)) {
+                    $msg = &#039;try installing the &quot;curl&quot; extension to use &quot;%s&quot; instead.&#039;;
+                } else {
+                    $msg = &#039;try using &quot;%s&quot; instead.&#039;;
+                }
+
+                throw new InvalidArgumentException(\sprintf(&#039;Option &quot;auth_ntlm&quot; is not supported by &quot;%s&quot;, &#039;.$msg, __CLASS__, CurlHttpClient::class));
+            }
+
+            if (&#039;vars&#039; === $name) {
+                throw new InvalidArgumentException(\sprintf(&#039;Option &quot;vars&quot; is not supported by &quot;%s&quot;, try using &quot;%s&quot; instead.&#039;, __CLASS__, UriTemplateHttpClient::class));
+            }
+
+            $alternatives = [];
+
+            foreach ($defaultOptions as $k =&gt; $v) {
+                if (levenshtein($name, $k) &lt;= \strlen($name) / 3 || str_contains($k, $name)) {
+                    $alternatives[] = $k;
+                }
+            }
+
+            throw new InvalidArgumentException(\sprintf(&#039;Unsupported option &quot;%s&quot; passed to &quot;%s&quot;, did you mean &quot;%s&quot;?&#039;, $name, __CLASS__, implode(&#039;&quot;, &quot;&#039;, $alternatives ?: array_keys($defaultOptions))));
+        }
+
+        return $options;
+    }
+
+    /**
+     * @return string[][]
+     *
+     * @throws InvalidArgumentException When an invalid header is found
+     */
+    private static function normalizeHeaders(array $headers): array
+    {
+        $normalizedHeaders = [];
+
+        foreach ($headers as $name =&gt; $values) {
+            if ($values instanceof \Stringable) {
+                $values = (string) $values;
+            }
+
+            if (\is_int($name)) {
+                if (!\is_string($values)) {
+                    throw new InvalidArgumentException(\sprintf(&#039;Invalid value for header &quot;%s&quot;: expected string, &quot;%s&quot; given.&#039;, $name, get_debug_type($values)));
+                }
+                [$name, $values] = explode(&#039;:&#039;, $values, 2);
+                $values = [ltrim($values)];
+            } elseif (!is_iterable($values)) {
+                if (\is_object($values)) {
+                    throw new InvalidArgumentException(\sprintf(&#039;Invalid value for header &quot;%s&quot;: expected string, &quot;%s&quot; given.&#039;, $name, get_debug_type($values)));
+                }
+
+                $values = (array) $values;
+            }
+
+            $lcName = strtolower($name);
+            $normalizedHeaders[$lcName] = [];
+
+            foreach ($values as $value) {
+                $normalizedHeaders[$lcName][] = $value = $name.&#039;: &#039;.$value;
+
+                if (\strlen($value) !== strcspn($value, &quot;\r\n\0&quot;)) {
+                    throw new InvalidArgumentException(\sprintf(&#039;Invalid header: CR/LF/NUL found in &quot;%s&quot;.&#039;, $value));
+                }
+            }
+        }
+
+        return $normalizedHeaders;
+    }
+
+    /**
+     * @param array|string|resource|\Traversable|\Closure $body
+     *
+     * @return string|resource|\Closure
+     *
+     * @throws InvalidArgumentException When an invalid body is passed
+     */
+    private static function normalizeBody($body, array &amp;$normalizedHeaders = [])
+    {
+        if (\is_array($body)) {
+            static $cookie;
+
+            $streams = [];
+            array_walk_recursive($body, $caster = static function (&amp;$v) use (&amp;$caster, &amp;$streams, &amp;$cookie) {
+                if (\is_resource($v) || $v instanceof StreamableInterface) {
+                    $cookie = hash(&#039;xxh128&#039;, $cookie ??= random_bytes(8), true);
+                    $k = substr(strtr(base64_encode($cookie), &#039;+/&#039;, &#039;-_&#039;), 0, -2);
+                    $streams[$k] = $v instanceof StreamableInterface ? $v-&gt;toStream(false) : $v;
+                    $v = $k;
+                } elseif (\is_object($v)) {
+                    if ($vars = get_object_vars($v)) {
+                        array_walk_recursive($vars, $caster);
+                        $v = $vars;
+                    } elseif ($v instanceof \Stringable) {
+                        $v = (string) $v;
+                    }
+                }
+            });
+            $caster = null;
+
+            if (&#039;&#039; === $body = http_build_query($body, &#039;&#039;, &#039;&amp;&#039;)) {
+                return &#039;&#039;;
+            }
+
+            if (!$streams &amp;&amp; !str_contains($normalizedHeaders[&#039;content-type&#039;][0] ?? &#039;&#039;, &#039;multipart/form-data&#039;)) {
+                if (!str_contains($normalizedHeaders[&#039;content-type&#039;][0] ?? &#039;&#039;, &#039;application/x-www-form-urlencoded&#039;)) {
+                    $normalizedHeaders[&#039;content-type&#039;] = [&#039;Content-Type: application/x-www-form-urlencoded&#039;];
+                }
+
+                return $body;
+            }
+
+            if (preg_match(&#039;{multipart/form-data; boundary=(?|&quot;([^&quot;\r\n]++)&quot;|([-!#$%&amp;\&#039;*+.^_`|~_A-Za-z0-9]++))}&#039;, $normalizedHeaders[&#039;content-type&#039;][0] ?? &#039;&#039;, $boundary)) {
+                $boundary = $boundary[1];
+            } else {
+                $boundary = substr(strtr(base64_encode($cookie ??= random_bytes(8)), &#039;+/&#039;, &#039;-_&#039;), 0, -2);
+                $normalizedHeaders[&#039;content-type&#039;] = [&#039;Content-Type: multipart/form-data; boundary=&#039;.$boundary];
+            }
+
+            $body = explode(&#039;&amp;&#039;, $body);
+            $contentLength = 0;
+
+            foreach ($body as $i =&gt; $part) {
+                [$k, $v] = explode(&#039;=&#039;, $part, 2);
+                $part = ($i ? &quot;\r\n&quot; : &#039;&#039;).&quot;--{$boundary}\r\n&quot;;
+                $k = str_replace([&#039;&quot;&#039;, &quot;\r&quot;, &quot;\n&quot;], [&#039;%22&#039;, &#039;%0D&#039;, &#039;%0A&#039;], urldecode($k)); // see WHATWG HTML living standard
+
+                if (!isset($streams[$v])) {
+                    $part .= &quot;Content-Disposition: form-data; name=\&quot;{$k}\&quot;\r\n\r\n&quot;.urldecode($v);
+                    $contentLength += 0 &lt;= $contentLength ? \strlen($part) : 0;
+                    $body[$i] = [$k, $part, null];
+                    continue;
+                }
+                $v = $streams[$v];
+
+                if (!\is_array($m = @stream_get_meta_data($v))) {
+                    throw new TransportException(\sprintf(&#039;Invalid &quot;%s&quot; resource found in body part &quot;%s&quot;.&#039;, get_resource_type($v), $k));
+                }
+                if (feof($v)) {
+                    throw new TransportException(\sprintf(&#039;Uploaded stream ended for body part &quot;%s&quot;.&#039;, $k));
+                }
+
+                $m += stream_context_get_options($v)[&#039;http&#039;] ?? [];
+                $filename = basename($m[&#039;filename&#039;] ?? $m[&#039;uri&#039;] ?? &#039;unknown&#039;);
+                $filename = str_replace([&#039;&quot;&#039;, &quot;\r&quot;, &quot;\n&quot;], [&#039;%22&#039;, &#039;%0D&#039;, &#039;%0A&#039;], $filename);
+                $contentType = $m[&#039;content_type&#039;] ?? null;
+
+                if (($headers = $m[&#039;wrapper_data&#039;] ?? []) instanceof StreamWrapper) {
+                    $hasContentLength = false;
+                    $headers = $headers-&gt;getResponse()-&gt;getInfo(&#039;response_headers&#039;);
+                } elseif ($hasContentLength = 0 &lt; $h = fstat($v)[&#039;size&#039;] ?? 0) {
+                    $contentLength += 0 &lt;= $contentLength ? $h : 0;
+                }
+
+                foreach (\is_array($headers) ? $headers : [] as $h) {
+                    if (\is_string($h) &amp;&amp; 0 === stripos($h, &#039;Content-Type: &#039;)) {
+                        $contentType ??= substr($h, 14);
+                    } elseif (!$hasContentLength &amp;&amp; \is_string($h) &amp;&amp; 0 === stripos($h, &#039;Content-Length: &#039;)) {
+                        $hasContentLength = true;
+                        $contentLength += 0 &lt;= $contentLength ? substr($h, 16) : 0;
+                    } elseif (\is_string($h) &amp;&amp; 0 === stripos($h, &#039;Content-Encoding: &#039;)) {
+                        $contentLength = -1;
+                    }
+                }
+
+                if (!$hasContentLength) {
+                    $contentLength = -1;
+                }
+                if (null === $contentType &amp;&amp; &#039;plainfile&#039; === ($m[&#039;wrapper_type&#039;] ?? null) &amp;&amp; isset($m[&#039;uri&#039;])) {
+                    $mimeTypes = class_exists(MimeTypes::class) ? MimeTypes::getDefault() : false;
+                    $contentType = $mimeTypes ? $mimeTypes-&gt;guessMimeType($m[&#039;uri&#039;]) : null;
+                }
+                $contentType ??= &#039;application/octet-stream&#039;;
+
+                $part .= &quot;Content-Disposition: form-data; name=\&quot;{$k}\&quot;; filename=\&quot;{$filename}\&quot;\r\n&quot;;
+                $part .= &quot;Content-Type: {$contentType}\r\n\r\n&quot;;
+
+                $contentLength += 0 &lt;= $contentLength ? \strlen($part) : 0;
+                $body[$i] = [$k, $part, $v];
+            }
+
+            $body[++$i] = [&#039;&#039;, &quot;\r\n--{$boundary}--\r\n&quot;, null];
+
+            if (0 &lt; $contentLength) {
+                $normalizedHeaders[&#039;content-length&#039;] = [&#039;Content-Length: &#039;.($contentLength += \strlen($body[$i][1]))];
+            }
+
+            $body = static function ($size) use ($body) {
+                foreach ($body as $i =&gt; [$k, $part, $h]) {
+                    unset($body[$i]);
+
+                    yield $part;
+
+                    while (null !== $h &amp;&amp; !feof($h)) {
+                        if (false === $part = fread($h, $size)) {
+                            throw new TransportException(\sprintf(&#039;Error while reading uploaded stream for body part &quot;%s&quot;.&#039;, $k));
+                        }
+
+                        yield $part;
+                    }
+                }
+                $h = null;
+            };
+        }
+
+        if (\is_string($body)) {
+            return $body;
+        }
+
+        $generatorToCallable = static fn (\Generator $body): \Closure =&gt; static function () use ($body) {
+            while ($body-&gt;valid()) {
+                $chunk = $body-&gt;current();
+                $body-&gt;next();
+
+                if (&#039;&#039; !== $chunk) {
+                    return $chunk;
+                }
+            }
+
+            return &#039;&#039;;
+        };
+
+        if ($body instanceof \Generator) {
+            return $generatorToCallable($body);
+        }
+
+        if ($body instanceof \Traversable) {
+            return $generatorToCallable((static function ($body) { yield from $body; })($body));
+        }
+
+        if ($body instanceof \Closure) {
+            $r = new \ReflectionFunction($body);
+            $body = $r-&gt;getClosure();
+
+            if ($r-&gt;isGenerator()) {
+                $body = $body(self::$CHUNK_SIZE);
+
+                return $generatorToCallable($body);
+            }
+
+            return $body;
+        }
+
+        if (!\is_array(@stream_get_meta_data($body))) {
+            throw new InvalidArgumentException(\sprintf(&#039;Option &quot;body&quot; must be string, stream resource, iterable or callable, &quot;%s&quot; given.&#039;, get_debug_type($body)));
+        }
+
+        return $body;
+    }
+
+    private static function dechunk(string $body): string
+    {
+        $h = fopen(&#039;php://temp&#039;, &#039;w+&#039;);
+        stream_filter_append($h, &#039;dechunk&#039;, \STREAM_FILTER_WRITE);
+        fwrite($h, $body);
+        $body = stream_get_contents($h, -1, 0);
+        rewind($h);
+        ftruncate($h, 0);
+
+        if (fwrite($h, &#039;-&#039;) &amp;&amp; &#039;&#039; !== stream_get_contents($h, -1, 0)) {
+            throw new TransportException(&#039;Request body has broken chunked encoding.&#039;);
+        }
+
+        return $body;
+    }
+
+    /**
+     * @throws InvalidArgumentException When an invalid fingerprint is passed
+     */
+    private static function normalizePeerFingerprint(mixed $fingerprint): array
+    {
+        if (\is_string($fingerprint)) {
+            $fingerprint = match (\strlen($fingerprint = str_replace(&#039;:&#039;, &#039;&#039;, $fingerprint))) {
+                32 =&gt; [&#039;md5&#039; =&gt; $fingerprint],
+                40 =&gt; [&#039;sha1&#039; =&gt; $fingerprint],
+                44 =&gt; [&#039;pin-sha256&#039; =&gt; [$fingerprint]],
+                64 =&gt; [&#039;sha256&#039; =&gt; $fingerprint],
+                default =&gt; throw new InvalidArgumentException(\sprintf(&#039;Cannot auto-detect fingerprint algorithm for &quot;%s&quot;.&#039;, $fingerprint)),
+            };
+        } elseif (\is_array($fingerprint)) {
+            foreach ($fingerprint as $algo =&gt; $hash) {
+                $fingerprint[$algo] = &#039;pin-sha256&#039; === $algo ? (array) $hash : str_replace(&#039;:&#039;, &#039;&#039;, $hash);
+            }
+        } else {
+            throw new InvalidArgumentException(\sprintf(&#039;Option &quot;peer_fingerprint&quot; must be string or array, &quot;%s&quot; given.&#039;, get_debug_type($fingerprint)));
+        }
+
+        return $fingerprint;
+    }
+
+    /**
+     * @throws InvalidArgumentException When the value cannot be json-encoded
+     */
+    private static function jsonEncode(mixed $value, ?int $flags = null, int $maxDepth = 512): string
+    {
+        $flags ??= \JSON_HEX_TAG | \JSON_HEX_APOS | \JSON_HEX_AMP | \JSON_HEX_QUOT | \JSON_PRESERVE_ZERO_FRACTION;
+
+        try {
+            $value = json_encode($value, $flags | \JSON_THROW_ON_ERROR, $maxDepth);
+        } catch (\JsonException $e) {
+            throw new InvalidArgumentException(&#039;Invalid value for &quot;json&quot; option: &#039;.$e-&gt;getMessage());
+        }
+
+        return $value;
+    }
+
+    /**
+     * Resolves a URL against a base URI.
+     *
+     * @see https://tools.ietf.org/html/rfc3986#section-5.2.2
+     *
+     * @throws InvalidArgumentException When an invalid URL is passed
+     */
+    private static function resolveUrl(array $url, ?array $base, array $queryDefaults = []): array
+    {
+        $givenUrl = $url;
+
+        if (null !== $base &amp;&amp; &#039;&#039; === ($base[&#039;scheme&#039;] ?? &#039;&#039;).($base[&#039;authority&#039;] ?? &#039;&#039;)) {
+            throw new InvalidArgumentException(\sprintf(&#039;Invalid &quot;base_uri&quot; option: host or scheme is missing in &quot;%s&quot;.&#039;, implode(&#039;&#039;, $base)));
+        }
+
+        if (null === $url[&#039;scheme&#039;] &amp;&amp; (null === $base || null === $base[&#039;scheme&#039;])) {
+            throw new InvalidArgumentException(\sprintf(&#039;Invalid URL: scheme is missing in &quot;%s&quot;. Did you forget to add &quot;http(s)://&quot;?&#039;, implode(&#039;&#039;, $base ?? $url)));
+        }
+
+        if (null === $base &amp;&amp; &#039;&#039; === $url[&#039;scheme&#039;].$url[&#039;authority&#039;]) {
+            throw new InvalidArgumentException(\sprintf(&#039;Invalid URL: no &quot;base_uri&quot; option was provided and host or scheme is missing in &quot;%s&quot;.&#039;, implode(&#039;&#039;, $url)));
+        }
+
+        if (null !== $url[&#039;scheme&#039;]) {
+            $url[&#039;path&#039;] = self::removeDotSegments($url[&#039;path&#039;] ?? &#039;&#039;);
+        } else {
+            if (null !== $url[&#039;authority&#039;]) {
+                $url[&#039;path&#039;] = self::removeDotSegments($url[&#039;path&#039;] ?? &#039;&#039;);
+            } else {
+                if (null === $url[&#039;path&#039;]) {
+                    $url[&#039;path&#039;] = $base[&#039;path&#039;];
+                    $url[&#039;query&#039;] ??= $base[&#039;query&#039;];
+                } else {
+                    if (&#039;/&#039; !== $url[&#039;path&#039;][0]) {
+                        if (null === $base[&#039;path&#039;]) {
+                            $url[&#039;path&#039;] = &#039;/&#039;.$url[&#039;path&#039;];
+                        } else {
+                            $segments = explode(&#039;/&#039;, $base[&#039;path&#039;]);
+                            array_splice($segments, -1, 1, [$url[&#039;path&#039;]]);
+                            $url[&#039;path&#039;] = implode(&#039;/&#039;, $segments);
+                        }
+                    }
+
+                    $url[&#039;path&#039;] = self::removeDotSegments($url[&#039;path&#039;]);
+                }
+
+                $url[&#039;authority&#039;] = $base[&#039;authority&#039;];
+
+                if ($queryDefaults) {
+                    $url[&#039;query&#039;] = &#039;?&#039;.self::mergeQueryString(substr($url[&#039;query&#039;] ?? &#039;&#039;, 1), $queryDefaults, false);
+                }
+            }
+
+            $url[&#039;scheme&#039;] = $base[&#039;scheme&#039;];
+        }
+
+        if (&#039;&#039; === ($url[&#039;path&#039;] ?? &#039;&#039;)) {
+            $url[&#039;path&#039;] = &#039;/&#039;;
+        }
+
+        if (&#039;?&#039; === ($url[&#039;query&#039;] ?? &#039;&#039;)) {
+            $url[&#039;query&#039;] = null;
+        }
+
+        if (null !== $url[&#039;scheme&#039;] &amp;&amp; null === $url[&#039;authority&#039;]) {
+            throw new InvalidArgumentException(\sprintf(&#039;Invalid URL: host is missing in &quot;%s&quot;.&#039;, implode(&#039;&#039;, $givenUrl)));
+        }
+
+        return $url;
+    }
+
+    /**
+     * Parses a URL and fixes its encoding if needed.
+     *
+     * @throws InvalidArgumentException When an invalid URL is passed
+     */
+    private static function parseUrl(string $url, array $query = [], array $allowedSchemes = [&#039;http&#039; =&gt; 80, &#039;https&#039; =&gt; 443]): array
+    {
+        if (false !== ($i = strpos($url, &#039;\\&#039;)) &amp;&amp; $i &lt; strcspn($url, &#039;?#&#039;)) {
+            throw new InvalidArgumentException(\sprintf(&#039;Malformed URL &quot;%s&quot;: backslashes are not allowed.&#039;, $url));
+        }
+        if (\strlen($url) !== strcspn($url, &quot;\r\n\t&quot;)) {
+            throw new InvalidArgumentException(\sprintf(&#039;Malformed URL &quot;%s&quot;: CR/LF/TAB characters are not allowed.&#039;, $url));
+        }
+        if (&#039;&#039; !== $url &amp;&amp; (\ord($url[0]) &lt;= 32 || \ord($url[-1]) &lt;= 32)) {
+            throw new InvalidArgumentException(\sprintf(&#039;Malformed URL &quot;%s&quot;: leading/trailing ASCII control characters or spaces are not allowed.&#039;, $url));
+        }
+
+        $tail = &#039;&#039;;
+
+        if (false === $parts = parse_url(\strlen($url) !== strcspn($url, &#039;?#&#039;) ? $url : $url.$tail = &#039;#&#039;)) {
+            throw new InvalidArgumentException(\sprintf(&#039;Malformed URL &quot;%s&quot;.&#039;, $url));
+        }
+
+        if ($query) {
+            $parts[&#039;query&#039;] = self::mergeQueryString($parts[&#039;query&#039;] ?? null, $query, true);
+        }
+
+        $scheme = $parts[&#039;scheme&#039;] ?? null;
+        $host = $parts[&#039;host&#039;] ?? null;
+
+        if (!$scheme &amp;&amp; $host &amp;&amp; !str_starts_with($url, &#039;//&#039;)) {
+            $parts = parse_url(&#039;:/&#039;.$url.$tail);
+            $parts[&#039;path&#039;] = substr($parts[&#039;path&#039;], 2);
+            $scheme = $host = null;
+        }
+
+        $port = $parts[&#039;port&#039;] ?? 0;
+
+        if (null !== $scheme) {
+            if (!isset($allowedSchemes[$scheme = strtolower($scheme)])) {
+                throw new InvalidArgumentException(\sprintf(&#039;Unsupported scheme in &quot;%s&quot;: &quot;%s&quot; expected.&#039;, $url, implode(&#039;&quot; or &quot;&#039;, array_keys($allowedSchemes))));
+            }
+
+            $port = $allowedSchemes[$scheme] === $port ? 0 : $port;
+            $scheme .= &#039;:&#039;;
+        }
+
+        if (null !== $host) {
+            if (!\defined(&#039;INTL_IDNA_VARIANT_UTS46&#039;) &amp;&amp; preg_match(&#039;/[\x80-\xFF]/&#039;, $host)) {
+                throw new InvalidArgumentException(\sprintf(&#039;Unsupported IDN &quot;%s&quot;, try enabling the &quot;intl&quot; PHP extension or running &quot;composer require symfony/polyfill-intl-idn&quot;.&#039;, $host));
+            }
+
+            $host = \defined(&#039;INTL_IDNA_VARIANT_UTS46&#039;) ? idn_to_ascii($host, \IDNA_DEFAULT | \IDNA_USE_STD3_RULES | \IDNA_CHECK_BIDI | \IDNA_CHECK_CONTEXTJ | \IDNA_NONTRANSITIONAL_TO_ASCII, \INTL_IDNA_VARIANT_UTS46) ?: strtolower($host) : strtolower($host);
+            $host .= $port ? &#039;:&#039;.$port : &#039;&#039;;
+        }
+
+        foreach ([&#039;user&#039;, &#039;pass&#039;, &#039;path&#039;, &#039;query&#039;, &#039;fragment&#039;] as $part) {
+            if (!isset($parts[$part])) {
+                continue;
+            }
+
+            if (str_contains($parts[$part], &#039;%&#039;)) {
+                // https://tools.ietf.org/html/rfc3986#section-2.3
+                $parts[$part] = preg_replace_callback(&#039;/%(?:2[DE]|3[0-9]|[46][1-9A-F]|5F|[57][0-9A]|7E)++/i&#039;, fn ($m) =&gt; rawurldecode($m[0]), $parts[$part]);
+            }
+
+            // https://tools.ietf.org/html/rfc3986#section-3.3
+            $parts[$part] = preg_replace_callback(&quot;#[^-A-Za-z0-9._~!$&amp;/&#039;()[\]*+,;=:@{}%]++#&quot;, fn ($m) =&gt; rawurlencode($m[0]), $parts[$part]);
+        }
+
+        return [
+            &#039;scheme&#039; =&gt; $scheme,
+            &#039;authority&#039; =&gt; null !== $host ? &#039;//&#039;.(isset($parts[&#039;user&#039;]) ? $parts[&#039;user&#039;].(isset($parts[&#039;pass&#039;]) ? &#039;:&#039;.$parts[&#039;pass&#039;] : &#039;&#039;).&#039;@&#039; : &#039;&#039;).$host : null,
+            &#039;path&#039; =&gt; isset($parts[&#039;path&#039;][0]) ? $parts[&#039;path&#039;] : null,
+            &#039;query&#039; =&gt; isset($parts[&#039;query&#039;]) ? &#039;?&#039;.$parts[&#039;query&#039;] : null,
+            &#039;fragment&#039; =&gt; isset($parts[&#039;fragment&#039;]) &amp;&amp; !$tail ? &#039;#&#039;.$parts[&#039;fragment&#039;] : null,
+        ];
+    }
+
+    /**
+     * Removes dot-segments from a path.
+     *
+     * @see https://tools.ietf.org/html/rfc3986#section-5.2.4
+     */
+    private static function removeDotSegments(string $path): string
+    {
+        $result = &#039;&#039;;
+
+        while (!\in_array($path, [&#039;&#039;, &#039;.&#039;, &#039;..&#039;], true)) {
+            if (&#039;.&#039; === $path[0] &amp;&amp; (str_starts_with($path, $p = &#039;../&#039;) || str_starts_with($path, $p = &#039;./&#039;))) {
+                $path = substr($path, \strlen($p));
+            } elseif (&#039;/.&#039; === $path || str_starts_with($path, &#039;/./&#039;)) {
+                $path = substr_replace($path, &#039;/&#039;, 0, 3);
+            } elseif (&#039;/..&#039; === $path || str_starts_with($path, &#039;/../&#039;)) {
+                $i = strrpos($result, &#039;/&#039;);
+                $result = $i ? substr($result, 0, $i) : &#039;&#039;;
+                $path = substr_replace($path, &#039;/&#039;, 0, 4);
+            } else {
+                $i = strpos($path, &#039;/&#039;, 1) ?: \strlen($path);
+                $result .= substr($path, 0, $i);
+                $path = substr($path, $i);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Merges and encodes a query array with a query string.
+     *
+     * @throws InvalidArgumentException When an invalid query-string value is passed
+     */
+    private static function mergeQueryString(?string $queryString, array $queryArray, bool $replace): ?string
+    {
+        if (!$queryArray) {
+            return $queryString;
+        }
+
+        $query = [];
+
+        if (null !== $queryString) {
+            foreach (explode(&#039;&amp;&#039;, $queryString) as $v) {
+                if (&#039;&#039; !== $v) {
+                    $k = urldecode(explode(&#039;=&#039;, $v, 2)[0]);
+                    $query[$k] = (isset($query[$k]) ? $query[$k].&#039;&amp;&#039; : &#039;&#039;).$v;
+                }
+            }
+        }
+
+        if ($replace) {
+            foreach ($queryArray as $k =&gt; $v) {
+                if (null === $v) {
+                    unset($query[$k]);
+                }
+            }
+        }
+
+        $queryString = http_build_query($queryArray, &#039;&#039;, &#039;&amp;&#039;, \PHP_QUERY_RFC3986);
+        $queryArray = [];
+
+        if ($queryString) {
+            if (str_contains($queryString, &#039;%&#039;)) {
+                // https://tools.ietf.org/html/rfc3986#section-2.3 + some chars not encoded by browsers
+                $queryString = strtr($queryString, [
+                    &#039;%21&#039; =&gt; &#039;!&#039;,
+                    &#039;%24&#039; =&gt; &#039;$&#039;,
+                    &#039;%28&#039; =&gt; &#039;(&#039;,
+                    &#039;%29&#039; =&gt; &#039;)&#039;,
+                    &#039;%2A&#039; =&gt; &#039;*&#039;,
+                    &#039;%2F&#039; =&gt; &#039;/&#039;,
+                    &#039;%3A&#039; =&gt; &#039;:&#039;,
+                    &#039;%3B&#039; =&gt; &#039;;&#039;,
+                    &#039;%40&#039; =&gt; &#039;@&#039;,
+                    &#039;%5B&#039; =&gt; &#039;[&#039;,
+                    &#039;%5D&#039; =&gt; &#039;]&#039;,
+                ]);
+            }
+
+            foreach (explode(&#039;&amp;&#039;, $queryString) as $v) {
+                $queryArray[rawurldecode(explode(&#039;=&#039;, $v, 2)[0])] = $v;
+            }
+        }
+
+        return implode(&#039;&amp;&#039;, $replace ? array_replace($query, $queryArray) : ($query + $queryArray));
+    }
+
+    /**
+     * Loads proxy configuration from the same environment variables as curl when no proxy is explicitly set.
+     */
+    private static function getProxy(?string $proxy, array $url, ?string $noProxy): ?array
+    {
+        if (null === $proxy = self::getProxyUrl($proxy, $url)) {
+            return null;
+        }
+
+        $proxy = (parse_url($proxy) ?: []) + [&#039;scheme&#039; =&gt; &#039;http&#039;];
+
+        if (!isset($proxy[&#039;host&#039;])) {
+            throw new TransportException(&#039;Invalid HTTP proxy: host is missing.&#039;);
+        }
+
+        if (&#039;http&#039; === $proxy[&#039;scheme&#039;]) {
+            $proxyUrl = &#039;tcp://&#039;.$proxy[&#039;host&#039;].&#039;:&#039;.($proxy[&#039;port&#039;] ?? &#039;80&#039;);
+        } elseif (&#039;https&#039; === $proxy[&#039;scheme&#039;]) {
+            $proxyUrl = &#039;ssl://&#039;.$proxy[&#039;host&#039;].&#039;:&#039;.($proxy[&#039;port&#039;] ?? &#039;443&#039;);
+        } else {
+            throw new TransportException(\sprintf(&#039;Unsupported proxy scheme &quot;%s&quot;: &quot;http&quot; or &quot;https&quot; expected.&#039;, $proxy[&#039;scheme&#039;]));
+        }
+
+        $noProxy ??= $_SERVER[&#039;no_proxy&#039;] ?? $_SERVER[&#039;NO_PROXY&#039;] ?? &#039;&#039;;
+        $noProxy = $noProxy ? preg_split(&#039;/[\s,]+/&#039;, $noProxy) : [];
+
+        return [
+            &#039;url&#039; =&gt; $proxyUrl,
+            &#039;auth&#039; =&gt; isset($proxy[&#039;user&#039;]) ? &#039;Basic &#039;.base64_encode(rawurldecode($proxy[&#039;user&#039;]).&#039;:&#039;.rawurldecode($proxy[&#039;pass&#039;] ?? &#039;&#039;)) : null,
+            &#039;no_proxy&#039; =&gt; $noProxy,
+        ];
+    }
+
+    private static function getProxyUrl(?string $proxy, array $url): ?string
+    {
+        if (null !== $proxy) {
+            return $proxy;
+        }
+
+        // Ignore HTTP_PROXY except on the CLI to work around httpoxy set of vulnerabilities
+        $proxy = $_SERVER[&#039;http_proxy&#039;] ?? (\in_array(\PHP_SAPI, [&#039;cli&#039;, &#039;phpdbg&#039;], true) ? $_SERVER[&#039;HTTP_PROXY&#039;] ?? null : null) ?? $_SERVER[&#039;all_proxy&#039;] ?? $_SERVER[&#039;ALL_PROXY&#039;] ?? null;
+
+        if (&#039;https:&#039; === $url[&#039;scheme&#039;]) {
+            $proxy = $_SERVER[&#039;https_proxy&#039;] ?? $_SERVER[&#039;HTTPS_PROXY&#039;] ?? $proxy;
+        }
+
+        return $proxy;
+    }
+
+    private static function shouldBuffer(array $headers): bool
+    {
+        if (null === $contentType = $headers[&#039;content-type&#039;][0] ?? null) {
+            return false;
+        }
+
+        if (false !== $i = strpos($contentType, &#039;;&#039;)) {
+            $contentType = substr($contentType, 0, $i);
+        }
+
+        return $contentType &amp;&amp; preg_match(&#039;#^(?:text/|application/(?:.+\+)?(?:json|xml)$)#i&#039;, $contentType);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/HttpOptions.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Caching -->
+
+</body>
+</html>

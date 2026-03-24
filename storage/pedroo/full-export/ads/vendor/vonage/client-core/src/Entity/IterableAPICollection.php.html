@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/vonage/client-core/src/Entity/IterableAPICollection.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Vonage\Entity;
+
+use Countable;
+use Iterator;
+use Laminas\Diactoros\Request;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Message\ResponseInterface;
+use RuntimeException;
+use Vonage\Client;
+use Vonage\Client\APIResource;
+use Vonage\Client\ClientAwareInterface;
+use Vonage\Client\ClientAwareTrait;
+use Vonage\Client\Exception as ClientException;
+use Vonage\Client\Exception\Exception;
+use Vonage\Client\Exception\Server;
+use Vonage\Entity\Filter\EmptyFilter;
+use Vonage\Entity\Filter\FilterInterface;
+
+use function array_key_exists;
+use function array_merge;
+use function count;
+use function filter_var;
+use function http_build_query;
+use function is_null;
+use function json_decode;
+use function md5;
+
+/**
+ * Common code for iterating over a collection, and using the collection class to discover the API path.
+ */
+class IterableAPICollection implements ClientAwareInterface, Iterator, Countable
+{
+    use ClientAwareTrait;
+
+    protected APIResource $api;
+
+    /**
+     * This allows for override if the endpoint API uÏses a different query key
+     */
+    protected string $pageIndexKey = &#039;page_index&#039;;
+
+    /**
+     * This allows for override if the endpoint API uses a different query key
+     */
+    protected string $pageSizeKey = &#039;page_size&#039;;
+
+    /**
+     * Determines if the collection will automatically go to the next page
+     */
+    protected bool $autoAdvance = true;
+
+    protected string $baseUrl = Client::BASE_API;
+
+    /**
+     * Holds a cache of various pages we have already polled
+     *
+     * @var array&lt;string, string&gt;
+     */
+    protected array $cache = [];
+
+    /**
+     * Index of the current resource of the current page
+     */
+    protected int $current = 0;
+
+    /**
+     * Count the items in the response instead of returning the count parameter
+     *
+     * @deprected This exists for legacy reasons, will be removed in v3
+     *
+     * @var bool
+     */
+    protected bool $naiveCount = false;
+
+    /**
+     * Current page data.
+     */
+    protected ?array $pageData = null;
+
+    /**
+     * Last API Response
+     */
+    protected ?ResponseInterface $response = null;
+
+    /**
+     * User set page index.
+     */
+    protected ?int $index = 1;
+
+    protected bool $isHAL = true;
+
+    /**
+     * Used to override the index, this is to hack inconsistent API behaviours
+     */
+    protected bool $noIndex = false;
+
+    /**
+     * Used if there are HAL elements, but entities are all in one request
+     * Specifically removes automatic pagination that adds request parameters
+     */
+    protected bool $noQueryParameters = false;
+
+    /**
+     * User set pgge size.
+     */
+    protected ?int $size = null;
+
+    protected ?FilterInterface $filter = null;
+
+    /**
+     * Used when HAL convention is used, but there is no collection name in the result
+     */
+    protected bool $halNoCollection = false;
+
+    protected $hydrator;
+
+    /**
+     * Used to override pagination to remove it from the URL page query
+     * but differs from noQueryParameters when you want to use other filters
+     */
+    protected bool $hasPagination = true;
+
+    public function isHalNoCollection(): bool
+    {
+        return $this-&gt;halNoCollection;
+    }
+
+    public function setHalNoCollection(bool $halNoCollection): IterableAPICollection
+    {
+        $this-&gt;halNoCollection = $halNoCollection;
+
+        return $this;
+    }
+
+    public function getPageIndexKey(): string
+    {
+        return $this-&gt;pageIndexKey;
+    }
+
+    public function setPageIndexKey(string $pageIndexKey): IterableAPICollection
+    {
+        $this-&gt;pageIndexKey = $pageIndexKey;
+
+        return $this;
+    }
+
+    public function getPageSizeKey(): string
+    {
+        return $this-&gt;pageSizeKey;
+    }
+
+    public function setPageSizeKey(string $pageSizeKey): IterableAPICollection
+    {
+        $this-&gt;pageSizeKey = $pageSizeKey;
+
+        return $this;
+    }
+
+    /**
+     * @param $hydrator
+     *
+     * @return $this
+     */
+    public function setHydrator($hydrator): self
+    {
+        $this-&gt;hydrator = $hydrator;
+        return $this;
+    }
+
+    /**
+     * @param $data
+     * @param $id deprecated
+     */
+    public function hydrateEntity($data, $id = null)
+    {
+        if ($this-&gt;hydrator) {
+            return $this-&gt;hydrator-&gt;hydrate($data);
+        }
+
+        return $data;
+    }
+
+    public function getResourceRoot(): array
+    {
+        // Handles issues where an API returns empty for no results, as opposed
+        // to a proper API response with a count field of 0
+        if (empty($this-&gt;pageData)) {
+            return [];
+        }
+
+        $collectionName = $this-&gt;getApiResource()-&gt;getCollectionName();
+
+        if ($this-&gt;getApiResource()-&gt;isHAL()) {
+            if ($this-&gt;isHalNoCollection() === true) {
+                return $this-&gt;pageData[&#039;_embedded&#039;];
+            }
+
+            return $this-&gt;pageData[&#039;_embedded&#039;][$collectionName];
+        }
+
+        if (!empty($this-&gt;getApiResource()-&gt;getCollectionName())) {
+            return $this-&gt;pageData[$collectionName];
+        }
+
+        return $this-&gt;pageData;
+    }
+
+    /**
+     * Return the current item, expects concrete collection to handle creating the object.
+     *
+     * @throws ClientExceptionInterface
+     * @throws ClientException\Exception
+     * @throws ClientException\Request
+     * @throws ClientException\Server
+     */
+    #[\ReturnTypeWillChange]
+    public function current()
+    {
+        if (is_null($this-&gt;current)) {
+            $this-&gt;rewind();
+        }
+
+        return $this-&gt;hydrateEntity($this-&gt;getResourceRoot()[$this-&gt;current], $this-&gt;key());
+    }
+
+    /**
+     * No checks here, just advance the index.
+     */
+    public function next(): void
+    {
+        $this-&gt;current++;
+    }
+
+    /**
+     * Return the ID of the resource, in some cases this is `id`, in others `uuid`.
+     *
+     * @return string
+     */
+    #[\ReturnTypeWillChange]
+    public function key()
+    {
+        return
+            $this-&gt;getResourceRoot()[$this-&gt;current][&#039;id&#039;] ??
+            $this-&gt;getResourceRoot()[$this-&gt;current][&#039;uuid&#039;] ??
+            $this-&gt;current;
+    }
+
+    /**
+     * Handle pagination automatically (unless configured not to).
+     *
+     * @throws ClientExceptionInterface
+     * @throws ClientException\Exception
+     * @throws ClientException\Request
+     * @throws ClientException\Server
+     */
+    public function valid(): bool
+    {
+        //can&#039;t be valid if there&#039;s not a page (rewind sets this)
+        if (!isset($this-&gt;pageData)) {
+            return false;
+        }
+
+        //all hal collections have an `_embedded` object, we expect there to be a property matching the collection name
+        if (
+            $this-&gt;isHalNoCollection() === false &amp;&amp;
+            $this-&gt;getApiResource()-&gt;isHAL() &amp;&amp;
+            !isset($this-&gt;pageData[&#039;_embedded&#039;][$this-&gt;getApiResource()-&gt;getCollectionName()])
+        ) {
+            return false;
+        }
+
+        //if we have a page with no items, we&#039;ve gone beyond the end of the collection
+        if (!count($this-&gt;getResourceRoot())) {
+            return false;
+        }
+
+        // If there is no item at the current counter, we&#039;ve gone beyond the end of this page
+        if (!$this-&gt;getAutoAdvance() &amp;&amp; !isset($this-&gt;getResourceRoot()[$this-&gt;current])) {
+            return false;
+        }
+
+        //index the start of a page at 0
+        if (is_null($this-&gt;current)) {
+            $this-&gt;current = 0;
+        }
+
+        //if our current index is past the current page, fetch the next page if possible and reset the index
+        if ($this-&gt;getAutoAdvance() &amp;&amp; !isset($this-&gt;getResourceRoot()[$this-&gt;current])) {
+            if (isset($this-&gt;pageData[&#039;_links&#039;])) {
+                if (isset($this-&gt;pageData[&#039;_links&#039;][&#039;next&#039;])) {
+                    $this-&gt;fetchPage($this-&gt;pageData[&#039;_links&#039;][&#039;next&#039;][&#039;href&#039;]);
+                    $this-&gt;current = 0;
+
+                    return true;
+                }
+                // We don&#039;t have a next page, so we&#039;re done
+                return false;
+            }
+
+            if ($this-&gt;current === count($this-&gt;getResourceRoot())) {
+                $this-&gt;index++;
+                $this-&gt;current = 0;
+                $this-&gt;fetchPage($this-&gt;getApiResource()-&gt;getBaseUri());
+
+                return !($this-&gt;count() === 0);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Fetch the initial page
+     *
+     * @throws ClientExceptionInterface
+     * @throws ClientException\Exception
+     * @throws ClientException\Request
+     * @throws ClientException\Server
+     */
+    public function rewind(): void
+    {
+        $this-&gt;current = 0;
+        $this-&gt;fetchPage($this-&gt;getApiResource()-&gt;getBaseUri());
+    }
+
+    /**
+     * @return $this
+     */
+    public function setApiResource(APIResource $api): self
+    {
+        $this-&gt;api = $api;
+
+        return $this;
+    }
+
+    public function getApiResource(): APIResource
+    {
+        return $this-&gt;api;
+    }
+
+    /**
+     * Count of total items
+     *
+     * @throws ClientExceptionInterface
+     * @throws ClientException\Exception
+     * @throws ClientException\Request
+     * @throws ClientException\Server
+     */
+    public function count(): int
+    {
+        if (!isset($this-&gt;pageData)) {
+            $this-&gt;rewind();
+        }
+
+        if (isset($this-&gt;pageData)) {
+            // Force counting the items for legacy reasons
+            if ($this-&gt;getNaiveCount()) {
+                return count($this-&gt;getResourceRoot());
+            }
+
+            if (array_key_exists(&#039;total_items&#039;, $this-&gt;pageData)) {
+                return $this-&gt;pageData[&#039;total_items&#039;];
+            }
+
+            if (array_key_exists(&#039;count&#039;, $this-&gt;pageData)) {
+                return $this-&gt;pageData[&#039;count&#039;];
+            }
+
+            return count($this-&gt;getResourceRoot());
+        }
+
+        return 0;
+    }
+
+    /**
+     * @return $this
+     */
+    public function setBaseUrl(string $url): self
+    {
+        $this-&gt;baseUrl = $url;
+
+        return $this;
+    }
+
+    /**
+     * @param $index
+     *
+     * @return $this
+     */
+    public function setPage($index): self
+    {
+        $this-&gt;index = (int)$index;
+
+        return $this;
+    }
+
+    /**
+     * @return int|mixed
+     */
+    public function getPage(): mixed
+    {
+        if (isset($this-&gt;pageData)) {
+            if (array_key_exists(&#039;page&#039;, $this-&gt;pageData)) {
+                return $this-&gt;pageData[&#039;page&#039;];
+            }
+
+            return $this-&gt;pageData[&#039;page_index&#039;];
+        }
+
+        if (isset($this-&gt;index)) {
+            return $this-&gt;index;
+        }
+
+        throw new RuntimeException(&#039;page not set&#039;);
+    }
+
+    /**
+     * @throws ClientExceptionInterface
+     * @throws ClientException\Exception
+     * @throws ClientException\Request
+     * @throws ClientException\Server
+     */
+    public function getPageData(): ?array
+    {
+        if (is_null($this-&gt;pageData)) {
+            $this-&gt;rewind();
+        }
+
+        return $this-&gt;pageData;
+    }
+
+    public function setPageData(array $data): void
+    {
+        $this-&gt;pageData = $data;
+    }
+
+    /**
+     * @return int|mixed|void
+     */
+    public function getSize()
+    {
+        if (isset($this-&gt;pageData)) {
+            if (array_key_exists(&#039;page_size&#039;, $this-&gt;pageData)) {
+                return $this-&gt;pageData[&#039;page_size&#039;];
+            }
+
+            return count($this-&gt;getResourceRoot());
+        }
+
+        if (isset($this-&gt;size)) {
+            return $this-&gt;size;
+        }
+
+        throw new RuntimeException(&#039;size not set&#039;);
+    }
+
+    public function setSize($size): self
+    {
+        $this-&gt;size = (int)$size;
+
+        return $this;
+    }
+
+    /**
+     * Filters reduce to query params and include paging settings.
+     */
+    public function setFilter(FilterInterface $filter): self
+    {
+        $this-&gt;filter = $filter;
+        return $this;
+    }
+
+    public function getFilter(): FilterInterface
+    {
+        if (!isset($this-&gt;filter)) {
+            $this-&gt;setFilter(new EmptyFilter());
+        }
+
+        return $this-&gt;filter;
+    }
+
+    /**
+     * Fetch a page using the current filter if no query is provided.
+     *
+     * @throws ClientException\Exception
+     * @throws ClientException\Request
+     * @throws ClientException\Server
+     * @throws ClientExceptionInterface
+     */
+    protected function fetchPage($absoluteUri): void
+    {
+        //use filter if no query provided
+        if (!str_contains((string) $absoluteUri, &#039;?&#039;)) {
+            $originalUri = $absoluteUri;
+
+            $query = [];
+
+            if (isset($this-&gt;size)) {
+                $query[$this-&gt;pageSizeKey] = $this-&gt;size;
+            }
+
+            if (isset($this-&gt;index) &amp;&amp; $this-&gt;hasPagination()) {
+                $query[$this-&gt;pageIndexKey] = $this-&gt;index;
+            }
+
+            if (isset($this-&gt;filter)) {
+                $query = array_merge($this-&gt;filter-&gt;getQuery(), $query);
+            }
+
+            $absoluteUri .= &#039;?&#039; . http_build_query($query);
+
+            // This is an override to completely remove request parameters for single requests
+            if ($this-&gt;getNoQueryParameters()) {
+                $absoluteUri = $originalUri;
+            }
+        }
+
+        $requestUri = $absoluteUri;
+
+        if (filter_var($absoluteUri, FILTER_VALIDATE_URL) === false) {
+            $requestUri = $this-&gt;getApiResource()-&gt;getBaseUrl() . $absoluteUri;
+        }
+
+        $cacheKey = md5((string) $requestUri);
+        if (array_key_exists($cacheKey, $this-&gt;cache)) {
+            $this-&gt;pageData = $this-&gt;cache[$cacheKey];
+
+            return;
+        }
+
+        $request = new Request($requestUri, &#039;GET&#039;);
+
+        if ($this-&gt;getApiResource()-&gt;getAuthHandlers()) {
+            $request = $this-&gt;getApiResource()-&gt;addAuth($request);
+        }
+
+        $response = $this-&gt;client-&gt;send($request);
+
+        $this-&gt;getApiResource()-&gt;setLastRequest($request);
+        $this-&gt;response = $response;
+        $this-&gt;getApiResource()-&gt;setLastResponse($response);
+
+        $body = $this-&gt;response-&gt;getBody()-&gt;getContents();
+        $json = json_decode($body, true);
+        $this-&gt;cache[md5((string) $requestUri)] = $json;
+        $this-&gt;pageData = $json;
+
+        if ((int)$response-&gt;getStatusCode() !== 200) {
+            throw $this-&gt;getException($response);
+        }
+    }
+
+    protected function getException(ResponseInterface $response): ClientException\Request|ClientException\Server
+    {
+        $response-&gt;getBody()-&gt;rewind();
+        $body = json_decode($response-&gt;getBody()-&gt;getContents(), true);
+        $status = (int)$response-&gt;getStatusCode();
+
+        // Error responses aren&#039;t consistent. Some are generated within the
+        // proxy and some are generated within voice itself. This handles
+        // both cases
+
+        // This message isn&#039;t very useful, but we shouldn&#039;t ever see it
+        $errorTitle = $body[&#039;error-code-label&#039;] ?? $body[&#039;error_title&#039;] ?? $body[&#039;title&#039;] ?? &#039;Unexpected error&#039;;
+
+        if ($status &gt;= 400 &amp;&amp; $status &lt; 500) {
+            $e = new ClientException\Request($errorTitle, $status);
+        } elseif ($status &gt;= 500 &amp;&amp; $status &lt; 600) {
+            $e = new ClientException\Server($errorTitle, $status);
+        } else {
+            $e = new ClientException\Exception(&#039;Unexpected HTTP Status Code&#039;);
+            throw $e;
+        }
+
+        return $e;
+    }
+
+    public function getAutoAdvance(): bool
+    {
+        return $this-&gt;autoAdvance;
+    }
+
+    public function setAutoAdvance(bool $autoAdvance): self
+    {
+        $this-&gt;autoAdvance = $autoAdvance;
+
+        return $this;
+    }
+
+    public function getNaiveCount(): bool
+    {
+        return $this-&gt;naiveCount;
+    }
+
+    public function setNaiveCount(bool $naiveCount): self
+    {
+        $this-&gt;naiveCount = $naiveCount;
+
+        return $this;
+    }
+
+    public function setNoQueryParameters(bool $noQueryParameters): self
+    {
+        $this-&gt;noQueryParameters = $noQueryParameters;
+
+        return $this;
+    }
+
+    public function getNoQueryParameters(): bool
+    {
+        return $this-&gt;noQueryParameters;
+    }
+
+    public function setIndex(?int $index): IterableAPICollection
+    {
+        $this-&gt;index = $index;
+
+        return $this;
+    }
+
+    public function hasPagination(): bool
+    {
+        return $this-&gt;hasPagination;
+    }
+
+    public function setHasPagination(bool $hasPagination): static
+    {
+        $this-&gt;hasPagination = $hasPagination;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/vonage/client-core/src/Entity/JsonResponseTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/vonage/client-core/src/Entity/Factory -->
+
+</body>
+</html>

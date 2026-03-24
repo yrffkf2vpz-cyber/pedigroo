@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Glacier/MultipartUploader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Glacier;
+
+use Aws\CommandInterface;
+use Aws\HashingStream;
+use Aws\Multipart\AbstractUploader;
+use Aws\Multipart\UploadState;
+use Aws\PhpHash;
+use Aws\ResultInterface;
+use GuzzleHttp\Psr7;
+use Psr\Http\Message\StreamInterface as Stream;
+
+/**
+ * Encapsulates the execution of a multipart upload to Glacier.
+ */
+class MultipartUploader extends AbstractUploader
+{
+    const PART_MIN_SIZE = 1048576;
+
+    private static $validPartSizes = [
+        1048576,    //   1 MB
+        2097152,    //   2 MB
+        4194304,    //   4 MB
+        8388608,    //   8 MB
+        16777216,   //  16 MB
+        33554432,   //  32 MB
+        67108864,   //  64 MB
+        134217728,  // 128 MB
+        268435456,  // 256 MB
+        536870912,  // 512 MB
+        1073741824, //   1 GB
+        2147483648, //   2 GB
+        4294967296, //   4 GB
+    ];
+
+    /**
+     * Creates an UploadState object for a multipart upload by querying the
+     * service for the specified upload&#039;s information.
+     *
+     * @param GlacierClient $client    GlacierClient object to use.
+     * @param string        $vaultName Vault name for the multipart upload.
+     * @param string        $uploadId  Upload ID for the multipart upload.
+     * @param string        $accountId Account ID for the multipart upload.
+     *
+     * @return UploadState
+     */
+    public static function getStateFromService(
+        GlacierClient $client,
+        $vaultName,
+        $uploadId,
+        $accountId = &#039;-&#039;
+    ) {
+        $state = new UploadState([
+            &#039;accountId&#039; =&gt; $accountId,
+            &#039;vaultName&#039; =&gt; $vaultName,
+            &#039;uploadId&#039;  =&gt; $uploadId,
+        ]);
+
+        foreach ($client-&gt;getPaginator(&#039;ListParts&#039;, $state-&gt;getId()) as $result) {
+            // Get the part size from the first part in the first result.
+            if (!$state-&gt;getPartSize()) {
+                $state-&gt;setPartSize($result[&#039;PartSizeInBytes&#039;]);
+            }
+            // Mark all the parts returned by ListParts as uploaded.
+            foreach ($result[&#039;Parts&#039;] as $part) {
+                list($rangeIndex, $rangeSize) = self::parseRange(
+                    $part[&#039;RangeInBytes&#039;],
+                    $state-&gt;getPartSize()
+                );
+                $state-&gt;markPartAsUploaded($rangeIndex, [
+                    &#039;size&#039;     =&gt; $rangeSize,
+                    &#039;checksum&#039; =&gt; $part[&#039;SHA256TreeHash&#039;],
+                ]);
+            }
+        }
+
+        $state-&gt;setStatus(UploadState::INITIATED);
+
+        return $state;
+    }
+
+    /**
+     * Creates a multipart upload for a Glacier archive.
+     *
+     * The valid configuration options are as follows:
+     *
+     * - account_id: (string, default=string(&#039;-&#039;)) Account ID for the archive
+     *   being uploaded, if different from the account making the request.
+     * - archive_description: (string) Description of the archive.
+     * - before_complete: (callable) Callback to invoke before the
+     *   `CompleteMultipartUpload` operation. The callback should have a
+     *   function signature like `function (Aws\Command $command) {...}`.
+     * - before_initiate: (callable) Callback to invoke before the
+     *   `InitiateMultipartUpload` operation. The callback should have a
+     *   function signature like `function (Aws\Command $command) {...}`.
+     * - before_upload: (callable) Callback to invoke before any
+     *   `UploadMultipartPart` operations. The callback should have a function
+     *   signature like `function (Aws\Command $command) {...}`.
+     * - concurrency: (int, default=int(3)) Maximum number of concurrent
+     *   `UploadMultipartPart` operations allowed during the multipart upload.
+     * - part_size: (int, default=int(1048576)) Part size, in bytes, to use when
+     *   doing a multipart upload. This must between 1 MB and 4 GB, and must be
+     *   a power of 2 (in megabytes).
+     * - prepare_data_source: (callable) Callback to invoke before starting the
+     *   multipart upload workflow. The callback should have a function
+     *   signature like `function () {...}`.
+     * - state: (Aws\Multipart\UploadState) An object that represents the state
+     *   of the multipart upload and that is used to resume a previous upload.
+     *   When this options is provided, the `account_id`, `key`, and `part_size`
+     *   options are ignored.
+     * - vault_name: (string, required) Vault name to use for the archive being
+     *   uploaded.
+     *
+     * @param GlacierClient $client Client used for the upload.
+     * @param mixed         $source Source of the data to upload.
+     * @param array         $config Configuration used to perform the upload.
+     */
+    public function __construct(GlacierClient $client, $source, array $config = [])
+    {
+        parent::__construct($client, $source, $config + [
+            &#039;account_id&#039; =&gt; &#039;-&#039;,
+            &#039;vault_name&#039; =&gt; null,
+        ]);
+    }
+
+    protected function loadUploadWorkflowInfo()
+    {
+        return [
+            &#039;command&#039; =&gt; [
+                &#039;initiate&#039; =&gt; &#039;InitiateMultipartUpload&#039;,
+                &#039;upload&#039;   =&gt; &#039;UploadMultipartPart&#039;,
+                &#039;complete&#039; =&gt; &#039;CompleteMultipartUpload&#039;,
+            ],
+            &#039;id&#039; =&gt; [
+                &#039;account_id&#039; =&gt; &#039;accountId&#039;,
+                &#039;vault_name&#039; =&gt; &#039;vaultName&#039;,
+                &#039;upload_id&#039;  =&gt; &#039;uploadId&#039;,
+            ],
+            &#039;part_num&#039; =&gt; &#039;range&#039;,
+        ];
+    }
+
+    protected function determinePartSize()
+    {
+        // Make sure the part size is set.
+        $partSize = $this-&gt;config[&#039;part_size&#039;] ?: self::PART_MIN_SIZE;
+
+        // Ensure that the part size is valid.
+        if (!in_array($partSize, self::$validPartSizes)) {
+            throw new \InvalidArgumentException(&#039;The part_size must be a power &#039;
+                . &#039;of 2, in megabytes, such that 1 MB &lt;= PART_SIZE &lt;= 4 GB.&#039;);
+        }
+
+        return $partSize;
+    }
+
+    protected function createPart($seekable, $number)
+    {
+        $data = [];
+        $firstByte = $this-&gt;source-&gt;tell();
+
+        // Read from the source to create the body stream. This also
+        // calculates the linear and tree hashes as the data is read.
+        if ($seekable) {
+            // Case 1: Stream is seekable, can make stream from new handle.
+            $body = Psr7\Utils::tryFopen($this-&gt;source-&gt;getMetadata(&#039;uri&#039;), &#039;r&#039;);
+            $body = $this-&gt;limitPartStream(Psr7\Utils::streamFor($body));
+            // Create another stream decorated with hashing streams and read
+            // through it, so we can get the hash values for the part.
+            $decoratedBody = $this-&gt;decorateWithHashes($body, $data);
+            while (!$decoratedBody-&gt;eof()) $decoratedBody-&gt;read(1048576);
+            // Seek the original source forward to the end of the range.
+            $this-&gt;source-&gt;seek($this-&gt;source-&gt;tell() + $body-&gt;getSize());
+        } else {
+            // Case 2: Stream is not seekable, must store part in temp stream.
+            $source = $this-&gt;limitPartStream($this-&gt;source);
+            $source = $this-&gt;decorateWithHashes($source, $data);
+            $body = Psr7\Utils::streamFor();
+            Psr7\Utils::copyToStream($source, $body);
+        }
+
+        // Do not create a part if the body size is zero.
+        if ($body-&gt;getSize() === 0) {
+            return false;
+        }
+
+        $body-&gt;seek(0);
+        $data[&#039;body&#039;] = $body;
+        $lastByte = $this-&gt;source-&gt;tell() - 1;
+        $data[&#039;range&#039;] = &quot;bytes {$firstByte}-{$lastByte}/*&quot;;
+
+        return $data;
+    }
+
+    protected function handleResult(CommandInterface $command, ResultInterface $result)
+    {
+        list($rangeIndex, $rangeSize) = $this-&gt;parseRange(
+            $command[&#039;range&#039;],
+            $this-&gt;state-&gt;getPartSize()
+        );
+
+        $this-&gt;state-&gt;markPartAsUploaded($rangeIndex, [
+            &#039;size&#039;     =&gt; $rangeSize,
+            &#039;checksum&#039; =&gt; $command[&#039;checksum&#039;]
+        ]);
+    }
+
+    protected function getInitiateParams()
+    {
+        $params = [&#039;partSize&#039; =&gt; $this-&gt;state-&gt;getPartSize()];
+        if (isset($this-&gt;config[&#039;archive_description&#039;])) {
+            $params[&#039;archiveDescription&#039;] = $this-&gt;config[&#039;archive_description&#039;];
+        }
+
+        return $params;
+    }
+
+    protected function getCompleteParams()
+    {
+        $treeHash = new TreeHash();
+        $archiveSize = 0;
+        foreach ($this-&gt;state-&gt;getUploadedParts() as $part) {
+            $archiveSize += $part[&#039;size&#039;];
+            $treeHash-&gt;addChecksum($part[&#039;checksum&#039;]);
+        }
+
+        return [
+            &#039;archiveSize&#039; =&gt; $archiveSize,
+            &#039;checksum&#039;    =&gt; bin2hex($treeHash-&gt;complete()),
+        ];
+    }
+
+    /**
+     * Decorates a stream with a tree AND linear sha256 hashing stream.
+     *
+     * @param Stream $stream Stream to decorate.
+     * @param array  $data   Data bag that results are injected into.
+     *
+     * @return Stream
+     */
+    private function decorateWithHashes(Stream $stream, array &amp;$data)
+    {
+        // Make sure that a tree hash is calculated.
+        $stream = new HashingStream($stream, new TreeHash(),
+            function ($result) use (&amp;$data) {
+                $data[&#039;checksum&#039;] = bin2hex($result);
+            }
+        );
+
+        // Make sure that a linear SHA256 hash is calculated.
+        $stream = new HashingStream($stream, new PhpHash(&#039;sha256&#039;),
+            function ($result) use (&amp;$data) {
+                $data[&#039;ContentSHA256&#039;] = bin2hex($result);
+            }
+        );
+
+        return $stream;
+    }
+
+    /**
+     * Parses a Glacier range string into a size and part number.
+     *
+     * @param string $range    Glacier range string (e.g., &quot;bytes 5-5000/*&quot;)
+     * @param int    $partSize The chosen part size
+     *
+     * @return array
+     */
+    private static function parseRange($range, $partSize)
+    {
+        // Strip away the prefix and suffix.
+        if (strpos($range, &#039;bytes&#039;) !== false) {
+            $range = substr($range, 6, -2);
+        }
+
+        // Split that range into it&#039;s parts.
+        list($firstByte, $lastByte) = explode(&#039;-&#039;, $range);
+
+        // Calculate and return range index and range size
+        return [
+            intval($firstByte / $partSize) + 1,
+            $lastByte - $firstByte + 1,
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Glacier/TreeHash.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Glacier/Exception -->
+
+</body>
+</html>

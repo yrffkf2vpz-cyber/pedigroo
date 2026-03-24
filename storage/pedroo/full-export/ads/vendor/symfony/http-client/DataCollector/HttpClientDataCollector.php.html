@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/DataCollector/HttpClientDataCollector.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\DataCollector;
+
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\HttpClientTrait;
+use Symfony\Component\HttpClient\TraceableHttpClient;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\DataCollector\DataCollector;
+use Symfony\Component\HttpKernel\DataCollector\LateDataCollectorInterface;
+use Symfony\Component\Process\Process;
+use Symfony\Component\VarDumper\Caster\ImgStub;
+
+/**
+ * @author Jérémy Romey &lt;jeremy@free-agent.fr&gt;
+ */
+final class HttpClientDataCollector extends DataCollector implements LateDataCollectorInterface
+{
+    use HttpClientTrait;
+
+    /**
+     * @var TraceableHttpClient[]
+     */
+    private array $clients = [];
+
+    public function registerClient(string $name, TraceableHttpClient $client): void
+    {
+        $this-&gt;clients[$name] = $client;
+    }
+
+    public function collect(Request $request, Response $response, ?\Throwable $exception = null): void
+    {
+        $this-&gt;lateCollect();
+    }
+
+    public function lateCollect(): void
+    {
+        $this-&gt;data[&#039;request_count&#039;] ??= 0;
+        $this-&gt;data[&#039;error_count&#039;] ??= 0;
+        $this-&gt;data += [&#039;clients&#039; =&gt; []];
+
+        foreach ($this-&gt;clients as $name =&gt; $client) {
+            [$errorCount, $traces] = $this-&gt;collectOnClient($client);
+
+            $this-&gt;data[&#039;clients&#039;] += [
+                $name =&gt; [
+                    &#039;traces&#039; =&gt; [],
+                    &#039;error_count&#039; =&gt; 0,
+                ],
+            ];
+
+            $this-&gt;data[&#039;clients&#039;][$name][&#039;traces&#039;] = array_merge($this-&gt;data[&#039;clients&#039;][$name][&#039;traces&#039;], $traces);
+            $this-&gt;data[&#039;request_count&#039;] += \count($traces);
+            $this-&gt;data[&#039;error_count&#039;] += $errorCount;
+            $this-&gt;data[&#039;clients&#039;][$name][&#039;error_count&#039;] += $errorCount;
+
+            if ($traces) {
+                $client-&gt;reset();
+            }
+        }
+    }
+
+    public function getClients(): array
+    {
+        return $this-&gt;data[&#039;clients&#039;] ?? [];
+    }
+
+    public function getRequestCount(): int
+    {
+        return $this-&gt;data[&#039;request_count&#039;] ?? 0;
+    }
+
+    public function getErrorCount(): int
+    {
+        return $this-&gt;data[&#039;error_count&#039;] ?? 0;
+    }
+
+    public function getName(): string
+    {
+        return &#039;http_client&#039;;
+    }
+
+    public function reset(): void
+    {
+        $this-&gt;data = [
+            &#039;clients&#039; =&gt; [],
+            &#039;request_count&#039; =&gt; 0,
+            &#039;error_count&#039; =&gt; 0,
+        ];
+    }
+
+    private function collectOnClient(TraceableHttpClient $client): array
+    {
+        $traces = $client-&gt;getTracedRequests();
+        $errorCount = 0;
+        $baseInfo = [
+            &#039;response_headers&#039; =&gt; 1,
+            &#039;retry_count&#039; =&gt; 1,
+            &#039;redirect_count&#039; =&gt; 1,
+            &#039;redirect_url&#039; =&gt; 1,
+            &#039;user_data&#039; =&gt; 1,
+            &#039;error&#039; =&gt; 1,
+            &#039;url&#039; =&gt; 1,
+        ];
+
+        foreach ($traces as $i =&gt; $trace) {
+            if (400 &lt;= ($trace[&#039;info&#039;][&#039;http_code&#039;] ?? 0)) {
+                ++$errorCount;
+            }
+
+            $info = $trace[&#039;info&#039;];
+            $traces[$i][&#039;http_code&#039;] = $info[&#039;http_code&#039;] ?? 0;
+
+            unset($info[&#039;filetime&#039;], $info[&#039;http_code&#039;], $info[&#039;ssl_verify_result&#039;], $info[&#039;content_type&#039;]);
+
+            if (($info[&#039;http_method&#039;] ?? null) === $trace[&#039;method&#039;]) {
+                unset($info[&#039;http_method&#039;]);
+            }
+
+            if (($info[&#039;url&#039;] ?? null) === $trace[&#039;url&#039;]) {
+                unset($info[&#039;url&#039;]);
+            }
+
+            foreach ($info as $k =&gt; $v) {
+                if (!$v || (is_numeric($v) &amp;&amp; 0 &gt; $v)) {
+                    unset($info[$k]);
+                }
+            }
+
+            if (\is_string($content = $trace[&#039;content&#039;])) {
+                $contentType = &#039;application/octet-stream&#039;;
+
+                foreach ($info[&#039;response_headers&#039;] ?? [] as $h) {
+                    if (0 === stripos($h, &#039;content-type: &#039;)) {
+                        $contentType = substr($h, \strlen(&#039;content-type: &#039;));
+                        break;
+                    }
+                }
+
+                if (str_starts_with($contentType, &#039;image/&#039;) &amp;&amp; class_exists(ImgStub::class)) {
+                    $content = new ImgStub($content, $contentType, &#039;&#039;);
+                } else {
+                    $content = [$content];
+                }
+
+                $content = [&#039;response_content&#039; =&gt; $content];
+            } elseif (\is_array($content)) {
+                $content = [&#039;response_json&#039; =&gt; $content];
+            } else {
+                $content = [];
+            }
+
+            if (isset($info[&#039;retry_count&#039;])) {
+                $content[&#039;retries&#039;] = $info[&#039;previous_info&#039;];
+                unset($info[&#039;previous_info&#039;]);
+            }
+
+            $debugInfo = array_diff_key($info, $baseInfo);
+            $info = [&#039;info&#039; =&gt; $debugInfo] + array_diff_key($info, $debugInfo) + $content;
+            unset($traces[$i][&#039;info&#039;]); // break PHP reference used by TraceableHttpClient
+            $traces[$i][&#039;info&#039;] = $this-&gt;cloneVar($info);
+            $traces[$i][&#039;options&#039;] = $this-&gt;cloneVar($trace[&#039;options&#039;]);
+            $traces[$i][&#039;curlCommand&#039;] = $this-&gt;getCurlCommand($trace);
+        }
+
+        return [$errorCount, $traces];
+    }
+
+    private function getCurlCommand(array $trace): ?string
+    {
+        if (!isset($trace[&#039;info&#039;][&#039;debug&#039;])) {
+            return null;
+        }
+
+        $url = $trace[&#039;info&#039;][&#039;original_url&#039;] ?? $trace[&#039;info&#039;][&#039;url&#039;] ?? $trace[&#039;url&#039;];
+        $command = [&#039;curl&#039;, &#039;--compressed&#039;];
+
+        if (isset($trace[&#039;options&#039;][&#039;resolve&#039;])) {
+            $port = parse_url($url, \PHP_URL_PORT) ?: (str_starts_with(&#039;http:&#039;, $url) ? 80 : 443);
+            foreach ($trace[&#039;options&#039;][&#039;resolve&#039;] as $host =&gt; $ip) {
+                if (null !== $ip) {
+                    $command[] = &#039;--resolve &#039;.escapeshellarg(&quot;$host:$port:$ip&quot;);
+                }
+            }
+        }
+
+        $dataArg = [];
+
+        if ($json = $trace[&#039;options&#039;][&#039;json&#039;] ?? null) {
+            $dataArg[] = &#039;--data-raw &#039;.$this-&gt;escapePayload(self::jsonEncode($json));
+        } elseif ($body = $trace[&#039;options&#039;][&#039;body&#039;] ?? null) {
+            if (\is_string($body)) {
+                $dataArg[] = &#039;--data-raw &#039;.$this-&gt;escapePayload($body);
+            } elseif (\is_array($body)) {
+                try {
+                    $body = self::normalizeBody($body);
+                } catch (TransportException) {
+                    return null;
+                }
+                if (!\is_string($body)) {
+                    return null;
+                }
+                foreach (explode(&#039;&amp;&#039;, $body) as $value) {
+                    $dataArg[] = &#039;--data-raw &#039;.$this-&gt;escapePayload(urldecode($value));
+                }
+            } else {
+                return null;
+            }
+        }
+
+        $dataArg = $dataArg ? implode(&#039; &#039;, $dataArg) : null;
+
+        foreach (explode(&quot;\n&quot;, $trace[&#039;info&#039;][&#039;debug&#039;]) as $line) {
+            $line = substr($line, 0, -1);
+
+            if (str_starts_with(&#039;&lt; &#039;, $line)) {
+                // End of the request, beginning of the response. Stop parsing.
+                break;
+            }
+
+            if (str_starts_with(&#039;Due to a bug in curl &#039;, $line)) {
+                // When the curl client disables debug info due to a curl bug, we cannot build the command.
+                return null;
+            }
+
+            if (&#039;&#039; === $line || preg_match(&#039;/^[*&lt;]|(Host: )/&#039;, $line)) {
+                continue;
+            }
+
+            if (preg_match(&#039;/^&gt; ([A-Z]+)/&#039;, $line, $match)) {
+                $command[] = \sprintf(&#039;--request %s&#039;, $match[1]);
+                $command[] = \sprintf(&#039;--url %s&#039;, escapeshellarg($url));
+                continue;
+            }
+
+            $command[] = &#039;--header &#039;.escapeshellarg($line);
+        }
+
+        if (null !== $dataArg) {
+            $command[] = $dataArg;
+        }
+
+        return implode(&quot; \\\n  &quot;, $command);
+    }
+
+    private function escapePayload(string $payload): string
+    {
+        static $useProcess;
+
+        if ($useProcess ??= \function_exists(&#039;proc_open&#039;) &amp;&amp; class_exists(Process::class)) {
+            return substr((new Process([&#039;&#039;, $payload]))-&gt;getCommandLine(), 3);
+        }
+
+        if (&#039;\\&#039; === \DIRECTORY_SEPARATOR) {
+            return &#039;&quot;&#039;.str_replace(&#039;&quot;&#039;, &#039;&quot;&quot;&#039;, $payload).&#039;&quot;&#039;;
+        }
+
+        return &quot;&#039;&quot;.str_replace(&quot;&#039;&quot;, &quot;&#039;\\&#039;&#039;&quot;, $payload).&quot;&#039;&quot;;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/DecoratorTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/DependencyInjection -->
+
+</body>
+</html>

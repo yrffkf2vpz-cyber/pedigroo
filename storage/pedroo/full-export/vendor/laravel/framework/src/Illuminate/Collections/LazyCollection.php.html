@@ -1,0 +1,1991 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Collections/LazyCollection.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Support;
+
+use ArrayIterator;
+use Closure;
+use DateInterval;
+use DateTimeImmutable;
+use DateTimeInterface;
+use Generator;
+use Illuminate\Contracts\Support\CanBeEscapedWhenCastToString;
+use Illuminate\Support\Traits\EnumeratesValues;
+use Illuminate\Support\Traits\Macroable;
+use InvalidArgumentException;
+use IteratorAggregate;
+use stdClass;
+use Traversable;
+
+/**
+ * @template TKey of array-key
+ *
+ * @template-covariant TValue
+ *
+ * @implements \Illuminate\Support\Enumerable&lt;TKey, TValue&gt;
+ */
+class LazyCollection implements CanBeEscapedWhenCastToString, Enumerable
+{
+    /**
+     * @use \Illuminate\Support\Traits\EnumeratesValues&lt;TKey, TValue&gt;
+     */
+    use EnumeratesValues, Macroable;
+
+    /**
+     * The source from which to generate items.
+     *
+     * @var (Closure(): \Generator&lt;TKey, TValue, mixed, void&gt;)|static|array&lt;TKey, TValue&gt;
+     */
+    public $source;
+
+    /**
+     * Create a new lazy collection instance.
+     *
+     * @param  \Illuminate\Contracts\Support\Arrayable&lt;TKey, TValue&gt;|iterable&lt;TKey, TValue&gt;|(Closure(): \Generator&lt;TKey, TValue, mixed, void&gt;)|self&lt;TKey, TValue&gt;|array&lt;TKey, TValue&gt;|null  $source
+     */
+    public function __construct($source = null)
+    {
+        if ($source instanceof Closure || $source instanceof self) {
+            $this-&gt;source = $source;
+        } elseif (is_null($source)) {
+            $this-&gt;source = static::empty();
+        } elseif ($source instanceof Generator) {
+            throw new InvalidArgumentException(
+                &#039;Generators should not be passed directly to LazyCollection. Instead, pass a generator function.&#039;
+            );
+        } else {
+            $this-&gt;source = $this-&gt;getArrayableItems($source);
+        }
+    }
+
+    /**
+     * Create a new collection instance if the value isn&#039;t one already.
+     *
+     * @template TMakeKey of array-key
+     * @template TMakeValue
+     *
+     * @param  \Illuminate\Contracts\Support\Arrayable&lt;TMakeKey, TMakeValue&gt;|iterable&lt;TMakeKey, TMakeValue&gt;|(Closure(): \Generator&lt;TMakeKey, TMakeValue, mixed, void&gt;)|self&lt;TMakeKey, TMakeValue&gt;|array&lt;TMakeKey, TMakeValue&gt;|null  $items
+     * @return static&lt;TMakeKey, TMakeValue&gt;
+     */
+    public static function make($items = [])
+    {
+        return new static($items);
+    }
+
+    /**
+     * Create a collection with the given range.
+     *
+     * @param  int  $from
+     * @param  int  $to
+     * @param  int  $step
+     * @return ($step is zero ? never : static&lt;int, int&gt;)
+     *
+     * @throws \InvalidArgumentException
+     */
+    public static function range($from, $to, $step = 1)
+    {
+        if ($step == 0) {
+            throw new InvalidArgumentException(&#039;Step value cannot be zero.&#039;);
+        }
+
+        return new static(function () use ($from, $to, $step) {
+            if ($from &lt;= $to) {
+                for (; $from &lt;= $to; $from += abs($step)) {
+                    yield $from;
+                }
+            } else {
+                for (; $from &gt;= $to; $from -= abs($step)) {
+                    yield $from;
+                }
+            }
+        });
+    }
+
+    /**
+     * Get all items in the enumerable.
+     *
+     * @return array&lt;TKey, TValue&gt;
+     */
+    public function all()
+    {
+        if (is_array($this-&gt;source)) {
+            return $this-&gt;source;
+        }
+
+        return iterator_to_array($this-&gt;getIterator());
+    }
+
+    /**
+     * Eager load all items into a new lazy collection backed by an array.
+     *
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function eager()
+    {
+        return new static($this-&gt;all());
+    }
+
+    /**
+     * Cache values as they&#039;re enumerated.
+     *
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function remember()
+    {
+        $iterator = $this-&gt;getIterator();
+
+        $iteratorIndex = 0;
+
+        $cache = [];
+
+        return new static(function () use ($iterator, &amp;$iteratorIndex, &amp;$cache) {
+            for ($index = 0; true; $index++) {
+                if (array_key_exists($index, $cache)) {
+                    yield $cache[$index][0] =&gt; $cache[$index][1];
+
+                    continue;
+                }
+
+                if ($iteratorIndex &lt; $index) {
+                    $iterator-&gt;next();
+
+                    $iteratorIndex++;
+                }
+
+                if (! $iterator-&gt;valid()) {
+                    break;
+                }
+
+                $cache[$index] = [$iterator-&gt;key(), $iterator-&gt;current()];
+
+                yield $cache[$index][0] =&gt; $cache[$index][1];
+            }
+        });
+    }
+
+    /**
+     * Get the median of a given key.
+     *
+     * @param  string|array&lt;array-key, string&gt;|null  $key
+     * @return float|int|null
+     */
+    public function median($key = null)
+    {
+        return $this-&gt;collect()-&gt;median($key);
+    }
+
+    /**
+     * Get the mode of a given key.
+     *
+     * @param  string|array&lt;string&gt;|null  $key
+     * @return array&lt;int, float|int&gt;|null
+     */
+    public function mode($key = null)
+    {
+        return $this-&gt;collect()-&gt;mode($key);
+    }
+
+    /**
+     * Collapse the collection of items into a single array.
+     *
+     * @return static&lt;int, mixed&gt;
+     */
+    public function collapse()
+    {
+        return new static(function () {
+            foreach ($this as $values) {
+                if (is_array($values) || $values instanceof Enumerable) {
+                    foreach ($values as $value) {
+                        yield $value;
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Collapse the collection of items into a single array while preserving its keys.
+     *
+     * @return static&lt;mixed, mixed&gt;
+     */
+    public function collapseWithKeys()
+    {
+        return new static(function () {
+            foreach ($this as $values) {
+                if (is_array($values) || $values instanceof Enumerable) {
+                    foreach ($values as $key =&gt; $value) {
+                        yield $key =&gt; $value;
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Determine if an item exists in the enumerable.
+     *
+     * @param  (callable(TValue, TKey): bool)|TValue|string  $key
+     * @param  mixed  $operator
+     * @param  mixed  $value
+     * @return bool
+     */
+    public function contains($key, $operator = null, $value = null)
+    {
+        if (func_num_args() === 1 &amp;&amp; $this-&gt;useAsCallable($key)) {
+            $placeholder = new stdClass;
+
+            /** @var callable $key */
+            return $this-&gt;first($key, $placeholder) !== $placeholder;
+        }
+
+        if (func_num_args() === 1) {
+            $needle = $key;
+
+            foreach ($this as $value) {
+                if ($value == $needle) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return $this-&gt;contains($this-&gt;operatorForWhere(...func_get_args()));
+    }
+
+    /**
+     * Determine if an item exists, using strict comparison.
+     *
+     * @param  (callable(TValue): bool)|TValue|array-key  $key
+     * @param  TValue|null  $value
+     * @return bool
+     */
+    public function containsStrict($key, $value = null)
+    {
+        if (func_num_args() === 2) {
+            return $this-&gt;contains(fn ($item) =&gt; data_get($item, $key) === $value);
+        }
+
+        if ($this-&gt;useAsCallable($key)) {
+            return ! is_null($this-&gt;first($key));
+        }
+
+        foreach ($this as $item) {
+            if ($item === $key) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Determine if an item is not contained in the enumerable.
+     *
+     * @param  mixed  $key
+     * @param  mixed  $operator
+     * @param  mixed  $value
+     * @return bool
+     */
+    public function doesntContain($key, $operator = null, $value = null)
+    {
+        return ! $this-&gt;contains(...func_get_args());
+    }
+
+    /**
+     * Determine if an item is not contained in the enumerable, using strict comparison.
+     *
+     * @param  mixed  $key
+     * @param  mixed  $operator
+     * @param  mixed  $value
+     * @return bool
+     */
+    public function doesntContainStrict($key, $operator = null, $value = null)
+    {
+        return ! $this-&gt;containsStrict(...func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function crossJoin(...$arrays)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Count the number of items in the collection by a field or using a callback.
+     *
+     * @param  (callable(TValue, TKey): (array-key|\UnitEnum))|string|null  $countBy
+     * @return static&lt;array-key, int&gt;
+     */
+    public function countBy($countBy = null)
+    {
+        $countBy = is_null($countBy)
+            ? $this-&gt;identity()
+            : $this-&gt;valueRetriever($countBy);
+
+        return new static(function () use ($countBy) {
+            $counts = [];
+
+            foreach ($this as $key =&gt; $value) {
+                $group = enum_value($countBy($value, $key));
+
+                if (empty($counts[$group])) {
+                    $counts[$group] = 0;
+                }
+
+                $counts[$group]++;
+            }
+
+            yield from $counts;
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function diff($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function diffUsing($items, callable $callback)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function diffAssoc($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function diffAssocUsing($items, callable $callback)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function diffKeys($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function diffKeysUsing($items, callable $callback)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function duplicates($callback = null, $strict = false)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function duplicatesStrict($callback = null)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function except($keys)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Run a filter over each of the items.
+     *
+     * @param  (callable(TValue, TKey): bool)|null  $callback
+     * @return static
+     */
+    public function filter(?callable $callback = null)
+    {
+        if (is_null($callback)) {
+            $callback = fn ($value) =&gt; (bool) $value;
+        }
+
+        return new static(function () use ($callback) {
+            foreach ($this as $key =&gt; $value) {
+                if ($callback($value, $key)) {
+                    yield $key =&gt; $value;
+                }
+            }
+        });
+    }
+
+    /**
+     * Get the first item from the enumerable passing the given truth test.
+     *
+     * @template TFirstDefault
+     *
+     * @param  (callable(TValue): bool)|null  $callback
+     * @param  TFirstDefault|(\Closure(): TFirstDefault)  $default
+     * @return TValue|TFirstDefault
+     */
+    public function first(?callable $callback = null, $default = null)
+    {
+        $iterator = $this-&gt;getIterator();
+
+        if (is_null($callback)) {
+            if (! $iterator-&gt;valid()) {
+                return value($default);
+            }
+
+            return $iterator-&gt;current();
+        }
+
+        foreach ($iterator as $key =&gt; $value) {
+            if ($callback($value, $key)) {
+                return $value;
+            }
+        }
+
+        return value($default);
+    }
+
+    /**
+     * Get a flattened list of the items in the collection.
+     *
+     * @param  int  $depth
+     * @return static&lt;int, mixed&gt;
+     */
+    public function flatten($depth = INF)
+    {
+        $instance = new static(function () use ($depth) {
+            foreach ($this as $item) {
+                if (! is_array($item) &amp;&amp; ! $item instanceof Enumerable) {
+                    yield $item;
+                } elseif ($depth === 1) {
+                    yield from $item;
+                } else {
+                    yield from (new static($item))-&gt;flatten($depth - 1);
+                }
+            }
+        });
+
+        return $instance-&gt;values();
+    }
+
+    /**
+     * Flip the items in the collection.
+     *
+     * @return static&lt;TValue, TKey&gt;
+     */
+    public function flip()
+    {
+        return new static(function () {
+            foreach ($this as $key =&gt; $value) {
+                yield $value =&gt; $key;
+            }
+        });
+    }
+
+    /**
+     * Get an item by key.
+     *
+     * @template TGetDefault
+     *
+     * @param  TKey|null  $key
+     * @param  TGetDefault|(\Closure(): TGetDefault)  $default
+     * @return TValue|TGetDefault
+     */
+    public function get($key, $default = null)
+    {
+        if (is_null($key)) {
+            return;
+        }
+
+        foreach ($this as $outerKey =&gt; $outerValue) {
+            if ($outerKey == $key) {
+                return $outerValue;
+            }
+        }
+
+        return value($default);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @template TGroupKey of array-key|\UnitEnum|\Stringable
+     *
+     * @param  (callable(TValue, TKey): TGroupKey)|array|string  $groupBy
+     * @return static&lt;
+     *  ($groupBy is (array|string)
+     *      ? array-key
+     *      : (TGroupKey is \UnitEnum ? array-key : (TGroupKey is \Stringable ? string : TGroupKey))),
+     *  static&lt;($preserveKeys is true ? TKey : int), ($groupBy is array ? mixed : TValue)&gt;
+     * &gt;
+     */
+    #[\Override]
+    public function groupBy($groupBy, $preserveKeys = false)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Key an associative array by a field or using a callback.
+     *
+     * @template TNewKey of array-key|\UnitEnum
+     *
+     * @param  (callable(TValue, TKey): TNewKey)|array|string  $keyBy
+     * @return static&lt;($keyBy is (array|string) ? array-key : (TNewKey is \UnitEnum ? array-key : TNewKey)), TValue&gt;
+     */
+    public function keyBy($keyBy)
+    {
+        return new static(function () use ($keyBy) {
+            $keyBy = $this-&gt;valueRetriever($keyBy);
+
+            foreach ($this as $key =&gt; $item) {
+                $resolvedKey = $keyBy($item, $key);
+
+                if (is_object($resolvedKey)) {
+                    $resolvedKey = (string) $resolvedKey;
+                }
+
+                yield $resolvedKey =&gt; $item;
+            }
+        });
+    }
+
+    /**
+     * Determine if an item exists in the collection by key.
+     *
+     * @param  mixed  $key
+     * @return bool
+     */
+    public function has($key)
+    {
+        $keys = array_flip(is_array($key) ? $key : func_get_args());
+        $count = count($keys);
+
+        foreach ($this as $key =&gt; $value) {
+            if (array_key_exists($key, $keys) &amp;&amp; --$count == 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Determine if any of the keys exist in the collection.
+     *
+     * @param  mixed  $key
+     * @return bool
+     */
+    public function hasAny($key)
+    {
+        $keys = array_flip(is_array($key) ? $key : func_get_args());
+
+        foreach ($this as $key =&gt; $value) {
+            if (array_key_exists($key, $keys)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Concatenate values of a given key as a string.
+     *
+     * @param  (callable(TValue, TKey): mixed)|string  $value
+     * @param  string|null  $glue
+     * @return string
+     */
+    public function implode($value, $glue = null)
+    {
+        return $this-&gt;collect()-&gt;implode(...func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function intersect($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function intersectUsing($items, callable $callback)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function intersectAssoc($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function intersectAssocUsing($items, callable $callback)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function intersectByKeys($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Determine if the items are empty or not.
+     *
+     * @return bool
+     */
+    public function isEmpty()
+    {
+        return ! $this-&gt;getIterator()-&gt;valid();
+    }
+
+    /**
+     * Determine if the collection contains a single item.
+     *
+     * @param  (callable(TValue, TKey): bool)|null  $callback
+     * @return bool
+     *
+     * @deprecated 12.49.0 Use the `hasSole()` method instead.
+     */
+    public function containsOneItem(?callable $callback = null): bool
+    {
+        return $this-&gt;hasSole($callback);
+    }
+
+    /**
+     * Determine if the collection contains multiple items.
+     *
+     * @return bool
+     *
+     * @deprecated 12.50.0 Use the `hasMany()` method instead.
+     */
+    public function containsManyItems(): bool
+    {
+        return $this-&gt;hasMany();
+    }
+
+    /**
+     * Join all items from the collection using a string. The final items can use a separate glue string.
+     *
+     * @param  string  $glue
+     * @param  string  $finalGlue
+     * @return string
+     */
+    public function join($glue, $finalGlue = &#039;&#039;)
+    {
+        return $this-&gt;collect()-&gt;join(...func_get_args());
+    }
+
+    /**
+     * Get the keys of the collection items.
+     *
+     * @return static&lt;int, TKey&gt;
+     */
+    public function keys()
+    {
+        return new static(function () {
+            foreach ($this as $key =&gt; $value) {
+                yield $key;
+            }
+        });
+    }
+
+    /**
+     * Get the last item from the collection.
+     *
+     * @template TLastDefault
+     *
+     * @param  (callable(TValue, TKey): bool)|null  $callback
+     * @param  TLastDefault|(\Closure(): TLastDefault)  $default
+     * @return TValue|TLastDefault
+     */
+    public function last(?callable $callback = null, $default = null)
+    {
+        $needle = $placeholder = new stdClass;
+
+        foreach ($this as $key =&gt; $value) {
+            if (is_null($callback) || $callback($value, $key)) {
+                $needle = $value;
+            }
+        }
+
+        return $needle === $placeholder ? value($default) : $needle;
+    }
+
+    /**
+     * Get the values of a given key.
+     *
+     * @param  string|array&lt;array-key, string&gt;  $value
+     * @param  string|null  $key
+     * @return static&lt;array-key, mixed&gt;
+     */
+    public function pluck($value, $key = null)
+    {
+        return new static(function () use ($value, $key) {
+            [$value, $key] = $this-&gt;explodePluckParameters($value, $key);
+
+            foreach ($this as $item) {
+                $itemValue = $value instanceof Closure
+                    ? $value($item)
+                    : data_get($item, $value);
+
+                if (is_null($key)) {
+                    yield $itemValue;
+                } else {
+                    $itemKey = $key instanceof Closure
+                        ? $key($item)
+                        : data_get($item, $key);
+
+                    if (is_object($itemKey) &amp;&amp; method_exists($itemKey, &#039;__toString&#039;)) {
+                        $itemKey = (string) $itemKey;
+                    }
+
+                    yield $itemKey =&gt; $itemValue;
+                }
+            }
+        });
+    }
+
+    /**
+     * Run a map over each of the items.
+     *
+     * @template TMapValue
+     *
+     * @param  callable(TValue, TKey): TMapValue  $callback
+     * @return static&lt;TKey, TMapValue&gt;
+     */
+    public function map(callable $callback)
+    {
+        return new static(function () use ($callback) {
+            foreach ($this as $key =&gt; $value) {
+                yield $key =&gt; $callback($value, $key);
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function mapToDictionary(callable $callback)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Run an associative map over each of the items.
+     *
+     * The callback should return an associative array with a single key/value pair.
+     *
+     * @template TMapWithKeysKey of array-key
+     * @template TMapWithKeysValue
+     *
+     * @param  callable(TValue, TKey): array&lt;TMapWithKeysKey, TMapWithKeysValue&gt;  $callback
+     * @return static&lt;TMapWithKeysKey, TMapWithKeysValue&gt;
+     */
+    public function mapWithKeys(callable $callback)
+    {
+        return new static(function () use ($callback) {
+            foreach ($this as $key =&gt; $value) {
+                yield from $callback($value, $key);
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function merge($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function mergeRecursive($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Multiply the items in the collection by the multiplier.
+     *
+     * @param  int  $multiplier
+     * @return static
+     */
+    public function multiply(int $multiplier)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Create a collection by using this collection for keys and another for its values.
+     *
+     * @template TCombineValue
+     *
+     * @param  \IteratorAggregate&lt;array-key, TCombineValue&gt;|array&lt;array-key, TCombineValue&gt;|(callable(): \Generator&lt;array-key, TCombineValue&gt;)  $values
+     * @return static&lt;TValue, TCombineValue&gt;
+     */
+    public function combine($values)
+    {
+        return new static(function () use ($values) {
+            $values = $this-&gt;makeIterator($values);
+
+            $errorMessage = &#039;Both parameters should have an equal number of elements&#039;;
+
+            foreach ($this as $key) {
+                if (! $values-&gt;valid()) {
+                    trigger_error($errorMessage, E_USER_WARNING);
+
+                    break;
+                }
+
+                yield $key =&gt; $values-&gt;current();
+
+                $values-&gt;next();
+            }
+
+            if ($values-&gt;valid()) {
+                trigger_error($errorMessage, E_USER_WARNING);
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function union($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Create a new collection consisting of every n-th element.
+     *
+     * @param  int  $step
+     * @param  int  $offset
+     * @return ($step is positive-int ? static : never)
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function nth($step, $offset = 0)
+    {
+        if ($step &lt; 1) {
+            throw new InvalidArgumentException(&#039;Step value must be at least 1.&#039;);
+        }
+
+        return new static(function () use ($step, $offset) {
+            $position = 0;
+
+            foreach ($this-&gt;slice($offset) as $item) {
+                if ($position % $step === 0) {
+                    yield $item;
+                }
+
+                $position++;
+            }
+        });
+    }
+
+    /**
+     * Get the items with the specified keys.
+     *
+     * @param  \Illuminate\Support\Enumerable&lt;array-key, TKey&gt;|array&lt;array-key, TKey&gt;|string  $keys
+     * @return static
+     */
+    public function only($keys)
+    {
+        if ($keys instanceof Enumerable) {
+            $keys = $keys-&gt;all();
+        } elseif (! is_null($keys)) {
+            $keys = is_array($keys) ? $keys : func_get_args();
+        }
+
+        return new static(function () use ($keys) {
+            if (is_null($keys)) {
+                yield from $this;
+            } else {
+                $keys = array_flip($keys);
+
+                foreach ($this as $key =&gt; $value) {
+                    if (array_key_exists($key, $keys)) {
+                        yield $key =&gt; $value;
+
+                        unset($keys[$key]);
+
+                        if (empty($keys)) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Select specific values from the items within the collection.
+     *
+     * @param  \Illuminate\Support\Enumerable&lt;array-key, TKey&gt;|array&lt;array-key, TKey&gt;|string  $keys
+     * @return static
+     */
+    public function select($keys)
+    {
+        if ($keys instanceof Enumerable) {
+            $keys = $keys-&gt;all();
+        } elseif (! is_null($keys)) {
+            $keys = is_array($keys) ? $keys : func_get_args();
+        }
+
+        return new static(function () use ($keys) {
+            if (is_null($keys)) {
+                yield from $this;
+            } else {
+                foreach ($this as $item) {
+                    $result = [];
+
+                    foreach ($keys as $key) {
+                        if (Arr::accessible($item) &amp;&amp; Arr::exists($item, $key)) {
+                            $result[$key] = $item[$key];
+                        } elseif (is_object($item) &amp;&amp; isset($item-&gt;{$key})) {
+                            $result[$key] = $item-&gt;{$key};
+                        }
+                    }
+
+                    yield $result;
+                }
+            }
+        });
+    }
+
+    /**
+     * Push all of the given items onto the collection.
+     *
+     * @template TConcatKey of array-key
+     * @template TConcatValue
+     *
+     * @param  iterable&lt;TConcatKey, TConcatValue&gt;  $source
+     * @return static&lt;TKey|TConcatKey, TValue|TConcatValue&gt;
+     */
+    public function concat($source)
+    {
+        return (new static(function () use ($source) {
+            yield from $this;
+            yield from $source;
+        }))-&gt;values();
+    }
+
+    /**
+     * Get one or a specified number of items randomly from the collection.
+     *
+     * @param  int|null  $number
+     * @param  bool  $preserveKeys
+     * @return static&lt;int, TValue&gt;|TValue
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function random($number = null, $preserveKeys = false)
+    {
+        $result = $this-&gt;collect()-&gt;random(...func_get_args());
+
+        return is_null($number) ? $result : new static($result);
+    }
+
+    /**
+     * Replace the collection items with the given items.
+     *
+     * @param  \Illuminate\Contracts\Support\Arrayable&lt;TKey, TValue&gt;|iterable&lt;TKey, TValue&gt;  $items
+     * @return static
+     */
+    public function replace($items)
+    {
+        return new static(function () use ($items) {
+            $items = $this-&gt;getArrayableItems($items);
+
+            foreach ($this as $key =&gt; $value) {
+                if (array_key_exists($key, $items)) {
+                    yield $key =&gt; $items[$key];
+
+                    unset($items[$key]);
+                } else {
+                    yield $key =&gt; $value;
+                }
+            }
+
+            foreach ($items as $key =&gt; $value) {
+                yield $key =&gt; $value;
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function replaceRecursive($items)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function reverse()
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Search the collection for a given value and return the corresponding key if successful.
+     *
+     * @param  TValue|(callable(TValue,TKey): bool)  $value
+     * @param  bool  $strict
+     * @return TKey|false
+     */
+    public function search($value, $strict = false)
+    {
+        /** @var (callable(TValue,TKey): bool) $predicate */
+        $predicate = $this-&gt;useAsCallable($value)
+            ? $value
+            : function ($item) use ($value, $strict) {
+                return $strict ? $item === $value : $item == $value;
+            };
+
+        foreach ($this as $key =&gt; $item) {
+            if ($predicate($item, $key)) {
+                return $key;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Get the item before the given item.
+     *
+     * @param  TValue|(callable(TValue,TKey): bool)  $value
+     * @param  bool  $strict
+     * @return TValue|null
+     */
+    public function before($value, $strict = false)
+    {
+        $previous = null;
+
+        /** @var (callable(TValue,TKey): bool) $predicate */
+        $predicate = $this-&gt;useAsCallable($value)
+            ? $value
+            : function ($item) use ($value, $strict) {
+                return $strict ? $item === $value : $item == $value;
+            };
+
+        foreach ($this as $key =&gt; $item) {
+            if ($predicate($item, $key)) {
+                return $previous;
+            }
+
+            $previous = $item;
+        }
+
+        return null;
+    }
+
+    /**
+     * Get the item after the given item.
+     *
+     * @param  TValue|(callable(TValue,TKey): bool)  $value
+     * @param  bool  $strict
+     * @return TValue|null
+     */
+    public function after($value, $strict = false)
+    {
+        $found = false;
+
+        /** @var (callable(TValue,TKey): bool) $predicate */
+        $predicate = $this-&gt;useAsCallable($value)
+            ? $value
+            : function ($item) use ($value, $strict) {
+                return $strict ? $item === $value : $item == $value;
+            };
+
+        foreach ($this as $key =&gt; $item) {
+            if ($found) {
+                return $item;
+            }
+
+            if ($predicate($item, $key)) {
+                $found = true;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function shuffle()
+    {
+        return $this-&gt;passthru(__FUNCTION__, []);
+    }
+
+    /**
+     * Create chunks representing a &quot;sliding window&quot; view of the items in the collection.
+     *
+     * @param  positive-int  $size
+     * @param  positive-int  $step
+     * @return static&lt;int, static&gt;
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function sliding($size = 2, $step = 1)
+    {
+        if ($size &lt; 1) {
+            throw new InvalidArgumentException(&#039;Size value must be at least 1.&#039;);
+        } elseif ($step &lt; 1) {
+            throw new InvalidArgumentException(&#039;Step value must be at least 1.&#039;);
+        }
+
+        return new static(function () use ($size, $step) {
+            $iterator = $this-&gt;getIterator();
+
+            $chunk = [];
+
+            while ($iterator-&gt;valid()) {
+                $chunk[$iterator-&gt;key()] = $iterator-&gt;current();
+
+                if (count($chunk) == $size) {
+                    yield (new static($chunk))-&gt;tap(function () use (&amp;$chunk, $step) {
+                        $chunk = array_slice($chunk, $step, null, true);
+                    });
+
+                    // If the $step between chunks is bigger than each chunk&#039;s $size
+                    // we will skip the extra items (which should never be in any
+                    // chunk) before we continue to the next chunk in the loop.
+                    if ($step &gt; $size) {
+                        $skip = $step - $size;
+
+                        for ($i = 0; $i &lt; $skip &amp;&amp; $iterator-&gt;valid(); $i++) {
+                            $iterator-&gt;next();
+                        }
+                    }
+                }
+
+                $iterator-&gt;next();
+            }
+        });
+    }
+
+    /**
+     * Skip the first {$count} items.
+     *
+     * @param  int  $count
+     * @return static
+     */
+    public function skip($count)
+    {
+        return new static(function () use ($count) {
+            $iterator = $this-&gt;getIterator();
+
+            while ($iterator-&gt;valid() &amp;&amp; $count--) {
+                $iterator-&gt;next();
+            }
+
+            while ($iterator-&gt;valid()) {
+                yield $iterator-&gt;key() =&gt; $iterator-&gt;current();
+
+                $iterator-&gt;next();
+            }
+        });
+    }
+
+    /**
+     * Skip items in the collection until the given condition is met.
+     *
+     * @param  TValue|callable(TValue,TKey): bool  $value
+     * @return static
+     */
+    public function skipUntil($value)
+    {
+        $callback = $this-&gt;useAsCallable($value) ? $value : $this-&gt;equality($value);
+
+        return $this-&gt;skipWhile($this-&gt;negate($callback));
+    }
+
+    /**
+     * Skip items in the collection while the given condition is met.
+     *
+     * @param  TValue|callable(TValue,TKey): bool  $value
+     * @return static
+     */
+    public function skipWhile($value)
+    {
+        $callback = $this-&gt;useAsCallable($value) ? $value : $this-&gt;equality($value);
+
+        return new static(function () use ($callback) {
+            $iterator = $this-&gt;getIterator();
+
+            while ($iterator-&gt;valid() &amp;&amp; $callback($iterator-&gt;current(), $iterator-&gt;key())) {
+                $iterator-&gt;next();
+            }
+
+            while ($iterator-&gt;valid()) {
+                yield $iterator-&gt;key() =&gt; $iterator-&gt;current();
+
+                $iterator-&gt;next();
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function slice($offset, $length = null)
+    {
+        if ($offset &lt; 0 || $length &lt; 0) {
+            return $this-&gt;passthru(__FUNCTION__, func_get_args());
+        }
+
+        $instance = $this-&gt;skip($offset);
+
+        return is_null($length) ? $instance : $instance-&gt;take($length);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws \InvalidArgumentException
+     */
+    #[\Override]
+    public function split($numberOfGroups)
+    {
+        if ($numberOfGroups &lt; 1) {
+            throw new InvalidArgumentException(&#039;Number of groups must be at least 1.&#039;);
+        }
+
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Get the first item in the collection, but only if exactly one item exists. Otherwise, throw an exception.
+     *
+     * @param  (callable(TValue, TKey): bool)|string|null  $key
+     * @param  mixed  $operator
+     * @param  mixed  $value
+     * @return TValue
+     *
+     * @throws \Illuminate\Support\ItemNotFoundException
+     * @throws \Illuminate\Support\MultipleItemsFoundException
+     */
+    public function sole($key = null, $operator = null, $value = null)
+    {
+        $filter = func_num_args() &gt; 1
+            ? $this-&gt;operatorForWhere(...func_get_args())
+            : $key;
+
+        return $this
+            -&gt;unless($filter == null)
+            -&gt;filter($filter)
+            -&gt;take(2)
+            -&gt;collect()
+            -&gt;sole();
+    }
+
+    /**
+     * Determine if the collection contains a single item or a single item matching the given criteria.
+     *
+     * @param  (callable(TValue, TKey): bool)|string|null  $key
+     * @param  mixed  $operator
+     * @param  mixed  $value
+     * @return bool
+     */
+    public function hasSole($key = null, $operator = null, $value = null): bool
+    {
+        $filter = func_num_args() &gt; 1
+            ? $this-&gt;operatorForWhere(...func_get_args())
+            : $key;
+
+        return $this
+            -&gt;unless($filter == null)
+            -&gt;filter($filter)
+            -&gt;take(2)
+            -&gt;count() === 1;
+    }
+
+    /**
+     * Get the first item in the collection but throw an exception if no matching items exist.
+     *
+     * @param  (callable(TValue, TKey): bool)|string|null  $key
+     * @param  mixed  $operator
+     * @param  mixed  $value
+     * @return TValue
+     *
+     * @throws \Illuminate\Support\ItemNotFoundException
+     */
+    public function firstOrFail($key = null, $operator = null, $value = null)
+    {
+        $filter = func_num_args() &gt; 1
+            ? $this-&gt;operatorForWhere(...func_get_args())
+            : $key;
+
+        return $this
+            -&gt;unless($filter == null)
+            -&gt;filter($filter)
+            -&gt;take(1)
+            -&gt;collect()
+            -&gt;firstOrFail();
+    }
+
+    /**
+     * Chunk the collection into chunks of the given size.
+     *
+     * @param  int  $size
+     * @param  bool  $preserveKeys
+     * @return ($preserveKeys is true ? static&lt;int, static&gt; : static&lt;int, static&lt;int, TValue&gt;&gt;)
+     */
+    public function chunk($size, $preserveKeys = true)
+    {
+        if ($size &lt;= 0) {
+            return static::empty();
+        }
+
+        $add = match ($preserveKeys) {
+            true =&gt; fn (array &amp;$chunk, Traversable $iterator) =&gt; $chunk[$iterator-&gt;key()] = $iterator-&gt;current(),
+            false =&gt; fn (array &amp;$chunk, Traversable $iterator) =&gt; $chunk[] = $iterator-&gt;current(),
+        };
+
+        return new static(function () use ($size, $add) {
+            $iterator = $this-&gt;getIterator();
+
+            while ($iterator-&gt;valid()) {
+                $chunk = [];
+
+                while (true) {
+                    $add($chunk, $iterator);
+
+                    if (count($chunk) &lt; $size) {
+                        $iterator-&gt;next();
+
+                        if (! $iterator-&gt;valid()) {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                yield new static($chunk);
+
+                $iterator-&gt;next();
+            }
+        });
+    }
+
+    /**
+     * Split a collection into a certain number of groups, and fill the first groups completely.
+     *
+     * @param  int  $numberOfGroups
+     * @return ($numberOfGroups is positive-int ? static&lt;int, static&gt; : never)
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function splitIn($numberOfGroups)
+    {
+        if ($numberOfGroups &lt; 1) {
+            throw new InvalidArgumentException(&#039;Number of groups must be at least 1.&#039;);
+        }
+
+        return $this-&gt;chunk((int) ceil($this-&gt;count() / $numberOfGroups));
+    }
+
+    /**
+     * Chunk the collection into chunks with a callback.
+     *
+     * @param  callable(TValue, TKey, Collection&lt;TKey, TValue&gt;): bool  $callback
+     * @return static&lt;int, static&lt;TKey, TValue&gt;&gt;
+     */
+    public function chunkWhile(callable $callback)
+    {
+        return new static(function () use ($callback) {
+            $iterator = $this-&gt;getIterator();
+
+            $chunk = new Collection;
+
+            if ($iterator-&gt;valid()) {
+                $chunk[$iterator-&gt;key()] = $iterator-&gt;current();
+
+                $iterator-&gt;next();
+            }
+
+            while ($iterator-&gt;valid()) {
+                if (! $callback($iterator-&gt;current(), $iterator-&gt;key(), $chunk)) {
+                    yield new static($chunk);
+
+                    $chunk = new Collection;
+                }
+
+                $chunk[$iterator-&gt;key()] = $iterator-&gt;current();
+
+                $iterator-&gt;next();
+            }
+
+            if ($chunk-&gt;isNotEmpty()) {
+                yield new static($chunk);
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function sort($callback = null)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function sortDesc($options = SORT_REGULAR)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function sortBy($callback, $options = SORT_REGULAR, $descending = false)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function sortByDesc($callback, $options = SORT_REGULAR)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function sortKeys($options = SORT_REGULAR, $descending = false)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function sortKeysDesc($options = SORT_REGULAR)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function sortKeysUsing(callable $callback)
+    {
+        return $this-&gt;passthru(__FUNCTION__, func_get_args());
+    }
+
+    /**
+     * Take the first or last {$limit} items.
+     *
+     * @param  int  $limit
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function take($limit)
+    {
+        if ($limit &lt; 0) {
+            return new static(function () use ($limit) {
+                $limit = abs($limit);
+                $ringBuffer = [];
+                $position = 0;
+
+                foreach ($this as $key =&gt; $value) {
+                    $ringBuffer[$position] = [$key, $value];
+                    $position = ($position + 1) % $limit;
+                }
+
+                for ($i = 0, $end = min($limit, count($ringBuffer)); $i &lt; $end; $i++) {
+                    $pointer = ($position + $i) % $limit;
+                    yield $ringBuffer[$pointer][0] =&gt; $ringBuffer[$pointer][1];
+                }
+            });
+        }
+
+        return new static(function () use ($limit) {
+            $iterator = $this-&gt;getIterator();
+
+            while ($limit--) {
+                if (! $iterator-&gt;valid()) {
+                    break;
+                }
+
+                yield $iterator-&gt;key() =&gt; $iterator-&gt;current();
+
+                if ($limit) {
+                    $iterator-&gt;next();
+                }
+            }
+        });
+    }
+
+    /**
+     * Take items in the collection until the given condition is met.
+     *
+     * @param  TValue|callable(TValue,TKey): bool  $value
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function takeUntil($value)
+    {
+        /** @var callable(TValue, TKey): bool $callback */
+        $callback = $this-&gt;useAsCallable($value) ? $value : $this-&gt;equality($value);
+
+        return new static(function () use ($callback) {
+            foreach ($this as $key =&gt; $item) {
+                if ($callback($item, $key)) {
+                    break;
+                }
+
+                yield $key =&gt; $item;
+            }
+        });
+    }
+
+    /**
+     * Take items in the collection until a given point in time, with an optional callback on timeout.
+     *
+     * @param  \DateTimeInterface  $timeout
+     * @param  callable(TValue|null, TKey|null): mixed|null  $callback
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function takeUntilTimeout(DateTimeInterface $timeout, ?callable $callback = null)
+    {
+        $timeout = $timeout-&gt;getTimestamp();
+
+        return new static(function () use ($timeout, $callback) {
+            if ($this-&gt;now() &gt;= $timeout) {
+                if ($callback) {
+                    $callback(null, null);
+                }
+
+                return;
+            }
+
+            foreach ($this as $key =&gt; $value) {
+                yield $key =&gt; $value;
+
+                if ($this-&gt;now() &gt;= $timeout) {
+                    if ($callback) {
+                        $callback($value, $key);
+                    }
+
+                    break;
+                }
+            }
+        });
+    }
+
+    /**
+     * Take items in the collection while the given condition is met.
+     *
+     * @param  TValue|callable(TValue,TKey): bool  $value
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function takeWhile($value)
+    {
+        /** @var callable(TValue, TKey): bool $callback */
+        $callback = $this-&gt;useAsCallable($value) ? $value : $this-&gt;equality($value);
+
+        return $this-&gt;takeUntil(fn ($item, $key) =&gt; ! $callback($item, $key));
+    }
+
+    /**
+     * Pass each item in the collection to the given callback, lazily.
+     *
+     * @param  callable(TValue, TKey): mixed  $callback
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function tapEach(callable $callback)
+    {
+        return new static(function () use ($callback) {
+            foreach ($this as $key =&gt; $value) {
+                $callback($value, $key);
+
+                yield $key =&gt; $value;
+            }
+        });
+    }
+
+    /**
+     * Throttle the values, releasing them at most once per the given seconds.
+     *
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function throttle(float $seconds)
+    {
+        return new static(function () use ($seconds) {
+            $microseconds = $seconds * 1_000_000;
+
+            foreach ($this as $key =&gt; $value) {
+                $fetchedAt = $this-&gt;preciseNow();
+
+                yield $key =&gt; $value;
+
+                $sleep = $microseconds - ($this-&gt;preciseNow() - $fetchedAt);
+
+                $this-&gt;usleep((int) $sleep);
+            }
+        });
+    }
+
+    /**
+     * Flatten a multi-dimensional associative array with dots.
+     *
+     * @return static
+     */
+    public function dot()
+    {
+        return $this-&gt;passthru(__FUNCTION__, []);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function undot()
+    {
+        return $this-&gt;passthru(__FUNCTION__, []);
+    }
+
+    /**
+     * Return only unique items from the collection array.
+     *
+     * @param  (callable(TValue, TKey): mixed)|string|null  $key
+     * @param  bool  $strict
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function unique($key = null, $strict = false)
+    {
+        $callback = $this-&gt;valueRetriever($key);
+
+        return new static(function () use ($callback, $strict) {
+            $exists = [];
+
+            foreach ($this as $key =&gt; $item) {
+                if (! in_array($id = $callback($item, $key), $exists, $strict)) {
+                    yield $key =&gt; $item;
+
+                    $exists[] = $id;
+                }
+            }
+        });
+    }
+
+    /**
+     * Reset the keys on the underlying array.
+     *
+     * @return static&lt;int, TValue&gt;
+     */
+    public function values()
+    {
+        return new static(function () {
+            foreach ($this as $item) {
+                yield $item;
+            }
+        });
+    }
+
+    /**
+     * Run the given callback every time the interval has passed.
+     *
+     * @return static&lt;TKey, TValue&gt;
+     */
+    public function withHeartbeat(DateInterval|int $interval, callable $callback)
+    {
+        $seconds = is_int($interval) ? $interval : $this-&gt;intervalSeconds($interval);
+
+        return new static(function () use ($seconds, $callback) {
+            $start = $this-&gt;now();
+
+            foreach ($this as $key =&gt; $value) {
+                $now = $this-&gt;now();
+
+                if (($now - $start) &gt;= $seconds) {
+                    $callback();
+
+                    $start = $now;
+                }
+
+                yield $key =&gt; $value;
+            }
+        });
+    }
+
+    /**
+     * Get the total seconds from the given interval.
+     */
+    protected function intervalSeconds(DateInterval $interval): int
+    {
+        $start = new DateTimeImmutable();
+
+        return $start-&gt;add($interval)-&gt;getTimestamp() - $start-&gt;getTimestamp();
+    }
+
+    /**
+     * Zip the collection together with one or more arrays.
+     *
+     * e.g. new LazyCollection([1, 2, 3])-&gt;zip([4, 5, 6]);
+     *      =&gt; [[1, 4], [2, 5], [3, 6]]
+     *
+     * @template TZipValue
+     *
+     * @param  \Illuminate\Contracts\Support\Arrayable&lt;array-key, TZipValue&gt;|iterable&lt;array-key, TZipValue&gt;  ...$items
+     * @return static&lt;int, static&lt;int, TValue|TZipValue&gt;&gt;
+     */
+    public function zip($items)
+    {
+        $iterables = func_get_args();
+
+        return new static(function () use ($iterables) {
+            $iterators = (new Collection($iterables))
+                -&gt;map(fn ($iterable) =&gt; $this-&gt;makeIterator($iterable))
+                -&gt;prepend($this-&gt;getIterator());
+
+            while ($iterators-&gt;contains-&gt;valid()) {
+                yield new static($iterators-&gt;map-&gt;current());
+
+                $iterators-&gt;each-&gt;next();
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    #[\Override]
+    public function pad($size, $value)
+    {
+        if ($size &lt; 0) {
+            return $this-&gt;passthru(__FUNCTION__, func_get_args());
+        }
+
+        return new static(function () use ($size, $value) {
+            $yielded = 0;
+
+            foreach ($this as $index =&gt; $item) {
+                yield $index =&gt; $item;
+
+                $yielded++;
+            }
+
+            while ($yielded++ &lt; $size) {
+                yield $value;
+            }
+        });
+    }
+
+    /**
+     * Get the values iterator.
+     *
+     * @return \Traversable&lt;TKey, TValue&gt;
+     */
+    public function getIterator(): Traversable
+    {
+        return $this-&gt;makeIterator($this-&gt;source);
+    }
+
+    /**
+     * Count the number of items in the collection.
+     *
+     * @return int
+     */
+    public function count(): int
+    {
+        if (is_array($this-&gt;source)) {
+            return count($this-&gt;source);
+        }
+
+        return iterator_count($this-&gt;getIterator());
+    }
+
+    /**
+     * Make an iterator from the given source.
+     *
+     * @template TIteratorKey of array-key
+     * @template TIteratorValue
+     *
+     * @param  \IteratorAggregate&lt;TIteratorKey, TIteratorValue&gt;|array&lt;TIteratorKey, TIteratorValue&gt;|(callable(): \Generator&lt;TIteratorKey, TIteratorValue&gt;)  $source
+     * @return \Traversable&lt;TIteratorKey, TIteratorValue&gt;
+     */
+    protected function makeIterator($source)
+    {
+        if ($source instanceof IteratorAggregate) {
+            return $source-&gt;getIterator();
+        }
+
+        if (is_array($source)) {
+            return new ArrayIterator($source);
+        }
+
+        if (is_callable($source)) {
+            $maybeTraversable = $source();
+
+            return $maybeTraversable instanceof Traversable
+                ? $maybeTraversable
+                : new ArrayIterator(Arr::wrap($maybeTraversable));
+        }
+
+        return new ArrayIterator((array) $source);
+    }
+
+    /**
+     * Explode the &quot;value&quot; and &quot;key&quot; arguments passed to &quot;pluck&quot;.
+     *
+     * @param  string|string[]  $value
+     * @param  string|string[]|null  $key
+     * @return array{string[],string[]|null}
+     */
+    protected function explodePluckParameters($value, $key)
+    {
+        $value = is_string($value) ? explode(&#039;.&#039;, $value) : $value;
+
+        $key = is_null($key) || is_array($key) || $key instanceof Closure ? $key : explode(&#039;.&#039;, $key);
+
+        return [$value, $key];
+    }
+
+    /**
+     * Pass this lazy collection through a method on the collection class.
+     *
+     * @param  string  $method
+     * @param  array&lt;mixed&gt;  $params
+     * @return static
+     */
+    protected function passthru($method, array $params)
+    {
+        return new static(function () use ($method, $params) {
+            yield from $this-&gt;collect()-&gt;$method(...$params);
+        });
+    }
+
+    /**
+     * Get the current time.
+     *
+     * @return int
+     */
+    protected function now()
+    {
+        return class_exists(Carbon::class)
+            ? Carbon::now()-&gt;timestamp
+            : time();
+    }
+
+    /**
+     * Get the precise current time.
+     *
+     * @return float
+     */
+    protected function preciseNow()
+    {
+        return class_exists(Carbon::class)
+            ? Carbon::now()-&gt;getPreciseTimestamp()
+            : microtime(true) * 1_000_000;
+    }
+
+    /**
+     * Sleep for the given amount of microseconds.
+     *
+     * @return void
+     */
+    protected function usleep(int $microseconds)
+    {
+        if ($microseconds &lt;= 0) {
+            return;
+        }
+
+        class_exists(Sleep::class)
+            ? Sleep::usleep($microseconds)
+            : usleep($microseconds);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Collections/MultipleItemsFoundException.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Collections/Traits -->
+
+</body>
+</html>

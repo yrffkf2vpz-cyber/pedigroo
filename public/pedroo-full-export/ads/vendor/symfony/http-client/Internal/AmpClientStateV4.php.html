@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Internal/AmpClientStateV4.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Internal;
+
+use Amp\CancellationToken;
+use Amp\Deferred;
+use Amp\Http\Client\Connection\ConnectionLimitingPool;
+use Amp\Http\Client\Connection\DefaultConnectionFactory;
+use Amp\Http\Client\InterceptedHttpClient;
+use Amp\Http\Client\Interceptor\RetryRequests;
+use Amp\Http\Client\PooledHttpClient;
+use Amp\Http\Client\Request;
+use Amp\Http\Client\Response;
+use Amp\Http\Tunnel\Http1TunnelConnector;
+use Amp\Http\Tunnel\Https1TunnelConnector;
+use Amp\Promise;
+use Amp\Socket\Certificate;
+use Amp\Socket\ClientTlsContext;
+use Amp\Socket\ConnectContext;
+use Amp\Socket\Connector;
+use Amp\Socket\DnsConnector;
+use Amp\Socket\SocketAddress;
+use Amp\Success;
+use Psr\Log\LoggerInterface;
+
+/**
+ * Internal representation of the Amp client&#039;s state.
+ *
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+final class AmpClientStateV4 extends ClientState
+{
+    public array $dnsCache = [];
+    public int $responseCount = 0;
+    public array $pushedResponses = [];
+
+    private array $clients = [];
+    private \Closure $clientConfigurator;
+
+    public function __construct(
+        ?callable $clientConfigurator,
+        private int $maxHostConnections,
+        private int $maxPendingPushes,
+        private ?LoggerInterface &amp;$logger,
+    ) {
+        $clientConfigurator ??= static fn (PooledHttpClient $client) =&gt; new InterceptedHttpClient($client, new RetryRequests(2));
+        $this-&gt;clientConfigurator = $clientConfigurator(...);
+    }
+
+    /**
+     * @return Promise&lt;Response&gt;
+     */
+    public function request(array $options, Request $request, CancellationToken $cancellation, array &amp;$info, \Closure $onProgress, &amp;$handle): Promise
+    {
+        if ($options[&#039;proxy&#039;]) {
+            if ($request-&gt;hasHeader(&#039;proxy-authorization&#039;)) {
+                $options[&#039;proxy&#039;][&#039;auth&#039;] = $request-&gt;getHeader(&#039;proxy-authorization&#039;);
+            }
+
+            // Matching &quot;no_proxy&quot; should follow the behavior of curl
+            $host = $request-&gt;getUri()-&gt;getHost();
+            foreach ($options[&#039;proxy&#039;][&#039;no_proxy&#039;] as $rule) {
+                $dotRule = &#039;.&#039;.ltrim($rule, &#039;.&#039;);
+
+                if (&#039;*&#039; === $rule || $host === $rule || str_ends_with($host, $dotRule)) {
+                    $options[&#039;proxy&#039;] = null;
+                    break;
+                }
+            }
+        }
+
+        $request = clone $request;
+
+        if ($request-&gt;hasHeader(&#039;proxy-authorization&#039;)) {
+            $request-&gt;removeHeader(&#039;proxy-authorization&#039;);
+        }
+
+        if ($options[&#039;capture_peer_cert_chain&#039;]) {
+            $info[&#039;peer_certificate_chain&#039;] = [];
+        }
+
+        $request-&gt;addEventListener(new AmpListenerV4($info, $options[&#039;peer_fingerprint&#039;][&#039;pin-sha256&#039;] ?? [], $onProgress, $handle));
+        $request-&gt;setPushHandler(fn ($request, $response): Promise =&gt; $this-&gt;handlePush($request, $response, $options));
+
+        ($request-&gt;hasHeader(&#039;content-length&#039;) ? new Success((int) $request-&gt;getHeader(&#039;content-length&#039;)) : $request-&gt;getBody()-&gt;getBodyLength())
+            -&gt;onResolve(static function ($e, $bodySize) use (&amp;$info) {
+                if (null !== $bodySize &amp;&amp; 0 &lt;= $bodySize) {
+                    $info[&#039;upload_content_length&#039;] = ((1 + $info[&#039;upload_content_length&#039;]) ?? 1) - 1 + $bodySize;
+                }
+            });
+
+        [$client, $connector] = $this-&gt;getClient($options);
+        $response = $client-&gt;request($request, $cancellation);
+        $response-&gt;onResolve(static function ($e) use ($connector, &amp;$handle) {
+            if (null === $e) {
+                $handle = $connector-&gt;handle;
+            }
+        });
+
+        return $response;
+    }
+
+    private function getClient(array $options): array
+    {
+        $options = [
+            &#039;bindto&#039; =&gt; $options[&#039;bindto&#039;] ?: &#039;0&#039;,
+            &#039;verify_peer&#039; =&gt; $options[&#039;verify_peer&#039;],
+            &#039;capath&#039; =&gt; $options[&#039;capath&#039;],
+            &#039;cafile&#039; =&gt; $options[&#039;cafile&#039;],
+            &#039;local_cert&#039; =&gt; $options[&#039;local_cert&#039;],
+            &#039;local_pk&#039; =&gt; $options[&#039;local_pk&#039;],
+            &#039;ciphers&#039; =&gt; $options[&#039;ciphers&#039;],
+            &#039;capture_peer_cert_chain&#039; =&gt; $options[&#039;capture_peer_cert_chain&#039;] || $options[&#039;peer_fingerprint&#039;],
+            &#039;proxy&#039; =&gt; $options[&#039;proxy&#039;],
+            &#039;crypto_method&#039; =&gt; $options[&#039;crypto_method&#039;],
+        ];
+
+        $key = hash(&#039;xxh128&#039;, serialize($options));
+
+        if (isset($this-&gt;clients[$key])) {
+            return $this-&gt;clients[$key];
+        }
+
+        $context = new ClientTlsContext(&#039;&#039;);
+        $options[&#039;verify_peer&#039;] || $context = $context-&gt;withoutPeerVerification();
+        $options[&#039;cafile&#039;] &amp;&amp; $context = $context-&gt;withCaFile($options[&#039;cafile&#039;]);
+        $options[&#039;capath&#039;] &amp;&amp; $context = $context-&gt;withCaPath($options[&#039;capath&#039;]);
+        $options[&#039;local_cert&#039;] &amp;&amp; $context = $context-&gt;withCertificate(new Certificate($options[&#039;local_cert&#039;], $options[&#039;local_pk&#039;]));
+        $options[&#039;ciphers&#039;] &amp;&amp; $context = $context-&gt;withCiphers($options[&#039;ciphers&#039;]);
+        $options[&#039;capture_peer_cert_chain&#039;] &amp;&amp; $context = $context-&gt;withPeerCapturing();
+        $options[&#039;crypto_method&#039;] &amp;&amp; $context = $context-&gt;withMinimumVersion($options[&#039;crypto_method&#039;]);
+
+        $connector = $handleConnector = new class implements Connector {
+            public DnsConnector $connector;
+            public string $uri;
+            /** @var resource|null */
+            public $handle;
+
+            public function connect(string $uri, ?ConnectContext $context = null, ?CancellationToken $token = null): Promise
+            {
+                $result = $this-&gt;connector-&gt;connect($this-&gt;uri ?? $uri, $context, $token);
+                $result-&gt;onResolve(function ($e, $socket) {
+                    $this-&gt;handle = $socket?-&gt;getResource();
+                });
+
+                return $result;
+            }
+        };
+        $connector-&gt;connector = new DnsConnector(new AmpResolverV4($this-&gt;dnsCache));
+
+        $context = (new ConnectContext())
+            -&gt;withTcpNoDelay()
+            -&gt;withTlsContext($context);
+
+        if ($options[&#039;bindto&#039;]) {
+            if (file_exists($options[&#039;bindto&#039;])) {
+                $connector-&gt;uri = &#039;unix://&#039;.$options[&#039;bindto&#039;];
+            } else {
+                $context = $context-&gt;withBindTo($options[&#039;bindto&#039;]);
+            }
+        }
+
+        if ($options[&#039;proxy&#039;]) {
+            $proxyUrl = parse_url($options[&#039;proxy&#039;][&#039;url&#039;]);
+            $proxySocket = new SocketAddress($proxyUrl[&#039;host&#039;], $proxyUrl[&#039;port&#039;]);
+            $proxyHeaders = $options[&#039;proxy&#039;][&#039;auth&#039;] ? [&#039;Proxy-Authorization&#039; =&gt; $options[&#039;proxy&#039;][&#039;auth&#039;]] : [];
+
+            if (&#039;ssl&#039; === $proxyUrl[&#039;scheme&#039;]) {
+                $connector = new Https1TunnelConnector($proxySocket, $context-&gt;getTlsContext(), $proxyHeaders, $connector);
+            } else {
+                $connector = new Http1TunnelConnector($proxySocket, $proxyHeaders, $connector);
+            }
+        }
+
+        $maxHostConnections = 0 &lt; $this-&gt;maxHostConnections ? $this-&gt;maxHostConnections : \PHP_INT_MAX;
+        $pool = new DefaultConnectionFactory($connector, $context);
+        $pool = ConnectionLimitingPool::byAuthority($maxHostConnections, $pool);
+
+        return $this-&gt;clients[$key] = [($this-&gt;clientConfigurator)(new PooledHttpClient($pool)), $handleConnector];
+    }
+
+    private function handlePush(Request $request, Promise $response, array $options): Promise
+    {
+        $deferred = new Deferred();
+        $authority = $request-&gt;getUri()-&gt;getAuthority();
+
+        if ($this-&gt;maxPendingPushes &lt;= \count($this-&gt;pushedResponses[$authority] ?? [])) {
+            $fifoUrl = key($this-&gt;pushedResponses[$authority]);
+            unset($this-&gt;pushedResponses[$authority][$fifoUrl]);
+            $this-&gt;logger?-&gt;debug(\sprintf(&#039;Evicting oldest pushed response: &quot;%s&quot;&#039;, $fifoUrl));
+        }
+
+        $url = (string) $request-&gt;getUri();
+        $this-&gt;logger?-&gt;debug(\sprintf(&#039;Queueing pushed response: &quot;%s&quot;&#039;, $url));
+        $this-&gt;pushedResponses[$authority][] = [$url, $deferred, $request, $response, [
+            &#039;proxy&#039; =&gt; $options[&#039;proxy&#039;],
+            &#039;bindto&#039; =&gt; $options[&#039;bindto&#039;],
+            &#039;local_cert&#039; =&gt; $options[&#039;local_cert&#039;],
+            &#039;local_pk&#039; =&gt; $options[&#039;local_pk&#039;],
+        ]];
+
+        return $deferred-&gt;promise();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Internal/AmpClientStateV5.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Messenger -->
+
+</body>
+</html>

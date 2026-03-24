@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/EC.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Pure-PHP implementation of EC.
+ *
+ * PHP version 5
+ *
+ * Here&#039;s an example of how to create signatures and verify signatures with this library:
+ * &lt;code&gt;
+ * &lt;?php
+ * include &#039;vendor/autoload.php&#039;;
+ *
+ * $private = \phpseclib3\Crypt\EC::createKey(&#039;secp256k1&#039;);
+ * $public = $private-&gt;getPublicKey();
+ *
+ * $plaintext = &#039;terrafrost&#039;;
+ *
+ * $signature = $private-&gt;sign($plaintext);
+ *
+ * echo $public-&gt;verify($plaintext, $signature) ? &#039;verified&#039; : &#039;unverified&#039;;
+ * ?&gt;
+ * &lt;/code&gt;
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2016 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\Crypt;
+
+use phpseclib3\Crypt\Common\AsymmetricKey;
+use phpseclib3\Crypt\EC\BaseCurves\Montgomery as MontgomeryCurve;
+use phpseclib3\Crypt\EC\BaseCurves\TwistedEdwards as TwistedEdwardsCurve;
+use phpseclib3\Crypt\EC\Curves\Curve25519;
+use phpseclib3\Crypt\EC\Curves\Ed25519;
+use phpseclib3\Crypt\EC\Curves\Ed448;
+use phpseclib3\Crypt\EC\Formats\Keys\PKCS1;
+use phpseclib3\Crypt\EC\Parameters;
+use phpseclib3\Crypt\EC\PrivateKey;
+use phpseclib3\Crypt\EC\PublicKey;
+use phpseclib3\Exception\UnsupportedAlgorithmException;
+use phpseclib3\Exception\UnsupportedCurveException;
+use phpseclib3\Exception\UnsupportedOperationException;
+use phpseclib3\File\ASN1;
+use phpseclib3\File\ASN1\Maps\ECParameters;
+use phpseclib3\Math\BigInteger;
+
+/**
+ * Pure-PHP implementation of EC.
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+abstract class EC extends AsymmetricKey
+{
+    /**
+     * Algorithm Name
+     *
+     * @var string
+     */
+    const ALGORITHM = &#039;EC&#039;;
+
+    /**
+     * Public Key QA
+     *
+     * @var object[]
+     */
+    protected $QA;
+
+    /**
+     * Curve
+     *
+     * @var EC\BaseCurves\Base
+     */
+    protected $curve;
+
+    /**
+     * Signature Format
+     *
+     * @var string
+     */
+    protected $format;
+
+    /**
+     * Signature Format (Short)
+     *
+     * @var string
+     */
+    protected $shortFormat;
+
+    /**
+     * Curve Name
+     *
+     * @var string
+     */
+    private $curveName;
+
+    /**
+     * Curve Order
+     *
+     * Used for deterministic ECDSA
+     *
+     * @var BigInteger
+     */
+    protected $q;
+
+    /**
+     * Alias for the private key
+     *
+     * Used for deterministic ECDSA. AsymmetricKey expects $x. I don&#039;t like x because
+     * with x you have x * the base point yielding an (x, y)-coordinate that is the
+     * public key. But the x is different depending on which side of the equal sign
+     * you&#039;re on. It&#039;s less ambiguous if you do dA * base point = (x, y)-coordinate.
+     *
+     * @var BigInteger
+     */
+    protected $x;
+
+    /**
+     * Context
+     *
+     * @var string
+     */
+    protected $context;
+
+    /**
+     * Signature Format
+     *
+     * @var string
+     */
+    protected $sigFormat;
+
+    /**
+     * Create public / private key pair.
+     *
+     * @param string $curve
+     * @return PrivateKey
+     */
+    public static function createKey($curve)
+    {
+        self::initialize_static_variables();
+
+        $class = new \ReflectionClass(static::class);
+        if ($class-&gt;isFinal()) {
+            throw new \RuntimeException(&#039;createKey() should not be called from final classes (&#039; . static::class . &#039;)&#039;);
+        }
+
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+
+        $curve = strtolower($curve);
+        if (self::$engines[&#039;libsodium&#039;] &amp;&amp; $curve == &#039;ed25519&#039; &amp;&amp; function_exists(&#039;sodium_crypto_sign_keypair&#039;)) {
+            $kp = sodium_crypto_sign_keypair();
+
+            $privatekey = EC::loadFormat(&#039;libsodium&#039;, sodium_crypto_sign_secretkey($kp));
+            //$publickey = EC::loadFormat(&#039;libsodium&#039;, sodium_crypto_sign_publickey($kp));
+
+            $privatekey-&gt;curveName = &#039;Ed25519&#039;;
+            //$publickey-&gt;curveName = $curve;
+
+            return $privatekey;
+        }
+
+        $privatekey = new PrivateKey();
+
+        $curveName = $curve;
+        if (preg_match(&#039;#(?:^curve|^ed)\d+$#&#039;, $curveName)) {
+            $curveName = ucfirst($curveName);
+        } elseif (substr($curveName, 0, 10) == &#039;brainpoolp&#039;) {
+            $curveName = &#039;brainpoolP&#039; . substr($curveName, 10);
+        }
+        $curve = &#039;\phpseclib3\Crypt\EC\Curves\\&#039; . $curveName;
+
+        if (!class_exists($curve)) {
+            throw new UnsupportedCurveException(&#039;Named Curve of &#039; . $curveName . &#039; is not supported&#039;);
+        }
+
+        $reflect = new \ReflectionClass($curve);
+        $curveName = $reflect-&gt;isFinal() ?
+            $reflect-&gt;getParentClass()-&gt;getShortName() :
+            $reflect-&gt;getShortName();
+
+        $curve = new $curve();
+        if ($curve instanceof TwistedEdwardsCurve) {
+            $arr = $curve-&gt;extractSecret(Random::string($curve instanceof Ed448 ? 57 : 32));
+            $privatekey-&gt;dA = $dA = $arr[&#039;dA&#039;];
+            $privatekey-&gt;secret = $arr[&#039;secret&#039;];
+        } else {
+            $privatekey-&gt;dA = $dA = $curve-&gt;createRandomMultiplier();
+        }
+        if ($curve instanceof Curve25519 &amp;&amp; self::$engines[&#039;libsodium&#039;]) {
+            //$r = pack(&#039;H*&#039;, &#039;0900000000000000000000000000000000000000000000000000000000000000&#039;);
+            //$QA = sodium_crypto_scalarmult($dA-&gt;toBytes(), $r);
+            $QA = sodium_crypto_box_publickey_from_secretkey($dA-&gt;toBytes());
+            $privatekey-&gt;QA = [$curve-&gt;convertInteger(new BigInteger(strrev($QA), 256))];
+        } else {
+            $privatekey-&gt;QA = $curve-&gt;multiplyPoint($curve-&gt;getBasePoint(), $dA);
+        }
+        $privatekey-&gt;curve = $curve;
+
+        //$publickey = clone $privatekey;
+        //unset($publickey-&gt;dA);
+        //unset($publickey-&gt;x);
+
+        $privatekey-&gt;curveName = $curveName;
+        //$publickey-&gt;curveName = $curveName;
+
+        if ($privatekey-&gt;curve instanceof TwistedEdwardsCurve) {
+            return $privatekey-&gt;withHash($curve::HASH);
+        }
+
+        return $privatekey;
+    }
+
+    /**
+     * OnLoad Handler
+     *
+     * @return bool
+     */
+    protected static function onLoad(array $components)
+    {
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+
+        if (!isset($components[&#039;dA&#039;]) &amp;&amp; !isset($components[&#039;QA&#039;])) {
+            $new = new Parameters();
+            $new-&gt;curve = $components[&#039;curve&#039;];
+            return $new;
+        }
+
+        $new = isset($components[&#039;dA&#039;]) ?
+            new PrivateKey() :
+            new PublicKey();
+        $new-&gt;curve = $components[&#039;curve&#039;];
+        $new-&gt;QA = $components[&#039;QA&#039;];
+
+        if (isset($components[&#039;dA&#039;])) {
+            $new-&gt;dA = $components[&#039;dA&#039;];
+            $new-&gt;secret = $components[&#039;secret&#039;];
+        }
+
+        if ($new-&gt;curve instanceof TwistedEdwardsCurve) {
+            return $new-&gt;withHash($components[&#039;curve&#039;]::HASH);
+        }
+
+        return $new;
+    }
+
+    /**
+     * Constructor
+     *
+     * PublicKey and PrivateKey objects can only be created from abstract RSA class
+     */
+    protected function __construct()
+    {
+        $this-&gt;sigFormat = self::validatePlugin(&#039;Signature&#039;, &#039;ASN1&#039;);
+        $this-&gt;shortFormat = &#039;ASN1&#039;;
+
+        parent::__construct();
+    }
+
+    /**
+     * Returns the curve
+     *
+     * Returns a string if it&#039;s a named curve, an array if not
+     *
+     * @return string|array
+     */
+    public function getCurve()
+    {
+        if ($this-&gt;curveName) {
+            return $this-&gt;curveName;
+        }
+
+        if ($this-&gt;curve instanceof MontgomeryCurve) {
+            $this-&gt;curveName = $this-&gt;curve instanceof Curve25519 ? &#039;Curve25519&#039; : &#039;Curve448&#039;;
+            return $this-&gt;curveName;
+        }
+
+        if ($this-&gt;curve instanceof TwistedEdwardsCurve) {
+            $this-&gt;curveName = $this-&gt;curve instanceof Ed25519 ? &#039;Ed25519&#039; : &#039;Ed448&#039;;
+            return $this-&gt;curveName;
+        }
+
+        $params = $this-&gt;getParameters()-&gt;toString(&#039;PKCS8&#039;, [&#039;namedCurve&#039; =&gt; true]);
+        $decoded = ASN1::extractBER($params);
+        $decoded = ASN1::decodeBER($decoded);
+        $decoded = ASN1::asn1map($decoded[0], ECParameters::MAP);
+        if (isset($decoded[&#039;namedCurve&#039;])) {
+            $this-&gt;curveName = $decoded[&#039;namedCurve&#039;];
+            return $decoded[&#039;namedCurve&#039;];
+        }
+
+        if (!$namedCurves) {
+            PKCS1::useSpecifiedCurve();
+        }
+
+        return $decoded;
+    }
+
+    /**
+     * Returns the key size
+     *
+     * Quoting https://tools.ietf.org/html/rfc5656#section-2,
+     *
+     * &quot;The size of a set of elliptic curve domain parameters on a prime
+     *  curve is defined as the number of bits in the binary representation
+     *  of the field order, commonly denoted by p.  Size on a
+     *  characteristic-2 curve is defined as the number of bits in the binary
+     *  representation of the field, commonly denoted by m.  A set of
+     *  elliptic curve domain parameters defines a group of order n generated
+     *  by a base point P&quot;
+     *
+     * @return int
+     */
+    public function getLength()
+    {
+        return $this-&gt;curve-&gt;getLength();
+    }
+
+    /**
+     * Returns the current engine being used
+     *
+     * @see self::useInternalEngine()
+     * @see self::useBestEngine()
+     * @return string
+     */
+    public function getEngine()
+    {
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+        if ($this-&gt;curve instanceof TwistedEdwardsCurve) {
+            return $this-&gt;curve instanceof Ed25519 &amp;&amp; self::$engines[&#039;libsodium&#039;] &amp;&amp; !isset($this-&gt;context) ?
+                &#039;libsodium&#039; : &#039;PHP&#039;;
+        }
+
+        return self::$engines[&#039;OpenSSL&#039;] &amp;&amp; in_array($this-&gt;hash-&gt;getHash(), openssl_get_md_methods()) ?
+            &#039;OpenSSL&#039; : &#039;PHP&#039;;
+    }
+
+    /**
+     * Returns the public key coordinates as a string
+     *
+     * Used by ECDH
+     *
+     * @return string
+     */
+    public function getEncodedCoordinates()
+    {
+        if ($this-&gt;curve instanceof MontgomeryCurve) {
+            return strrev($this-&gt;QA[0]-&gt;toBytes(true));
+        }
+        if ($this-&gt;curve instanceof TwistedEdwardsCurve) {
+            return $this-&gt;curve-&gt;encodePoint($this-&gt;QA);
+        }
+        return &quot;\4&quot; . $this-&gt;QA[0]-&gt;toBytes(true) . $this-&gt;QA[1]-&gt;toBytes(true);
+    }
+
+    /**
+     * Returns the parameters
+     *
+     * @see self::getPublicKey()
+     * @param string $type optional
+     * @return mixed
+     */
+    public function getParameters($type = &#039;PKCS1&#039;)
+    {
+        $type = self::validatePlugin(&#039;Keys&#039;, $type, &#039;saveParameters&#039;);
+
+        $key = $type::saveParameters($this-&gt;curve);
+
+        return EC::load($key, &#039;PKCS1&#039;)
+            -&gt;withHash($this-&gt;hash-&gt;getHash())
+            -&gt;withSignatureFormat($this-&gt;shortFormat);
+    }
+
+    /**
+     * Determines the signature padding mode
+     *
+     * Valid values are: ASN1, SSH2, Raw
+     *
+     * @param string $format
+     */
+    public function withSignatureFormat($format)
+    {
+        if ($this-&gt;curve instanceof MontgomeryCurve) {
+            throw new UnsupportedOperationException(&#039;Montgomery Curves cannot be used to create signatures&#039;);
+        }
+
+        $new = clone $this;
+        $new-&gt;shortFormat = $format;
+        $new-&gt;sigFormat = self::validatePlugin(&#039;Signature&#039;, $format);
+        return $new;
+    }
+
+    /**
+     * Returns the signature format currently being used
+     *
+     */
+    public function getSignatureFormat()
+    {
+        return $this-&gt;shortFormat;
+    }
+
+    /**
+     * Sets the context
+     *
+     * Used by Ed25519 / Ed448.
+     *
+     * @see self::sign()
+     * @see self::verify()
+     * @param string $context optional
+     */
+    public function withContext($context = null)
+    {
+        if (!$this-&gt;curve instanceof TwistedEdwardsCurve) {
+            throw new UnsupportedCurveException(&#039;Only Ed25519 and Ed448 support contexts&#039;);
+        }
+
+        $new = clone $this;
+        if (!isset($context)) {
+            $new-&gt;context = null;
+            return $new;
+        }
+        if (!is_string($context)) {
+            throw new \InvalidArgumentException(&#039;setContext expects a string&#039;);
+        }
+        if (strlen($context) &gt; 255) {
+            throw new \LengthException(&#039;The context is supposed to be, at most, 255 bytes long&#039;);
+        }
+        $new-&gt;context = $context;
+        return $new;
+    }
+
+    /**
+     * Returns the signature format currently being used
+     *
+     */
+    public function getContext()
+    {
+        return $this-&gt;context;
+    }
+
+    /**
+     * Determines which hashing function should be used
+     *
+     * @param string $hash
+     */
+    public function withHash($hash)
+    {
+        if ($this-&gt;curve instanceof MontgomeryCurve) {
+            throw new UnsupportedOperationException(&#039;Montgomery Curves cannot be used to create signatures&#039;);
+        }
+        if ($this-&gt;curve instanceof Ed25519 &amp;&amp; $hash != &#039;sha512&#039;) {
+            throw new UnsupportedAlgorithmException(&#039;Ed25519 only supports sha512 as a hash&#039;);
+        }
+        if ($this-&gt;curve instanceof Ed448 &amp;&amp; $hash != &#039;shake256-912&#039;) {
+            throw new UnsupportedAlgorithmException(&#039;Ed448 only supports shake256 with a length of 114 bytes&#039;);
+        }
+
+        return parent::withHash($hash);
+    }
+
+    /**
+     * __toString() magic method
+     *
+     * @return string
+     */
+    public function __toString()
+    {
+        if ($this-&gt;curve instanceof MontgomeryCurve) {
+            return &#039;&#039;;
+        }
+
+        return parent::__toString();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/EC/BaseCurves/Base.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/Common -->
+
+</body>
+</html>

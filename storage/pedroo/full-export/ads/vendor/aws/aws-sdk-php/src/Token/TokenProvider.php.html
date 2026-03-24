@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Token/TokenProvider.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Token;
+
+use Aws;
+use Aws\CacheInterface;
+use Aws\Exception\TokenException;
+use GuzzleHttp\Promise;
+
+/**
+ * Token providers are functions that accept no arguments and return a
+ * promise that is fulfilled with an {@see \Aws\Token\TokenInterface}
+ * or rejected with an {@see \Aws\Exception\TokenException}.
+ *
+ * &lt;code&gt;
+ * use Aws\Token\TokenProvider;
+ * $provider = TokenProvider::defaultProvider();
+ * // Returns a TokenInterface or throws.
+ * $token = $provider()-&gt;wait();
+ * &lt;/code&gt;
+ *
+ * Token providers can be composed to create a token using conditional
+ * logic that can create different tokens in different environments. You
+ * can compose multiple providers into a single provider using
+ * {@see Aws\Token\TokenProvider::chain}. This function accepts
+ * providers as variadic arguments and returns a new function that will invoke
+ * each provider until a token is successfully returned.
+ */
+class TokenProvider
+{
+    const ENV_PROFILE = &#039;AWS_PROFILE&#039;;
+
+    use ParsesIniTrait;
+
+    /**
+     * Create a default token provider tha checks for cached a SSO token from
+     * the CLI
+     *
+     * This provider is automatically wrapped in a memoize function that caches
+     * previously provided tokens.
+     *
+     * @param array $config Optional array of token provider options.
+     *
+     * @return callable
+     */
+    public static function defaultProvider(array $config = [])
+    {
+        $cacheable = [
+            &#039;sso&#039;,
+        ];
+
+        $defaultChain = [];
+
+        if (!isset($config[&#039;use_aws_shared_config_files&#039;])
+            || $config[&#039;use_aws_shared_config_files&#039;] !== false
+        ) {
+            $profileName = getenv(self::ENV_PROFILE) ?: &#039;default&#039;;
+            $defaultChain[&#039;sso&#039;] = self::sso(
+                $profileName,
+                self::getHomeDir() . &#039;/.aws/config&#039;,
+                $config
+            );
+        }
+
+        if (isset($config[&#039;token&#039;])
+            &amp;&amp; $config[&#039;token&#039;] instanceof CacheInterface
+        ) {
+            foreach ($cacheable as $provider) {
+                if (isset($defaultChain[$provider])) {
+                    $defaultChain[$provider] = self::cache(
+                        $defaultChain[$provider],
+                        $config[&#039;token&#039;],
+                        &#039;aws_cached_&#039; . $provider . &#039;_token&#039;
+                    );
+                }
+            }
+        }
+
+        return self::memoize(
+            call_user_func_array(
+                [__CLASS__, &#039;chain&#039;],
+                array_values($defaultChain)
+            )
+        );
+    }
+
+    /**
+     * Create a token provider function from a static token.
+     *
+     * @param TokenInterface $token
+     *
+     * @return callable
+     */
+    public static function fromToken(TokenInterface $token)
+    {
+        $promise = Promise\Create::promiseFor($token);
+
+        return static function () use ($promise) {
+            return $promise;
+        };
+    }
+
+    /**
+     * Creates an aggregate token provider that invokes the provided
+     * variadic providers one after the other until a provider returns
+     * a token.
+     *
+     * @return callable
+     */
+    public static function chain()
+    {
+        $links = func_get_args();
+        //Common use case for when aws_shared_config_files is false
+        if (empty($links)) {
+            return static function () {
+                return Promise\Create::promiseFor(false);
+            };
+        }
+
+        return static function () use ($links) {
+            /** @var callable $parent */
+            $parent = array_shift($links);
+            $promise = $parent();
+            while ($next = array_shift($links)) {
+                $promise = $promise-&gt;otherwise($next);
+            }
+            return $promise;
+        };
+    }
+
+    /**
+     * Wraps a token provider and caches a previously provided token.
+     * Ensures that cached tokens are refreshed when they expire.
+     *
+     * @param callable $provider Token provider function to wrap.
+     * @return callable
+     */
+    public static function memoize(callable $provider)
+    {
+        return static function () use ($provider) {
+            static $result;
+            static $isConstant;
+
+            // Constant tokens will be returned constantly.
+            if ($isConstant) {
+                return $result;
+            }
+
+            // Create the initial promise that will be used as the cached value
+            // until it expires.
+            if (null === $result) {
+                $result = $provider();
+            }
+
+            // Return a token that could expire and refresh when needed.
+            return $result
+                -&gt;then(function (TokenInterface $token) use ($provider, &amp;$isConstant, &amp;$result) {
+                    // Determine if the token is constant.
+                    if (!$token-&gt;getExpiration()) {
+                        $isConstant = true;
+                        return $token;
+                    }
+
+                    if (!$token-&gt;isExpired()) {
+                        return $token;
+                    }
+                    return $result = $provider();
+                })
+                -&gt;otherwise(function($reason) use (&amp;$result) {
+                    // Cleanup rejected promise.
+                    $result = null;
+                    return Promise\Create::promiseFor(null);
+                });
+        };
+    }
+
+    /**
+     * Wraps a token provider and saves provided token in an
+     * instance of Aws\CacheInterface. Forwards calls when no token found
+     * in cache and updates cache with the results.
+     *
+     * @param callable $provider Token provider function to wrap
+     * @param CacheInterface $cache Cache to store the token
+     * @param string|null $cacheKey (optional) Cache key to use
+     *
+     * @return callable
+     */
+    public static function cache(
+        callable $provider,
+        CacheInterface $cache,
+        $cacheKey = null
+    ){
+        $cacheKey = $cacheKey ?: &#039;aws_cached_token&#039;;
+
+        return static function () use ($provider, $cache, $cacheKey) {
+            $found = $cache-&gt;get($cacheKey);
+            if (is_array($found) &amp;&amp; isset($found[&#039;token&#039;])) {
+                $foundToken = $found[&#039;token&#039;];
+                if ($foundToken instanceof TokenInterface) {
+                    if (!$foundToken-&gt;isExpired()) {
+                        return Promise\Create::promiseFor($foundToken);
+                    }
+                    if (isset($found[&#039;refreshMethod&#039;]) &amp;&amp; is_callable($found[&#039;refreshMethod&#039;])) {
+                        return Promise\Create::promiseFor($found[&#039;refreshMethod&#039;]());
+                    }
+                }
+            }
+
+            return $provider()
+                -&gt;then(function (TokenInterface $token) use (
+                    $cache,
+                    $cacheKey
+                ) {
+                    $cache-&gt;set(
+                        $cacheKey,
+                        [&#039;token&#039; =&gt; $token],
+                        null === $token-&gt;getExpiration() ?
+                            0 : $token-&gt;getExpiration() - time()
+                    );
+
+                    return $token;
+                });
+        };
+    }
+
+    /**
+     * Gets profiles from the ~/.aws/config ini file
+     */
+    private static function loadDefaultProfiles()
+    {
+        $profiles = [];
+        $configFile = self::getHomeDir() . &#039;/.aws/config&#039;;
+
+        if (file_exists($configFile)) {
+            $configProfileData = \Aws\parse_ini_file($configFile, true, INI_SCANNER_RAW);
+            foreach ($configProfileData as $name =&gt; $profile) {
+                // standardize config profile names
+                $name = str_replace(&#039;profile &#039;, &#039;&#039;, $name);
+                if (!isset($profiles[$name])) {
+                    $profiles[$name] = $profile;
+                }
+            }
+        }
+
+        return $profiles;
+    }
+
+    private static function reject($msg)
+    {
+        return new Promise\RejectedPromise(new TokenException($msg));
+    }
+
+    /**
+     * Token provider that creates a token from cached sso credentials
+     *
+     * @param string $profileName the name of the ini profile name
+     * @param string $filename the location of the ini file
+     * @param array $config configuration options
+     *
+     * @return SsoTokenProvider
+     * @see Aws\Token\SsoTokenProvider for $config details.
+     */
+    public static function sso(
+        $profileName,
+        $filename,
+        $config = []
+    ){
+        $ssoClient = $config[&#039;ssoClient&#039;] ?? null;
+
+        return new SsoTokenProvider($profileName, $filename, $ssoClient);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Token/TokenSource.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/TranscribeService -->
+
+</body>
+</html>

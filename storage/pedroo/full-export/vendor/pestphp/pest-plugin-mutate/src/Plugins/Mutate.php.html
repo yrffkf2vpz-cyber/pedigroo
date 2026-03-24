@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest-plugin-mutate/src/Plugins/Mutate.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Mutate\Plugins;
+
+use NunoMaduro\Collision\Highlighter;
+use Pest\Contracts\Bootstrapper;
+use Pest\Contracts\Plugins\AddsOutput;
+use Pest\Contracts\Plugins\Bootable;
+use Pest\Contracts\Plugins\HandlesArguments;
+use Pest\Exceptions\InvalidOption;
+use Pest\Mutate\Boostrappers\BootPhpUnitSubscribers;
+use Pest\Mutate\Boostrappers\BootSubscribers;
+use Pest\Mutate\Cache\FileStore;
+use Pest\Mutate\Contracts\MutationTestRunner;
+use Pest\Mutate\Contracts\Printer;
+use Pest\Mutate\Event\Events\Test\HookMethod\BeforeFirstTestExecuted;
+use Pest\Mutate\Event\Events\Test\HookMethod\BeforeFirstTestExecutedSubscriber;
+use Pest\Mutate\Event\Events\Test\Outcome\Tested;
+use Pest\Mutate\Event\Events\Test\Outcome\TestedSubscriber;
+use Pest\Mutate\Event\Events\Test\Outcome\Timeout;
+use Pest\Mutate\Event\Events\Test\Outcome\TimeoutSubscriber;
+use Pest\Mutate\Event\Events\Test\Outcome\Uncovered;
+use Pest\Mutate\Event\Events\Test\Outcome\UncoveredSubscriber;
+use Pest\Mutate\Event\Events\Test\Outcome\Untested;
+use Pest\Mutate\Event\Events\Test\Outcome\UntestedSubscriber;
+use Pest\Mutate\Event\Events\TestSuite\FinishMutationGeneration;
+use Pest\Mutate\Event\Events\TestSuite\FinishMutationGenerationSubscriber;
+use Pest\Mutate\Event\Events\TestSuite\FinishMutationSuite;
+use Pest\Mutate\Event\Events\TestSuite\FinishMutationSuiteSubscriber;
+use Pest\Mutate\Event\Events\TestSuite\StartMutationGeneration;
+use Pest\Mutate\Event\Events\TestSuite\StartMutationGenerationSubscriber;
+use Pest\Mutate\Event\Events\TestSuite\StartMutationSuite;
+use Pest\Mutate\Event\Events\TestSuite\StartMutationSuiteSubscriber;
+use Pest\Mutate\Event\Facade;
+use Pest\Mutate\Repositories\ConfigurationRepository;
+use Pest\Mutate\Subscribers\PrinterSubscriber;
+use Pest\Mutate\Support\Printers\DefaultPrinter;
+use Pest\Mutate\Support\StreamWrapper;
+use Pest\Plugins\Concerns\HandleArguments;
+use Pest\Plugins\Parallel;
+use Pest\Support\Container;
+use Pest\Support\Coverage;
+use Psr\SimpleCache\CacheInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * @internal
+ *
+ * @final
+ */
+class Mutate implements AddsOutput, Bootable, HandlesArguments
+{
+    use HandleArguments;
+
+    final public const string ENV_MUTATION_TESTING = &#039;PEST_MUTATION_TESTING&#039;;
+
+    final public const string ENV_MUTATION_FILE = &#039;PEST_MUTATION_FILE&#039;;
+
+    /**
+     * The Kernel bootstrappers.
+     *
+     * @var array&lt;int, class-string&gt;
+     */
+    private const array BOOTSTRAPPERS = [
+        BootPhpUnitSubscribers::class,
+        BootSubscribers::class,
+    ];
+
+    /**
+     * Creates a new Plugin instance.
+     */
+    public function __construct(
+        private readonly Container $container,
+        private readonly OutputInterface $output,
+    ) {
+        //
+    }
+
+    public function boot(): void
+    {
+        if (getenv(self::ENV_MUTATION_TESTING) !== false) {
+            // @phpstan-ignore-next-line
+            StreamWrapper::start(getenv(self::ENV_MUTATION_TESTING), (string) getenv(self::ENV_MUTATION_FILE));
+        }
+
+        $this-&gt;container-&gt;add(MutationTestRunner::class, $runner = new \Pest\Mutate\Tester\MutationTestRunner);
+        $this-&gt;container-&gt;add(Printer::class, $printer = new DefaultPrinter($this-&gt;output));
+
+        if ($_SERVER[&#039;COLLISION_PRINTER_COMPACT&#039;] ?? false) {
+            $printer-&gt;compact();
+        }
+
+        foreach (self::BOOTSTRAPPERS as $bootstrapper) {
+            $bootstrapper = Container::getInstance()-&gt;get($bootstrapper);
+            assert($bootstrapper instanceof Bootstrapper);
+
+            $bootstrapper-&gt;boot();
+        }
+
+        $this-&gt;container-&gt;add(CacheInterface::class, new FileStore(dirname(__DIR__, 2).&#039;/.temp/pest-mutate-cache&#039;));
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function handleArguments(array $arguments): array
+    {
+        /** @var \Pest\Mutate\Tester\MutationTestRunner $mutationTestRunner */
+        $mutationTestRunner = Container::getInstance()-&gt;get(MutationTestRunner::class);
+
+        if (! $this-&gt;hasArgument(&#039;--mutate&#039;, $arguments)) {
+            if (! $mutationTestRunner-&gt;isEnabled()) {
+                return $arguments;
+            }
+        } else {
+            $arguments = $this-&gt;popArgument(&#039;--mutate&#039;, $arguments);
+        }
+
+        if (! Coverage::isAvailable() &amp;&amp; ! isset($_SERVER[&#039;PEST_PLUGIN_INTERNAL_TEST_SUITE&#039;])) {
+            throw new InvalidOption(&#039;Mutation testing requires code coverage to be enabled. You can find more about code coverage in the Pest documentation.&#039;);
+        }
+
+        $mutationTestRunner-&gt;enable();
+        $this-&gt;ensurePrinterIsRegistered();
+
+        $coverageRequired = array_filter($arguments, fn (string $argument): bool =&gt; str_starts_with($argument, &#039;--coverage&#039;)) !== [];
+        if ($coverageRequired) {
+            $mutationTestRunner-&gt;doNotDisableCodeCoverage();
+        } else {
+            $arguments[] = &#039;--coverage-php=&#039;.Coverage::getPath();
+        }
+
+        $arguments = Container::getInstance()-&gt;get(ConfigurationRepository::class) // @phpstan-ignore-line
+            -&gt;cliConfiguration-&gt;fromArguments($arguments);
+
+        $mutationTestRunner-&gt;setOriginalArguments($arguments);
+        $mutationTestRunner-&gt;setStartTime(microtime(true));
+
+        return $arguments;
+    }
+
+    public function addOutput(int $exitCode): int
+    {
+        /** @var MutationTestRunner $mutationTestRunner */
+        $mutationTestRunner = Container::getInstance()-&gt;get(MutationTestRunner::class);
+
+        if (Parallel::isWorker() || $exitCode !== 0 || ! $mutationTestRunner-&gt;isEnabled()) {
+            return $exitCode;
+        }
+
+        if (isset($_SERVER[&#039;PEST_PLUGIN_INTERNAL_TEST_SUITE&#039;]) &amp;&amp; $_SERVER[&#039;PEST_PLUGIN_INTERNAL_TEST_SUITE&#039;] === 1) {
+            return $exitCode;
+        }
+
+        /** @var ConfigurationRepository $configurationRepository */
+        $configurationRepository = Container::getInstance()-&gt;get(ConfigurationRepository::class);
+        $configuration = $configurationRepository-&gt;mergedConfiguration();
+
+        $paths = $configurationRepository-&gt;cliConfiguration-&gt;toArray()[&#039;paths&#039;] ?? false;
+
+        if (! is_array($paths) &amp;&amp; $configuration-&gt;classes === [] &amp;&amp; ! $configuration-&gt;everything) {
+            $this-&gt;output-&gt;writeln([&#039;  &lt;bg=red&gt; ERROR &lt;/&gt; Mutation testing requires the usage of the `covers()` function or `mutates()` function. Here is an example:&#039;, &#039;&#039;]);
+
+            $highlighter = new Highlighter;
+            $content = $highlighter-&gt;highlight(&lt;&lt;&lt;&#039;PHP&#039;
+                covers(TodoController::class); // mutations will be generated only for this class
+                // or mutates(TodoController::class);
+
+                it(&#039;list todos&#039;, function () {
+                    // your test here...
+                });
+            PHP, 1);
+
+            $this-&gt;output-&gt;writeln($content);
+
+            $this-&gt;output-&gt;writeln([&#039;&#039;, &#039;  &lt;bg=cyan&gt; INFO &lt;/&gt; Optionally, you can use mutation testing with our filters:&#039;, &#039;&#039;]);
+
+            $this-&gt;output-&gt;writeln([
+                &#039;  &lt;fg=gray&gt;pest --mutate --parallel --path=app/Models&lt;/&gt;&#039;,
+                &#039;  &lt;fg=gray&gt;pest --mutate --parallel --class=App\\Models&lt;/&gt;&#039;,
+                &#039;  &lt;fg=gray&gt;pest --mutate --parallel --everything --covered-only&lt;/&gt;&#039;,
+            ]);
+
+            $this-&gt;output-&gt;writeln([&#039;&#039;, &#039;  However, we recommend using the `covers()` function or the `mutates()` function for better performance, and keep tracking of your mutation testing score over time.&#039;]);
+
+            return 1;
+        }
+
+        return $mutationTestRunner-&gt;run();
+    }
+
+    private function ensurePrinterIsRegistered(): void
+    {
+        /** @var Printer $printer */
+        $printer = Container::getInstance()-&gt;get(Printer::class);
+
+        $subscribers = [
+            // Test &gt; Hook Methods
+            new class($printer) extends PrinterSubscriber implements BeforeFirstTestExecutedSubscriber
+            {
+                public function notify(BeforeFirstTestExecuted $event): void
+                {
+                    $this-&gt;printer()-&gt;printFilename($event-&gt;testCollection);
+                }
+            },
+
+            // Test &gt; Outcome
+            new class($printer) extends PrinterSubscriber implements TestedSubscriber
+            {
+                public function notify(Tested $event): void
+                {
+                    $this-&gt;printer()-&gt;reportTestedMutation($event-&gt;test);
+                }
+            },
+
+            new class($printer) extends PrinterSubscriber implements UntestedSubscriber
+            {
+                public function notify(Untested $event): void
+                {
+                    $this-&gt;printer()-&gt;reportUntestedMutation($event-&gt;test);
+                }
+            },
+
+            new class($printer) extends PrinterSubscriber implements TimeoutSubscriber
+            {
+                public function notify(Timeout $event): void
+                {
+                    $this-&gt;printer()-&gt;reportTimedOutMutation($event-&gt;test);
+                }
+            },
+
+            new class($printer) extends PrinterSubscriber implements UncoveredSubscriber
+            {
+                public function notify(Uncovered $event): void
+                {
+                    $this-&gt;printer()-&gt;reportUncoveredMutation($event-&gt;test);
+                }
+            },
+
+            // MutationSuite
+            new class($printer) extends PrinterSubscriber implements StartMutationGenerationSubscriber
+            {
+                public function notify(StartMutationGeneration $event): void
+                {
+                    $this-&gt;printer()-&gt;reportMutationGenerationStarted($event-&gt;mutationSuite);
+                }
+            },
+
+            new class($printer) extends PrinterSubscriber implements FinishMutationGenerationSubscriber
+            {
+                public function notify(FinishMutationGeneration $event): void
+                {
+                    $this-&gt;printer()-&gt;reportMutationGenerationFinished($event-&gt;mutationSuite);
+                }
+            },
+
+            new class($printer) extends PrinterSubscriber implements StartMutationSuiteSubscriber
+            {
+                public function notify(StartMutationSuite $event): void
+                {
+                    $this-&gt;printer()-&gt;reportMutationSuiteStarted($event-&gt;mutationSuite);
+                }
+            },
+
+            new class($printer) extends PrinterSubscriber implements FinishMutationSuiteSubscriber
+            {
+                public function notify(FinishMutationSuite $event): void
+                {
+                    $this-&gt;printer()-&gt;reportMutationSuiteFinished($event-&gt;mutationSuite);
+                }
+            },
+        ];
+
+        Facade::instance()-&gt;registerSubscribers(...$subscribers);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest-plugin-mutate/src/Repositories/ConfigurationRepository.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest-plugin-mutate/src/Repositories -->
+
+</body>
+</html>

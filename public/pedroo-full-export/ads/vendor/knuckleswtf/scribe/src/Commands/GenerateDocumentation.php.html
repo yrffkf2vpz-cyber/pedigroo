@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Commands/GenerateDocumentation.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Foundation\Application;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\URL;
+use Illuminate\Support\Str;
+use Knuckles\Camel\Camel;
+use Knuckles\Scribe\GroupedEndpoints\GroupedEndpointsFactory;
+use Knuckles\Scribe\Matching\RouteMatcherInterface;
+use Knuckles\Scribe\Scribe;
+use Knuckles\Scribe\Tools\ConfigDiffer;
+use Knuckles\Scribe\Tools\ConsoleOutputUtils as c;
+use Knuckles\Scribe\Tools\DocumentationConfig;
+use Knuckles\Scribe\Tools\ErrorHandlingUtils as e;
+use Knuckles\Scribe\Tools\Globals;
+use Knuckles\Scribe\Tools\PathConfig;
+use Knuckles\Scribe\Writing\Writer;
+use Shalvah\Upgrader\Upgrader;
+
+class GenerateDocumentation extends Command
+{
+    protected $signature = &quot;scribe:generate
+                            {--force : Discard any changes you&#039;ve made to the YAML or Markdown files}
+                            {--no-extraction : Skip extraction of route and API info and just transform the YAML and Markdown files into HTML}
+                            {--no-upgrade-check : Skip checking for config file upgrades. Won&#039;t make things faster, but can be helpful if the command is buggy}
+                            {--config=scribe : Choose which config file to use}
+                            {--scribe-dir= : Specify the directory where Scribe stores its intermediate output and cache. Defaults to `.&lt;config_file&gt;`}
+    &quot;;
+
+    protected $description = &#039;Generate API documentation from your Laravel routes.&#039;;
+
+    protected DocumentationConfig $docConfig;
+
+    protected bool $shouldExtract;
+
+    protected bool $forcing;
+
+    protected PathConfig $paths;
+
+    public function handle(RouteMatcherInterface $routeMatcher, GroupedEndpointsFactory $groupedEndpointsFactory): void
+    {
+        $this-&gt;bootstrap();
+
+        if (!empty($this-&gt;docConfig-&gt;get(&quot;default_group&quot;))) {
+            $this-&gt;warn(&quot;It looks like you just upgraded to Scribe v4.&quot;);
+            $this-&gt;warn(&quot;Please run the upgrade command first: `php artisan scribe:upgrade`.&quot;);
+            exit(1);
+        }
+
+        // Extraction stage - extract endpoint info either from app or existing Camel files (previously extracted data)
+        $groupedEndpointsInstance = $groupedEndpointsFactory-&gt;make($this, $routeMatcher, $this-&gt;paths);
+        $extractedEndpoints = $groupedEndpointsInstance-&gt;get();
+        $userDefinedEndpoints = Camel::loadUserDefinedEndpoints(Camel::camelDir($this-&gt;paths));
+        $groupedEndpoints = $this-&gt;mergeUserDefinedEndpoints($extractedEndpoints, $userDefinedEndpoints);
+
+        // Output stage
+        $configFileOrder = $this-&gt;docConfig-&gt;get(&#039;groups.order&#039;, []);
+        $groupedEndpoints = Camel::prepareGroupedEndpointsForOutput($groupedEndpoints, $configFileOrder);
+
+        if (!count($userDefinedEndpoints)) {
+            // Update the example custom file if there were no custom endpoints
+            $this-&gt;writeExampleCustomEndpoint();
+        }
+
+        /** @var Writer $writer */
+        $writer = app(Writer::class, [&#039;config&#039; =&gt; $this-&gt;docConfig, &#039;paths&#039; =&gt; $this-&gt;paths]);
+        $writer-&gt;writeDocs($groupedEndpoints);
+
+        // Retiring the automatic upgrade check, since the config file is no longer changing as frequently.
+        // $this-&gt;upgradeConfigFileIfNeeded();
+
+        $this-&gt;sayGoodbye(errored: $groupedEndpointsInstance-&gt;hasEncounteredErrors());
+    }
+
+    public function isForcing(): bool
+    {
+        return $this-&gt;forcing;
+    }
+
+    public function shouldExtract(): bool
+    {
+        return $this-&gt;shouldExtract;
+    }
+
+    public function getDocConfig(): DocumentationConfig
+    {
+        return $this-&gt;docConfig;
+    }
+
+    protected function runBootstrapHook()
+    {
+        if (is_callable(Globals::$__bootstrap)) {
+            call_user_func_array(Globals::$__bootstrap, [$this]);
+        }
+    }
+
+    public function bootstrap(): void
+    {
+        // The --verbose option is included with all Artisan commands.
+        Globals::$shouldBeVerbose = $this-&gt;option(&#039;verbose&#039;);
+
+        c::bootstrapOutput($this-&gt;output);
+
+        $configName = $this-&gt;option(&#039;config&#039;);
+        if (!config($configName)) {
+            throw new \InvalidArgumentException(&quot;The specified config (config/{$configName}.php) doesn&#039;t exist.&quot;);
+        }
+
+        $this-&gt;paths = new PathConfig($configName);
+        if ($this-&gt;hasOption(&#039;scribe-dir&#039;) &amp;&amp; !empty($this-&gt;option(&#039;scribe-dir&#039;))) {
+            $this-&gt;paths = new PathConfig(
+                $configName, scribeDir: $this-&gt;option(&#039;scribe-dir&#039;)
+            );
+        }
+
+        $this-&gt;docConfig = new DocumentationConfig(config($this-&gt;paths-&gt;configName));
+
+        // Force root URL so it works in Postman collection
+        $baseUrl = $this-&gt;docConfig-&gt;get(&#039;base_url&#039;) ?? config(&#039;app.url&#039;);
+
+        try {
+            // Renamed from forceRootUrl in Laravel 11.43 or so
+            URL::useOrigin($baseUrl);
+        } catch (\BadMethodCallException) {
+            URL::forceRootUrl($baseUrl);
+        }
+
+        $this-&gt;forcing = $this-&gt;option(&#039;force&#039;);
+        $this-&gt;shouldExtract = !$this-&gt;option(&#039;no-extraction&#039;);
+
+        if ($this-&gt;forcing &amp;&amp; !$this-&gt;shouldExtract) {
+            throw new \InvalidArgumentException(&quot;Can&#039;t use --force and --no-extraction together.&quot;);
+        }
+
+        $this-&gt;runBootstrapHook();
+    }
+
+    protected function mergeUserDefinedEndpoints(array $groupedEndpoints, array $userDefinedEndpoints): array
+    {
+        foreach ($userDefinedEndpoints as $endpoint) {
+            $indexOfGroupWhereThisEndpointShouldBeAdded = Arr::first(array_keys($groupedEndpoints), function ($key) use ($groupedEndpoints, $endpoint) {
+                $group = $groupedEndpoints[$key];
+                return $group[&#039;name&#039;] === ($endpoint[&#039;metadata&#039;][&#039;groupName&#039;] ?? $this-&gt;docConfig-&gt;get(&#039;groups.default&#039;, &#039;&#039;));
+            });
+
+            if ($indexOfGroupWhereThisEndpointShouldBeAdded !== null) {
+                $groupedEndpoints[$indexOfGroupWhereThisEndpointShouldBeAdded][&#039;endpoints&#039;][] = $endpoint;
+            } else {
+                $newGroup = [
+                    &#039;name&#039; =&gt; $endpoint[&#039;metadata&#039;][&#039;groupName&#039;] ?? $this-&gt;docConfig-&gt;get(&#039;groups.default&#039;, &#039;&#039;),
+                    &#039;description&#039; =&gt; $endpoint[&#039;metadata&#039;][&#039;groupDescription&#039;] ?? null,
+                    &#039;endpoints&#039; =&gt; [$endpoint],
+                ];
+
+                $groupedEndpoints[$newGroup[&#039;name&#039;]] = $newGroup;
+            }
+        }
+
+        return $groupedEndpoints;
+    }
+
+    protected function writeExampleCustomEndpoint(): void
+    {
+        // We add an example to guide users in case they need to add a custom endpoint.
+        copy(__DIR__ . &#039;/../../resources/example_custom_endpoint.yaml&#039;, Camel::camelDir($this-&gt;paths) . &#039;/custom.0.yaml&#039;);
+    }
+
+    protected function upgradeConfigFileIfNeeded(): void
+    {
+        if ($this-&gt;option(&#039;no-upgrade-check&#039;)) return;
+
+        $this-&gt;info(&quot;Checking for any pending upgrades to your config file...&quot;);
+        try {
+            $defaultConfig = require __DIR__.&quot;/../../config/scribe.php&quot;;
+            $ignore = [&#039;example_languages&#039;, &#039;routes&#039;, &#039;description&#039;, &#039;auth.extra_info&#039;, &quot;intro_text&quot;, &quot;groups&quot;, &quot;database_connections_to_transact&quot;];
+            $asList = [&#039;strategies.*&#039;, &quot;examples.models_source&quot;];
+            $differ = new ConfigDiffer(original: $this-&gt;docConfig-&gt;data, changed: $defaultConfig, ignorePaths: $ignore, asList: $asList);
+
+            $diff = $differ-&gt;getDiff();
+            // Remove items the user has set
+            $realDiff = [];
+            foreach ($diff as $key =&gt; $value) {
+                if (is_null($this-&gt;docConfig-&gt;get($key))) {
+                    $realDiff[$key] = $value;
+                }
+            }
+            if (!empty($realDiff)) {
+                $this-&gt;newLine();
+
+                $this-&gt;warn(&quot;You&#039;re using an updated version of Scribe, which may have added new items to the config file.&quot;);
+                $this-&gt;info(&quot;Here&#039;s what is different:&quot;);
+                foreach ($realDiff as $key =&gt; $item) {
+                    $this-&gt;line(&quot;$key --now defaults to-&gt; $item&quot;);
+                }
+
+                if (!$this-&gt;input-&gt;isInteractive()) {
+                    $this-&gt;info(sprintf(&quot;To upgrade, see the full changelog at: https://github.com/knuckleswtf/scribe/blob/%s/CHANGELOG.md,&quot;, Scribe::VERSION));
+                    $this-&gt;info(&quot;And config reference at https://scribe.knuckles.wtf/laravel/reference/config&quot;);
+                    return;
+                }
+            }
+        } catch (\Throwable $e) {
+            $this-&gt;warn(&quot;Check failed with error:&quot;);
+            e::dumpExceptionIfVerbose($e);
+            $this-&gt;warn(&quot;This did not affect your docs. Please report this issue in the project repo: https://github.com/knuckleswtf/scribe&quot;);
+        }
+
+    }
+
+    protected function sayGoodbye(bool $errored = false): void
+    {
+        $message = &#039;All done. &#039;;
+        if ($this-&gt;docConfig-&gt;outputRoutedThroughLaravel()) {
+            if ($this-&gt;docConfig-&gt;get(&#039;laravel.add_routes&#039;)) {
+                $message .= &#039;Visit your docs at &#039; . url($this-&gt;docConfig-&gt;get(&#039;laravel.docs_url&#039;));
+            }
+        } else if (Str::endsWith(base_path(&#039;public&#039;), &#039;public&#039;) &amp;&amp; Str::startsWith($this-&gt;docConfig-&gt;get(&#039;static.output_path&#039;), &#039;public/&#039;)) {
+            $message = &#039;Visit your docs at &#039; . url(str_replace(&#039;public/&#039;, &#039;&#039;, $this-&gt;docConfig-&gt;get(&#039;static.output_path&#039;)));
+        }
+
+        $this-&gt;newLine();
+        c::success($message);
+
+        if ($errored) {
+            c::warn(&#039;Generated docs, but encountered some errors while processing routes.&#039;);
+            c::warn(&#039;Check the output above for details.&#039;);
+            if (empty($_SERVER[&quot;SCRIBE_TESTS&quot;])) {
+                exit(2);
+            }
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Commands/MakeStrategy.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Commands/stubs -->
+
+</body>
+</html>

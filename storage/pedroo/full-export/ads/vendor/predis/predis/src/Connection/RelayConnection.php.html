@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Connection/RelayConnection.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Connection;
+
+use InvalidArgumentException;
+use Predis\ClientException;
+use Predis\Command\CommandInterface;
+use Predis\NotSupportedException;
+use Predis\Response\ErrorInterface as ErrorResponseInterface;
+use Predis\Response\ServerException;
+use Relay\Exception as RelayException;
+use Relay\Relay;
+
+/**
+ * This class provides the implementation of a Predis connection that
+ * uses Relay for network communication and in-memory caching.
+ *
+ * Using Relay allows for:
+ * 1) significantly faster reads thanks to in-memory caching
+ * 2) fast data serialization using igbinary
+ * 3) fast data compression using lzf, lz4 or zstd
+ *
+ * Usage of igbinary serialization and zstd compresses reduces
+ * network traffic and Redis memory usage by ~75%.
+ *
+ * For instructions on how to install the Relay extension, please consult
+ * the repository of the project: https://relay.so/docs/installation
+ *
+ * The connection parameters supported by this class are:
+ *
+ *  - scheme: it can be either &#039;tcp&#039;, &#039;tls&#039; or &#039;unix&#039;.
+ *  - host: hostname or IP address of the server.
+ *  - port: TCP port of the server.
+ *  - path: path of a UNIX domain socket when scheme is &#039;unix&#039;.
+ *  - timeout: timeout to perform the connection.
+ *  - read_write_timeout: timeout of read / write operations.
+ *  - cache: whether to use in-memory caching
+ *  - serializer: data serializer
+ *  - compression: data compression algorithm
+ *
+ * @see https://github.com/cachewerk/relay
+ */
+class RelayConnection extends StreamConnection
+{
+    use RelayMethods;
+
+    /**
+     * The Relay instance.
+     *
+     * @var Relay
+     */
+    protected $client;
+
+    /**
+     * These commands must be called on the client, not using `Relay::rawCommand()`.
+     *
+     * @var string[]
+     */
+    public $atypicalCommands = [
+        &#039;AUTH&#039;,
+        &#039;SELECT&#039;,
+
+        &#039;TYPE&#039;,
+
+        &#039;MULTI&#039;,
+        &#039;EXEC&#039;,
+        &#039;DISCARD&#039;,
+
+        &#039;WATCH&#039;,
+        &#039;UNWATCH&#039;,
+
+        &#039;SUBSCRIBE&#039;,
+        &#039;UNSUBSCRIBE&#039;,
+        &#039;PSUBSCRIBE&#039;,
+        &#039;PUNSUBSCRIBE&#039;,
+        &#039;SSUBSCRIBE&#039;,
+        &#039;SUNSUBSCRIBE&#039;,
+    ];
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __construct(ParametersInterface $parameters)
+    {
+        $this-&gt;assertExtensions();
+
+        $this-&gt;parameters = $this-&gt;assertParameters($parameters);
+        $this-&gt;client = $this-&gt;createClient();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function isConnected()
+    {
+        return $this-&gt;client-&gt;isConnected();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function disconnect()
+    {
+        if ($this-&gt;client-&gt;isConnected()) {
+            $this-&gt;client-&gt;close();
+        }
+    }
+
+    /**
+     * Checks if the Relay extension is loaded in PHP.
+     */
+    private function assertExtensions()
+    {
+        if (!extension_loaded(&#039;relay&#039;)) {
+            throw new NotSupportedException(
+                &#039;The &quot;relay&quot; extension is required by this connection backend.&#039;
+            );
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function assertParameters(ParametersInterface $parameters)
+    {
+        if (!in_array($parameters-&gt;scheme, [&#039;tcp&#039;, &#039;tls&#039;, &#039;unix&#039;, &#039;redis&#039;, &#039;rediss&#039;])) {
+            throw new InvalidArgumentException(&quot;Invalid scheme: &#039;{$parameters-&gt;scheme}&#039;.&quot;);
+        }
+
+        if (!in_array($parameters-&gt;serializer, [null, &#039;php&#039;, &#039;igbinary&#039;, &#039;msgpack&#039;, &#039;json&#039;])) {
+            throw new InvalidArgumentException(&quot;Invalid serializer: &#039;{$parameters-&gt;serializer}&#039;.&quot;);
+        }
+
+        if (!in_array($parameters-&gt;compression, [null, &#039;lzf&#039;, &#039;lz4&#039;, &#039;zstd&#039;])) {
+            throw new InvalidArgumentException(&quot;Invalid compression algorithm: &#039;{$parameters-&gt;compression}&#039;.&quot;);
+        }
+
+        return $parameters;
+    }
+
+    /**
+     * Creates a new instance of the client.
+     *
+     * @return Relay
+     */
+    private function createClient()
+    {
+        $client = new Relay();
+
+        // throw when errors occur and return `null` for non-existent keys
+        $client-&gt;setOption(Relay::OPT_PHPREDIS_COMPATIBILITY, false);
+
+        // use reply literals
+        $client-&gt;setOption(Relay::OPT_REPLY_LITERAL, true);
+
+        // disable Relay&#039;s command/connection retry
+        $client-&gt;setOption(Relay::OPT_MAX_RETRIES, 0);
+
+        // whether to use in-memory caching
+        $client-&gt;setOption(Relay::OPT_USE_CACHE, $this-&gt;parameters-&gt;cache ?? true);
+
+        // set data serializer
+        $client-&gt;setOption(Relay::OPT_SERIALIZER, constant(sprintf(
+            &#039;%s::SERIALIZER_%s&#039;,
+            Relay::class,
+            strtoupper($this-&gt;parameters-&gt;serializer ?? &#039;none&#039;)
+        )));
+
+        // set data compression algorithm
+        $client-&gt;setOption(Relay::OPT_COMPRESSION, constant(sprintf(
+            &#039;%s::COMPRESSION_%s&#039;,
+            Relay::class,
+            strtoupper($this-&gt;parameters-&gt;compression ?? &#039;none&#039;)
+        )));
+
+        return $client;
+    }
+
+    /**
+     * Returns the underlying client.
+     *
+     * @return Relay
+     */
+    public function getClient()
+    {
+        return $this-&gt;client;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getIdentifier()
+    {
+        try {
+            return $this-&gt;client-&gt;endpointId();
+        } catch (RelayException $ex) {
+            return parent::getIdentifier();
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function createStreamSocket(ParametersInterface $parameters, $address, $flags)
+    {
+        $timeout = isset($parameters-&gt;timeout) ? (float) $parameters-&gt;timeout : 5.0;
+
+        $retry_interval = 0;
+        $read_timeout = 5.0;
+
+        if (isset($parameters-&gt;read_write_timeout)) {
+            $read_timeout = (float) $parameters-&gt;read_write_timeout;
+            $read_timeout = $read_timeout &gt; 0 ? $read_timeout : 0;
+        }
+
+        try {
+            $this-&gt;client-&gt;connect(
+                $parameters-&gt;path ?? $parameters-&gt;host,
+                isset($parameters-&gt;path) ? 0 : $parameters-&gt;port,
+                $timeout,
+                null,
+                $retry_interval,
+                $read_timeout
+            );
+        } catch (RelayException $ex) {
+            $this-&gt;onConnectionError($ex-&gt;getMessage(), $ex-&gt;getCode());
+        }
+
+        return $this-&gt;client;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function executeCommand(CommandInterface $command)
+    {
+        if (!$this-&gt;client-&gt;isConnected()) {
+            $this-&gt;getResource();
+        }
+
+        try {
+            $name = $command-&gt;getId();
+
+            // When using compression or a serializer, we&#039;ll need a dedicated
+            // handler for `Predis\Command\RawCommand` calls, currently both
+            // parameters are unsupported until a future Relay release
+            return in_array($name, $this-&gt;atypicalCommands)
+                ? $this-&gt;client-&gt;{$name}(...$command-&gt;getArguments())
+                : $this-&gt;client-&gt;rawCommand($name, ...$command-&gt;getArguments());
+        } catch (RelayException $ex) {
+            $exception = $this-&gt;onCommandError($ex, $command);
+
+            if ($exception instanceof ErrorResponseInterface) {
+                return $exception;
+            }
+
+            throw $exception;
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function onCommandError(RelayException $exception, CommandInterface $command)
+    {
+        $code = $exception-&gt;getCode();
+        $message = $exception-&gt;getMessage();
+
+        if (strpos($message, &#039;RELAY_ERR_IO&#039;) !== false) {
+            return new ConnectionException($this, $message, $code, $exception);
+        }
+
+        if (strpos($message, &#039;RELAY_ERR_REDIS&#039;) !== false) {
+            return new ServerException($message, $code, $exception);
+        }
+
+        if (strpos($message, &#039;RELAY_ERR_WRONGTYPE&#039;) !== false &amp;&amp; strpos($message, &quot;Got reply-type &#039;status&#039;&quot;) !== false) {
+            $message = &#039;Operation against a key holding the wrong kind of value&#039;;
+        }
+
+        return new ClientException($message, $code, $exception);
+    }
+
+    /**
+     * Applies the configured serializer and compression to given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    public function pack($value)
+    {
+        return $this-&gt;client-&gt;_pack($value);
+    }
+
+    /**
+     * Deserializes and decompresses to given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    public function unpack($value)
+    {
+        return $this-&gt;client-&gt;_unpack($value);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function writeRequest(CommandInterface $command)
+    {
+        throw new NotSupportedException(&#039;The &quot;relay&quot; extension does not support writing requests.&#039;);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function readResponse(CommandInterface $command)
+    {
+        throw new NotSupportedException(&#039;The &quot;relay&quot; extension does not support reading responses.&#039;);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __destruct()
+    {
+        $this-&gt;disconnect();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __wakeup()
+    {
+        $this-&gt;assertExtensions();
+        $this-&gt;client = $this-&gt;createClient();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Connection/RelayMethods.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Connection/Cluster -->
+
+</body>
+</html>

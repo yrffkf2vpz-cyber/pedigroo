@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laminas/laminas-diactoros/src/UploadedFile.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Laminas\Diactoros;
+
+use Override;
+use Psr\Http\Message\StreamInterface;
+use Psr\Http\Message\UploadedFileInterface;
+
+use function assert;
+use function dirname;
+use function fclose;
+use function file_exists;
+use function fopen;
+use function fwrite;
+use function is_dir;
+use function is_resource;
+use function is_string;
+use function is_writable;
+use function move_uploaded_file;
+use function str_starts_with;
+use function unlink;
+
+use const PHP_SAPI;
+use const UPLOAD_ERR_CANT_WRITE;
+use const UPLOAD_ERR_EXTENSION;
+use const UPLOAD_ERR_FORM_SIZE;
+use const UPLOAD_ERR_INI_SIZE;
+use const UPLOAD_ERR_NO_FILE;
+use const UPLOAD_ERR_NO_TMP_DIR;
+use const UPLOAD_ERR_OK;
+use const UPLOAD_ERR_PARTIAL;
+
+class UploadedFile implements UploadedFileInterface
+{
+    public const ERROR_MESSAGES = [
+        UPLOAD_ERR_OK         =&gt; &#039;There is no error, the file uploaded with success&#039;,
+        UPLOAD_ERR_INI_SIZE   =&gt; &#039;The uploaded file exceeds the upload_max_filesize directive in php.ini&#039;,
+        UPLOAD_ERR_FORM_SIZE  =&gt; &#039;The uploaded file exceeds the MAX_FILE_SIZE directive that was &#039;
+            . &#039;specified in the HTML form&#039;,
+        UPLOAD_ERR_PARTIAL    =&gt; &#039;The uploaded file was only partially uploaded&#039;,
+        UPLOAD_ERR_NO_FILE    =&gt; &#039;No file was uploaded&#039;,
+        UPLOAD_ERR_NO_TMP_DIR =&gt; &#039;Missing a temporary folder&#039;,
+        UPLOAD_ERR_CANT_WRITE =&gt; &#039;Failed to write file to disk&#039;,
+        UPLOAD_ERR_EXTENSION  =&gt; &#039;A PHP extension stopped the file upload.&#039;,
+    ];
+
+    private readonly int $error;
+
+    private ?string $file = null;
+
+    private bool $moved = false;
+
+    private ?StreamInterface $stream = null;
+
+    /**
+     * @param string|resource|StreamInterface $streamOrFile
+     * @throws Exception\InvalidArgumentException
+     */
+    public function __construct(
+        $streamOrFile,
+        private readonly ?int $size,
+        int $errorStatus,
+        private readonly ?string $clientFilename = null,
+        private readonly ?string $clientMediaType = null
+    ) {
+        if ($errorStatus === UPLOAD_ERR_OK) {
+            if (is_string($streamOrFile)) {
+                $this-&gt;file = $streamOrFile;
+            }
+            if (is_resource($streamOrFile)) {
+                $this-&gt;stream = new Stream($streamOrFile);
+            }
+
+            if ($this-&gt;file === null &amp;&amp; $this-&gt;stream === null) {
+                if (! $streamOrFile instanceof StreamInterface) {
+                    throw new Exception\InvalidArgumentException(&#039;Invalid stream or file provided for UploadedFile&#039;);
+                }
+                $this-&gt;stream = $streamOrFile;
+            }
+        }
+
+        if (0 &gt; $errorStatus || 8 &lt; $errorStatus) {
+            throw new Exception\InvalidArgumentException(
+                &#039;Invalid error status for UploadedFile; must be an UPLOAD_ERR_* constant&#039;
+            );
+        }
+        $this-&gt;error = $errorStatus;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @throws Exception\UploadedFileAlreadyMovedException If the upload was not successful.
+     */
+    #[Override]
+    public function getStream(): StreamInterface
+    {
+        if ($this-&gt;error !== UPLOAD_ERR_OK) {
+            throw Exception\UploadedFileErrorException::dueToStreamUploadError(
+                self::ERROR_MESSAGES[$this-&gt;error]
+            );
+        }
+
+        if ($this-&gt;moved) {
+            throw new Exception\UploadedFileAlreadyMovedException();
+        }
+
+        if ($this-&gt;stream instanceof StreamInterface) {
+            return $this-&gt;stream;
+        }
+
+        assert($this-&gt;file !== null, &#039;Always true condition for psalm type safety&#039;);
+        $this-&gt;stream = new Stream($this-&gt;file);
+        return $this-&gt;stream;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @see http://php.net/is_uploaded_file
+     * @see http://php.net/move_uploaded_file
+     *
+     * @param string $targetPath Path to which to move the uploaded file.
+     * @throws Exception\UploadedFileErrorException If the upload was not successful.
+     * @throws Exception\InvalidArgumentException If the $path specified is invalid.
+     * @throws Exception\UploadedFileErrorException On any error during the
+     *     move operation, or on the second or subsequent call to the method.
+     */
+    #[Override]
+    public function moveTo(string $targetPath): void
+    {
+        if ($this-&gt;moved) {
+            throw new Exception\UploadedFileAlreadyMovedException(&#039;Cannot move file; already moved!&#039;);
+        }
+
+        if ($this-&gt;error !== UPLOAD_ERR_OK) {
+            throw Exception\UploadedFileErrorException::dueToStreamUploadError(
+                self::ERROR_MESSAGES[$this-&gt;error]
+            );
+        }
+
+        if (empty($targetPath)) {
+            throw new Exception\InvalidArgumentException(
+                &#039;Invalid path provided for move operation; must be a non-empty string&#039;
+            );
+        }
+
+        $targetDirectory = dirname($targetPath);
+        if (! is_dir($targetDirectory) || ! is_writable($targetDirectory)) {
+            throw Exception\UploadedFileErrorException::dueToUnwritableTarget($targetDirectory);
+        }
+
+        $sapi = PHP_SAPI;
+        switch (true) {
+            case empty($sapi)
+                || str_starts_with($sapi, &#039;cli&#039;)
+                || str_starts_with($sapi, &#039;phpdbg&#039;)
+                || $this-&gt;file === null:
+                // Non-SAPI environment, or no filename present
+                $this-&gt;writeFile($targetPath);
+
+                if ($this-&gt;stream instanceof StreamInterface) {
+                    $this-&gt;stream-&gt;close();
+                }
+                if (is_string($this-&gt;file) &amp;&amp; file_exists($this-&gt;file)) {
+                    unlink($this-&gt;file);
+                }
+                break;
+            default:
+                // SAPI environment, with file present
+                if (false === move_uploaded_file($this-&gt;file, $targetPath)) {
+                    throw Exception\UploadedFileErrorException::forUnmovableFile();
+                }
+                break;
+        }
+
+        $this-&gt;moved = true;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @return int|null The file size in bytes or null if unknown.
+     */
+    #[Override]
+    public function getSize(): ?int
+    {
+        return $this-&gt;size;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @see http://php.net/manual/en/features.file-upload.errors.php
+     *
+     * @return int One of PHP&#039;s UPLOAD_ERR_XXX constants.
+     */
+    #[Override]
+    public function getError(): int
+    {
+        return $this-&gt;error;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @return string|null The filename sent by the client or null if none
+     *     was provided.
+     */
+    #[Override]
+    public function getClientFilename(): ?string
+    {
+        return $this-&gt;clientFilename;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    #[Override]
+    public function getClientMediaType(): ?string
+    {
+        return $this-&gt;clientMediaType;
+    }
+
+    /**
+     * Write internal stream to given path
+     */
+    private function writeFile(string $path): void
+    {
+        $handle = fopen($path, &#039;wb+&#039;);
+        if (false === $handle) {
+            throw Exception\UploadedFileErrorException::dueToUnwritablePath();
+        }
+
+        $stream = $this-&gt;getStream();
+        $stream-&gt;rewind();
+        while (! $stream-&gt;eof()) {
+            fwrite($handle, $stream-&gt;read(4096));
+        }
+
+        fclose($handle);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laminas/laminas-diactoros/src/UploadedFileFactory.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laminas/laminas-diactoros/src/Exception -->
+
+</body>
+</html>

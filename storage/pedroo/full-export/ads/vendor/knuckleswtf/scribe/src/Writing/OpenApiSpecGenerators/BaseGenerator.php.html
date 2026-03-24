@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Writing/OpenApiSpecGenerators/BaseGenerator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Writing\OpenApiSpecGenerators;
+
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Knuckles\Camel\Camel;
+use Knuckles\Camel\Extraction\Response;
+use Knuckles\Camel\Output\OutputEndpointData;
+use Knuckles\Camel\Output\Parameter;
+use Knuckles\Scribe\Tools\Utils;
+use Knuckles\Scribe\Writing\OpenAPISpecWriter;
+
+/**
+ * The main generator for Open API Spec. It adds the minimum needed information to the spec.
+ */
+class BaseGenerator extends OpenApiGenerator
+{
+    public function root(array $root, array $groupedEndpoints): array
+    {
+        return array_merge($root, [
+            &#039;openapi&#039; =&gt; $this-&gt;config-&gt;get(&#039;openapi.version&#039;, OpenAPISpecWriter::SPEC_VERSION),
+            &#039;info&#039; =&gt; [
+                &#039;title&#039; =&gt; $this-&gt;config-&gt;get(&#039;title&#039;) ?: config(&#039;app.name&#039;, &#039;&#039;),
+                &#039;description&#039; =&gt; $this-&gt;config-&gt;get(&#039;description&#039;, &#039;&#039;),
+                &#039;version&#039; =&gt; &#039;1.0.0&#039;,
+            ],
+            &#039;servers&#039; =&gt; [
+                [
+                    &#039;url&#039; =&gt; rtrim($this-&gt;config-&gt;get(&#039;base_url&#039;) ?? config(&#039;app.url&#039;), &#039;/&#039;),
+                ],
+            ],
+            &#039;tags&#039; =&gt; array_values(array_map(function (array $group) {
+                return [
+                    &#039;name&#039; =&gt; $group[&#039;name&#039;],
+                    &#039;description&#039; =&gt; $group[&#039;description&#039;],
+                ];
+            }, $groupedEndpoints)),
+        ]);
+    }
+
+    public function pathItem(array $pathItem, array $groupedEndpoints, OutputEndpointData $endpoint): array
+    {
+        $spec = [
+            &#039;summary&#039; =&gt; $endpoint-&gt;metadata-&gt;title,
+            &#039;operationId&#039; =&gt; $this-&gt;operationId($endpoint),
+            &#039;description&#039; =&gt; $endpoint-&gt;metadata-&gt;description,
+            &#039;parameters&#039; =&gt; $this-&gt;generateEndpointParametersSpec($endpoint),
+            &#039;responses&#039; =&gt; $this-&gt;generateEndpointResponsesSpec($endpoint),
+            &#039;tags&#039; =&gt; [Arr::first($groupedEndpoints, function ($group) use ($endpoint) {
+                return Camel::doesGroupContainEndpoint($group, $endpoint);
+            })[&#039;name&#039;]],
+        ];
+
+        if ($endpoint-&gt;metadata-&gt;deprecated) {
+            $spec[&#039;deprecated&#039;] = true;
+        }
+
+        if (count($endpoint-&gt;bodyParameters)) {
+            $spec[&#039;requestBody&#039;] = $this-&gt;generateEndpointRequestBodySpec($endpoint);
+        }
+
+        return array_merge($pathItem, $spec);
+    }
+
+
+    public function pathParameters(array $parameters, array $endpoints, array $urlParameters): array
+    {
+        foreach ($urlParameters as $name =&gt; $details) {
+            $parameterData = [
+                &#039;in&#039; =&gt; &#039;path&#039;,
+                &#039;name&#039; =&gt; $name,
+                &#039;description&#039; =&gt; $details-&gt;description,
+                &#039;example&#039; =&gt; $details-&gt;example,
+                // Currently, OAS requires path parameters to be required
+                &#039;required&#039; =&gt; true,
+                &#039;schema&#039; =&gt; [
+                    &#039;type&#039; =&gt; $details-&gt;type,
+                ],
+            ];
+            // Workaround for optional parameters
+            if (empty($details-&gt;required)) {
+                $parameterData[&#039;description&#039;] = rtrim(&#039;Optional parameter. &#039; . $parameterData[&#039;description&#039;]);
+                $parameterData[&#039;examples&#039;] = [
+                    &#039;omitted&#039; =&gt; [
+                        &#039;summary&#039; =&gt; &#039;When the value is omitted&#039;,
+                        &#039;value&#039; =&gt; &#039;&#039;,
+                    ],
+                ];
+
+                if ($parameterData[&#039;example&#039;] !== null) {
+                    $parameterData[&#039;examples&#039;][&#039;present&#039;] = [
+                        &#039;summary&#039; =&gt; &#039;When the value is present&#039;,
+                        &#039;value&#039; =&gt; $parameterData[&#039;example&#039;],
+                    ];
+                }
+
+                // Can&#039;t have `example` and `examples`
+                unset($parameterData[&#039;example&#039;]);
+            }
+            $parameters[$name] = $parameterData;
+        }
+
+        return $parameters;
+    }
+
+
+    protected function operationId(OutputEndpointData $endpoint): string
+    {
+        if ($endpoint-&gt;metadata-&gt;title) return preg_replace(&#039;/[^\w+]/&#039;, &#039;&#039;, Str::camel($endpoint-&gt;metadata-&gt;title));
+
+        $parts = preg_split(&#039;/[^\w+]/&#039;, $endpoint-&gt;uri, -1, PREG_SPLIT_NO_EMPTY);
+        return Str::lower($endpoint-&gt;httpMethods[0]) . join(&#039;&#039;, array_map(fn($part) =&gt; ucfirst($part), $parts));
+    }
+
+    /**
+     * Add query parameters and headers.
+     *
+     * @param OutputEndpointData $endpoint
+     *
+     * @return array&lt;int, array&lt;string,mixed&gt;&gt;
+     */
+    protected function generateEndpointParametersSpec(OutputEndpointData $endpoint): array
+    {
+        $parameters = [];
+
+        if (count($endpoint-&gt;queryParameters)) {
+            /**
+             * @var string $name
+             * @var Parameter $details
+             */
+            foreach ($endpoint-&gt;queryParameters as $name =&gt; $details) {
+                $parameterData = [
+                    &#039;in&#039; =&gt; &#039;query&#039;,
+                    &#039;name&#039; =&gt; $name,
+                    &#039;description&#039; =&gt; $details-&gt;description,
+                    &#039;example&#039; =&gt; $details-&gt;example,
+                    &#039;required&#039; =&gt; $details-&gt;required,
+                    &#039;schema&#039; =&gt; $this-&gt;generateFieldData($details),
+                ];
+                if ($details-&gt;deprecated) {
+                    $parameterData[&#039;deprecated&#039;] = true;
+                }
+                $parameters[] = $parameterData;
+            }
+        }
+
+        if (count($endpoint-&gt;headers)) {
+            foreach ($endpoint-&gt;headers as $name =&gt; $value) {
+                if (in_array(strtolower($name), [&#039;content-type&#039;, &#039;accept&#039;, &#039;authorization&#039;]))
+                    // These headers are not allowed in the spec.
+                    // https://swagger.io/docs/specification/describing-parameters/#header-parameters
+                    continue;
+
+                $parameters[] = [
+                    &#039;in&#039; =&gt; &#039;header&#039;,
+                    &#039;name&#039; =&gt; $name,
+                    &#039;description&#039; =&gt; &#039;&#039;,
+                    &#039;example&#039; =&gt; $value,
+                    &#039;schema&#039; =&gt; [
+                        &#039;type&#039; =&gt; &#039;string&#039;,
+                    ],
+                ];
+            }
+        }
+
+        return $parameters;
+    }
+
+    protected function generateEndpointRequestBodySpec(OutputEndpointData $endpoint): array|\stdClass
+    {
+        $body = [];
+
+        if (count($endpoint-&gt;bodyParameters)) {
+            $schema = [
+                &#039;type&#039; =&gt; &#039;object&#039;,
+                &#039;properties&#039; =&gt; [],
+            ];
+
+            $hasRequiredParameter = false;
+            $hasFileParameter = false;
+
+            foreach ($endpoint-&gt;nestedBodyParameters as $name =&gt; $details) {
+                if ($name === &quot;[]&quot;) { // Request body is an array
+                    $hasRequiredParameter = true;
+                    $schema = $this-&gt;generateFieldData($details);
+                    break;
+                }
+
+                if ($details[&#039;required&#039;]) {
+                    $hasRequiredParameter = true;
+                    // Don&#039;t declare this earlier.
+                    // The spec doesn&#039;t allow for an empty `required` array. Must have something there.
+                    $schema[&#039;required&#039;][] = $name;
+                }
+
+                if ($details[&#039;type&#039;] === &#039;file&#039;) {
+                    $hasFileParameter = true;
+                }
+
+                $fieldData = $this-&gt;generateFieldData($details);
+                if ($details[&#039;deprecated&#039;]) {
+                    $fieldData[&#039;deprecated&#039;] = true;
+                }
+
+                $schema[&#039;properties&#039;][$name] = $fieldData;
+            }
+
+            // We remove &#039;properties&#039; if the request body is an array, so we need to check if it&#039;s still there
+            if (array_key_exists(&#039;properties&#039;, $schema)) {
+                $schema[&#039;properties&#039;] = $this-&gt;objectIfEmpty($schema[&#039;properties&#039;]);
+            }
+            $body[&#039;required&#039;] = $hasRequiredParameter;
+
+            if ($hasFileParameter) {
+                // If there are file parameters, content type changes to multipart
+                $contentType = &#039;multipart/form-data&#039;;
+            } elseif (isset($endpoint-&gt;headers[&#039;Content-Type&#039;])) {
+                $contentType = $endpoint-&gt;headers[&#039;Content-Type&#039;];
+            } else {
+                $contentType = &#039;application/json&#039;;
+            }
+
+            $body[&#039;content&#039;][$contentType][&#039;schema&#039;] = $schema;
+
+        }
+
+        // return object rather than empty array, so can get properly serialised as object
+        return $this-&gt;objectIfEmpty($body);
+    }
+
+    protected function generateEndpointResponsesSpec(OutputEndpointData $endpoint)
+    {
+        // See https://swagger.io/docs/specification/describing-responses/
+        $responses = [];
+
+        foreach ($endpoint-&gt;responses as $response) {
+            $code = $response-&gt;status; // OpenAPI spec requires status codes to be integers
+            // OpenAPI groups responses by status code
+            // Only one response type per status code, so only the last one will be used
+            if ($code === &#039;204&#039;) {
+                // Must not add content for 204
+                $responses[$code] = [
+                    &#039;description&#039; =&gt; $this-&gt;getResponseDescription($response),
+                ];
+            } elseif (isset($responses[$code])) {
+                // If we already have a response for this status code and content type,
+                // we change to a `oneOf` which includes all the responses
+                $content = $this-&gt;generateResponseContentSpec($response-&gt;content, $endpoint);
+                $contentType = array_keys($content)[0];
+                if (isset($responses[$code][&#039;content&#039;][$contentType])) {
+                    $newResponseExample = array_replace([
+                        &#039;description&#039; =&gt; $this-&gt;getResponseDescription($response),
+                    ], $content[$contentType][&#039;schema&#039;]);
+
+                    // If we&#039;ve already created the oneOf object, add this response
+                    if (isset($responses[$code][&#039;content&#039;][$contentType][&#039;schema&#039;][&#039;oneOf&#039;])) {
+                        $responses[$code][&#039;content&#039;][$contentType][&#039;schema&#039;][&#039;oneOf&#039;][] = $newResponseExample;
+                    } else {
+                        // Create the oneOf object
+                        $existingResponseExample = array_replace([
+                            &#039;description&#039; =&gt; $responses[$code][&#039;description&#039;],
+                        ], $responses[$code][&#039;content&#039;][$contentType][&#039;schema&#039;]);
+
+                        $responses[$code][&#039;description&#039;] = &#039;&#039;;
+                        $responses[$code][&#039;content&#039;][$contentType][&#039;schema&#039;] = [
+                            &#039;oneOf&#039; =&gt; [$existingResponseExample, $newResponseExample]
+                        ];
+                    }
+                }
+            } else {
+                // Store as the response for this status
+                $responses[$code] = [
+                    &#039;description&#039; =&gt; $this-&gt;getResponseDescription($response),
+                    &#039;content&#039; =&gt; $this-&gt;generateResponseContentSpec($response-&gt;content, $endpoint),
+                ];
+            }
+        }
+
+        // return object rather than empty array, so can get properly serialised as object
+        return $this-&gt;objectIfEmpty($responses);
+    }
+
+    protected function getResponseDescription(Response $response): string
+    {
+        if (Str::startsWith($response-&gt;content, &quot;&lt;&lt;binary&gt;&gt;&quot;)) {
+            return trim(str_replace(&quot;&lt;&lt;binary&gt;&gt;&quot;, &quot;&quot;, $response-&gt;content));
+        }
+
+        $description = strval($response-&gt;description);
+        // Don&#039;t include the status code in description; see https://github.com/knuckleswtf/scribe/issues/271
+        if (preg_match(&quot;/\d{3},\s+(.+)/&quot;, $description, $matches)) {
+            $description = $matches[1];
+        } else if ($description === strval($response-&gt;status)) {
+            $description = &#039;&#039;;
+        }
+        return $description;
+    }
+
+    protected function generateResponseContentSpec(?string $responseContent, OutputEndpointData $endpoint)
+    {
+        if (Str::startsWith($responseContent, &#039;&lt;&lt;binary&gt;&gt;&#039;)) {
+            return [
+                &#039;application/octet-stream&#039; =&gt; [
+                    &#039;schema&#039; =&gt; [
+                        &#039;type&#039; =&gt; &#039;string&#039;,
+                        &#039;format&#039; =&gt; &#039;binary&#039;,
+                    ],
+                ],
+            ];
+        }
+
+        if ($responseContent === null) {
+            $schema = [
+                &#039;type&#039; =&gt; &#039;object&#039;,
+            ];
+            $this-&gt;applyNullable($schema, true);
+            return [
+                &#039;application/json&#039; =&gt; [
+                    &#039;schema&#039; =&gt; $schema,
+                ],
+            ];
+        }
+
+        $decoded = json_decode($responseContent);
+        if ($decoded === null) { // Decoding failed, so we return the content string as is
+            return [
+                &#039;text/plain&#039; =&gt; [
+                    &#039;schema&#039; =&gt; [
+                        &#039;type&#039; =&gt; &#039;string&#039;,
+                        &#039;example&#039; =&gt; $responseContent,
+                    ],
+                ],
+            ];
+        }
+
+        $response = $endpoint-&gt;responses-&gt;where(&#039;content&#039;, $responseContent)-&gt;first();
+        $contentType = $response-&gt;headers[&#039;content-type&#039;] ?? $response-&gt;headers[&#039;Content-Type&#039;] ?? &#039;application/json&#039;;
+
+        switch ($type = gettype($decoded)) {
+            case &#039;string&#039;:
+            case &#039;boolean&#039;:
+            case &#039;integer&#039;:
+            case &#039;double&#039;:
+                return [
+                    $contentType =&gt; [
+                        &#039;schema&#039; =&gt; [
+                            &#039;type&#039; =&gt; $type === &#039;double&#039; ? &#039;number&#039; : $type,
+                            &#039;example&#039; =&gt; $decoded,
+                        ],
+                    ],
+                ];
+
+            case &#039;array&#039;:
+                if (!count($decoded)) {
+                    // empty array
+                    return [
+                        $contentType =&gt; [
+                            &#039;schema&#039; =&gt; [
+                                &#039;type&#039; =&gt; &#039;array&#039;,
+                                &#039;items&#039; =&gt; [
+                                    &#039;type&#039; =&gt; &#039;object&#039;, // No better idea what to put here
+                                ],
+                                &#039;example&#039; =&gt; $decoded,
+                            ],
+                        ],
+                    ];
+                }
+
+                // Non-empty array
+                if (is_object($decoded[0])) {
+                    // If the first item is an object, we assume it&#039;s an array of objects&#039;
+                    $properties = collect($decoded[0])-&gt;mapWithKeys(function ($value, $key) use ($endpoint) {
+                        return [$key =&gt; $this-&gt;generateSchemaForResponseValue($value, $endpoint, $key)];
+                    })-&gt;toArray();
+
+                    return [
+                        $contentType =&gt; [
+                            &#039;schema&#039; =&gt; [
+                                &#039;type&#039; =&gt; &#039;array&#039;,
+                                &#039;items&#039; =&gt; [
+                                    &#039;type&#039; =&gt; $this-&gt;convertScribeOrPHPTypeToOpenAPIType(gettype($decoded[0])),
+                                    &#039;properties&#039; =&gt; $this-&gt;objectIfEmpty($properties),
+                                ],
+                                &#039;example&#039; =&gt; $decoded,
+                            ],
+                        ],
+                    ];
+                }
+
+                return [
+                    $contentType =&gt; [
+                        &#039;schema&#039; =&gt; [
+                            &#039;type&#039; =&gt; &#039;array&#039;,
+                            &#039;items&#039; =&gt; [
+                                &#039;type&#039; =&gt; $this-&gt;convertScribeOrPHPTypeToOpenAPIType(gettype($decoded[0])),
+                            ],
+                            &#039;example&#039; =&gt; $decoded,
+                        ],
+                    ],
+                ];
+
+            case &#039;object&#039;:
+                $properties = collect($decoded)-&gt;mapWithKeys(function ($value, $key) use ($endpoint) {
+                    return [$key =&gt; $this-&gt;generateSchemaForResponseValue($value, $endpoint, $key)];
+                })-&gt;toArray();
+                $required = $this-&gt;filterRequiredResponseFields($endpoint, array_keys($properties));
+
+                $data = [
+                    $contentType =&gt; [
+                        &#039;schema&#039; =&gt; [
+                            &#039;type&#039; =&gt; &#039;object&#039;,
+                            &#039;example&#039; =&gt; $decoded,
+                            &#039;properties&#039; =&gt; $this-&gt;objectIfEmpty($properties),
+                        ],
+                    ],
+                ];
+                if ($required) {
+                    $data[$contentType][&#039;schema&#039;][&#039;required&#039;] = $required;
+                }
+
+                return $data;
+            default:
+                return [];
+        }
+    }
+
+    /**
+     * Given an array, return an object if the array is empty. To be used with fields that are
+     * required by OpenAPI spec to be objects, since empty arrays get serialised as [].
+     */
+    protected function objectIfEmpty(array $field): array|\stdClass
+    {
+        return count($field) &gt; 0 ? $field : new \stdClass();
+    }
+
+
+    /**
+     * @param Parameter|array $field
+     *
+     * @return array
+     */
+    public function generateFieldData($field): array
+    {
+        if (is_array($field)) {
+            $field = new Parameter($field);
+        }
+
+        if ($field-&gt;type === &#039;file&#039;) {
+            // See https://swagger.io/docs/specification/describing-request-body/file-upload/
+            $fieldData = [
+                &#039;type&#039; =&gt; &#039;string&#039;,
+                &#039;format&#039; =&gt; &#039;binary&#039;,
+                &#039;description&#039; =&gt; $field-&gt;description ?: &#039;&#039;,
+            ];
+            $this-&gt;applyNullable($fieldData, $field-&gt;nullable);
+            return $fieldData;
+        } else if (Utils::isArrayType($field-&gt;type)) {
+            $baseType = Utils::getBaseTypeFromArrayType($field-&gt;type);
+            $baseItem = ($baseType === &#039;file&#039;) ? [
+                &#039;type&#039; =&gt; &#039;string&#039;,
+                &#039;format&#039; =&gt; &#039;binary&#039;,
+            ] : [&#039;type&#039; =&gt; $baseType];
+
+            if (!empty($field-&gt;enumValues)) {
+                $baseItem[&#039;enum&#039;] = $field-&gt;enumValues;
+            }
+
+            $this-&gt;applyNullable($baseItem, $field-&gt;nullable);
+
+            $fieldData = [
+                &#039;type&#039; =&gt; &#039;array&#039;,
+                &#039;description&#039; =&gt; $field-&gt;description ?: &#039;&#039;,
+                &#039;example&#039; =&gt; $field-&gt;example,
+                &#039;items&#039; =&gt; Utils::isArrayType($baseType)
+                    ? $this-&gt;generateFieldData([
+                        &#039;name&#039; =&gt; &#039;&#039;,
+                        &#039;type&#039; =&gt; $baseType,
+                        &#039;example&#039; =&gt; ($field-&gt;example ?: [null])[0],
+                        &#039;nullable&#039; =&gt; $field-&gt;nullable,
+                    ])
+                    : $baseItem,
+            ];
+            if (str_replace(&#039;[]&#039;, &quot;&quot;, $field-&gt;type) === &#039;file&#039;) {
+                // Don&#039;t include example for file params in OAS; it&#039;s hard to translate it correctly
+                unset($fieldData[&#039;example&#039;]);
+            }
+
+            if ($baseType === &#039;object&#039; &amp;&amp; !empty($field-&gt;__fields)) {
+                if ($fieldData[&#039;items&#039;][&#039;type&#039;] === &#039;object&#039;) {
+                    $fieldData[&#039;items&#039;][&#039;properties&#039;] = [];
+                }
+                foreach ($field-&gt;__fields as $fieldSimpleName =&gt; $subfield) {
+                    $fieldData[&#039;items&#039;][&#039;properties&#039;][$fieldSimpleName] = $this-&gt;generateFieldData($subfield);
+                    if ($subfield[&#039;required&#039;]) {
+                        $fieldData[&#039;items&#039;][&#039;required&#039;][] = $fieldSimpleName;
+                    }
+                }
+            }
+
+            return $fieldData;
+        } else if ($field-&gt;type === &#039;object&#039;) {
+            $data = [
+                &#039;type&#039; =&gt; &#039;object&#039;,
+                &#039;description&#039; =&gt; $field-&gt;description ?: &#039;&#039;,
+                &#039;example&#039; =&gt; $field-&gt;example,
+                &#039;properties&#039; =&gt; $this-&gt;objectIfEmpty(collect($field-&gt;__fields)-&gt;mapWithKeys(function ($subfield, $subfieldName) {
+                    return [$subfieldName =&gt; $this-&gt;generateFieldData($subfield)];
+                })-&gt;all()),
+                &#039;required&#039; =&gt; collect($field-&gt;__fields)-&gt;filter(fn ($f) =&gt; $f[&#039;required&#039;])-&gt;keys()-&gt;toArray(),
+            ];
+            $this-&gt;applyNullable($data, $field-&gt;nullable);
+            // The spec doesn&#039;t allow for an empty `required` array. Must have something there.
+            if (empty($data[&#039;required&#039;])) {
+                unset($data[&#039;required&#039;]);
+            }
+            return $data;
+        } else {
+            $schema = [
+                &#039;type&#039; =&gt; static::normalizeTypeName($field-&gt;type),
+                &#039;description&#039; =&gt; $field-&gt;description ?: &#039;&#039;,
+                &#039;example&#039; =&gt; $field-&gt;example,
+            ];
+            if (!empty($field-&gt;enumValues)) {
+                $schema[&#039;enum&#039;] = $field-&gt;enumValues;
+            }
+            $this-&gt;applyNullable($schema, $field-&gt;nullable);
+
+            return $schema;
+        }
+    }
+
+
+    /**
+     * Given a value, generate the schema for it. The schema consists of: {type:, example:, properties: (if value is an
+     * object)}, and possibly a description for each property. The $endpoint and $path are used for looking up response
+     * field descriptions.
+     */
+    public function generateSchemaForResponseValue(mixed $value, OutputEndpointData $endpoint, string $path): array
+    {
+        if ($value instanceof \stdClass) {
+            $value = (array)$value;
+            $properties = [];
+            // Recurse into the object
+            foreach ($value as $subField =&gt; $subValue) {
+                $subFieldPath = sprintf(&#039;%s.%s&#039;, $path, $subField);
+                $properties[$subField] = $this-&gt;generateSchemaForResponseValue($subValue, $endpoint, $subFieldPath);
+            }
+            $required = $this-&gt;filterRequiredResponseFields($endpoint, array_keys($properties), $path);
+
+            $schema = [
+                &#039;type&#039; =&gt; &#039;object&#039;,
+                &#039;properties&#039; =&gt; $this-&gt;objectIfEmpty($properties),
+            ];
+            if ($required) {
+                $schema[&#039;required&#039;] = $required;
+            }
+            $this-&gt;setDescription($schema, $endpoint, $path);
+
+            return $schema;
+        }
+
+        $schema = [
+            &#039;type&#039; =&gt; $this-&gt;convertScribeOrPHPTypeToOpenAPIType(gettype($value)),
+            &#039;example&#039; =&gt; $value,
+        ];
+        $this-&gt;setDescription($schema, $endpoint, $path);
+
+        // Set enum values for the property if they exist
+        if (isset($endpoint-&gt;responseFields[$path]-&gt;enumValues)) {
+            $schema[&#039;enum&#039;] = $endpoint-&gt;responseFields[$path]-&gt;enumValues;
+        }
+
+        if ($schema[&#039;type&#039;] === &#039;array&#039; &amp;&amp; !empty($value)) {
+            $schema[&#039;example&#039;] = json_decode(json_encode($schema[&#039;example&#039;]), true); // Convert stdClass to array
+
+            $sample = $value[0];
+            $typeOfEachItem = $this-&gt;convertScribeOrPHPTypeToOpenAPIType(gettype($sample));
+            $schema[&#039;items&#039;][&#039;type&#039;] = $typeOfEachItem;
+
+            if ($typeOfEachItem === &#039;object&#039;) {
+                $schema[&#039;items&#039;][&#039;properties&#039;] = collect($sample)-&gt;mapWithKeys(function ($v, $k) use ($endpoint, $path) {
+                    return [$k =&gt; $this-&gt;generateSchemaForResponseValue($v, $endpoint, &quot;$path.$k&quot;)];
+                })-&gt;toArray();
+
+                $required = $this-&gt;filterRequiredResponseFields($endpoint, array_keys($schema[&#039;items&#039;][&#039;properties&#039;]),
+                    $path);
+                if ($required) {
+                    $schema[&#039;required&#039;] = $required;
+                }
+            }
+        }
+
+        return $schema;
+    }
+
+
+    /**
+     * Given an enpoint and a set of object keys at a path, return the properties that are specified as required.
+     */
+    public function filterRequiredResponseFields(OutputEndpointData $endpoint, array $properties, string $path = &#039;&#039;): array
+    {
+        $required = [];
+        foreach ($properties as $property) {
+            $responseField = $endpoint-&gt;responseFields[&quot;$path.$property&quot;] ?? $endpoint-&gt;responseFields[$property] ?? null;
+            if ($responseField &amp;&amp; $responseField-&gt;required) {
+                $required[] = $property;
+            }
+        }
+
+        return $required;
+    }
+
+    /*
+     * Set the description for the schema. If the field has a description, it is set in the schema.
+     */
+    private function setDescription(array &amp;$schema, OutputEndpointData $endpoint, string $path): void
+    {
+        if (isset($endpoint-&gt;responseFields[$path]-&gt;description)) {
+            $schema[&#039;description&#039;] = $endpoint-&gt;responseFields[$path]-&gt;description;
+        }
+    }
+
+    protected function convertScribeOrPHPTypeToOpenAPIType($type)
+    {
+        return match ($type) {
+            &#039;float&#039;, &#039;double&#039; =&gt; &#039;number&#039;,
+            &#039;NULL&#039; =&gt; &#039;string&#039;,
+            default =&gt; $type,
+        };
+    }
+
+    /**
+     * Handle nullable fields based on OpenAPI version.
+     * In OpenAPI 3.0, use &#039;nullable: true&#039;.
+     * In OpenAPI 3.1, use JSON Schema&#039;s type array syntax: &#039;type: [&quot;string&quot;, &quot;null&quot;]&#039;.
+     */
+    protected function applyNullable(array &amp;$schema, bool $nullable): void
+    {
+        if (!$nullable) {
+            return;
+        }
+
+        $schema[&#039;nullable&#039;] = true;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Writing/OpenApiSpecGenerators/OpenApiGenerator.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/lab404 -->
+
+</body>
+</html>

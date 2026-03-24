@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-foundation/UriSigner.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpFoundation;
+
+use Psr\Clock\ClockInterface;
+use Symfony\Component\HttpFoundation\Exception\ExpiredSignedUriException;
+use Symfony\Component\HttpFoundation\Exception\LogicException;
+use Symfony\Component\HttpFoundation\Exception\SignedUriException;
+use Symfony\Component\HttpFoundation\Exception\UnsignedUriException;
+use Symfony\Component\HttpFoundation\Exception\UnverifiedSignedUriException;
+
+/**
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ */
+class UriSigner
+{
+    private const STATUS_VALID = 1;
+    private const STATUS_INVALID = 2;
+    private const STATUS_MISSING = 3;
+    private const STATUS_EXPIRED = 4;
+
+    /**
+     * @param string $hashParameter       Query string parameter to use
+     * @param string $expirationParameter Query string parameter to use for expiration
+     */
+    public function __construct(
+        #[\SensitiveParameter] private string $secret,
+        private string $hashParameter = &#039;_hash&#039;,
+        private string $expirationParameter = &#039;_expiration&#039;,
+        private ?ClockInterface $clock = null,
+    ) {
+        if (!$secret) {
+            throw new \InvalidArgumentException(&#039;A non-empty secret is required.&#039;);
+        }
+    }
+
+    /**
+     * Signs a URI.
+     *
+     * The given URI is signed by adding the query string parameter
+     * which value depends on the URI and the secret.
+     *
+     * @param \DateTimeInterface|\DateInterval|int|null $expiration The expiration for the given URI.
+     *                                                              If $expiration is a \DateTimeInterface, it&#039;s expected to be the exact date + time.
+     *                                                              If $expiration is a \DateInterval, the interval is added to &quot;now&quot; to get the date + time.
+     *                                                              If $expiration is an int, it&#039;s expected to be a timestamp in seconds of the exact date + time.
+     *                                                              If $expiration is null, no expiration.
+     *
+     * The expiration is added as a query string parameter.
+     */
+    public function sign(string $uri/* , \DateTimeInterface|\DateInterval|int|null $expiration = null */): string
+    {
+        $expiration = null;
+
+        if (1 &lt; \func_num_args()) {
+            $expiration = func_get_arg(1);
+        }
+
+        if (null !== $expiration &amp;&amp; !$expiration instanceof \DateTimeInterface &amp;&amp; !$expiration instanceof \DateInterval &amp;&amp; !\is_int($expiration)) {
+            throw new \TypeError(\sprintf(&#039;The second argument of &quot;%s()&quot; must be an instance of &quot;%s&quot; or &quot;%s&quot;, an integer or null (%s given).&#039;, __METHOD__, \DateTimeInterface::class, \DateInterval::class, get_debug_type($expiration)));
+        }
+
+        $url = parse_url($uri);
+        $params = [];
+
+        if (isset($url[&#039;query&#039;])) {
+            parse_str($url[&#039;query&#039;], $params);
+        }
+
+        if (isset($params[$this-&gt;hashParameter])) {
+            throw new LogicException(\sprintf(&#039;URI query parameter conflict: parameter name &quot;%s&quot; is reserved.&#039;, $this-&gt;hashParameter));
+        }
+
+        if (isset($params[$this-&gt;expirationParameter])) {
+            throw new LogicException(\sprintf(&#039;URI query parameter conflict: parameter name &quot;%s&quot; is reserved.&#039;, $this-&gt;expirationParameter));
+        }
+
+        if (null !== $expiration) {
+            $params[$this-&gt;expirationParameter] = $this-&gt;getExpirationTime($expiration);
+        }
+
+        $uri = $this-&gt;buildUrl($url, $params);
+        $params[$this-&gt;hashParameter] = $this-&gt;computeHash($uri);
+
+        return $this-&gt;buildUrl($url, $params);
+    }
+
+    /**
+     * Checks that a URI contains the correct hash.
+     * Also checks if the URI has not expired (If you used expiration during signing).
+     */
+    public function check(string $uri): bool
+    {
+        return self::STATUS_VALID === $this-&gt;doVerify($uri);
+    }
+
+    public function checkRequest(Request $request): bool
+    {
+        return self::STATUS_VALID === $this-&gt;doVerify(self::normalize($request));
+    }
+
+    /**
+     * Verify a Request or string URI.
+     *
+     * @throws UnsignedUriException         If the URI is not signed
+     * @throws UnverifiedSignedUriException If the signature is invalid
+     * @throws ExpiredSignedUriException    If the URI has expired
+     * @throws SignedUriException
+     */
+    public function verify(Request|string $uri): void
+    {
+        $uri = self::normalize($uri);
+        $status = $this-&gt;doVerify($uri);
+
+        match ($status) {
+            self::STATUS_VALID =&gt; null,
+            self::STATUS_INVALID =&gt; throw new UnverifiedSignedUriException(),
+            self::STATUS_EXPIRED =&gt; throw new ExpiredSignedUriException(),
+            default =&gt; throw new UnsignedUriException(),
+        };
+    }
+
+    private function computeHash(string $uri): string
+    {
+        return strtr(rtrim(base64_encode(hash_hmac(&#039;sha256&#039;, $uri, $this-&gt;secret, true)), &#039;=&#039;), [&#039;/&#039; =&gt; &#039;_&#039;, &#039;+&#039; =&gt; &#039;-&#039;]);
+    }
+
+    private function buildUrl(array $url, array $params = []): string
+    {
+        ksort($params, \SORT_STRING);
+        $url[&#039;query&#039;] = http_build_query($params, &#039;&#039;, &#039;&amp;&#039;);
+
+        $scheme = isset($url[&#039;scheme&#039;]) ? $url[&#039;scheme&#039;].&#039;://&#039; : &#039;&#039;;
+        $host = $url[&#039;host&#039;] ?? &#039;&#039;;
+        $port = isset($url[&#039;port&#039;]) ? &#039;:&#039;.$url[&#039;port&#039;] : &#039;&#039;;
+        $user = $url[&#039;user&#039;] ?? &#039;&#039;;
+        $pass = isset($url[&#039;pass&#039;]) ? &#039;:&#039;.$url[&#039;pass&#039;] : &#039;&#039;;
+        $pass = ($user || $pass) ? &quot;$pass@&quot; : &#039;&#039;;
+        $path = $url[&#039;path&#039;] ?? &#039;&#039;;
+        $query = $url[&#039;query&#039;] ? &#039;?&#039;.$url[&#039;query&#039;] : &#039;&#039;;
+        $fragment = isset($url[&#039;fragment&#039;]) ? &#039;#&#039;.$url[&#039;fragment&#039;] : &#039;&#039;;
+
+        return $scheme.$user.$pass.$host.$port.$path.$query.$fragment;
+    }
+
+    private function getExpirationTime(\DateTimeInterface|\DateInterval|int $expiration): string
+    {
+        if ($expiration instanceof \DateTimeInterface) {
+            return $expiration-&gt;format(&#039;U&#039;);
+        }
+
+        if ($expiration instanceof \DateInterval) {
+            return $this-&gt;now()-&gt;add($expiration)-&gt;format(&#039;U&#039;);
+        }
+
+        return (string) $expiration;
+    }
+
+    private function now(): \DateTimeImmutable
+    {
+        return $this-&gt;clock?-&gt;now() ?? \DateTimeImmutable::createFromFormat(&#039;U&#039;, time());
+    }
+
+    /**
+     * @return self::STATUS_*
+     */
+    private function doVerify(string $uri): int
+    {
+        $url = parse_url($uri);
+        $params = [];
+
+        if (isset($url[&#039;query&#039;])) {
+            parse_str($url[&#039;query&#039;], $params);
+        }
+
+        if (empty($params[$this-&gt;hashParameter])) {
+            return self::STATUS_MISSING;
+        }
+
+        $hash = $params[$this-&gt;hashParameter];
+        unset($params[$this-&gt;hashParameter]);
+
+        if (!hash_equals($this-&gt;computeHash($this-&gt;buildUrl($url, $params)), strtr(rtrim($hash, &#039;=&#039;), [&#039;/&#039; =&gt; &#039;_&#039;, &#039;+&#039; =&gt; &#039;-&#039;]))) {
+            return self::STATUS_INVALID;
+        }
+
+        if (!$expiration = $params[$this-&gt;expirationParameter] ?? false) {
+            return self::STATUS_VALID;
+        }
+
+        if ($this-&gt;now()-&gt;getTimestamp() &lt; $expiration) {
+            return self::STATUS_VALID;
+        }
+
+        return self::STATUS_EXPIRED;
+    }
+
+    private static function normalize(Request|string $uri): string
+    {
+        if ($uri instanceof Request) {
+            $qs = ($qs = $uri-&gt;server-&gt;get(&#039;QUERY_STRING&#039;)) ? &#039;?&#039;.$qs : &#039;&#039;;
+            $uri = $uri-&gt;getSchemeAndHttpHost().$uri-&gt;getBaseUrl().$uri-&gt;getPathInfo().$qs;
+        }
+
+        return $uri;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-foundation/UrlHelper.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-foundation/Exception -->
+
+</body>
+</html>

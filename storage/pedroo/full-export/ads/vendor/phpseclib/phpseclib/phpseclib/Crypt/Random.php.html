@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/Random.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Random Number Generator
+ *
+ * PHP version 5
+ *
+ * Here&#039;s a short example of how to use this library:
+ * &lt;code&gt;
+ * &lt;?php
+ *    include &#039;vendor/autoload.php&#039;;
+ *
+ *    echo bin2hex(\phpseclib3\Crypt\Random::string(8));
+ * ?&gt;
+ * &lt;/code&gt;
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2007 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\Crypt;
+
+/**
+ * Pure-PHP Random Number Generator
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+abstract class Random
+{
+    /**
+     * Generate a random string.
+     *
+     * Although microoptimizations are generally discouraged as they impair readability this function is ripe with
+     * microoptimizations because this function has the potential of being called a huge number of times.
+     * eg. for RSA key generation.
+     *
+     * @param int $length
+     * @throws \RuntimeException if a symmetric cipher is needed but not loaded
+     * @return string
+     */
+    public static function string($length)
+    {
+        if (!$length) {
+            return &#039;&#039;;
+        }
+
+        try {
+            return random_bytes($length);
+        } catch (\Exception $e) {
+            // random_compat will throw an Exception, which in PHP 5 does not implement Throwable
+        } catch (\Throwable $e) {
+            // If a sufficient source of randomness is unavailable, random_bytes() will throw an
+            // object that implements the Throwable interface (Exception, TypeError, Error).
+            // We don&#039;t actually need to do anything here. The string() method should just continue
+            // as normal. Note, however, that if we don&#039;t have a sufficient source of randomness for
+            // random_bytes(), most of the other calls here will fail too, so we&#039;ll end up using
+            // the PHP implementation.
+        }
+        // at this point we have no choice but to use a pure-PHP CSPRNG
+
+        // cascade entropy across multiple PHP instances by fixing the session and collecting all
+        // environmental variables, including the previous session data and the current session
+        // data.
+        //
+        // mt_rand seeds itself by looking at the PID and the time, both of which are (relatively)
+        // easy to guess at. linux uses mouse clicks, keyboard timings, etc, as entropy sources, but
+        // PHP isn&#039;t low level to be able to use those as sources and on a web server there&#039;s not likely
+        // going to be a ton of keyboard or mouse action. web servers do have one thing that we can use
+        // however, a ton of people visiting the website. obviously you don&#039;t want to base your seeding
+        // solely on parameters a potential attacker sends but (1) not everything in $_SERVER is controlled
+        // by the user and (2) this isn&#039;t just looking at the data sent by the current user - it&#039;s based
+        // on the data sent by all users. one user requests the page and a hash of their info is saved.
+        // another user visits the page and the serialization of their data is utilized along with the
+        // server environment stuff and a hash of the previous http request data (which itself utilizes
+        // a hash of the session data before that). certainly an attacker should be assumed to have
+        // full control over his own http requests. he, however, is not going to have control over
+        // everyone&#039;s http requests.
+        static $crypto = false, $v;
+        if ($crypto === false) {
+            // save old session data
+            $old_session_id = session_id();
+            $old_use_cookies = ini_get(&#039;session.use_cookies&#039;);
+            $old_session_cache_limiter = session_cache_limiter();
+            $_OLD_SESSION = isset($_SESSION) ? $_SESSION : false;
+            if ($old_session_id != &#039;&#039;) {
+                session_write_close();
+            }
+
+            session_id(1);
+            ini_set(&#039;session.use_cookies&#039;, 0);
+            session_cache_limiter(&#039;&#039;);
+            session_start();
+
+            $v = (isset($_SERVER) ? self::safe_serialize($_SERVER) : &#039;&#039;) .
+                 (isset($_POST) ? self::safe_serialize($_POST) : &#039;&#039;) .
+                 (isset($_GET) ? self::safe_serialize($_GET) : &#039;&#039;) .
+                 (isset($_COOKIE) ? self::safe_serialize($_COOKIE) : &#039;&#039;) .
+                 // as of PHP 8.1 $GLOBALS can&#039;t be accessed by reference, which eliminates
+                 // the need for phpseclib_safe_serialize. see https://wiki.php.net/rfc/restrict_globals_usage
+                 // for more info
+                 (version_compare(PHP_VERSION, &#039;8.1.0&#039;, &#039;&gt;=&#039;) ? serialize($GLOBALS) : self::safe_serialize($GLOBALS)) .
+                 self::safe_serialize($_SESSION) .
+                 self::safe_serialize($_OLD_SESSION);
+            $v = $seed = $_SESSION[&#039;seed&#039;] = sha1($v, true);
+            if (!isset($_SESSION[&#039;count&#039;])) {
+                $_SESSION[&#039;count&#039;] = 0;
+            }
+            $_SESSION[&#039;count&#039;]++;
+
+            session_write_close();
+
+            // restore old session data
+            if ($old_session_id != &#039;&#039;) {
+                session_id($old_session_id);
+                session_start();
+                ini_set(&#039;session.use_cookies&#039;, $old_use_cookies);
+                session_cache_limiter($old_session_cache_limiter);
+            } else {
+                if ($_OLD_SESSION !== false) {
+                    $_SESSION = $_OLD_SESSION;
+                    unset($_OLD_SESSION);
+                } else {
+                    unset($_SESSION);
+                }
+            }
+
+            // in SSH2 a shared secret and an exchange hash are generated through the key exchange process.
+            // the IV client to server is the hash of that &quot;nonce&quot; with the letter A and for the encryption key it&#039;s the letter C.
+            // if the hash doesn&#039;t produce enough a key or an IV that&#039;s long enough concat successive hashes of the
+            // original hash and the current hash. we&#039;ll be emulating that. for more info see the following URL:
+            //
+            // http://tools.ietf.org/html/rfc4253#section-7.2
+            //
+            // see the is_string($crypto) part for an example of how to expand the keys
+            $key = sha1($seed . &#039;A&#039;, true);
+            $iv = sha1($seed . &#039;C&#039;, true);
+
+            // ciphers are used as per the nist.gov link below. also, see this link:
+            //
+            // http://en.wikipedia.org/wiki/Cryptographically_secure_pseudorandom_number_generator#Designs_based_on_cryptographic_primitives
+            switch (true) {
+                case class_exists(&#039;\phpseclib3\Crypt\AES&#039;):
+                    $crypto = new AES(&#039;ctr&#039;);
+                    break;
+                case class_exists(&#039;\phpseclib3\Crypt\Twofish&#039;):
+                    $crypto = new Twofish(&#039;ctr&#039;);
+                    break;
+                case class_exists(&#039;\phpseclib3\Crypt\Blowfish&#039;):
+                    $crypto = new Blowfish(&#039;ctr&#039;);
+                    break;
+                case class_exists(&#039;\phpseclib3\Crypt\TripleDES&#039;):
+                    $crypto = new TripleDES(&#039;ctr&#039;);
+                    break;
+                case class_exists(&#039;\phpseclib3\Crypt\DES&#039;):
+                    $crypto = new DES(&#039;ctr&#039;);
+                    break;
+                case class_exists(&#039;\phpseclib3\Crypt\RC4&#039;):
+                    $crypto = new RC4();
+                    break;
+                default:
+                    throw new \RuntimeException(__CLASS__ . &#039; requires at least one symmetric cipher be loaded&#039;);
+            }
+
+            $crypto-&gt;setKey(substr($key, 0, $crypto-&gt;getKeyLength() &gt;&gt; 3));
+            $crypto-&gt;setIV(substr($iv, 0, $crypto-&gt;getBlockLength() &gt;&gt; 3));
+            $crypto-&gt;enableContinuousBuffer();
+        }
+
+        //return $crypto-&gt;encrypt(str_repeat(&quot;\0&quot;, $length));
+
+        // the following is based off of ANSI X9.31:
+        //
+        // http://csrc.nist.gov/groups/STM/cavp/documents/rng/931rngext.pdf
+        //
+        // OpenSSL uses that same standard for it&#039;s random numbers:
+        //
+        // http://www.opensource.apple.com/source/OpenSSL/OpenSSL-38/openssl/fips-1.0/rand/fips_rand.c
+        // (do a search for &quot;ANS X9.31 A.2.4&quot;)
+        $result = &#039;&#039;;
+        while (strlen($result) &lt; $length) {
+            $i = $crypto-&gt;encrypt(microtime()); // strlen(microtime()) == 21
+            $r = $crypto-&gt;encrypt($i ^ $v); // strlen($v) == 20
+            $v = $crypto-&gt;encrypt($r ^ $i); // strlen($r) == 20
+            $result .= $r;
+        }
+
+        return substr($result, 0, $length);
+    }
+
+    /**
+     * Safely serialize variables
+     *
+     * If a class has a private __sleep() it&#039;ll emit a warning
+     * @return mixed
+     * @param mixed $arr
+     */
+    private static function safe_serialize(&amp;$arr)
+    {
+        if (is_object($arr)) {
+            return &#039;&#039;;
+        }
+        if (!is_array($arr)) {
+            return serialize($arr);
+        }
+        // prevent circular array recursion
+        if (isset($arr[&#039;__phpseclib_marker&#039;])) {
+            return &#039;&#039;;
+        }
+        $safearr = [];
+        $arr[&#039;__phpseclib_marker&#039;] = true;
+        foreach (array_keys($arr) as $key) {
+            // do not recurse on the &#039;__phpseclib_marker&#039; key itself, for smaller memory usage
+            if ($key !== &#039;__phpseclib_marker&#039;) {
+                $safearr[$key] = self::safe_serialize($arr[$key]);
+            }
+        }
+        unset($arr[&#039;__phpseclib_marker&#039;]);
+        return serialize($safearr);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/Rijndael.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/Common -->
+
+</body>
+</html>

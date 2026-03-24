@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/ApplyChecksumMiddleware.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\S3;
+
+use Aws\Api\Service;
+use Aws\Api\Shape;
+use Aws\CommandInterface;
+use Aws\MetricsBuilder;
+use GuzzleHttp\Psr7;
+use InvalidArgumentException;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Apply required or optional checksums to requests before sending.
+ *
+ * IMPORTANT: This middleware must be added after the &quot;build&quot; step.
+ *
+ * @internal
+ */
+class ApplyChecksumMiddleware
+{
+    use CalculatesChecksumTrait;
+
+    public const DEFAULT_CALCULATION_MODE = &#039;when_supported&#039;;
+    public const DEFAULT_ALGORITHM = &#039;crc32&#039;;
+
+    /**
+     * @var true[]
+     *
+     * S3 Operations for which pre-calculated SHA256
+     * Checksums can be added to the command
+     */
+    public static $sha256 = [
+        &#039;PutObject&#039; =&gt; true,
+        &#039;UploadPart&#039; =&gt; true,
+    ];
+
+    /** @var Service */
+    private $api;
+
+    /** @var array */
+    private $config;
+
+    /** @var callable */
+    private $nextHandler;
+
+    /**
+     * Create a middleware wrapper function.
+     *
+     * @param Service $api
+     * @return callable
+     */
+    public static function wrap(Service $api, array $config = [])
+    {
+        return function (callable $handler) use ($api, $config) {
+            return new self($handler, $api, $config);
+        };
+    }
+
+    public function __construct(
+        callable $nextHandler,
+        Service $api, 
+        array $config = []
+    )
+    {
+        $this-&gt;api = $api;
+        $this-&gt;nextHandler = $nextHandler;
+        $this-&gt;config = $config;
+    }
+
+    public function __invoke(
+        CommandInterface $command,
+        RequestInterface $request
+    ) {
+        $next = $this-&gt;nextHandler;
+        $name = $command-&gt;getName();
+        $body = $request-&gt;getBody();
+        $operation = $this-&gt;api-&gt;getOperation($name);
+        $mode = $command[&#039;@context&#039;][&#039;request_checksum_calculation&#039;]
+            ?? $this-&gt;config[&#039;request_checksum_calculation&#039;]
+            ?? self::DEFAULT_CALCULATION_MODE;
+
+        $command-&gt;getMetricsBuilder()-&gt;identifyMetricByValueAndAppend(
+            &#039;request_checksum_calculation&#039;,
+            $mode
+        );
+
+        // Trigger warning if AddContentMD5 is specified for PutObject or UploadPart
+        $this-&gt;handleDeprecatedAddContentMD5($command);
+
+        $checksumInfo = $operation[&#039;httpChecksum&#039;] ?? [];
+        $checksumMemberName = $checksumInfo[&#039;requestAlgorithmMember&#039;] ?? &#039;&#039;;
+        $checksumMember = !empty($checksumMemberName)
+            ? $operation-&gt;getInput()-&gt;getMember($checksumMemberName)
+            : null;
+        $checksumRequired = $checksumInfo[&#039;requestChecksumRequired&#039;] ?? false;
+        $requestedAlgorithm = $command[$checksumMemberName] ?? null;
+
+        $shouldAddChecksum = $this-&gt;shouldAddChecksum(
+            $mode,
+            $checksumRequired,
+            $checksumMember,
+            $requestedAlgorithm
+        );
+        if ($shouldAddChecksum) {
+            if (!$this-&gt;hasAlgorithmHeader($request)) {
+                $supportedAlgorithms =  array_map(&#039;strtolower&#039;, $checksumMember[&#039;enum&#039;] ?? []);
+                $algorithm = $this-&gt;determineChecksumAlgorithm(
+                    $supportedAlgorithms,
+                    $requestedAlgorithm,
+                    $checksumMemberName
+                );
+                $request = $this-&gt;addAlgorithmHeader($algorithm, $request, $body);
+
+                $command-&gt;getMetricsBuilder()-&gt;identifyMetricByValueAndAppend(
+                    &#039;request_checksum&#039;,
+                    $algorithm
+                );
+            }
+        }
+
+        // Set the content hash header if ContentSHA256 is provided
+        if (isset(self::$sha256[$name]) &amp;&amp; $command[&#039;ContentSHA256&#039;]) {
+            $request = $request-&gt;withHeader(
+                &#039;X-Amz-Content-Sha256&#039;,
+                $command[&#039;ContentSHA256&#039;]
+            );
+            $command-&gt;getMetricsBuilder()-&gt;append(
+                MetricsBuilder::FLEXIBLE_CHECKSUMS_REQ_SHA256
+            );
+        }
+
+        return $next($command, $request);
+    }
+
+    /**
+     * @param CommandInterface $command
+     *
+     * @return void
+     */
+    private function handleDeprecatedAddContentMD5(CommandInterface $command): void
+    {
+        if (!empty($command[&#039;AddContentMD5&#039;])) {
+            trigger_error(
+                &#039;S3 no longer supports MD5 checksums. &#039; .
+                &#039;A CRC32 checksum will be computed and applied on your behalf.&#039;,
+                E_USER_DEPRECATED
+            );
+            $command[&#039;ChecksumAlgorithm&#039;] = self::DEFAULT_ALGORITHM;
+        }
+    }
+
+    /**
+     * @param string $mode
+     * @param Shape|null $checksumMember
+     * @param string $name
+     * @param bool $checksumRequired
+     * @param string|null $requestedAlgorithm
+     *
+     * @return bool
+     */
+    private function shouldAddChecksum(
+        string $mode,
+        bool $checksumRequired,
+        ?Shape $checksumMember,
+        ?string $requestedAlgorithm
+    ): bool
+    {
+        return ($mode === &#039;when_supported&#039; &amp;&amp; $checksumMember)
+            || ($mode === &#039;when_required&#039;
+                &amp;&amp; ($checksumRequired || ($checksumMember &amp;&amp; $requestedAlgorithm)));
+    }
+
+    /**
+     * @param Shape|null $checksumMember
+     * @param string|null $requestedAlgorithm
+     * @param string|null $checksumMemberName
+     *
+     * @return string
+     */
+    private function determineChecksumAlgorithm(
+        array $supportedAlgorithms,
+        ?string $requestedAlgorithm,
+        ?string $checksumMemberName
+    ): string
+    {
+        $algorithm = self::DEFAULT_ALGORITHM;
+
+        if ($requestedAlgorithm) {
+            $requestedAlgorithm = strtolower($requestedAlgorithm);
+            if (!in_array($requestedAlgorithm, $supportedAlgorithms)) {
+                throw new InvalidArgumentException(
+                    &quot;Unsupported algorithm supplied for input variable {$checksumMemberName}. &quot; .
+                    &quot;Supported checksums for this operation include: &quot;
+                    . implode(&quot;, &quot;, $supportedAlgorithms) . &quot;.&quot;
+                );
+            }
+            $algorithm = $requestedAlgorithm;
+        }
+
+        return $algorithm;
+    }
+
+    /**
+     * @param string $requestedAlgorithm
+     * @param RequestInterface $request
+     * @param StreamInterface $body
+     *
+     * @return RequestInterface
+     */
+    private function addAlgorithmHeader(
+        string $requestedAlgorithm,
+        RequestInterface $request,
+        StreamInterface $body
+    ): RequestInterface
+    {
+        $headerName = &quot;x-amz-checksum-{$requestedAlgorithm}&quot;;
+        if (!$request-&gt;hasHeader($headerName)) {
+            $encoded = self::getEncodedValue($requestedAlgorithm, $body);
+            $request = $request-&gt;withHeader($headerName, $encoded);
+        }
+
+        return $request;
+    }
+
+    /**
+     * @param RequestInterface $request
+     *
+     * @return bool
+     */
+    private function hasAlgorithmHeader(RequestInterface $request): bool
+    {
+        $headers = $request-&gt;getHeaders();
+
+        foreach ($headers as $name =&gt; $values) {
+            if (stripos($name, &#039;x-amz-checksum-&#039;) === 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/BatchDelete.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/Crypto -->
+
+</body>
+</html>

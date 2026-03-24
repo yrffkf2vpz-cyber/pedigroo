@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/prompts/src/Prompt.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Laravel\Prompts;
+
+use Closure;
+use Laravel\Prompts\Exceptions\FormRevertedException;
+use Laravel\Prompts\Output\ConsoleOutput;
+use Laravel\Prompts\Support\Result;
+use RuntimeException;
+use Symfony\Component\Console\Output\OutputInterface;
+use Throwable;
+
+abstract class Prompt
+{
+    use Concerns\Colors;
+    use Concerns\Cursor;
+    use Concerns\Erase;
+    use Concerns\Events;
+    use Concerns\FakesInputOutput;
+    use Concerns\Fallback;
+    use Concerns\Interactivity;
+    use Concerns\Themes;
+
+    /**
+     * The current state of the prompt.
+     */
+    public string $state = &#039;initial&#039;;
+
+    /**
+     * The error message from the validator.
+     */
+    public string $error = &#039;&#039;;
+
+    /**
+     * The cancel message displayed when this prompt is cancelled.
+     */
+    public string $cancelMessage = &#039;Cancelled.&#039;;
+
+    /**
+     * The previously rendered frame.
+     */
+    protected string $prevFrame = &#039;&#039;;
+
+    /**
+     * How many new lines were written by the last output.
+     */
+    protected int $newLinesWritten = 1;
+
+    /**
+     * Whether user input is required.
+     */
+    public bool|string $required;
+
+    /**
+     * The transformation callback.
+     */
+    public ?Closure $transform = null;
+
+    /**
+     * The validator callback or rules.
+     */
+    public mixed $validate;
+
+    /**
+     * The cancellation callback.
+     */
+    protected static ?Closure $cancelUsing;
+
+    /**
+     * Indicates if the prompt has been validated.
+     */
+    protected bool $validated = false;
+
+    /**
+     * The custom validation callback.
+     */
+    protected static ?Closure $validateUsing;
+
+    /**
+     * The revert handler from the StepBuilder.
+     */
+    protected static ?Closure $revertUsing = null;
+
+    /**
+     * The output instance.
+     */
+    protected static OutputInterface $output;
+
+    /**
+     * The terminal instance.
+     */
+    protected static Terminal $terminal;
+
+    /**
+     * Get the value of the prompt.
+     */
+    abstract public function value(): mixed;
+
+    /**
+     * Render the prompt and listen for input.
+     */
+    public function prompt(): mixed
+    {
+        try {
+            $this-&gt;capturePreviousNewLines();
+
+            if (static::shouldFallback()) {
+                return $this-&gt;fallback();
+            }
+
+            static::$interactive ??= stream_isatty(STDIN);
+
+            if (! static::$interactive) {
+                return $this-&gt;default();
+            }
+
+            $this-&gt;checkEnvironment();
+
+            try {
+                static::terminal()-&gt;setTty(&#039;-icanon -isig -echo&#039;);
+            } catch (Throwable $e) {
+                static::output()-&gt;writeln(&quot;&lt;comment&gt;{$e-&gt;getMessage()}&lt;/comment&gt;&quot;);
+                static::fallbackWhen(true);
+
+                return $this-&gt;fallback();
+            }
+
+            $this-&gt;hideCursor();
+            $this-&gt;render();
+
+            $result = $this-&gt;runLoop(function (string $key): ?Result {
+                $continue = $this-&gt;handleKeyPress($key);
+
+                $this-&gt;render();
+
+                if ($continue === false || $key === Key::CTRL_C) {
+                    if ($key === Key::CTRL_C) {
+                        if (isset(static::$cancelUsing)) {
+                            return Result::from((static::$cancelUsing)());
+                        } else {
+                            static::terminal()-&gt;exit();
+                        }
+                    }
+
+                    if ($key === Key::CTRL_U &amp;&amp; self::$revertUsing) {
+                        throw new FormRevertedException;
+                    }
+
+                    return Result::from($this-&gt;transformedValue());
+                }
+
+                // Continue looping.
+                return null;
+            });
+
+            return $result;
+        } finally {
+            $this-&gt;clearListeners();
+        }
+    }
+
+    /**
+     * Implementation of the prompt looping mechanism.
+     *
+     * @param  callable(string $key): ?Result  $callable
+     */
+    public function runLoop(callable $callable): mixed
+    {
+        while (($key = static::terminal()-&gt;read()) !== null) {
+            /**
+             * If $key is an empty string, Terminal::read
+             * has failed. We can continue to the next
+             * iteration of the loop, and try again.
+             */
+            if ($key === &#039;&#039;) {
+                continue;
+            }
+
+            $result = $callable($key);
+
+            if ($result instanceof Result) {
+                return $result-&gt;value;
+            }
+        }
+    }
+
+    /**
+     * Register a callback to be invoked when a user cancels a prompt.
+     */
+    public static function cancelUsing(?Closure $callback): void
+    {
+        static::$cancelUsing = $callback;
+    }
+
+    /**
+     * How many new lines were written by the last output.
+     */
+    public function newLinesWritten(): int
+    {
+        return $this-&gt;newLinesWritten;
+    }
+
+    /**
+     * Capture the number of new lines written by the last output.
+     */
+    protected function capturePreviousNewLines(): void
+    {
+        $this-&gt;newLinesWritten = method_exists(static::output(), &#039;newLinesWritten&#039;)
+            ? static::output()-&gt;newLinesWritten()
+            : 1;
+    }
+
+    /**
+     * Set the output instance.
+     */
+    public static function setOutput(OutputInterface $output): void
+    {
+        self::$output = $output;
+    }
+
+    /**
+     * Get the current output instance.
+     */
+    protected static function output(): OutputInterface
+    {
+        return self::$output ??= new ConsoleOutput;
+    }
+
+    /**
+     * Write output directly, bypassing newline capture.
+     */
+    protected static function writeDirectly(string $message): void
+    {
+        match (true) {
+            method_exists(static::output(), &#039;writeDirectly&#039;) =&gt; static::output()-&gt;writeDirectly($message),
+            method_exists(static::output(), &#039;getOutput&#039;) =&gt; static::output()-&gt;getOutput()-&gt;write($message),
+            default =&gt; static::output()-&gt;write($message),
+        };
+    }
+
+    /**
+     * Get the terminal instance.
+     */
+    public static function terminal(): Terminal
+    {
+        return static::$terminal ??= new Terminal;
+    }
+
+    /**
+     * Set the custom validation callback.
+     */
+    public static function validateUsing(Closure $callback): void
+    {
+        static::$validateUsing = $callback;
+    }
+
+    /**
+     * Revert the prompt using the given callback.
+     *
+     * @internal
+     */
+    public static function revertUsing(Closure $callback): void
+    {
+        static::$revertUsing = $callback;
+    }
+
+    /**
+     * Clear any previous revert callback.
+     *
+     * @internal
+     */
+    public static function preventReverting(): void
+    {
+        static::$revertUsing = null;
+    }
+
+    /**
+     * Render the prompt.
+     */
+    protected function render(): void
+    {
+        $this-&gt;terminal()-&gt;initDimensions();
+
+        $frame = $this-&gt;renderTheme();
+
+        if ($frame === $this-&gt;prevFrame) {
+            return;
+        }
+
+        if ($this-&gt;state === &#039;initial&#039;) {
+            static::output()-&gt;write($frame);
+
+            $this-&gt;state = &#039;active&#039;;
+            $this-&gt;prevFrame = $frame;
+
+            return;
+        }
+
+        $terminalHeight = $this-&gt;terminal()-&gt;lines();
+        $previousFrameHeight = count(explode(PHP_EOL, $this-&gt;prevFrame));
+        $renderableLines = array_slice(explode(PHP_EOL, $frame), abs(min(0, $terminalHeight - $previousFrameHeight)));
+
+        $this-&gt;moveCursorToColumn(1);
+        $this-&gt;moveCursorUp(min($terminalHeight, $previousFrameHeight) - 1);
+        $this-&gt;eraseDown();
+        $this-&gt;output()-&gt;write(implode(PHP_EOL, $renderableLines));
+
+        $this-&gt;prevFrame = $frame;
+    }
+
+    /**
+     * Submit the prompt.
+     */
+    protected function submit(): void
+    {
+        $this-&gt;validate($this-&gt;transformedValue());
+
+        if ($this-&gt;state !== &#039;error&#039;) {
+            $this-&gt;state = &#039;submit&#039;;
+        }
+    }
+
+    /**
+     * Handle a key press and determine whether to continue.
+     */
+    private function handleKeyPress(string $key): bool
+    {
+        if ($this-&gt;state === &#039;error&#039;) {
+            $this-&gt;state = &#039;active&#039;;
+        }
+
+        $this-&gt;emit(&#039;key&#039;, $key);
+
+        if ($this-&gt;state === &#039;submit&#039;) {
+            return false;
+        }
+
+        if ($key === Key::CTRL_U) {
+            if (! self::$revertUsing) {
+                $this-&gt;state = &#039;error&#039;;
+                $this-&gt;error = &#039;This cannot be reverted.&#039;;
+
+                return true;
+            }
+
+            $this-&gt;state = &#039;cancel&#039;;
+            $this-&gt;cancelMessage = &#039;Reverted.&#039;;
+
+            call_user_func(self::$revertUsing);
+
+            return false;
+        }
+
+        if ($key === Key::CTRL_C) {
+            $this-&gt;state = &#039;cancel&#039;;
+
+            return false;
+        }
+
+        if ($this-&gt;validated) {
+            $this-&gt;validate($this-&gt;transformedValue());
+        }
+
+        return true;
+    }
+
+    /**
+     * Transform the input.
+     */
+    private function transform(mixed $value): mixed
+    {
+        if (is_null($this-&gt;transform)) {
+            return $value;
+        }
+
+        return call_user_func($this-&gt;transform, $value);
+    }
+
+    /**
+     * Get the transformed value of the prompt.
+     */
+    protected function transformedValue(): mixed
+    {
+        return $this-&gt;transform($this-&gt;value());
+    }
+
+    /**
+     * Validate the input.
+     */
+    private function validate(mixed $value): void
+    {
+        $this-&gt;validated = true;
+
+        if ($this-&gt;required !== false &amp;&amp; $this-&gt;isInvalidWhenRequired($value)) {
+            $this-&gt;state = &#039;error&#039;;
+            $this-&gt;error = is_string($this-&gt;required) &amp;&amp; strlen($this-&gt;required) &gt; 0 ? $this-&gt;required : &#039;Required.&#039;;
+
+            return;
+        }
+
+        if (! isset($this-&gt;validate) &amp;&amp; ! isset(static::$validateUsing)) {
+            return;
+        }
+
+        $error = match (true) {
+            is_callable($this-&gt;validate) =&gt; ($this-&gt;validate)($value),
+            isset(static::$validateUsing) =&gt; (static::$validateUsing)($this),
+            default =&gt; throw new RuntimeException(&#039;The validation logic is missing.&#039;),
+        };
+
+        if (! is_string($error) &amp;&amp; ! is_null($error)) {
+            throw new RuntimeException(&#039;The validator must return a string or null.&#039;);
+        }
+
+        if (is_string($error) &amp;&amp; strlen($error) &gt; 0) {
+            $this-&gt;state = &#039;error&#039;;
+            $this-&gt;error = $error;
+        }
+    }
+
+    /**
+     * Determine whether the given value is invalid when the prompt is required.
+     */
+    protected function isInvalidWhenRequired(mixed $value): bool
+    {
+        return $value === &#039;&#039; || $value === [] || $value === false || $value === null;
+    }
+
+    /**
+     * Check whether the environment can support the prompt.
+     */
+    private function checkEnvironment(): void
+    {
+        if (PHP_OS_FAMILY === &#039;Windows&#039;) {
+            throw new RuntimeException(&#039;Prompts is not currently supported on Windows. Please use WSL or configure a fallback.&#039;);
+        }
+    }
+
+    /**
+     * Restore the cursor and terminal state.
+     */
+    public function __destruct()
+    {
+        $this-&gt;restoreCursor();
+
+        static::terminal()-&gt;restoreTty();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/prompts/src/SearchPrompt.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/prompts/src/Concerns -->
+
+</body>
+</html>

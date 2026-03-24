@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/mime/Part/TextPart.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Mime\Part;
+
+use Symfony\Component\Mime\Encoder\Base64ContentEncoder;
+use Symfony\Component\Mime\Encoder\ContentEncoderInterface;
+use Symfony\Component\Mime\Encoder\EightBitContentEncoder;
+use Symfony\Component\Mime\Encoder\QpContentEncoder;
+use Symfony\Component\Mime\Exception\InvalidArgumentException;
+use Symfony\Component\Mime\Header\Headers;
+
+/**
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ */
+class TextPart extends AbstractPart
+{
+    private const DEFAULT_ENCODERS = [&#039;quoted-printable&#039;, &#039;base64&#039;, &#039;8bit&#039;];
+
+    /** @internal, to be removed in 8.0 */
+    protected Headers $_headers;
+
+    private static array $encoders = [];
+
+    /** @var resource|string|File */
+    private $body;
+    private ?string $charset;
+    private string $subtype;
+    private ?string $disposition = null;
+    private ?string $name = null;
+    private string $encoding;
+    private ?bool $seekable = null;
+
+    /**
+     * @param resource|string|File $body Use a File instance to defer loading the file until rendering
+     */
+    public function __construct($body, ?string $charset = &#039;utf-8&#039;, string $subtype = &#039;plain&#039;, ?string $encoding = null)
+    {
+        parent::__construct();
+
+        if (!\is_string($body) &amp;&amp; !\is_resource($body) &amp;&amp; !$body instanceof File) {
+            throw new \TypeError(\sprintf(&#039;The body of &quot;%s&quot; must be a string, a resource, or an instance of &quot;%s&quot; (got &quot;%s&quot;).&#039;, self::class, File::class, get_debug_type($body)));
+        }
+
+        if ($body instanceof File) {
+            $path = $body-&gt;getPath();
+            if ((is_file($path) &amp;&amp; !is_readable($path)) || is_dir($path)) {
+                throw new InvalidArgumentException(\sprintf(&#039;Path &quot;%s&quot; is not readable.&#039;, $path));
+            }
+        }
+
+        $this-&gt;body = $body;
+        $this-&gt;charset = $charset;
+        $this-&gt;subtype = $subtype;
+        $this-&gt;seekable = \is_resource($body) ? stream_get_meta_data($body)[&#039;seekable&#039;] &amp;&amp; 0 === fseek($body, 0, \SEEK_CUR) : null;
+
+        if (null === $encoding) {
+            $this-&gt;encoding = $this-&gt;chooseEncoding();
+        } else {
+            if (!\in_array($encoding, self::DEFAULT_ENCODERS, true) &amp;&amp; !\array_key_exists($encoding, self::$encoders)) {
+                throw new InvalidArgumentException(\sprintf(&#039;The encoding must be one of &quot;%s&quot; (&quot;%s&quot; given).&#039;, implode(&#039;&quot;, &quot;&#039;, array_unique(array_merge(self::DEFAULT_ENCODERS, array_keys(self::$encoders)))), $encoding));
+            }
+            $this-&gt;encoding = $encoding;
+        }
+    }
+
+    public function getMediaType(): string
+    {
+        return &#039;text&#039;;
+    }
+
+    public function getMediaSubtype(): string
+    {
+        return $this-&gt;subtype;
+    }
+
+    /**
+     * @param string $disposition one of attachment, inline, or form-data
+     *
+     * @return $this
+     */
+    public function setDisposition(string $disposition): static
+    {
+        $this-&gt;disposition = $disposition;
+
+        return $this;
+    }
+
+    /**
+     * @return ?string null or one of attachment, inline, or form-data
+     */
+    public function getDisposition(): ?string
+    {
+        return $this-&gt;disposition;
+    }
+
+    /**
+     * Sets the name of the file (used by FormDataPart).
+     *
+     * @return $this
+     */
+    public function setName(string $name): static
+    {
+        $this-&gt;name = $name;
+
+        return $this;
+    }
+
+    /**
+     * Gets the name of the file.
+     */
+    public function getName(): ?string
+    {
+        return $this-&gt;name;
+    }
+
+    public function getBody(): string
+    {
+        if ($this-&gt;body instanceof File) {
+            if (false === $ret = @file_get_contents($this-&gt;body-&gt;getPath())) {
+                throw new InvalidArgumentException(error_get_last()[&#039;message&#039;]);
+            }
+
+            return $ret;
+        }
+
+        if (null === $this-&gt;seekable) {
+            return $this-&gt;body;
+        }
+
+        if ($this-&gt;seekable) {
+            rewind($this-&gt;body);
+        }
+
+        return stream_get_contents($this-&gt;body) ?: &#039;&#039;;
+    }
+
+    public function bodyToString(): string
+    {
+        return $this-&gt;getEncoder()-&gt;encodeString($this-&gt;getBody(), $this-&gt;charset);
+    }
+
+    public function bodyToIterable(): iterable
+    {
+        if ($this-&gt;body instanceof File) {
+            $path = $this-&gt;body-&gt;getPath();
+            if (false === $handle = @fopen($path, &#039;r&#039;, false)) {
+                throw new InvalidArgumentException(\sprintf(&#039;Unable to open path &quot;%s&quot;.&#039;, $path));
+            }
+
+            yield from $this-&gt;getEncoder()-&gt;encodeByteStream($handle);
+        } elseif (null !== $this-&gt;seekable) {
+            if ($this-&gt;seekable) {
+                rewind($this-&gt;body);
+            }
+            yield from $this-&gt;getEncoder()-&gt;encodeByteStream($this-&gt;body);
+        } else {
+            yield $this-&gt;getEncoder()-&gt;encodeString($this-&gt;body);
+        }
+    }
+
+    public function getPreparedHeaders(): Headers
+    {
+        $headers = parent::getPreparedHeaders();
+
+        $headers-&gt;setHeaderBody(&#039;Parameterized&#039;, &#039;Content-Type&#039;, $this-&gt;getMediaType().&#039;/&#039;.$this-&gt;getMediaSubtype());
+        if ($this-&gt;charset) {
+            $headers-&gt;setHeaderParameter(&#039;Content-Type&#039;, &#039;charset&#039;, $this-&gt;charset);
+        }
+        if ($this-&gt;name &amp;&amp; &#039;form-data&#039; !== $this-&gt;disposition) {
+            $headers-&gt;setHeaderParameter(&#039;Content-Type&#039;, &#039;name&#039;, $this-&gt;name);
+        }
+        $headers-&gt;setHeaderBody(&#039;Text&#039;, &#039;Content-Transfer-Encoding&#039;, $this-&gt;encoding);
+
+        if (!$headers-&gt;has(&#039;Content-Disposition&#039;) &amp;&amp; null !== $this-&gt;disposition) {
+            $headers-&gt;setHeaderBody(&#039;Parameterized&#039;, &#039;Content-Disposition&#039;, $this-&gt;disposition);
+            if ($this-&gt;name) {
+                $headers-&gt;setHeaderParameter(&#039;Content-Disposition&#039;, &#039;name&#039;, $this-&gt;name);
+            }
+        }
+
+        return $headers;
+    }
+
+    public function asDebugString(): string
+    {
+        $str = parent::asDebugString();
+        if (null !== $this-&gt;charset) {
+            $str .= &#039; charset: &#039;.$this-&gt;charset;
+        }
+        if (null !== $this-&gt;disposition) {
+            $str .= &#039; disposition: &#039;.$this-&gt;disposition;
+        }
+
+        return $str;
+    }
+
+    private function getEncoder(): ContentEncoderInterface
+    {
+        if (&#039;8bit&#039; === $this-&gt;encoding) {
+            return self::$encoders[$this-&gt;encoding] ??= new EightBitContentEncoder();
+        }
+
+        if (&#039;quoted-printable&#039; === $this-&gt;encoding) {
+            return self::$encoders[$this-&gt;encoding] ??= new QpContentEncoder();
+        }
+
+        if (&#039;base64&#039; === $this-&gt;encoding) {
+            return self::$encoders[$this-&gt;encoding] ??= new Base64ContentEncoder();
+        }
+
+        return self::$encoders[$this-&gt;encoding];
+    }
+
+    public static function addEncoder(ContentEncoderInterface $encoder): void
+    {
+        if (\in_array($encoder-&gt;getName(), self::DEFAULT_ENCODERS, true)) {
+            throw new InvalidArgumentException(&#039;You are not allowed to change the default encoders (&quot;quoted-printable&quot;, &quot;base64&quot;, and &quot;8bit&quot;).&#039;);
+        }
+
+        self::$encoders[$encoder-&gt;getName()] = $encoder;
+    }
+
+    private function chooseEncoding(): string
+    {
+        if (null === $this-&gt;charset) {
+            return &#039;base64&#039;;
+        }
+
+        return &#039;quoted-printable&#039;;
+    }
+
+    public function __serialize(): array
+    {
+        if (self::class === (new \ReflectionMethod($this, &#039;__sleep&#039;))-&gt;class || self::class !== (new \ReflectionMethod($this, &#039;__serialize&#039;))-&gt;class) {
+            // convert resources to strings for serialization
+            if (null !== $this-&gt;seekable) {
+                $this-&gt;body = $this-&gt;getBody();
+                $this-&gt;seekable = null;
+            }
+
+            return [
+                &#039;_headers&#039; =&gt; $this-&gt;getHeaders(),
+                &#039;body&#039; =&gt; $this-&gt;body,
+                &#039;charset&#039; =&gt; $this-&gt;charset,
+                &#039;subtype&#039; =&gt; $this-&gt;subtype,
+                &#039;disposition&#039; =&gt; $this-&gt;disposition,
+                &#039;name&#039; =&gt; $this-&gt;name,
+                &#039;encoding&#039; =&gt; $this-&gt;encoding,
+            ];
+        }
+
+        trigger_deprecation(&#039;symfony/mime&#039;, &#039;7.4&#039;, &#039;Implementing &quot;%s::__sleep()&quot; is deprecated, use &quot;__serialize()&quot; instead.&#039;, get_debug_type($this));
+
+        $data = [];
+        foreach ($this-&gt;__sleep() as $key) {
+            try {
+                if (($r = new \ReflectionProperty($this, $key))-&gt;isInitialized($this)) {
+                    $data[$key] = $r-&gt;getValue($this);
+                }
+            } catch (\ReflectionException) {
+                $data[$key] = $this-&gt;$key;
+            }
+        }
+
+        return $data;
+    }
+
+    public function __unserialize(array $data): void
+    {
+        if ($wakeup = self::class !== (new \ReflectionMethod($this, &#039;__wakeup&#039;))-&gt;class &amp;&amp; self::class === (new \ReflectionMethod($this, &#039;__unserialize&#039;))-&gt;class) {
+            trigger_deprecation(&#039;symfony/mime&#039;, &#039;7.4&#039;, &#039;Implementing &quot;%s::__wakeup()&quot; is deprecated, use &quot;__unserialize()&quot; instead.&#039;, get_debug_type($this));
+        }
+
+        if ($headers = $data[&#039;_headers&#039;] ?? $data[&quot;\0*\0_headers&quot;] ?? null) {
+            unset($data[&#039;_headers&#039;], $data[&quot;\0*\0_headers&quot;]);
+            parent::__unserialize([&#039;headers&#039; =&gt; $headers]);
+        }
+
+        if ([&#039;body&#039;, &#039;charset&#039;, &#039;subtype&#039;, &#039;disposition&#039;, &#039;name&#039;, &#039;encoding&#039;] === array_keys($data)) {
+            parent::__unserialize([&#039;headers&#039; =&gt; $headers]);
+            $this-&gt;body = $data[&#039;body&#039;];
+            $this-&gt;charset = $data[&#039;charset&#039;];
+            $this-&gt;subtype = $data[&#039;subtype&#039;];
+            $this-&gt;disposition = $data[&#039;disposition&#039;];
+            $this-&gt;name = $data[&#039;name&#039;];
+            $this-&gt;encoding = $data[&#039;encoding&#039;];
+
+            if ($wakeup) {
+                $this-&gt;__wakeup();
+            } elseif (!\is_string($this-&gt;body) &amp;&amp; !$this-&gt;body instanceof File) {
+                throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+            }
+
+            return;
+        }
+
+        if ([&quot;\0&quot;.self::class.&quot;\0body&quot;, &quot;\0&quot;.self::class.&quot;\0charset&quot;, &quot;\0&quot;.self::class.&quot;\0subtype&quot;, &quot;\0&quot;.self::class.&quot;\0disposition&quot;, &quot;\0&quot;.self::class.&quot;\0name&quot;, &quot;\0&quot;.self::class.&quot;\0encoding&quot;] === array_keys($data)) {
+            $this-&gt;body = $data[&quot;\0&quot;.self::class.&quot;\0body&quot;];
+            $this-&gt;charset = $data[&quot;\0&quot;.self::class.&quot;\0charset&quot;];
+            $this-&gt;subtype = $data[&quot;\0&quot;.self::class.&quot;\0subtype&quot;];
+            $this-&gt;disposition = $data[&quot;\0&quot;.self::class.&quot;\0disposition&quot;];
+            $this-&gt;name = $data[&quot;\0&quot;.self::class.&quot;\0name&quot;];
+            $this-&gt;encoding = $data[&quot;\0&quot;.self::class.&quot;\0encoding&quot;];
+
+            if ($wakeup) {
+                $this-&gt;_headers = $headers;
+                $this-&gt;__wakeup();
+            } elseif (!\is_string($this-&gt;body) &amp;&amp; !$this-&gt;body instanceof File) {
+                throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+            }
+
+            return;
+        }
+
+        trigger_deprecation(&#039;symfony/mime&#039;, &#039;7.4&#039;, &#039;Passing extra keys to &quot;%s::__unserialize()&quot; is deprecated, populate properties in &quot;%s::__unserialize()&quot; instead.&#039;, self::class, get_debug_type($this));
+
+        \Closure::bind(function ($data) use ($wakeup) {
+            foreach ($data as $key =&gt; $value) {
+                $this-&gt;{(&quot;\0&quot; === $key[0] ?? &#039;&#039;) ? substr($key, 1 + strrpos($key, &quot;\0&quot;)) : $key} = $value;
+            }
+
+            if ($wakeup) {
+                $this-&gt;__wakeup();
+            }
+        }, $this, static::class)($data);
+    }
+
+    /**
+     * @deprecated since Symfony 7.4, will be replaced by `__serialize()` in 8.0
+     */
+    public function __sleep(): array
+    {
+        trigger_deprecation(&#039;symfony/mime&#039;, &#039;7.4&#039;, &#039;Calling &quot;%s::__sleep()&quot; is deprecated, use &quot;__serialize()&quot; instead.&#039;, get_debug_type($this));
+
+        // convert resources to strings for serialization
+        if (null !== $this-&gt;seekable) {
+            $this-&gt;body = $this-&gt;getBody();
+            $this-&gt;seekable = null;
+        }
+
+        $this-&gt;_headers = $this-&gt;getHeaders();
+
+        return [&#039;_headers&#039;, &#039;body&#039;, &#039;charset&#039;, &#039;subtype&#039;, &#039;disposition&#039;, &#039;name&#039;, &#039;encoding&#039;];
+    }
+
+    /**
+     * @deprecated since Symfony 7.4, will be replaced by `__unserialize()` in 8.0
+     */
+    public function __wakeup(): void
+    {
+        trigger_deprecation(&#039;symfony/mime&#039;, &#039;7.4&#039;, &#039;Calling &quot;%s::__wakeup()&quot; is deprecated, use &quot;__unserialize()&quot; instead.&#039;, get_debug_type($this));
+
+        $r = new \ReflectionProperty(AbstractPart::class, &#039;headers&#039;);
+        $r-&gt;setValue($this, $this-&gt;_headers);
+        unset($this-&gt;_headers);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/mime/README.md -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/mime/Part/Multipart -->
+
+</body>
+</html>

@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/console/Attribute/MapInput.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Console\Attribute;
+
+use Symfony\Component\Console\Attribute\Reflection\ReflectionMember;
+use Symfony\Component\Console\Exception\LogicException;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Interaction\Interaction;
+
+/**
+ * Maps a command input into an object (DTO).
+ */
+#[\Attribute(\Attribute::TARGET_PARAMETER | \Attribute::TARGET_PROPERTY)]
+final class MapInput
+{
+    /**
+     * @var array&lt;string, Argument|Option|self&gt;
+     */
+    private array $definition = [];
+
+    private \ReflectionClass $class;
+
+    /**
+     * @var list&lt;Interact&gt;
+     */
+    private array $interactiveAttributes = [];
+
+    /**
+     * @internal
+     */
+    public static function tryFrom(\ReflectionParameter|\ReflectionProperty $member): ?self
+    {
+        $reflection = new ReflectionMember($member);
+
+        if (!$self = $reflection-&gt;getAttribute(self::class)) {
+            return null;
+        }
+
+        $type = $reflection-&gt;getType();
+
+        if (!$type instanceof \ReflectionNamedType) {
+            throw new LogicException(\sprintf(&#039;The input %s &quot;%s&quot; must have a named type.&#039;, $reflection-&gt;getMemberName(), $member-&gt;name));
+        }
+
+        if (!class_exists($class = $type-&gt;getName())) {
+            throw new LogicException(\sprintf(&#039;The input class &quot;%s&quot; does not exist.&#039;, $type-&gt;getName()));
+        }
+
+        $self-&gt;class = new \ReflectionClass($class);
+
+        foreach ($self-&gt;class-&gt;getProperties() as $property) {
+            if ($argument = Argument::tryFrom($property)) {
+                $self-&gt;definition[$property-&gt;name] = $argument;
+            } elseif ($option = Option::tryFrom($property)) {
+                $self-&gt;definition[$property-&gt;name] = $option;
+            } elseif ($input = self::tryFrom($property)) {
+                $self-&gt;definition[$property-&gt;name] = $input;
+            }
+
+            if (isset($self-&gt;definition[$property-&gt;name]) &amp;&amp; (!$property-&gt;isPublic() || $property-&gt;isStatic())) {
+                throw new LogicException(\sprintf(&#039;The input property &quot;%s::$%s&quot; must be public and non-static.&#039;, $self-&gt;class-&gt;name, $property-&gt;name));
+            }
+        }
+
+        if (!$self-&gt;definition) {
+            throw new LogicException(\sprintf(&#039;The input class &quot;%s&quot; must have at least one argument or option.&#039;, $self-&gt;class-&gt;name));
+        }
+
+        foreach ($self-&gt;class-&gt;getMethods() as $method) {
+            if ($attribute = Interact::tryFrom($method)) {
+                $self-&gt;interactiveAttributes[] = $attribute;
+            }
+        }
+
+        return $self;
+    }
+
+    /**
+     * @internal
+     */
+    public function resolveValue(InputInterface $input): object
+    {
+        $instance = $this-&gt;class-&gt;newInstanceWithoutConstructor();
+
+        foreach ($this-&gt;definition as $name =&gt; $spec) {
+            // ignore required arguments that are not set yet (may happen in interactive mode)
+            if ($spec instanceof Argument &amp;&amp; $spec-&gt;isRequired() &amp;&amp; \in_array($input-&gt;getArgument($spec-&gt;name), [null, []], true)) {
+                continue;
+            }
+
+            $instance-&gt;$name = $spec-&gt;resolveValue($input);
+        }
+
+        return $instance;
+    }
+
+    /**
+     * @internal
+     */
+    public function setValue(InputInterface $input, object $object): void
+    {
+        foreach ($this-&gt;definition as $name =&gt; $spec) {
+            $property = $this-&gt;class-&gt;getProperty($name);
+
+            if (!$property-&gt;isInitialized($object) || \in_array($value = $property-&gt;getValue($object), [null, []], true)) {
+                continue;
+            }
+
+            match (true) {
+                $spec instanceof Argument =&gt; $input-&gt;setArgument($spec-&gt;name, $value),
+                $spec instanceof Option =&gt; $input-&gt;setOption($spec-&gt;name, $value),
+                $spec instanceof self =&gt; $spec-&gt;setValue($input, $value),
+                default =&gt; throw new LogicException(&#039;Unexpected specification type.&#039;),
+            };
+        }
+    }
+
+    /**
+     * @return iterable&lt;Argument&gt;
+     */
+    public function getArguments(): iterable
+    {
+        foreach ($this-&gt;definition as $spec) {
+            if ($spec instanceof Argument) {
+                yield $spec;
+            } elseif ($spec instanceof self) {
+                yield from $spec-&gt;getArguments();
+            }
+        }
+    }
+
+    /**
+     * @return iterable&lt;Option&gt;
+     */
+    public function getOptions(): iterable
+    {
+        foreach ($this-&gt;definition as $spec) {
+            if ($spec instanceof Option) {
+                yield $spec;
+            } elseif ($spec instanceof self) {
+                yield from $spec-&gt;getOptions();
+            }
+        }
+    }
+
+    /**
+     * @internal
+     *
+     * @return iterable&lt;Interaction&gt;
+     */
+    public function getPropertyInteractions(): iterable
+    {
+        foreach ($this-&gt;definition as $spec) {
+            if ($spec instanceof self) {
+                yield from $spec-&gt;getPropertyInteractions();
+            } elseif ($spec instanceof Argument &amp;&amp; $attribute = $spec-&gt;getInteractiveAttribute()) {
+                yield new Interaction($this, $attribute);
+            }
+        }
+    }
+
+    /**
+     * @internal
+     *
+     * @return iterable&lt;Interaction&gt;
+     */
+    public function getMethodInteractions(): iterable
+    {
+        foreach ($this-&gt;definition as $spec) {
+            if ($spec instanceof self) {
+                yield from $spec-&gt;getMethodInteractions();
+            }
+        }
+
+        foreach ($this-&gt;interactiveAttributes as $attribute) {
+            yield new Interaction($this, $attribute);
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/console/Attribute/Option.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/console/Attribute/Reflection -->
+
+</body>
+</html>

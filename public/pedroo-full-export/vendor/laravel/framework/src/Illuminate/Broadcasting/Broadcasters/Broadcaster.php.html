@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Broadcasting/Broadcasters/Broadcaster.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Broadcasting\Broadcasters;
+
+use Closure;
+use Exception;
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Broadcasting\Broadcaster as BroadcasterContract;
+use Illuminate\Contracts\Broadcasting\HasBroadcastChannel;
+use Illuminate\Contracts\Routing\BindingRegistrar;
+use Illuminate\Contracts\Routing\UrlRoutable;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Reflector;
+use ReflectionClass;
+use ReflectionFunction;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+
+abstract class Broadcaster implements BroadcasterContract
+{
+    /**
+     * The callback to resolve the authenticated user information.
+     *
+     * @var \Closure|null
+     */
+    protected $authenticatedUserCallback = null;
+
+    /**
+     * The registered channel authenticators.
+     *
+     * @var array
+     */
+    protected $channels = [];
+
+    /**
+     * The registered channel options.
+     *
+     * @var array
+     */
+    protected $channelOptions = [];
+
+    /**
+     * The binding registrar instance.
+     *
+     * @var \Illuminate\Contracts\Routing\BindingRegistrar
+     */
+    protected $bindingRegistrar;
+
+    /**
+     * Resolve the authenticated user payload for the incoming connection request.
+     *
+     * See: https://pusher.com/docs/channels/library_auth_reference/auth-signatures/#user-authentication.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return array|null
+     */
+    public function resolveAuthenticatedUser($request)
+    {
+        if ($this-&gt;authenticatedUserCallback) {
+            return $this-&gt;authenticatedUserCallback-&gt;__invoke($request);
+        }
+    }
+
+    /**
+     * Register the user retrieval callback used to authenticate connections.
+     *
+     * See: https://pusher.com/docs/channels/library_auth_reference/auth-signatures/#user-authentication.
+     *
+     * @param  \Closure  $callback
+     * @return void
+     */
+    public function resolveAuthenticatedUserUsing(Closure $callback)
+    {
+        $this-&gt;authenticatedUserCallback = $callback;
+    }
+
+    /**
+     * Register a channel authenticator.
+     *
+     * @param  \Illuminate\Contracts\Broadcasting\HasBroadcastChannel|string  $channel
+     * @param  callable|string  $callback
+     * @param  array  $options
+     * @return $this
+     */
+    public function channel($channel, $callback, $options = [])
+    {
+        if ($channel instanceof HasBroadcastChannel) {
+            $channel = $channel-&gt;broadcastChannelRoute();
+        } elseif (is_string($channel) &amp;&amp; class_exists($channel) &amp;&amp; is_a($channel, HasBroadcastChannel::class, true)) {
+            $channel = (new $channel)-&gt;broadcastChannelRoute();
+        }
+
+        $this-&gt;channels[$channel] = $callback;
+
+        $this-&gt;channelOptions[$channel] = $options;
+
+        return $this;
+    }
+
+    /**
+     * Authenticate the incoming request for a given channel.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  string  $channel
+     * @return mixed
+     *
+     * @throws \Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException
+     */
+    protected function verifyUserCanAccessChannel($request, $channel)
+    {
+        foreach ($this-&gt;channels as $pattern =&gt; $callback) {
+            if (! $this-&gt;channelNameMatchesPattern($channel, $pattern)) {
+                continue;
+            }
+
+            $parameters = $this-&gt;extractAuthParameters($pattern, $channel, $callback);
+
+            $handler = $this-&gt;normalizeChannelHandlerToCallable($callback);
+
+            $result = $handler($this-&gt;retrieveUser($request, $channel), ...$parameters);
+
+            if ($result === false) {
+                throw new AccessDeniedHttpException;
+            } elseif ($result) {
+                return $this-&gt;validAuthenticationResponse($request, $result);
+            }
+        }
+
+        throw new AccessDeniedHttpException;
+    }
+
+    /**
+     * Extract the parameters from the given pattern and channel.
+     *
+     * @param  string  $pattern
+     * @param  string  $channel
+     * @param  callable|string  $callback
+     * @return array
+     */
+    protected function extractAuthParameters($pattern, $channel, $callback)
+    {
+        $callbackParameters = $this-&gt;extractParameters($callback);
+
+        return (new Collection($this-&gt;extractChannelKeys($pattern, $channel)))
+            -&gt;reject(fn ($value, $key) =&gt; is_numeric($key))
+            -&gt;map(fn ($value, $key) =&gt; $this-&gt;resolveBinding($key, $value, $callbackParameters))
+            -&gt;values()
+            -&gt;all();
+    }
+
+    /**
+     * Extracts the parameters out of what the user passed to handle the channel authentication.
+     *
+     * @param  callable|string  $callback
+     * @return \ReflectionParameter[]
+     *
+     * @throws \Exception
+     */
+    protected function extractParameters($callback)
+    {
+        if (is_callable($callback)) {
+            return (new ReflectionFunction($callback))-&gt;getParameters();
+        } elseif (is_string($callback)) {
+            return $this-&gt;extractParametersFromClass($callback);
+        }
+
+        throw new Exception(&#039;Given channel handler is an unknown type.&#039;);
+    }
+
+    /**
+     * Extracts the parameters out of a class channel&#039;s &quot;join&quot; method.
+     *
+     * @param  string  $callback
+     * @return \ReflectionParameter[]
+     *
+     * @throws \Exception
+     */
+    protected function extractParametersFromClass($callback)
+    {
+        $reflection = new ReflectionClass($callback);
+
+        if (! $reflection-&gt;hasMethod(&#039;join&#039;)) {
+            throw new Exception(&#039;Class based channel must define a &quot;join&quot; method.&#039;);
+        }
+
+        return $reflection-&gt;getMethod(&#039;join&#039;)-&gt;getParameters();
+    }
+
+    /**
+     * Extract the channel keys from the incoming channel name.
+     *
+     * @param  string  $pattern
+     * @param  string  $channel
+     * @return array
+     */
+    protected function extractChannelKeys($pattern, $channel)
+    {
+        preg_match(&#039;/^&#039;.preg_replace(&#039;/\{(.*?)\}/&#039;, &#039;(?&lt;$1&gt;[^\.]+)&#039;, $pattern).&#039;/&#039;, $channel, $keys);
+
+        return $keys;
+    }
+
+    /**
+     * Resolve the given parameter binding.
+     *
+     * @param  string  $key
+     * @param  string  $value
+     * @param  array  $callbackParameters
+     * @return mixed
+     */
+    protected function resolveBinding($key, $value, $callbackParameters)
+    {
+        $newValue = $this-&gt;resolveExplicitBindingIfPossible($key, $value);
+
+        return $newValue === $value ? $this-&gt;resolveImplicitBindingIfPossible(
+            $key, $value, $callbackParameters
+        ) : $newValue;
+    }
+
+    /**
+     * Resolve an explicit parameter binding if applicable.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return mixed
+     */
+    protected function resolveExplicitBindingIfPossible($key, $value)
+    {
+        $binder = $this-&gt;binder();
+
+        if ($binder &amp;&amp; $binder-&gt;getBindingCallback($key)) {
+            return call_user_func($binder-&gt;getBindingCallback($key), $value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Resolve an implicit parameter binding if applicable.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  array  $callbackParameters
+     * @return mixed
+     *
+     * @throws \Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException
+     */
+    protected function resolveImplicitBindingIfPossible($key, $value, $callbackParameters)
+    {
+        foreach ($callbackParameters as $parameter) {
+            if (! $this-&gt;isImplicitlyBindable($key, $parameter)) {
+                continue;
+            }
+
+            $className = Reflector::getParameterClassName($parameter);
+
+            if (is_null($model = (new $className)-&gt;resolveRouteBinding($value))) {
+                throw new AccessDeniedHttpException;
+            }
+
+            return $model;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Determine if a given key and parameter is implicitly bindable.
+     *
+     * @param  string  $key
+     * @param  \ReflectionParameter  $parameter
+     * @return bool
+     */
+    protected function isImplicitlyBindable($key, $parameter)
+    {
+        return $parameter-&gt;getName() === $key &amp;&amp;
+                        Reflector::isParameterSubclassOf($parameter, UrlRoutable::class);
+    }
+
+    /**
+     * Format the channel array into an array of strings.
+     *
+     * @param  array  $channels
+     * @return array
+     */
+    protected function formatChannels(array $channels)
+    {
+        return array_map(function ($channel) {
+            return (string) $channel;
+        }, $channels);
+    }
+
+    /**
+     * Get the model binding registrar instance.
+     *
+     * @return \Illuminate\Contracts\Routing\BindingRegistrar
+     */
+    protected function binder()
+    {
+        if (! $this-&gt;bindingRegistrar) {
+            $this-&gt;bindingRegistrar = Container::getInstance()-&gt;bound(BindingRegistrar::class)
+                ? Container::getInstance()-&gt;make(BindingRegistrar::class)
+                : null;
+        }
+
+        return $this-&gt;bindingRegistrar;
+    }
+
+    /**
+     * Normalize the given callback into a callable.
+     *
+     * @param  mixed  $callback
+     * @return callable
+     */
+    protected function normalizeChannelHandlerToCallable($callback)
+    {
+        return is_callable($callback) ? $callback : function (...$args) use ($callback) {
+            return Container::getInstance()
+                -&gt;make($callback)
+                -&gt;join(...$args);
+        };
+    }
+
+    /**
+     * Retrieve the authenticated user using the configured guard (if any).
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  string  $channel
+     * @return mixed
+     */
+    protected function retrieveUser($request, $channel)
+    {
+        $options = $this-&gt;retrieveChannelOptions($channel);
+
+        $guards = $options[&#039;guards&#039;] ?? null;
+
+        if (is_null($guards)) {
+            return $request-&gt;user();
+        }
+
+        foreach (Arr::wrap($guards) as $guard) {
+            if ($user = $request-&gt;user($guard)) {
+                return $user;
+            }
+        }
+    }
+
+    /**
+     * Retrieve options for a certain channel.
+     *
+     * @param  string  $channel
+     * @return array
+     */
+    protected function retrieveChannelOptions($channel)
+    {
+        foreach ($this-&gt;channelOptions as $pattern =&gt; $options) {
+            if (! $this-&gt;channelNameMatchesPattern($channel, $pattern)) {
+                continue;
+            }
+
+            return $options;
+        }
+
+        return [];
+    }
+
+    /**
+     * Check if the channel name from the request matches a pattern from registered channels.
+     *
+     * @param  string  $channel
+     * @param  string  $pattern
+     * @return bool
+     */
+    protected function channelNameMatchesPattern($channel, $pattern)
+    {
+        $pattern = str_replace(&#039;.&#039;, &#039;\.&#039;, $pattern);
+
+        return preg_match(&#039;/^&#039;.preg_replace(&#039;/\{(.*?)\}/&#039;, &#039;([^\.]+)&#039;, $pattern).&#039;$/&#039;, $channel);
+    }
+
+    /**
+     * Get all of the registered channels.
+     *
+     * @return \Illuminate\Support\Collection
+     */
+    public function getChannels()
+    {
+        return new Collection($this-&gt;channels);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Broadcasting/Broadcasters/LogBroadcaster.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Bus -->
+
+</body>
+</html>

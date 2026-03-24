@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/psy/psysh/src/ProjectTrust.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy;
+
+use Symfony\Component\Console\Helper\QuestionHelper;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Question\ConfirmationQuestion;
+
+/**
+ * Handles project trust decisions, persistence, and interactive prompting.
+ */
+class ProjectTrust
+{
+    private string $mode = Configuration::PROJECT_TRUST_PROMPT;
+    private bool $forceTrust = false;
+    private bool $forceUntrust = false;
+    private bool $warnedUntrustedAutoload = false;
+
+    /** @var string[] Project roots trusted for this session only (when persistence fails) */
+    private array $sessionTrustedRoots = [];
+
+    private ConfigPaths $configPaths;
+
+    public function __construct(ConfigPaths $configPaths)
+    {
+        $this-&gt;configPaths = $configPaths;
+    }
+
+    /**
+     * Get the current trust mode.
+     */
+    public function getMode(): string
+    {
+        return $this-&gt;mode;
+    }
+
+    /**
+     * Set the trust mode.
+     *
+     * Accepts one of: &#039;prompt&#039;, &#039;always&#039;, &#039;never&#039;.
+     */
+    public function setMode(string $mode): void
+    {
+        $this-&gt;mode = $mode;
+    }
+
+    /**
+     * Set trust mode from environment variable.
+     *
+     * Accepts: true, 1, false, 0
+     *
+     * @throws \InvalidArgumentException for invalid values
+     */
+    public function setModeFromEnv(string $value): void
+    {
+        switch (\strtolower(\trim($value))) {
+            case &#039;true&#039;:
+            case &#039;1&#039;:
+                $this-&gt;mode = Configuration::PROJECT_TRUST_ALWAYS;
+                break;
+            case &#039;false&#039;:
+            case &#039;0&#039;:
+                $this-&gt;mode = Configuration::PROJECT_TRUST_NEVER;
+                break;
+            default:
+                throw new \InvalidArgumentException(&#039;Invalid PSYSH_TRUST_PROJECT value. Expected: true, 1, false, or 0&#039;);
+        }
+    }
+
+    /**
+     * Set force trust for this run.
+     */
+    public function setForceTrust(bool $force = true): void
+    {
+        $this-&gt;forceTrust = $force;
+        if ($force) {
+            $this-&gt;forceUntrust = false;
+        }
+    }
+
+    /**
+     * Get force trust status.
+     */
+    public function getForceTrust(): bool
+    {
+        return $this-&gt;forceTrust;
+    }
+
+    /**
+     * Set force untrust for this run.
+     */
+    public function setForceUntrust(bool $force = true): void
+    {
+        $this-&gt;forceUntrust = $force;
+        if ($force) {
+            $this-&gt;forceTrust = false;
+        }
+    }
+
+    /**
+     * Get force untrust status.
+     */
+    public function getForceUntrust(): bool
+    {
+        return $this-&gt;forceUntrust;
+    }
+
+    /**
+     * Check project trust status.
+     *
+     * @return bool|null true if trusted, false if untrusted, null if should prompt
+     */
+    public function getProjectTrustStatus(string $projectRoot): ?bool
+    {
+        if ($this-&gt;forceUntrust || $this-&gt;mode === Configuration::PROJECT_TRUST_NEVER) {
+            return false;
+        }
+
+        if ($this-&gt;forceTrust || $this-&gt;mode === Configuration::PROJECT_TRUST_ALWAYS || $this-&gt;isProjectTrusted($projectRoot)) {
+            return true;
+        }
+
+        return null;
+    }
+
+    /**
+     * Check if a project root is trusted (via stored trust or session trust).
+     */
+    public function isProjectTrusted(string $root): bool
+    {
+        if ($this-&gt;forceUntrust) {
+            return false;
+        }
+
+        if ($this-&gt;forceTrust) {
+            return true;
+        }
+
+        if ($this-&gt;mode === Configuration::PROJECT_TRUST_ALWAYS) {
+            return true;
+        }
+
+        if ($this-&gt;mode === Configuration::PROJECT_TRUST_NEVER) {
+            return false;
+        }
+
+        $root = $this-&gt;normalizeProjectRoot($root);
+        $trustedRoots = $this-&gt;getTrustedProjectRoots();
+
+        if (\in_array($root, $trustedRoots, true)) {
+            return true;
+        }
+
+        return \in_array($root, $this-&gt;sessionTrustedRoots, true);
+    }
+
+    /**
+     * Trust a project root, persisting if possible.
+     *
+     * Falls back to session-only trust with a warning if persistence fails.
+     */
+    public function trustProjectRoot(string $root, ?OutputInterface $output = null): bool
+    {
+        $root = $this-&gt;normalizeProjectRoot($root);
+        $trustedRoots = $this-&gt;getTrustedProjectRoots();
+        if (!\in_array($root, $trustedRoots, true)) {
+            $trustedRoots[] = $root;
+        }
+
+        if (!$this-&gt;saveTrustedProjectRoots($trustedRoots)) {
+            if ($output !== null) {
+                $this-&gt;warnTrustPersistenceFailed($root, $output);
+            }
+            $this-&gt;sessionTrustedRoots[] = $root;
+
+            return true;
+        }
+
+        return true;
+    }
+
+    /**
+     * Display a trust persistence failure warning.
+     */
+    public function warnTrustPersistenceFailed(string $root, OutputInterface $output): void
+    {
+        if ($output instanceof \Symfony\Component\Console\Output\ConsoleOutput) {
+            $output = $output-&gt;getErrorOutput();
+        }
+
+        $prettyDir = ConfigPaths::prettyPath($root);
+        $output-&gt;writeln(
+            &quot;&lt;comment&gt;Warning: Unable to save trust settings. Trusting {$prettyDir} for this session only.&lt;/comment&gt;&quot;
+        );
+    }
+
+    /**
+     * Display a warning about untrusted autoload warming.
+     */
+    public function warnUntrustedAutoloadWarming(string $projectRoot, OutputInterface $output): void
+    {
+        if ($this-&gt;warnedUntrustedAutoload) {
+            return;
+        }
+
+        $this-&gt;warnedUntrustedAutoload = true;
+        if ($output instanceof \Symfony\Component\Console\Output\ConsoleOutput) {
+            $output = $output-&gt;getErrorOutput();
+        }
+
+        $prettyDir = ConfigPaths::prettyPath($projectRoot);
+        $output-&gt;writeln(
+            &quot;&lt;comment&gt;Skipping project autoload (vendor/autoload.php) in untrusted project {$prettyDir}. Use --trust-project to allow.&lt;/comment&gt;&quot;
+        );
+    }
+
+    /**
+     * Display the interactive trust prompt and trust the project on approval.
+     *
+     * @param string[] $features Features that need trust
+     *
+     * @return bool true if user approved
+     */
+    public function promptForTrust(InputInterface $input, OutputInterface $output, string $root, array $features): bool
+    {
+        $helper = new QuestionHelper();
+        $prettyDir = ConfigPaths::prettyPath($root);
+
+        $output-&gt;writeln(&#039;&#039;);
+        $output-&gt;writeln(&quot;&lt;comment&gt;Unrecognized project {$prettyDir}&lt;/comment&gt;&quot;);
+        $output-&gt;writeln(&#039;&#039;);
+        $output-&gt;writeln(&#039;Untrusted projects run in Restricted Mode to protect your system.&#039;);
+        $output-&gt;writeln(&#039;&#039;);
+        $output-&gt;writeln(&#039;Trusting this project would enable:&#039;);
+        foreach ($features as $feature) {
+            $output-&gt;writeln(&quot;  - {$feature}&quot;);
+        }
+        $output-&gt;writeln(&#039;&#039;);
+
+        $question = new ConfirmationQuestion(&#039;Trust and continue? (y/N) &#039;, false);
+        if ($helper-&gt;ask($input, $output, $question)) {
+            $this-&gt;trustProjectRoot($root, $output);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Normalize a project root path.
+     */
+    public function normalizeProjectRoot(string $root): string
+    {
+        $realRoot = \realpath($root);
+        if ($realRoot !== false) {
+            $root = $realRoot;
+        }
+
+        return \str_replace(&#039;\\&#039;, &#039;/&#039;, $root);
+    }
+
+    /**
+     * Get the project root for trust decisions (walks up to find composer.json).
+     */
+    public function getProjectRoot(): ?string
+    {
+        $root = $this-&gt;configPaths-&gt;projectRoot();
+        if ($root === null) {
+            return null;
+        }
+
+        return $this-&gt;normalizeProjectRoot($root);
+    }
+
+    /**
+     * Get the local config root (cwd only, no ancestor walking).
+     */
+    public function getLocalConfigRoot(): ?string
+    {
+        $root = $this-&gt;configPaths-&gt;localConfigRoot();
+        if ($root === null) {
+            return null;
+        }
+
+        return $this-&gt;normalizeProjectRoot($root);
+    }
+
+    /**
+     * Check if a project has Composer autoload files.
+     *
+     * Walks up the directory tree from the project root looking for
+     * vendor/autoload.php or vendor/composer/autoload_psr4.php.
+     */
+    public function hasComposerAutoloadFiles(string $projectRoot): bool
+    {
+        $dir = $projectRoot;
+        $parent = \dirname($dir);
+
+        while ($dir !== $parent) {
+            if (@\is_file($dir.&#039;/vendor/autoload.php&#039;) || @\is_file($dir.&#039;/vendor/composer/autoload_psr4.php&#039;)) {
+                return true;
+            }
+
+            $dir = $parent;
+            $parent = \dirname($dir);
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if the project has a local PsySH installation.
+     *
+     * Looks for psy/psysh in composer.json name or composer.lock packages,
+     * and falls back to the PSYSH_UNTRUSTED_PROJECT env var.
+     */
+    public function getLocalPsyshProjectRoot(string $projectRoot): ?string
+    {
+        $composerJson = $projectRoot.&#039;/composer.json&#039;;
+        if (@\is_file($composerJson)) {
+            $cfg = \json_decode(@\file_get_contents($composerJson), true);
+            if (\is_array($cfg) &amp;&amp; isset($cfg[&#039;name&#039;]) &amp;&amp; $cfg[&#039;name&#039;] === &#039;psy/psysh&#039;) {
+                if (@\is_file($projectRoot.&#039;/vendor/autoload.php&#039;)) {
+                    return $this-&gt;normalizeProjectRoot($projectRoot);
+                }
+            }
+        }
+
+        $composerLock = $projectRoot.&#039;/composer.lock&#039;;
+        if (@\is_file($composerLock)) {
+            $cfg = \json_decode(@\file_get_contents($composerLock), true);
+            if (\is_array($cfg)) {
+                $packages = \array_merge($cfg[&#039;packages&#039;] ?? [], $cfg[&#039;packages-dev&#039;] ?? []);
+                foreach ($packages as $pkg) {
+                    if (isset($pkg[&#039;name&#039;]) &amp;&amp; $pkg[&#039;name&#039;] === &#039;psy/psysh&#039;) {
+                        if (@\is_file($projectRoot.&#039;/vendor/autoload.php&#039;)) {
+                            return $this-&gt;normalizeProjectRoot($projectRoot);
+                        }
+
+                        return null;
+                    }
+                }
+            }
+        }
+
+        if (isset($_SERVER[&#039;PSYSH_UNTRUSTED_PROJECT&#039;]) &amp;&amp; $_SERVER[&#039;PSYSH_UNTRUSTED_PROJECT&#039;]) {
+            return $this-&gt;normalizeProjectRoot($_SERVER[&#039;PSYSH_UNTRUSTED_PROJECT&#039;]);
+        }
+
+        return null;
+    }
+
+    /**
+     * Get trusted project roots from the trust file.
+     *
+     * @return string[]
+     */
+    public function getTrustedProjectRoots(): array
+    {
+        $trustFile = $this-&gt;getProjectTrustFilePath();
+        if ($trustFile === null || !@\is_file($trustFile)) {
+            return [];
+        }
+
+        $contents = @\file_get_contents($trustFile);
+        if ($contents === false || $contents === &#039;&#039;) {
+            return [];
+        }
+
+        $data = \json_decode($contents, true);
+        if (!\is_array($data)) {
+            return [];
+        }
+
+        $roots = [];
+        foreach ($data as $dir) {
+            if (\is_string($dir) &amp;&amp; $dir !== &#039;&#039;) {
+                $roots[] = $dir;
+            }
+        }
+
+        return \array_values(\array_unique($roots));
+    }
+
+    /**
+     * Save trusted project roots to the trust file.
+     *
+     * @param string[] $roots
+     */
+    public function saveTrustedProjectRoots(array $roots): bool
+    {
+        $trustFile = $this-&gt;getProjectTrustFileForWrite();
+        if ($trustFile === false) {
+            return false;
+        }
+
+        $roots = \array_values(\array_unique(\array_filter($roots, &#039;is_string&#039;)));
+        $json = \json_encode($roots, \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES);
+        if ($json === false) {
+            return false;
+        }
+
+        return \file_put_contents($trustFile, $json.\PHP_EOL) !== false;
+    }
+
+    /**
+     * Get the path to the trusted projects file.
+     */
+    public function getProjectTrustFilePath(): ?string
+    {
+        $configDir = $this-&gt;configPaths-&gt;currentConfigDir();
+        if ($configDir === null) {
+            return null;
+        }
+
+        return $configDir.&#039;/trusted_projects.json&#039;;
+    }
+
+    /**
+     * Get a writable path to the trusted projects file, creating dirs if needed.
+     *
+     * @return string|false
+     */
+    private function getProjectTrustFileForWrite()
+    {
+        $trustFile = $this-&gt;getProjectTrustFilePath();
+        if ($trustFile === null) {
+            return false;
+        }
+
+        return ConfigPaths::touchFileWithMkdir($trustFile);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/psy/psysh/src/Readline/GNUReadline.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/psy/psysh/src/CodeCleaner -->
+
+</body>
+</html>

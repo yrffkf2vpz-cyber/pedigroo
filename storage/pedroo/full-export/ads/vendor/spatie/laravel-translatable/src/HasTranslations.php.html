@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/spatie/laravel-translatable/src/HasTranslations.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Spatie\Translatable;
+
+use Exception;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Spatie\Translatable\Events\TranslationHasBeenSetEvent;
+use Spatie\Translatable\Exceptions\AttributeIsNotTranslatable;
+
+trait HasTranslations
+{
+    protected ?string $translationLocale = null;
+
+    public function initializeHasTranslations(): void
+    {
+        $this-&gt;mergeCasts(
+            array_fill_keys($this-&gt;getTranslatableAttributes(), &#039;array&#039;),
+        );
+    }
+
+    public static function usingLocale(string $locale): self
+    {
+        return (new self)-&gt;setLocale($locale);
+    }
+
+    public function useFallbackLocale(): bool
+    {
+        if (property_exists($this, &#039;useFallbackLocale&#039;)) {
+            return $this-&gt;useFallbackLocale;
+        }
+
+        return true;
+    }
+
+    public function getAttributeValue($key): mixed
+    {
+        if (! $this-&gt;isTranslatableAttribute($key)) {
+            return parent::getAttributeValue($key);
+        }
+
+        return $this-&gt;getTranslation($key, $this-&gt;getLocale(), $this-&gt;useFallbackLocale());
+    }
+
+    protected function mutateAttributeForArray($key, $value): mixed
+    {
+        if (! $this-&gt;isTranslatableAttribute($key)) {
+            return parent::mutateAttributeForArray($key, $value);
+        }
+
+        $translations = $this-&gt;getTranslations($key);
+
+        return array_map(fn ($value) =&gt; parent::mutateAttributeForArray($key, $value), $translations);
+    }
+
+    public function setAttribute($key, $value)
+    {
+        if (! $this-&gt;isTranslatableAttribute($key)) {
+            return parent::setAttribute($key, $value);
+        }
+
+        if (is_array($value) &amp;&amp; (! array_is_list($value) || count($value) === 0)) {
+            return $this-&gt;setTranslations($key, $value);
+        }
+
+        return $this-&gt;setTranslation($key, $this-&gt;getLocale(), $value);
+    }
+
+    public function translate(string $key, string $locale = &#039;&#039;, bool $useFallbackLocale = true): mixed
+    {
+        return $this-&gt;getTranslation($key, $locale, $useFallbackLocale);
+    }
+
+    public function getTranslation(string $key, string $locale, bool $useFallbackLocale = true): mixed
+    {
+        $normalizedLocale = $this-&gt;normalizeLocale($key, $locale, $useFallbackLocale);
+
+        $isKeyMissingFromLocale = ($locale !== $normalizedLocale);
+
+        $translations = $this-&gt;getTranslations($key);
+
+        $baseKey = Str::before($key, &#039;-&gt;&#039;); // get base key in case it is JSON nested key
+
+        $translatableConfig = app(Translatable::class);
+
+        if (is_null(self::getAttributeFromArray($baseKey))) {
+            $translation = null;
+        } else {
+            $translation = isset($translations[$normalizedLocale]) ? $translations[$normalizedLocale] : null;
+            $translation ??= ($translatableConfig-&gt;allowNullForTranslation) ? null : &#039;&#039;;
+        }
+
+        if ($isKeyMissingFromLocale &amp;&amp; $translatableConfig-&gt;missingKeyCallback) {
+            try {
+                $callbackReturnValue = ($translatableConfig-&gt;missingKeyCallback)($this, $key, $locale, $translation, $normalizedLocale);
+                if (is_string($callbackReturnValue)) {
+                    $translation = $callbackReturnValue;
+                }
+            } catch (Exception) {
+                // prevent the fallback to crash
+            }
+        }
+
+        $key = str_replace(&#039;-&gt;&#039;, &#039;-&#039;, $key);
+
+        if ($this-&gt;hasGetMutator($key)) {
+            return $this-&gt;mutateAttribute($key, $translation);
+        }
+
+        if ($this-&gt;hasAttributeMutator($key)) {
+            return $this-&gt;mutateAttributeMarkedAttribute($key, $translation);
+        }
+
+        return $translation;
+    }
+
+    public function getTranslationWithFallback(string $key, string $locale): mixed
+    {
+        return $this-&gt;getTranslation($key, $locale, true);
+    }
+
+    public function getTranslationWithoutFallback(string $key, string $locale): mixed
+    {
+        return $this-&gt;getTranslation($key, $locale, false);
+    }
+
+    public function getTranslations(?string $key = null, ?array $allowedLocales = null): array
+    {
+        if ($key !== null) {
+            $this-&gt;guardAgainstNonTranslatableAttribute($key);
+            $translatableConfig = app(Translatable::class);
+
+            if ($this-&gt;isNestedKey($key)) {
+                [$key, $nestedKey] = explode(&#039;.&#039;, str_replace(&#039;-&gt;&#039;, &#039;.&#039;, $key), 2);
+            }
+
+            return array_filter(
+                Arr::get($this-&gt;fromJson($this-&gt;getAttributeFromArray($key)), $nestedKey ?? null, []),
+                fn ($value, $locale) =&gt; $this-&gt;filterTranslations($value, $locale, $allowedLocales, $translatableConfig-&gt;allowNullForTranslation, $translatableConfig-&gt;allowEmptyStringForTranslation),
+                ARRAY_FILTER_USE_BOTH,
+            );
+        }
+
+        return array_reduce($this-&gt;getTranslatableAttributes(), function ($result, $item) use ($allowedLocales) {
+            $result[$item] = $this-&gt;getTranslations($item, $allowedLocales);
+
+            return $result;
+        });
+    }
+
+    public function setTranslation(string $key, string $locale, $value): self
+    {
+        $this-&gt;guardAgainstNonTranslatableAttribute($key);
+
+        $translations = $this-&gt;getTranslations($key);
+
+        $oldValue = $translations[$locale] ?? &#039;&#039;;
+
+        $mutatorKey = str_replace(&#039;-&gt;&#039;, &#039;-&#039;, $key);
+
+        if ($this-&gt;hasSetMutator($mutatorKey)) {
+            $method = &#039;set&#039;.Str::studly($mutatorKey).&#039;Attribute&#039;;
+
+            $this-&gt;{$method}($value, $locale);
+
+            $value = $this-&gt;attributes[$key];
+        } elseif ($this-&gt;hasAttributeSetMutator($mutatorKey)) { // handle new attribute mutator
+            $this-&gt;setAttributeMarkedMutatedAttributeValue($mutatorKey, $value);
+
+            $value = $this-&gt;attributes[$mutatorKey];
+        }
+
+        $translations[$locale] = $value;
+
+        if ($this-&gt;isNestedKey($key)) {
+            unset($this-&gt;attributes[$key], $this-&gt;attributes[$mutatorKey]);
+
+            $this-&gt;fillJsonAttribute($key, $translations);
+        } else {
+            $this-&gt;attributes[$key] = json_encode($translations, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+
+        event(new TranslationHasBeenSetEvent($this, $key, $locale, $oldValue, $value));
+
+        return $this;
+    }
+
+    public function setTranslations(string $key, array $translations): self
+    {
+        $this-&gt;guardAgainstNonTranslatableAttribute($key);
+
+        if (! empty($translations)) {
+            foreach ($translations as $locale =&gt; $translation) {
+                $this-&gt;setTranslation($key, $locale, $translation);
+            }
+        } else {
+            $this-&gt;attributes[$key] = $this-&gt;asJson([]);
+        }
+
+        return $this;
+    }
+
+    public function forgetTranslation(string $key, string $locale): self
+    {
+        $translations = $this-&gt;getTranslations($key);
+
+        unset(
+            $translations[$locale],
+            $this-&gt;$key
+        );
+
+        $this-&gt;setTranslations($key, $translations);
+
+        return $this;
+    }
+
+    public function forgetTranslations(string $key, bool $asNull = false): self
+    {
+        $this-&gt;guardAgainstNonTranslatableAttribute($key);
+
+        collect($this-&gt;getTranslatedLocales($key))-&gt;each(function (string $locale) use ($key) {
+            $this-&gt;forgetTranslation($key, $locale);
+        });
+
+        if ($asNull) {
+            $this-&gt;attributes[$key] = null;
+        }
+
+        return $this;
+    }
+
+    public function forgetAllTranslations(string $locale): self
+    {
+        collect($this-&gt;getTranslatableAttributes())-&gt;each(function (string $attribute) use ($locale) {
+            $this-&gt;forgetTranslation($attribute, $locale);
+        });
+
+        return $this;
+    }
+
+    public function getTranslatedLocales(string $key): array
+    {
+        return array_keys($this-&gt;getTranslations($key));
+    }
+
+    public function isNestedKey(string $key): bool
+    {
+        return str_contains($key, &#039;-&gt;&#039;);
+    }
+
+    public function isTranslatableAttribute(string $key): bool
+    {
+        return in_array($key, $this-&gt;getTranslatableAttributes());
+    }
+
+    public function hasTranslation(string $key, ?string $locale = null): bool
+    {
+        $locale = $locale ?: $this-&gt;getLocale();
+
+        return isset($this-&gt;getTranslations($key)[$locale]);
+    }
+
+    public function replaceTranslations(string $key, array $translations): self
+    {
+        foreach ($this-&gt;getTranslatedLocales($key) as $locale) {
+            $this-&gt;forgetTranslation($key, $locale);
+        }
+
+        $this-&gt;setTranslations($key, $translations);
+
+        return $this;
+    }
+
+    protected function guardAgainstNonTranslatableAttribute(string $key): void
+    {
+        if (! $this-&gt;isTranslatableAttribute($key)) {
+            throw AttributeIsNotTranslatable::make($key, $this);
+        }
+    }
+
+    protected function normalizeLocale(string $key, string $locale, bool $useFallbackLocale): string
+    {
+        $translatedLocales = $this-&gt;getTranslatedLocales($key);
+
+        if (in_array($locale, $translatedLocales)) {
+            return $locale;
+        }
+
+        if (! $useFallbackLocale) {
+            return $locale;
+        }
+
+        if (method_exists($this, &#039;getFallbackLocale&#039;)) {
+            $fallbackLocale = $this-&gt;getFallbackLocale();
+        }
+
+        $fallbackConfig = app(Translatable::class);
+
+        $fallbackLocale ??= $fallbackConfig-&gt;fallbackLocale ?? config(&#039;app.fallback_locale&#039;);
+
+        if (! is_null($fallbackLocale) &amp;&amp; in_array($fallbackLocale, $translatedLocales)) {
+            return $fallbackLocale;
+        }
+
+        if (! empty($translatedLocales) &amp;&amp; $fallbackConfig-&gt;fallbackAny) {
+            return $translatedLocales[0];
+        }
+
+        return $locale;
+    }
+
+    protected function filterTranslations(mixed $value = null, ?string $locale = null, ?array $allowedLocales = null, bool $allowNull = false, bool $allowEmptyString = false): bool
+    {
+        if ($value === null &amp;&amp; ! $allowNull) {
+            return false;
+        }
+
+        if ($value === &#039;&#039; &amp;&amp; ! $allowEmptyString) {
+            return false;
+        }
+
+        if ($allowedLocales === null) {
+            return true;
+        }
+
+        if (! in_array($locale, $allowedLocales)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public function setLocale(string $locale): self
+    {
+        $this-&gt;translationLocale = $locale;
+
+        return $this;
+    }
+
+    public function getLocale(): string
+    {
+        return $this-&gt;translationLocale ?: config(&#039;app.locale&#039;);
+    }
+
+    public function getTranslatableAttributes(): array
+    {
+        return is_array($this-&gt;translatable)
+            ? $this-&gt;translatable
+            : [];
+    }
+
+    public function translations(): Attribute
+    {
+        return Attribute::get(function () {
+            return collect($this-&gt;getTranslatableAttributes())
+                -&gt;mapWithKeys(function (string $key) {
+                    return [$key =&gt; $this-&gt;getTranslations($key)];
+                })
+                -&gt;toArray();
+        });
+    }
+
+    public function locales(): array
+    {
+        return array_unique(
+            array_reduce($this-&gt;getTranslatableAttributes(), function ($result, $item) {
+                return array_merge($result, $this-&gt;getTranslatedLocales($item));
+            }, [])
+        );
+    }
+
+    public function scopeWhereLocale(Builder $query, string $column, string $locale): void
+    {
+        $query-&gt;whereNotNull(&quot;{$column}-&gt;{$locale}&quot;);
+    }
+
+    public function scopeWhereLocales(Builder $query, string $column, array $locales): void
+    {
+        $query-&gt;where(function (Builder $query) use ($column, $locales) {
+            foreach ($locales as $locale) {
+                $query-&gt;orWhereNotNull(&quot;{$column}-&gt;{$locale}&quot;);
+            }
+        });
+    }
+
+    public function scopeWhereJsonContainsLocale(Builder $query, string $column, string $locale, mixed $value, string $operand = &#039;=&#039;): void
+    {
+        $query-&gt;where(&quot;{$column}-&gt;{$locale}&quot;, $operand, $value);
+    }
+
+    public function scopeWhereJsonContainsLocales(Builder $query, string $column, array $locales, mixed $value, string $operand = &#039;=&#039;): void
+    {
+        $query-&gt;where(function (Builder $query) use ($column, $locales, $value, $operand) {
+            foreach ($locales as $locale) {
+                $query-&gt;orWhere(&quot;{$column}-&gt;{$locale}&quot;, $operand, $value);
+            }
+        });
+    }
+
+    /**
+     * @deprecated
+     */
+    public static function whereLocale(string $column, string $locale): Builder
+    {
+        return static::query()-&gt;whereNotNull(&quot;{$column}-&gt;{$locale}&quot;);
+    }
+
+    /**
+     * @deprecated
+     */
+    public static function whereLocales(string $column, array $locales): Builder
+    {
+        return static::query()-&gt;where(function (Builder $query) use ($column, $locales) {
+            foreach ($locales as $locale) {
+                $query-&gt;orWhereNotNull(&quot;{$column}-&gt;{$locale}&quot;);
+            }
+        });
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/spatie/laravel-translatable/src/Translatable.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/spatie/laravel-translatable/src/Events -->
+
+</body>
+</html>

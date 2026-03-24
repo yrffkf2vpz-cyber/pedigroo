@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/routing/Loader/AttributeClassLoader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Routing\Loader;
+
+use Symfony\Component\Config\Loader\LoaderInterface;
+use Symfony\Component\Config\Loader\LoaderResolverInterface;
+use Symfony\Component\Config\Resource\ReflectionClassResource;
+use Symfony\Component\Routing\Attribute\DeprecatedAlias;
+use Symfony\Component\Routing\Attribute\Route as RouteAttribute;
+use Symfony\Component\Routing\Exception\InvalidArgumentException;
+use Symfony\Component\Routing\Exception\LogicException;
+use Symfony\Component\Routing\Route;
+use Symfony\Component\Routing\RouteCollection;
+
+/**
+ * AttributeClassLoader loads routing information from a PHP class and its methods.
+ *
+ * You need to define an implementation for the configureRoute() method. Most of the
+ * time, this method should define some PHP callable to be called for the route
+ * (a controller in MVC speak).
+ *
+ * The #[Route] attribute can be set on the class (for global parameters),
+ * and on each method.
+ *
+ * The #[Route] attribute main value is the route path. The attribute also
+ * recognizes several parameters: requirements, options, defaults, schemes,
+ * methods, host, and name. The name parameter is mandatory.
+ * Here is an example of how you should be able to use it:
+ *
+ *     #[Route(&#039;/Blog&#039;)]
+ *     class Blog
+ *     {
+ *         #[Route(&#039;/&#039;, name: &#039;blog_index&#039;)]
+ *         public function index()
+ *         {
+ *         }
+ *         #[Route(&#039;/{id}&#039;, name: &#039;blog_post&#039;, requirements: [&quot;id&quot; =&gt; &#039;\d+&#039;])]
+ *         public function show()
+ *         {
+ *         }
+ *     }
+ *
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ * @author Alexander M. Turek &lt;me@derrabus.de&gt;
+ * @author Alexandre Daubois &lt;alex.daubois@gmail.com&gt;
+ */
+abstract class AttributeClassLoader implements LoaderInterface
+{
+    /**
+     * @deprecated since Symfony 7.2, use &quot;setRouteAttributeClass()&quot; instead.
+     */
+    protected string $routeAnnotationClass = RouteAttribute::class;
+    private string $routeAttributeClass = RouteAttribute::class;
+    protected int $defaultRouteIndex = 0;
+
+    public function __construct(
+        protected readonly ?string $env = null,
+    ) {
+    }
+
+    /**
+     * @deprecated since Symfony 7.2, use &quot;setRouteAttributeClass(string $class)&quot; instead
+     *
+     * Sets the annotation class to read route properties from.
+     */
+    public function setRouteAnnotationClass(string $class): void
+    {
+        trigger_deprecation(&#039;symfony/routing&#039;, &#039;7.2&#039;, &#039;The &quot;%s()&quot; method is deprecated, use &quot;%s::setRouteAttributeClass()&quot; instead.&#039;, __METHOD__, self::class);
+
+        $this-&gt;setRouteAttributeClass($class);
+    }
+
+    /**
+     * Sets the attribute class to read route properties from.
+     */
+    public function setRouteAttributeClass(string $class): void
+    {
+        $this-&gt;routeAnnotationClass = $class;
+        $this-&gt;routeAttributeClass = $class;
+    }
+
+    /**
+     * @throws \InvalidArgumentException When route can&#039;t be parsed
+     */
+    public function load(mixed $class, ?string $type = null): RouteCollection
+    {
+        if (!class_exists($class)) {
+            throw new \InvalidArgumentException(\sprintf(&#039;Class &quot;%s&quot; does not exist.&#039;, $class));
+        }
+
+        $class = new \ReflectionClass($class);
+        if ($class-&gt;isAbstract()) {
+            throw new \InvalidArgumentException(\sprintf(&#039;Attributes from class &quot;%s&quot; cannot be read as it is abstract.&#039;, $class-&gt;getName()));
+        }
+
+        $globals = $this-&gt;getGlobals($class);
+        $collection = new RouteCollection();
+        $collection-&gt;addResource(new ReflectionClassResource($class));
+        if ($globals[&#039;env&#039;] &amp;&amp; !\in_array($this-&gt;env, $globals[&#039;env&#039;], true)) {
+            return $collection;
+        }
+        $fqcnAlias = false;
+
+        if (!$class-&gt;hasMethod(&#039;__invoke&#039;)) {
+            foreach ($this-&gt;getAttributes($class) as $attr) {
+                if ($attr-&gt;aliases) {
+                    throw new InvalidArgumentException(\sprintf(&#039;Route aliases cannot be used on non-invokable class &quot;%s&quot;.&#039;, $class-&gt;getName()));
+                }
+            }
+        }
+
+        foreach ($class-&gt;getMethods() as $method) {
+            $this-&gt;defaultRouteIndex = 0;
+            $routeNamesBefore = array_keys($collection-&gt;all());
+            foreach ($this-&gt;getAttributes($method) as $attr) {
+                $this-&gt;addRoute($collection, $attr, $globals, $class, $method);
+                if (&#039;__invoke&#039; === $method-&gt;name) {
+                    $fqcnAlias = true;
+                }
+            }
+
+            if (1 === $collection-&gt;count() - \count($routeNamesBefore)) {
+                $newRouteName = current(array_diff(array_keys($collection-&gt;all()), $routeNamesBefore));
+                if ($newRouteName !== $aliasName = \sprintf(&#039;%s::%s&#039;, $class-&gt;name, $method-&gt;name)) {
+                    $collection-&gt;addAlias($aliasName, $newRouteName);
+                }
+            }
+        }
+        if (0 === $collection-&gt;count() &amp;&amp; $class-&gt;hasMethod(&#039;__invoke&#039;)) {
+            $globals = $this-&gt;resetGlobals();
+            foreach ($this-&gt;getAttributes($class) as $attr) {
+                $this-&gt;addRoute($collection, $attr, $globals, $class, $class-&gt;getMethod(&#039;__invoke&#039;));
+                $fqcnAlias = true;
+            }
+        }
+        if ($fqcnAlias &amp;&amp; 1 === $collection-&gt;count()) {
+            $invokeRouteName = key($collection-&gt;all());
+            if ($invokeRouteName !== $class-&gt;name) {
+                $collection-&gt;addAlias($class-&gt;name, $invokeRouteName);
+            }
+
+            if ($invokeRouteName !== $aliasName = \sprintf(&#039;%s::__invoke&#039;, $class-&gt;name)) {
+                $collection-&gt;addAlias($aliasName, $invokeRouteName);
+            }
+        }
+
+        return $collection;
+    }
+
+    /**
+     * @param RouteAttribute $attr or an object that exposes a similar interface
+     */
+    protected function addRoute(RouteCollection $collection, object $attr, array $globals, \ReflectionClass $class, \ReflectionMethod $method): void
+    {
+        if ($attr-&gt;envs &amp;&amp; !\in_array($this-&gt;env, $attr-&gt;envs, true)) {
+            return;
+        }
+
+        $name = $attr-&gt;name ?? $this-&gt;getDefaultRouteName($class, $method);
+        $name = $globals[&#039;name&#039;].$name;
+
+        $requirements = $attr-&gt;requirements;
+
+        foreach ($requirements as $placeholder =&gt; $requirement) {
+            if (\is_int($placeholder)) {
+                throw new \InvalidArgumentException(\sprintf(&#039;A placeholder name must be a string (%d given). Did you forget to specify the placeholder key for the requirement &quot;%s&quot; of route &quot;%s&quot; in &quot;%s::%s()&quot;?&#039;, $placeholder, $requirement, $name, $class-&gt;getName(), $method-&gt;getName()));
+            }
+        }
+
+        $defaults = array_replace($globals[&#039;defaults&#039;], $attr-&gt;defaults);
+        $requirements = array_replace($globals[&#039;requirements&#039;], $requirements);
+        $options = array_replace($globals[&#039;options&#039;], $attr-&gt;options);
+        $schemes = array_unique(array_merge($globals[&#039;schemes&#039;], $attr-&gt;schemes));
+        $methods = array_unique(array_merge($globals[&#039;methods&#039;], $attr-&gt;methods));
+
+        $host = $attr-&gt;host ?? $globals[&#039;host&#039;];
+        $condition = $attr-&gt;condition ?? $globals[&#039;condition&#039;];
+        $priority = $attr-&gt;priority ?? $globals[&#039;priority&#039;];
+
+        $path = $attr-&gt;path;
+        $prefix = $globals[&#039;localized_paths&#039;] ?: $globals[&#039;path&#039;];
+        $paths = [];
+
+        if (\is_array($path)) {
+            if (!\is_array($prefix)) {
+                foreach ($path as $locale =&gt; $localePath) {
+                    $paths[$locale] = $prefix.$localePath;
+                }
+            } elseif ($missing = array_diff_key($prefix, $path)) {
+                throw new \LogicException(\sprintf(&#039;Route to &quot;%s&quot; is missing paths for locale(s) &quot;%s&quot;.&#039;, $class-&gt;name.&#039;::&#039;.$method-&gt;name, implode(&#039;&quot;, &quot;&#039;, array_keys($missing))));
+            } else {
+                foreach ($path as $locale =&gt; $localePath) {
+                    if (!isset($prefix[$locale])) {
+                        throw new \LogicException(\sprintf(&#039;Route to &quot;%s&quot; with locale &quot;%s&quot; is missing a corresponding prefix in class &quot;%s&quot;.&#039;, $method-&gt;name, $locale, $class-&gt;name));
+                    }
+
+                    $paths[$locale] = $prefix[$locale].$localePath;
+                }
+            }
+        } elseif (\is_array($prefix)) {
+            foreach ($prefix as $locale =&gt; $localePrefix) {
+                $paths[$locale] = $localePrefix.$path;
+            }
+        } else {
+            $paths[] = $prefix.$path;
+        }
+
+        foreach ($method-&gt;getParameters() as $param) {
+            if (isset($defaults[$param-&gt;name]) || !$param-&gt;isDefaultValueAvailable()) {
+                continue;
+            }
+            foreach ($paths as $locale =&gt; $path) {
+                if (preg_match(\sprintf(&#039;/\{(?|([^\}:&lt;]++):%s(?:\.[^\}&lt;]++)?|(%1$s))(?:&lt;.*?&gt;)?\}/&#039;, preg_quote($param-&gt;name)), $path, $matches)) {
+                    if (\is_scalar($defaultValue = $param-&gt;getDefaultValue()) || null === $defaultValue) {
+                        $defaults[$matches[1]] = $defaultValue;
+                    } elseif ($defaultValue instanceof \BackedEnum) {
+                        $defaults[$matches[1]] = $defaultValue-&gt;value;
+                    }
+                    break;
+                }
+            }
+        }
+
+        foreach ($paths as $locale =&gt; $path) {
+            $route = $this-&gt;createRoute($path, $defaults, $requirements, $options, $host, $schemes, $methods, $condition);
+            $this-&gt;configureRoute($route, $class, $method, $attr);
+            if (0 !== $locale) {
+                $route-&gt;setDefault(&#039;_locale&#039;, $locale);
+                $route-&gt;setRequirement(&#039;_locale&#039;, preg_quote($locale));
+                $route-&gt;setDefault(&#039;_canonical_route&#039;, $name);
+                $collection-&gt;add($name.&#039;.&#039;.$locale, $route, $priority);
+            } else {
+                $collection-&gt;add($name, $route, $priority);
+            }
+        }
+
+        foreach ($attr-&gt;aliases as $aliasAttribute) {
+            $aliasName = $aliasAttribute instanceof DeprecatedAlias ? $aliasAttribute-&gt;aliasName : $aliasAttribute;
+
+            foreach (array_keys($paths) as $locale) {
+                $suffix = 0 !== $locale ? &#039;.&#039;.$locale : &#039;&#039;;
+                $alias = $collection-&gt;addAlias($aliasName.$suffix, $name.$suffix);
+
+                if ($aliasAttribute instanceof DeprecatedAlias) {
+                    $alias-&gt;setDeprecated(
+                        $aliasAttribute-&gt;package,
+                        $aliasAttribute-&gt;version,
+                        $aliasAttribute-&gt;message
+                    );
+                }
+            }
+        }
+    }
+
+    public function supports(mixed $resource, ?string $type = null): bool
+    {
+        return \is_string($resource) &amp;&amp; preg_match(&#039;/^(?:\\\\?[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)+$/&#039;, $resource) &amp;&amp; (!$type || &#039;attribute&#039; === $type);
+    }
+
+    public function setResolver(LoaderResolverInterface $resolver): void
+    {
+    }
+
+    public function getResolver(): LoaderResolverInterface
+    {
+        throw new LogicException(\sprintf(&#039;The &quot;%s()&quot; method must not be called.&#039;, __METHOD__));
+    }
+
+    /**
+     * Gets the default route name for a class method.
+     *
+     * @return string
+     */
+    protected function getDefaultRouteName(\ReflectionClass $class, \ReflectionMethod $method)
+    {
+        $name = str_replace(&#039;\\&#039;, &#039;_&#039;, $class-&gt;name).&#039;_&#039;.$method-&gt;name;
+        $name = \function_exists(&#039;mb_strtolower&#039;) &amp;&amp; preg_match(&#039;//u&#039;, $name) ? mb_strtolower($name, &#039;UTF-8&#039;) : strtolower($name);
+        if ($this-&gt;defaultRouteIndex &gt; 0) {
+            $name .= &#039;_&#039;.$this-&gt;defaultRouteIndex;
+        }
+        ++$this-&gt;defaultRouteIndex;
+
+        return $name;
+    }
+
+    /**
+     * @return array&lt;string, mixed&gt;
+     */
+    protected function getGlobals(\ReflectionClass $class): array
+    {
+        $globals = $this-&gt;resetGlobals();
+
+        // to be replaced in Symfony 8.0 by $this-&gt;routeAttributeClass
+        if ($attribute = $class-&gt;getAttributes($this-&gt;routeAnnotationClass, \ReflectionAttribute::IS_INSTANCEOF)[0] ?? null) {
+            $attr = $attribute-&gt;newInstance();
+
+            if (null !== $attr-&gt;name) {
+                $globals[&#039;name&#039;] = $attr-&gt;name;
+            }
+
+            if (\is_string($attr-&gt;path)) {
+                $globals[&#039;path&#039;] = $attr-&gt;path;
+                $globals[&#039;localized_paths&#039;] = [];
+            } else {
+                $globals[&#039;localized_paths&#039;] = $attr-&gt;path ?? [];
+            }
+
+            if (null !== $attr-&gt;requirements) {
+                $globals[&#039;requirements&#039;] = $attr-&gt;requirements;
+            }
+
+            if (null !== $attr-&gt;options) {
+                $globals[&#039;options&#039;] = $attr-&gt;options;
+            }
+
+            if (null !== $attr-&gt;defaults) {
+                $globals[&#039;defaults&#039;] = $attr-&gt;defaults;
+            }
+
+            if (null !== $attr-&gt;schemes) {
+                $globals[&#039;schemes&#039;] = $attr-&gt;schemes;
+            }
+
+            if (null !== $attr-&gt;methods) {
+                $globals[&#039;methods&#039;] = $attr-&gt;methods;
+            }
+
+            if (null !== $attr-&gt;host) {
+                $globals[&#039;host&#039;] = $attr-&gt;host;
+            }
+
+            if (null !== $attr-&gt;condition) {
+                $globals[&#039;condition&#039;] = $attr-&gt;condition;
+            }
+
+            $globals[&#039;priority&#039;] = $attr-&gt;priority ?? 0;
+            $globals[&#039;env&#039;] = $attr-&gt;envs;
+
+            foreach ($globals[&#039;requirements&#039;] as $placeholder =&gt; $requirement) {
+                if (\is_int($placeholder)) {
+                    throw new \InvalidArgumentException(\sprintf(&#039;A placeholder name must be a string (%d given). Did you forget to specify the placeholder key for the requirement &quot;%s&quot; in &quot;%s&quot;?&#039;, $placeholder, $requirement, $class-&gt;getName()));
+                }
+            }
+        }
+
+        return $globals;
+    }
+
+    private function resetGlobals(): array
+    {
+        return [
+            &#039;path&#039; =&gt; null,
+            &#039;localized_paths&#039; =&gt; [],
+            &#039;requirements&#039; =&gt; [],
+            &#039;options&#039; =&gt; [],
+            &#039;defaults&#039; =&gt; [],
+            &#039;schemes&#039; =&gt; [],
+            &#039;methods&#039; =&gt; [],
+            &#039;host&#039; =&gt; &#039;&#039;,
+            &#039;condition&#039; =&gt; &#039;&#039;,
+            &#039;name&#039; =&gt; &#039;&#039;,
+            &#039;priority&#039; =&gt; 0,
+            &#039;env&#039; =&gt; null,
+        ];
+    }
+
+    protected function createRoute(string $path, array $defaults, array $requirements, array $options, ?string $host, array $schemes, array $methods, ?string $condition): Route
+    {
+        return new Route($path, $defaults, $requirements, $options, $host, $schemes, $methods, $condition);
+    }
+
+    /**
+     * @param RouteAttribute $attr or an object that exposes a similar interface
+     *
+     * @return void
+     */
+    abstract protected function configureRoute(Route $route, \ReflectionClass $class, \ReflectionMethod $method, object $attr);
+
+    /**
+     * @return iterable&lt;int, RouteAttribute&gt;
+     */
+    private function getAttributes(\ReflectionClass|\ReflectionMethod $reflection): iterable
+    {
+        // to be replaced in Symfony 8.0 by $this-&gt;routeAttributeClass
+        foreach ($reflection-&gt;getAttributes($this-&gt;routeAnnotationClass, \ReflectionAttribute::IS_INSTANCEOF) as $attribute) {
+            yield $attribute-&gt;newInstance();
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/routing/Loader/AttributeDirectoryLoader.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/routing/Loader/Configurator -->
+
+</body>
+</html>

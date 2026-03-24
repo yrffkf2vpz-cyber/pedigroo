@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Signature/SignatureV4.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Signature;
+
+use Aws\Credentials\CredentialsInterface;
+use AWS\CRT\Auth\Signable;
+use AWS\CRT\Auth\SignatureType;
+use AWS\CRT\Auth\SignedBodyHeaderType;
+use AWS\CRT\Auth\Signing;
+use AWS\CRT\Auth\SigningAlgorithm;
+use AWS\CRT\Auth\SigningConfigAWS;
+use AWS\CRT\Auth\StaticCredentialsProvider;
+use AWS\CRT\HTTP\Request;
+use Aws\Exception\CommonRuntimeException;
+use Aws\Exception\CouldNotCreateChecksumException;
+use GuzzleHttp\Psr7;
+use Psr\Http\Message\RequestInterface;
+
+/**
+ * Signature Version 4
+ * @link http://docs.aws.amazon.com/general/latest/gr/signature-version-4.html
+ */
+class SignatureV4 implements SignatureInterface
+{
+    use SignatureTrait;
+    const ISO8601_BASIC = &#039;Ymd\THis\Z&#039;;
+    const UNSIGNED_PAYLOAD = &#039;UNSIGNED-PAYLOAD&#039;;
+    const AMZ_CONTENT_SHA256_HEADER = &#039;X-Amz-Content-Sha256&#039;;
+
+    /** @var string */
+    private $service;
+
+    /** @var string */
+    protected $region;
+
+    /** @var bool */
+    private $unsigned;
+
+    /** @var bool */
+    private $useV4a;
+
+    /**
+     * The following headers are not signed because signing these headers
+     * would potentially cause a signature mismatch when sending a request
+     * through a proxy or if modified at the HTTP client level.
+     *
+     * @return array
+     */
+    protected function getHeaderBlacklist()
+    {
+        return [
+            &#039;cache-control&#039;         =&gt; true,
+            &#039;content-type&#039;          =&gt; true,
+            &#039;content-length&#039;        =&gt; true,
+            &#039;expect&#039;                =&gt; true,
+            &#039;max-forwards&#039;          =&gt; true,
+            &#039;pragma&#039;                =&gt; true,
+            &#039;range&#039;                 =&gt; true,
+            &#039;te&#039;                    =&gt; true,
+            &#039;if-match&#039;              =&gt; true,
+            &#039;if-none-match&#039;         =&gt; true,
+            &#039;if-modified-since&#039;     =&gt; true,
+            &#039;if-unmodified-since&#039;   =&gt; true,
+            &#039;if-range&#039;              =&gt; true,
+            &#039;accept&#039;                =&gt; true,
+            &#039;authorization&#039;         =&gt; true,
+            &#039;proxy-authorization&#039;   =&gt; true,
+            &#039;from&#039;                  =&gt; true,
+            &#039;referer&#039;               =&gt; true,
+            &#039;user-agent&#039;            =&gt; true,
+            &#039;X-Amz-User-Agent&#039;      =&gt; true,
+            &#039;x-amzn-trace-id&#039;       =&gt; true,
+            &#039;aws-sdk-invocation-id&#039; =&gt; true,
+            &#039;aws-sdk-retry&#039;         =&gt; true,
+        ];
+    }
+
+    /**
+     * @param string $service Service name to use when signing
+     * @param string $region  Region name to use when signing
+     * @param array $options Array of configuration options used when signing
+     *      - unsigned-body: Flag to make request have unsigned payload.
+     *        Unsigned body is used primarily for streaming requests.
+     */
+    public function __construct($service, $region, array $options = [])
+    {
+        $this-&gt;service = $service;
+        $this-&gt;region = $region;
+        $this-&gt;unsigned = isset($options[&#039;unsigned-body&#039;]) ? $options[&#039;unsigned-body&#039;] : false;
+        $this-&gt;useV4a = isset($options[&#039;use_v4a&#039;]) &amp;&amp; $options[&#039;use_v4a&#039;] === true;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function signRequest(
+        RequestInterface $request,
+        CredentialsInterface $credentials,
+        $signingService = null
+    ) {
+        $ldt = gmdate(self::ISO8601_BASIC);
+        $sdt = substr($ldt, 0, 8);
+        $parsed = $this-&gt;parseRequest($request);
+        $parsed[&#039;headers&#039;][&#039;X-Amz-Date&#039;] = [$ldt];
+
+        if ($token = $credentials-&gt;getSecurityToken()) {
+            $parsed[&#039;headers&#039;][&#039;X-Amz-Security-Token&#039;] = [$token];
+        }
+        $service = isset($signingService) ? $signingService : $this-&gt;service;
+
+        if ($this-&gt;useV4a) {
+            return $this-&gt;signWithV4a($credentials, $request, $service);
+        }
+
+        $cs = $this-&gt;createScope($sdt, $this-&gt;region, $service);
+        $payload = $this-&gt;getPayload($request);
+
+        if ($payload == self::UNSIGNED_PAYLOAD) {
+            $parsed[&#039;headers&#039;][self::AMZ_CONTENT_SHA256_HEADER] = [$payload];
+        }
+
+        $context = $this-&gt;createContext($parsed, $payload);
+        $toSign = $this-&gt;createStringToSign($ldt, $cs, $context[&#039;creq&#039;]);
+        $signingKey = $this-&gt;getSigningKey(
+            $sdt,
+            $this-&gt;region,
+            $service,
+            $credentials-&gt;getSecretKey()
+        );
+        $signature = hash_hmac(&#039;sha256&#039;, $toSign, $signingKey);
+        $parsed[&#039;headers&#039;][&#039;Authorization&#039;] = [
+            &quot;AWS4-HMAC-SHA256 &quot;
+            . &quot;Credential={$credentials-&gt;getAccessKeyId()}/{$cs}, &quot;
+            . &quot;SignedHeaders={$context[&#039;headers&#039;]}, Signature={$signature}&quot;
+        ];
+
+        return $this-&gt;buildRequest($parsed);
+    }
+
+    /**
+     * Get the headers that were used to pre-sign the request.
+     * Used for the X-Amz-SignedHeaders header.
+     *
+     * @param array $headers
+     * @return array
+     */
+    private function getPresignHeaders(array $headers)
+    {
+        $presignHeaders = [];
+        $blacklist = $this-&gt;getHeaderBlacklist();
+        foreach ($headers as $name =&gt; $value) {
+            $lName = strtolower($name);
+            if (!isset($blacklist[$lName])
+                &amp;&amp; $name !== self::AMZ_CONTENT_SHA256_HEADER
+            ) {
+                $presignHeaders[] = $lName;
+            }
+        }
+        return $presignHeaders;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function presign(
+        RequestInterface $request,
+        CredentialsInterface $credentials,
+        $expires,
+        array $options = []
+    ) {
+        $startTimestamp = isset($options[&#039;start_time&#039;])
+            ? $this-&gt;convertToTimestamp($options[&#039;start_time&#039;], null)
+            : time();
+        $expiresTimestamp = $this-&gt;convertToTimestamp($expires, $startTimestamp);
+
+        if ($this-&gt;useV4a) {
+            return $this-&gt;presignWithV4a(
+                $request,
+                $credentials,
+                $this-&gt;convertExpires($expiresTimestamp, $startTimestamp)
+            );
+        }
+
+        $parsed = $this-&gt;createPresignedRequest($request, $credentials);
+
+        $payload = $this-&gt;getPresignedPayload($request);
+        $httpDate = gmdate(self::ISO8601_BASIC, $startTimestamp);
+        $shortDate = substr($httpDate, 0, 8);
+        $scope = $this-&gt;createScope($shortDate, $this-&gt;region, $this-&gt;service);
+        $credential = $credentials-&gt;getAccessKeyId() . &#039;/&#039; . $scope;
+        if ($credentials-&gt;getSecurityToken()) {
+            unset($parsed[&#039;headers&#039;][&#039;X-Amz-Security-Token&#039;]);
+        }
+        $parsed[&#039;query&#039;][&#039;X-Amz-Algorithm&#039;] = &#039;AWS4-HMAC-SHA256&#039;;
+        $parsed[&#039;query&#039;][&#039;X-Amz-Credential&#039;] = $credential;
+        $parsed[&#039;query&#039;][&#039;X-Amz-Date&#039;] = gmdate(&#039;Ymd\THis\Z&#039;, $startTimestamp);
+        $parsed[&#039;query&#039;][&#039;X-Amz-SignedHeaders&#039;] = implode(&#039;;&#039;, $this-&gt;getPresignHeaders($parsed[&#039;headers&#039;]));
+        $parsed[&#039;query&#039;][&#039;X-Amz-Expires&#039;] = $this-&gt;convertExpires($expiresTimestamp, $startTimestamp);
+        $context = $this-&gt;createContext($parsed, $payload);
+        $stringToSign = $this-&gt;createStringToSign($httpDate, $scope, $context[&#039;creq&#039;]);
+        $key = $this-&gt;getSigningKey(
+            $shortDate,
+            $this-&gt;region,
+            $this-&gt;service,
+            $credentials-&gt;getSecretKey()
+        );
+        $parsed[&#039;query&#039;][&#039;X-Amz-Signature&#039;] = hash_hmac(&#039;sha256&#039;, $stringToSign, $key);
+
+        return $this-&gt;buildRequest($parsed);
+    }
+
+    /**
+     * Converts a POST request to a GET request by moving POST fields into the
+     * query string.
+     *
+     * Useful for pre-signing query protocol requests.
+     *
+     * @param RequestInterface $request Request to clone
+     *
+     * @return RequestInterface
+     * @throws \InvalidArgumentException if the method is not POST
+     */
+    public static function convertPostToGet(RequestInterface $request, $additionalQueryParams = &quot;&quot;)
+    {
+        if ($request-&gt;getMethod() !== &#039;POST&#039;) {
+            throw new \InvalidArgumentException(&#039;Expected a POST request but &#039;
+                . &#039;received a &#039; . $request-&gt;getMethod() . &#039; request.&#039;);
+        }
+
+        $sr = $request-&gt;withMethod(&#039;GET&#039;)
+            -&gt;withBody(Psr7\Utils::streamFor(&#039;&#039;))
+            -&gt;withoutHeader(&#039;Content-Type&#039;)
+            -&gt;withoutHeader(&#039;Content-Length&#039;);
+
+        // Move POST fields to the query if they are present
+        if ($request-&gt;getHeaderLine(&#039;Content-Type&#039;) === &#039;application/x-www-form-urlencoded&#039;) {
+            $body = (string) $request-&gt;getBody() . $additionalQueryParams;
+            $sr = $sr-&gt;withUri($sr-&gt;getUri()-&gt;withQuery($body));
+        }
+
+        return $sr;
+    }
+
+    protected function getPayload(RequestInterface $request)
+    {
+        if ($this-&gt;unsigned &amp;&amp; $request-&gt;getUri()-&gt;getScheme() == &#039;https&#039;) {
+            return self::UNSIGNED_PAYLOAD;
+        }
+        // Calculate the request signature payload
+        if ($request-&gt;hasHeader(self::AMZ_CONTENT_SHA256_HEADER)) {
+            // Handle streaming operations (e.g. Glacier.UploadArchive)
+            return $request-&gt;getHeaderLine(self::AMZ_CONTENT_SHA256_HEADER);
+        }
+
+        if (!$request-&gt;getBody()-&gt;isSeekable()) {
+            throw new CouldNotCreateChecksumException(&#039;sha256&#039;);
+        }
+
+        try {
+            return Psr7\Utils::hash($request-&gt;getBody(), &#039;sha256&#039;);
+        } catch (\Exception $e) {
+            throw new CouldNotCreateChecksumException(&#039;sha256&#039;, $e);
+        }
+    }
+
+    protected function getPresignedPayload(RequestInterface $request)
+    {
+        return $this-&gt;getPayload($request);
+    }
+
+    protected function createCanonicalizedPath($path)
+    {
+        $doubleEncoded = rawurlencode(ltrim($path, &#039;/&#039;));
+
+        return &#039;/&#039; . str_replace(&#039;%2F&#039;, &#039;/&#039;, $doubleEncoded);
+    }
+
+    private function createStringToSign($longDate, $credentialScope, $creq)
+    {
+        $hash = hash(&#039;sha256&#039;, $creq);
+
+        return &quot;AWS4-HMAC-SHA256\n{$longDate}\n{$credentialScope}\n{$hash}&quot;;
+    }
+
+    private function createPresignedRequest(
+        RequestInterface $request,
+        CredentialsInterface $credentials
+    ) {
+        $parsedRequest = $this-&gt;parseRequest($request);
+
+        // Make sure to handle temporary credentials
+        if ($token = $credentials-&gt;getSecurityToken()) {
+            $parsedRequest[&#039;headers&#039;][&#039;X-Amz-Security-Token&#039;] = [$token];
+        }
+
+        return $this-&gt;moveHeadersToQuery($parsedRequest);
+    }
+
+    /**
+     * @param array  $parsedRequest
+     * @param string $payload Hash of the request payload
+     * @return array Returns an array of context information
+     */
+    private function createContext(array $parsedRequest, $payload)
+    {
+        $blacklist = $this-&gt;getHeaderBlacklist();
+
+        // Normalize the path as required by SigV4
+        $canon = $parsedRequest[&#039;method&#039;] . &quot;\n&quot;
+            . $this-&gt;createCanonicalizedPath($parsedRequest[&#039;path&#039;]) . &quot;\n&quot;
+            . $this-&gt;getCanonicalizedQuery($parsedRequest[&#039;query&#039;]) . &quot;\n&quot;;
+
+        // Case-insensitively aggregate all of the headers.
+        $aggregate = [];
+        foreach ($parsedRequest[&#039;headers&#039;] as $key =&gt; $values) {
+            $key = strtolower($key);
+            if (!isset($blacklist[$key])) {
+                foreach ($values as $v) {
+                    $aggregate[$key][] = $v;
+                }
+            }
+        }
+
+        ksort($aggregate);
+        $canonHeaders = [];
+        foreach ($aggregate as $k =&gt; $v) {
+            if (count($v) &gt; 0) {
+                sort($v);
+            }
+            $canonHeaders[] = $k . &#039;:&#039; . preg_replace(&#039;/\s+/&#039;, &#039; &#039;, implode(&#039;,&#039;, $v));
+        }
+
+        $signedHeadersString = implode(&#039;;&#039;, array_keys($aggregate));
+        $canon .= implode(&quot;\n&quot;, $canonHeaders) . &quot;\n\n&quot;
+            . $signedHeadersString . &quot;\n&quot;
+            . $payload;
+
+        return [&#039;creq&#039; =&gt; $canon, &#039;headers&#039; =&gt; $signedHeadersString];
+    }
+
+    private function getCanonicalizedQuery(array $query)
+    {
+        unset($query[&#039;X-Amz-Signature&#039;]);
+
+        if (!$query) {
+            return &#039;&#039;;
+        }
+
+        $qs = &#039;&#039;;
+        uksort($query, static function (string $a, string $b): int {
+            return strcmp(rawurlencode($a), rawurlencode($b));
+        });
+        foreach ($query as $k =&gt; $v) {
+            if (!is_array($v)) {
+                $qs .= rawurlencode($k) . &#039;=&#039; . rawurlencode($v !== null ? $v : &#039;&#039;) . &#039;&amp;&#039;;
+            } else {
+                sort($v);
+                foreach ($v as $value) {
+                    $qs .= rawurlencode($k) . &#039;=&#039; . rawurlencode($value !== null ? $value : &#039;&#039;) . &#039;&amp;&#039;;
+                }
+            }
+        }
+
+        return substr($qs, 0, -1);
+    }
+
+    private function convertToTimestamp($dateValue, $relativeTimeBase = null)
+    {
+        if ($dateValue instanceof \DateTimeInterface) {
+            $timestamp = $dateValue-&gt;getTimestamp();
+        } elseif (!is_numeric($dateValue)) {
+            $timestamp = strtotime($dateValue,
+                $relativeTimeBase === null ? time() : $relativeTimeBase
+            );
+        } else {
+            $timestamp = $dateValue;
+        }
+
+        return $timestamp;
+    }
+
+    private function convertExpires($expiresTimestamp, $startTimestamp)
+    {
+        $duration = $expiresTimestamp - $startTimestamp;
+
+        // Ensure that the duration of the signature is not longer than a week
+        if ($duration &gt; 604800) {
+            throw new \InvalidArgumentException(&#039;The expiration date of a &#039;
+                . &#039;signature version 4 presigned URL must be less than one &#039;
+                . &#039;week&#039;);
+        }
+
+        return $duration;
+    }
+
+    private function moveHeadersToQuery(array $parsedRequest)
+    {
+        //x-amz-user-agent shouldn&#039;t be put in a query param
+        unset($parsedRequest[&#039;headers&#039;][&#039;X-Amz-User-Agent&#039;]);
+
+        foreach ($parsedRequest[&#039;headers&#039;] as $name =&gt; $header) {
+            $lname = strtolower($name);
+            if (substr($lname, 0, 5) == &#039;x-amz&#039;) {
+                $parsedRequest[&#039;query&#039;][$name] = $header;
+            }
+            $blacklist = $this-&gt;getHeaderBlacklist();
+            if (isset($blacklist[$lname])
+                || $lname === strtolower(self::AMZ_CONTENT_SHA256_HEADER)
+            ) {
+                unset($parsedRequest[&#039;headers&#039;][$name]);
+            }
+        }
+
+        return $parsedRequest;
+    }
+
+    private function parseRequest(RequestInterface $request)
+    {
+        // Clean up any previously set headers.
+        /** @var RequestInterface $request */
+        $request = $request
+            -&gt;withoutHeader(&#039;X-Amz-Date&#039;)
+            -&gt;withoutHeader(&#039;Date&#039;)
+            -&gt;withoutHeader(&#039;Authorization&#039;);
+        $uri = $request-&gt;getUri();
+
+        return [
+            &#039;method&#039;  =&gt; $request-&gt;getMethod(),
+            &#039;path&#039;    =&gt; $uri-&gt;getPath(),
+            &#039;query&#039;   =&gt; Psr7\Query::parse($uri-&gt;getQuery()),
+            &#039;uri&#039;     =&gt; $uri,
+            &#039;headers&#039; =&gt; $request-&gt;getHeaders(),
+            &#039;body&#039;    =&gt; $request-&gt;getBody(),
+            &#039;version&#039; =&gt; $request-&gt;getProtocolVersion()
+        ];
+    }
+
+    private function buildRequest(array $req)
+    {
+        if ($req[&#039;query&#039;]) {
+            $req[&#039;uri&#039;] = $req[&#039;uri&#039;]-&gt;withQuery(Psr7\Query::build($req[&#039;query&#039;]));
+        }
+
+        return new Psr7\Request(
+            $req[&#039;method&#039;],
+            $req[&#039;uri&#039;],
+            $req[&#039;headers&#039;],
+            $req[&#039;body&#039;],
+            $req[&#039;version&#039;]
+        );
+    }
+
+    protected function verifyCRTLoaded()
+    {
+        if (!extension_loaded(&#039;awscrt&#039;)) {
+            throw new CommonRuntimeException(
+                &quot;AWS Common Runtime for PHP is required to use Signature V4A&quot;
+                . &quot;.  Please install it using the instructions found at&quot;
+                . &quot; https://github.com/aws/aws-sdk-php/blob/master/CRT_INSTRUCTIONS.md&quot;
+            );
+        }
+    }
+
+    protected function createCRTStaticCredentialsProvider($credentials)
+    {
+        return new StaticCredentialsProvider([
+            &#039;access_key_id&#039; =&gt; $credentials-&gt;getAccessKeyId(),
+            &#039;secret_access_key&#039; =&gt; $credentials-&gt;getSecretKey(),
+            &#039;session_token&#039; =&gt; $credentials-&gt;getSecurityToken(),
+        ]);
+    }
+
+    private function removeIllegalV4aHeaders(&amp;$request)
+    {
+        static $illegalV4aHeaders = [
+            self::AMZ_CONTENT_SHA256_HEADER,
+            &#039;aws-sdk-invocation-id&#039;,
+            &#039;aws-sdk-retry&#039;,
+            &#039;x-amz-region-set&#039;,
+            &#039;transfer-encoding&#039;
+        ];
+        $storedHeaders = [];
+
+        foreach ($illegalV4aHeaders as $header) {
+            if ($request-&gt;hasHeader($header)) {
+                $storedHeaders[$header] = $request-&gt;getHeader($header);
+                $request = $request-&gt;withoutHeader($header);
+            }
+        }
+
+        return $storedHeaders;
+    }
+
+    private function CRTRequestFromGuzzleRequest($request)
+    {
+        return new Request(
+            $request-&gt;getMethod(),
+            (string) $request-&gt;getUri(),
+            [], //leave empty as the query is parsed from the uri object
+            array_map(function ($header) {return $header[0];}, $request-&gt;getHeaders())
+        );
+    }
+
+    /**
+     * @param CredentialsInterface $credentials
+     * @param RequestInterface $request
+     * @param $signingService
+     * @param SigningConfigAWS|null $signingConfig
+     * @return RequestInterface
+     */
+    protected function signWithV4a(
+        CredentialsInterface $credentials,
+        RequestInterface $request,
+        $signingService,
+        ?SigningConfigAWS $signingConfig = null
+    ){
+        $this-&gt;verifyCRTLoaded();
+        $signingConfig = $signingConfig ?? new SigningConfigAWS([
+            &#039;algorithm&#039; =&gt; SigningAlgorithm::SIGv4_ASYMMETRIC,
+            &#039;signature_type&#039; =&gt; SignatureType::HTTP_REQUEST_HEADERS,
+            &#039;credentials_provider&#039; =&gt; $this-&gt;createCRTStaticCredentialsProvider($credentials),
+            &#039;signed_body_value&#039; =&gt; $this-&gt;getPayload($request),
+            &#039;should_normalize_uri_path&#039; =&gt; true,
+            &#039;use_double_uri_encode&#039; =&gt; true,
+            &#039;region&#039; =&gt; $this-&gt;region,
+            &#039;service&#039; =&gt; $signingService,
+            &#039;date&#039; =&gt; time(),
+        ]);
+
+        $removedIllegalHeaders = $this-&gt;removeIllegalV4aHeaders($request);
+        $http_request = $this-&gt;CRTRequestFromGuzzleRequest($request);
+
+        Signing::signRequestAws(
+            Signable::fromHttpRequest($http_request),
+            $signingConfig, function ($signing_result, $error_code) use (&amp;$http_request) {
+            $signing_result-&gt;applyToHttpRequest($http_request);
+        });
+        foreach ($removedIllegalHeaders as $header =&gt; $value) {
+            $request = $request-&gt;withHeader($header, $value);
+        }
+
+        $sigV4AHeaders = $http_request-&gt;headers();
+        foreach ($sigV4AHeaders-&gt;toArray() as $h =&gt; $v) {
+            $request = $request-&gt;withHeader($h, $v);
+        }
+
+        return $request;
+    }
+
+    protected function presignWithV4a(
+        RequestInterface $request,
+        CredentialsInterface $credentials,
+        $expires
+    )
+    {
+        $this-&gt;verifyCRTLoaded();
+        $credentials_provider = $this-&gt;createCRTStaticCredentialsProvider($credentials);
+        $signingConfig = new SigningConfigAWS([
+            &#039;algorithm&#039; =&gt; SigningAlgorithm::SIGv4_ASYMMETRIC,
+            &#039;signature_type&#039; =&gt; SignatureType::HTTP_REQUEST_QUERY_PARAMS,
+            &#039;credentials_provider&#039; =&gt; $credentials_provider,
+            &#039;signed_body_value&#039; =&gt; $this-&gt;getPresignedPayload($request),
+            &#039;region&#039; =&gt; &quot;*&quot;,
+            &#039;service&#039; =&gt; $this-&gt;service,
+            &#039;date&#039; =&gt; time(),
+            &#039;expiration_in_seconds&#039; =&gt; $expires
+        ]);
+
+        $this-&gt;removeIllegalV4aHeaders($request);
+        foreach ($this-&gt;getHeaderBlacklist() as $headerName =&gt; $headerValue) {
+            if ($request-&gt;hasHeader($headerName)) {
+                $request = $request-&gt;withoutHeader($headerName);
+            }
+        }
+
+        $http_request = $this-&gt;CRTRequestFromGuzzleRequest($request);
+        Signing::signRequestAws(
+            Signable::fromHttpRequest($http_request),
+            $signingConfig, function ($signing_result, $error_code) use (&amp;$http_request) {
+            $signing_result-&gt;applyToHttpRequest($http_request);
+        });
+
+        return $request-&gt;withUri(
+            new Psr7\Uri($http_request-&gt;pathAndQuery())
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Signin/Exception/SigninException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Signin -->
+
+</body>
+</html>

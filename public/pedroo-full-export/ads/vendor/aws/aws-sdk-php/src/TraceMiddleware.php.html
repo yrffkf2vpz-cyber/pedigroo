@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/TraceMiddleware.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws;
+
+use Aws\Api\Service;
+use Aws\Exception\AwsException;
+use GuzzleHttp\Promise\RejectedPromise;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
+use RecursiveArrayIterator;
+use RecursiveIteratorIterator;
+
+/**
+ * Traces state changes between middlewares.
+ */
+class TraceMiddleware
+{
+    private $prevOutput;
+    private $prevInput;
+    private $config;
+    /** @var Service */
+    private $service;
+
+    private static $authHeaders = [
+        &#039;X-Amz-Security-Token&#039; =&gt; &#039;[TOKEN]&#039;,
+    ];
+
+    private static $authStrings = [
+        // S3Signature
+        &#039;/AWSAccessKeyId=[A-Z0-9]{20}&amp;/i&#039; =&gt; &#039;AWSAccessKeyId=[KEY]&amp;&#039;,
+        // SignatureV4 Signature and S3Signature
+        &#039;/Signature=.+/i&#039; =&gt; &#039;Signature=[SIGNATURE]&#039;,
+        // SignatureV4 access key ID
+        &#039;/Credential=[A-Z0-9]{20}\//i&#039; =&gt; &#039;Credential=[KEY]/&#039;,
+        // S3 signatures
+        &#039;/AWS [A-Z0-9]{20}:.+/&#039; =&gt; &#039;AWS AKI[KEY]:[SIGNATURE]&#039;,
+        // STS Presigned URLs
+        &#039;/X-Amz-Security-Token=[^&amp;]+/i&#039; =&gt; &#039;X-Amz-Security-Token=[TOKEN]&#039;,
+        // Crypto *Stream Keys
+        &#039;/\[&quot;key.{27,36}Stream.{9}\]=&gt;\s+.{7}\d{2}\) &quot;\X{16,64}&quot;/U&#039; =&gt; &#039;[&quot;key&quot;:[CONTENT KEY]]&#039;,
+    ];
+
+    /**
+     * Configuration array can contain the following key value pairs.
+     *
+     * - logfn: (callable) Function that is invoked with log messages. By
+     *   default, PHP&#039;s &quot;echo&quot; function will be utilized.
+     * - stream_size: (int) When the size of a stream is greater than this
+     *   number, the stream data will not be logged. Set to &quot;0&quot; to not log any
+     *   stream data.
+     * - scrub_auth: (bool) Set to false to disable the scrubbing of auth data
+     *   from the logged messages.
+     * - http: (bool) Set to false to disable the &quot;debug&quot; feature of lower
+     *   level HTTP adapters (e.g., verbose curl output).
+     * - auth_strings: (array) A mapping of authentication string regular
+     *   expressions to scrubbed strings. These mappings are passed directly to
+     *   preg_replace (e.g., preg_replace($key, $value, $debugOutput) if
+     *   &quot;scrub_auth&quot; is set to true.
+     * - auth_headers: (array) A mapping of header names known to contain
+     *   sensitive data to what the scrubbed value should be. The value of any
+     *   headers contained in this array will be replaced with the if
+     *   &quot;scrub_auth&quot; is set to true.
+     */
+    public function __construct(array $config = [], ?Service $service = null)
+    {
+        $this-&gt;config = $config + [
+            &#039;logfn&#039;        =&gt; function ($value) { echo $value; },
+            &#039;stream_size&#039;  =&gt; 524288,
+            &#039;scrub_auth&#039;   =&gt; true,
+            &#039;http&#039;         =&gt; true,
+            &#039;auth_strings&#039; =&gt; [],
+            &#039;auth_headers&#039; =&gt; [],
+        ];
+
+        $this-&gt;config[&#039;auth_strings&#039;] += self::$authStrings;
+        $this-&gt;config[&#039;auth_headers&#039;] += self::$authHeaders;
+        $this-&gt;service = $service;
+    }
+
+    public function __invoke($step, $name)
+    {
+        $this-&gt;prevOutput = $this-&gt;prevInput = [];
+
+        return function (callable $next) use ($step, $name) {
+            return function (
+                CommandInterface $command,
+                $request = null
+            ) use ($next, $step, $name) {
+                $this-&gt;createHttpDebug($command);
+                $start = microtime(true);
+                $this-&gt;stepInput([
+                    &#039;step&#039;    =&gt; $step,
+                    &#039;name&#039;    =&gt; $name,
+                    &#039;request&#039; =&gt; $this-&gt;requestArray($request),
+                    &#039;command&#039; =&gt; $this-&gt;commandArray($command)
+                ]);
+
+                return $next($command, $request)-&gt;then(
+                    function ($value) use ($step, $name, $command, $start) {
+                        $this-&gt;flushHttpDebug($command);
+                        $this-&gt;stepOutput($start, [
+                            &#039;step&#039;   =&gt; $step,
+                            &#039;name&#039;   =&gt; $name,
+                            &#039;result&#039; =&gt; $this-&gt;resultArray($value),
+                            &#039;error&#039;  =&gt; null
+                        ]);
+                        return $value;
+                    },
+                    function ($reason) use ($step, $name, $start, $command) {
+                        $this-&gt;flushHttpDebug($command);
+                        $this-&gt;stepOutput($start, [
+                            &#039;step&#039;   =&gt; $step,
+                            &#039;name&#039;   =&gt; $name,
+                            &#039;result&#039; =&gt; null,
+                            &#039;error&#039;  =&gt; $this-&gt;exceptionArray($reason)
+                        ]);
+                        return new RejectedPromise($reason);
+                    }
+                );
+            };
+        };
+    }
+
+    private function stepInput($entry)
+    {
+        static $keys = [&#039;command&#039;, &#039;request&#039;];
+        $this-&gt;compareStep($this-&gt;prevInput, $entry, &#039;-&gt; Entering&#039;, $keys);
+        $this-&gt;write(&quot;\n&quot;);
+        $this-&gt;prevInput = $entry;
+    }
+
+    private function stepOutput($start, $entry)
+    {
+        static $keys = [&#039;result&#039;, &#039;error&#039;];
+        $this-&gt;compareStep($this-&gt;prevOutput, $entry, &#039;&lt;- Leaving&#039;, $keys);
+        $totalTime = microtime(true) - $start;
+        $this-&gt;write(&quot;  Inclusive step time: &quot; . $totalTime . &quot;\n\n&quot;);
+        $this-&gt;prevOutput = $entry;
+    }
+
+    private function compareStep(array $a, array $b, $title, array $keys)
+    {
+        $changes = [];
+        foreach ($keys as $key) {
+            $av = isset($a[$key]) ? $a[$key] : null;
+            $bv = isset($b[$key]) ? $b[$key] : null;
+            $this-&gt;compareArray($av, $bv, $key, $changes);
+        }
+        $str = &quot;\n{$title} step {$b[&#039;step&#039;]}, name &#039;{$b[&#039;name&#039;]}&#039;&quot;;
+        $str .= &quot;\n&quot; . str_repeat(&#039;-&#039;, strlen($str) - 1) . &quot;\n\n  &quot;;
+        $str .= $changes
+            ? implode(&quot;\n  &quot;, str_replace(&quot;\n&quot;, &quot;\n  &quot;, $changes))
+            : &#039;no changes&#039;;
+        $this-&gt;write($str . &quot;\n&quot;);
+    }
+
+    private function commandArray(CommandInterface $cmd)
+    {
+        return [
+            &#039;instance&#039; =&gt; spl_object_hash($cmd),
+            &#039;name&#039;     =&gt; $cmd-&gt;getName(),
+            &#039;params&#039;   =&gt; $this-&gt;getRedactedArray($cmd)
+        ];
+    }
+
+    private function requestArray($request = null)
+    {
+        return !$request instanceof RequestInterface
+            ? []
+            : array_filter([
+                &#039;instance&#039; =&gt; spl_object_hash($request),
+                &#039;method&#039;   =&gt; $request-&gt;getMethod(),
+                &#039;headers&#039;  =&gt; $this-&gt;redactHeaders($request-&gt;getHeaders()),
+                &#039;body&#039;     =&gt; $this-&gt;streamStr($request-&gt;getBody()),
+                &#039;scheme&#039;   =&gt; $request-&gt;getUri()-&gt;getScheme(),
+                &#039;port&#039;     =&gt; $request-&gt;getUri()-&gt;getPort(),
+                &#039;path&#039;     =&gt; $request-&gt;getUri()-&gt;getPath(),
+                &#039;query&#039;    =&gt; $request-&gt;getUri()-&gt;getQuery(),
+        ]);
+    }
+
+    private function responseArray(?ResponseInterface $response = null)
+    {
+        return !$response ? [] : [
+            &#039;instance&#039;   =&gt; spl_object_hash($response),
+            &#039;statusCode&#039; =&gt; $response-&gt;getStatusCode(),
+            &#039;headers&#039;    =&gt; $this-&gt;redactHeaders($response-&gt;getHeaders()),
+            &#039;body&#039;       =&gt; $this-&gt;streamStr($response-&gt;getBody())
+        ];
+    }
+
+    private function resultArray($value)
+    {
+        return $value instanceof ResultInterface
+            ? [
+                &#039;instance&#039; =&gt; spl_object_hash($value),
+                &#039;data&#039;     =&gt; $value-&gt;toArray()
+            ] : $value;
+    }
+
+    private function exceptionArray($e)
+    {
+        if (!($e instanceof \Exception)) {
+            return $e;
+        }
+
+        $result = [
+            &#039;instance&#039;   =&gt; spl_object_hash($e),
+            &#039;class&#039;      =&gt; get_class($e),
+            &#039;message&#039;    =&gt; $e-&gt;getMessage(),
+            &#039;file&#039;       =&gt; $e-&gt;getFile(),
+            &#039;line&#039;       =&gt; $e-&gt;getLine(),
+            &#039;trace&#039;      =&gt; $e-&gt;getTraceAsString(),
+        ];
+
+        if ($e instanceof AwsException) {
+            $result += [
+                &#039;type&#039;       =&gt; $e-&gt;getAwsErrorType(),
+                &#039;code&#039;       =&gt; $e-&gt;getAwsErrorCode(),
+                &#039;requestId&#039;  =&gt; $e-&gt;getAwsRequestId(),
+                &#039;statusCode&#039; =&gt; $e-&gt;getStatusCode(),
+                &#039;result&#039;     =&gt; $this-&gt;resultArray($e-&gt;getResult()),
+                &#039;request&#039;    =&gt; $this-&gt;requestArray($e-&gt;getRequest()),
+                &#039;response&#039;   =&gt; $this-&gt;responseArray($e-&gt;getResponse()),
+            ];
+        }
+
+        return $result;
+    }
+
+    private function compareArray($a, $b, $path, array &amp;$diff)
+    {
+        if ($a === $b) {
+            return;
+        }
+
+        if (is_array($a)) {
+            $b = (array) $b;
+            $keys = array_unique(array_merge(array_keys($a), array_keys($b)));
+            foreach ($keys as $k) {
+                if (!array_key_exists($k, $a)) {
+                    $this-&gt;compareArray(null, $b[$k], &quot;{$path}.{$k}&quot;, $diff);
+                } elseif (!array_key_exists($k, $b)) {
+                    $this-&gt;compareArray($a[$k], null, &quot;{$path}.{$k}&quot;, $diff);
+                } else {
+                    $this-&gt;compareArray($a[$k], $b[$k], &quot;{$path}.{$k}&quot;, $diff);
+                }
+            }
+        } elseif ($a !== null &amp;&amp; $b === null) {
+            $diff[] = &quot;{$path} was unset&quot;;
+        } elseif ($a === null &amp;&amp; $b !== null) {
+            $diff[] = sprintf(&quot;%s was set to %s&quot;, $path, $this-&gt;str($b));
+        } else {
+            $diff[] = sprintf(&quot;%s changed from %s to %s&quot;, $path, $this-&gt;str($a), $this-&gt;str($b));
+        }
+    }
+
+    private function str($value)
+    {
+        if (is_scalar($value)) {
+            return (string) $value;
+        }
+
+        if ($value instanceof \Exception) {
+            $value = $this-&gt;exceptionArray($value);
+        }
+
+        ob_start();
+        var_dump($value);
+        return ob_get_clean();
+    }
+
+    private function streamStr(StreamInterface $body)
+    {
+        return $body-&gt;getSize() &lt; $this-&gt;config[&#039;stream_size&#039;]
+            ? (string) $body
+            : &#039;stream(size=&#039; . $body-&gt;getSize() . &#039;)&#039;;
+    }
+
+    private function createHttpDebug(CommandInterface $command)
+    {
+        if ($this-&gt;config[&#039;http&#039;] &amp;&amp; !isset($command[&#039;@http&#039;][&#039;debug&#039;])) {
+            $command[&#039;@http&#039;][&#039;debug&#039;] = fopen(&#039;php://temp&#039;, &#039;w+&#039;);
+        }
+    }
+
+    private function flushHttpDebug(CommandInterface $command)
+    {
+        if ($res = $command[&#039;@http&#039;][&#039;debug&#039;]) {
+            if (is_resource($res)) {
+                rewind($res);
+                $this-&gt;write(stream_get_contents($res));
+                fclose($res);
+            }
+            $command[&#039;@http&#039;][&#039;debug&#039;] = null;
+        }
+    }
+
+    private function write($value)
+    {
+        if ($this-&gt;config[&#039;scrub_auth&#039;]) {
+            foreach ($this-&gt;config[&#039;auth_strings&#039;] as $pattern =&gt; $replacement) {
+                $value = preg_replace_callback(
+                    $pattern,
+                    function ($matches) use ($replacement) {
+                        return $replacement;
+                    },
+                    $value
+                );
+            }
+        }
+
+        call_user_func($this-&gt;config[&#039;logfn&#039;], $value);
+    }
+
+    private function redactHeaders(array $headers)
+    {
+        if ($this-&gt;config[&#039;scrub_auth&#039;]) {
+            $headers = $this-&gt;config[&#039;auth_headers&#039;] + $headers;
+        }
+
+        return $headers;
+    }
+
+    /**
+     * @param CommandInterface $cmd
+     * @return array
+     */
+    private function getRedactedArray(CommandInterface $cmd)
+    {
+        if (!isset($this-&gt;service[&quot;shapes&quot;])) {
+            return $cmd-&gt;toArray();
+        }
+        $shapes = $this-&gt;service[&quot;shapes&quot;];
+        $cmdArray = $cmd-&gt;toArray();
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveArrayIterator($cmdArray),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        foreach ($iterator as $parameter =&gt; $value) {
+           if (isset($shapes[$parameter][&#039;sensitive&#039;]) &amp;&amp;
+               $shapes[$parameter][&#039;sensitive&#039;] === true
+           ) {
+               $redactedValue = is_string($value) ? &quot;[{$parameter}]&quot; : [&quot;[{$parameter}]&quot;];
+               $currentDepth = $iterator-&gt;getDepth();
+               for ($subDepth = $currentDepth; $subDepth &gt;= 0; $subDepth--) {
+                   $subIterator = $iterator-&gt;getSubIterator($subDepth);
+                   $subIterator-&gt;offsetSet(
+                       $subIterator-&gt;key(),
+                       ($subDepth === $currentDepth
+                           ? $redactedValue
+                           : $iterator-&gt;getSubIterator(($subDepth+1))-&gt;getArrayCopy()
+                       )
+                   );
+               }
+           }
+        }
+        return $iterator-&gt;getArrayCopy();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/TranscribeService/Exception/TranscribeServiceException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/ACMPCA -->
+
+</body>
+</html>

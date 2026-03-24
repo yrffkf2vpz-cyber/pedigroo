@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Database/Concerns/BuildsQueries.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database\Concerns;
+
+use Illuminate\Container\Container;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\MultipleRecordsFoundException;
+use Illuminate\Database\Query\Expression;
+use Illuminate\Database\RecordNotFoundException;
+use Illuminate\Database\RecordsNotFoundException;
+use Illuminate\Pagination\Cursor;
+use Illuminate\Pagination\CursorPaginator;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Pagination\Paginator;
+use Illuminate\Support\Collection;
+use Illuminate\Support\LazyCollection;
+use Illuminate\Support\Str;
+use Illuminate\Support\Traits\Conditionable;
+use InvalidArgumentException;
+use RuntimeException;
+
+/**
+ * @template TValue
+ *
+ * @mixin \Illuminate\Database\Query\Builder
+ */
+trait BuildsQueries
+{
+    use Conditionable;
+
+    /**
+     * Chunk the results of the query.
+     *
+     * @param  int  $count
+     * @param  callable(\Illuminate\Support\Collection&lt;int, TValue&gt;, int): mixed  $callback
+     * @return bool
+     */
+    public function chunk($count, callable $callback)
+    {
+        $this-&gt;enforceOrderBy();
+
+        $skip = $this-&gt;getOffset();
+        $remaining = $this-&gt;getLimit();
+
+        $page = 1;
+
+        do {
+            $offset = (($page - 1) * $count) + (int) $skip;
+
+            $limit = is_null($remaining) ? $count : min($count, $remaining);
+
+            if ($limit == 0) {
+                break;
+            }
+
+            $results = $this-&gt;offset($offset)-&gt;limit($limit)-&gt;get();
+
+            $countResults = $results-&gt;count();
+
+            if ($countResults == 0) {
+                break;
+            }
+
+            if (! is_null($remaining)) {
+                $remaining = max($remaining - $countResults, 0);
+            }
+
+            if ($callback($results, $page) === false) {
+                return false;
+            }
+
+            unset($results);
+
+            $page++;
+        } while ($countResults == $count);
+
+        return true;
+    }
+
+    /**
+     * Run a map over each item while chunking.
+     *
+     * @template TReturn
+     *
+     * @param  callable(TValue): TReturn  $callback
+     * @param  int  $count
+     * @return \Illuminate\Support\Collection&lt;int, TReturn&gt;
+     */
+    public function chunkMap(callable $callback, $count = 1000)
+    {
+        $collection = new Collection;
+
+        $this-&gt;chunk($count, function ($items) use ($collection, $callback) {
+            $items-&gt;each(function ($item) use ($collection, $callback) {
+                $collection-&gt;push($callback($item));
+            });
+        });
+
+        return $collection;
+    }
+
+    /**
+     * Execute a callback over each item while chunking.
+     *
+     * @param  callable(TValue, int): mixed  $callback
+     * @param  int  $count
+     * @return bool
+     *
+     * @throws \RuntimeException
+     */
+    public function each(callable $callback, $count = 1000)
+    {
+        return $this-&gt;chunk($count, function ($results) use ($callback) {
+            foreach ($results as $key =&gt; $value) {
+                if ($callback($value, $key) === false) {
+                    return false;
+                }
+            }
+        });
+    }
+
+    /**
+     * Chunk the results of a query by comparing IDs.
+     *
+     * @param  int  $count
+     * @param  callable(\Illuminate\Support\Collection&lt;int, TValue&gt;, int): mixed  $callback
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return bool
+     */
+    public function chunkById($count, callable $callback, $column = null, $alias = null)
+    {
+        return $this-&gt;orderedChunkById($count, $callback, $column, $alias);
+    }
+
+    /**
+     * Chunk the results of a query by comparing IDs in descending order.
+     *
+     * @param  int  $count
+     * @param  callable(\Illuminate\Support\Collection&lt;int, TValue&gt;, int): mixed  $callback
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return bool
+     */
+    public function chunkByIdDesc($count, callable $callback, $column = null, $alias = null)
+    {
+        return $this-&gt;orderedChunkById($count, $callback, $column, $alias, descending: true);
+    }
+
+    /**
+     * Chunk the results of a query by comparing IDs in a given order.
+     *
+     * @param  int  $count
+     * @param  callable(\Illuminate\Support\Collection&lt;int, TValue&gt;, int): mixed  $callback
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @param  bool  $descending
+     * @return bool
+     *
+     * @throws \RuntimeException
+     */
+    public function orderedChunkById($count, callable $callback, $column = null, $alias = null, $descending = false)
+    {
+        $column ??= $this-&gt;defaultKeyName();
+        $alias ??= $column;
+        $lastId = null;
+        $skip = $this-&gt;getOffset();
+        $remaining = $this-&gt;getLimit();
+
+        $page = 1;
+
+        do {
+            $clone = clone $this;
+
+            if ($skip &amp;&amp; $page &gt; 1) {
+                $clone-&gt;offset(0);
+            }
+
+            $limit = is_null($remaining) ? $count : min($count, $remaining);
+
+            if ($limit == 0) {
+                break;
+            }
+
+            // We&#039;ll execute the query for the given page and get the results. If there are
+            // no results we can just break and return from here. When there are results
+            // we will call the callback with the current chunk of these results here.
+            if ($descending) {
+                $results = $clone-&gt;forPageBeforeId($limit, $lastId, $column)-&gt;get();
+            } else {
+                $results = $clone-&gt;forPageAfterId($limit, $lastId, $column)-&gt;get();
+            }
+
+            $countResults = $results-&gt;count();
+
+            if ($countResults == 0) {
+                break;
+            }
+
+            if (! is_null($remaining)) {
+                $remaining = max($remaining - $countResults, 0);
+            }
+
+            // On each chunk result set, we will pass them to the callback and then let the
+            // developer take care of everything within the callback, which allows us to
+            // keep the memory low for spinning through large result sets for working.
+            if ($callback($results, $page) === false) {
+                return false;
+            }
+
+            $lastId = data_get($results-&gt;last(), $alias);
+
+            if ($lastId === null) {
+                throw new RuntimeException(&quot;The chunkById operation was aborted because the [{$alias}] column is not present in the query result.&quot;);
+            }
+
+            unset($results);
+
+            $page++;
+        } while ($countResults == $count);
+
+        return true;
+    }
+
+    /**
+     * Execute a callback over each item while chunking by ID.
+     *
+     * @param  callable(TValue, int): mixed  $callback
+     * @param  int  $count
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return bool
+     */
+    public function eachById(callable $callback, $count = 1000, $column = null, $alias = null)
+    {
+        return $this-&gt;chunkById($count, function ($results, $page) use ($callback, $count) {
+            foreach ($results as $key =&gt; $value) {
+                if ($callback($value, (($page - 1) * $count) + $key) === false) {
+                    return false;
+                }
+            }
+        }, $column, $alias);
+    }
+
+    /**
+     * Query lazily, by chunks of the given size.
+     *
+     * @param  int  $chunkSize
+     * @return \Illuminate\Support\LazyCollection&lt;int, TValue&gt;
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function lazy($chunkSize = 1000)
+    {
+        if ($chunkSize &lt; 1) {
+            throw new InvalidArgumentException(&#039;The chunk size should be at least 1&#039;);
+        }
+
+        $this-&gt;enforceOrderBy();
+
+        return new LazyCollection(function () use ($chunkSize) {
+            $page = 1;
+
+            while (true) {
+                $results = $this-&gt;forPage($page++, $chunkSize)-&gt;get();
+
+                foreach ($results as $result) {
+                    yield $result;
+                }
+
+                if ($results-&gt;count() &lt; $chunkSize) {
+                    return;
+                }
+            }
+        });
+    }
+
+    /**
+     * Query lazily, by chunking the results of a query by comparing IDs.
+     *
+     * @param  int  $chunkSize
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return \Illuminate\Support\LazyCollection&lt;int, TValue&gt;
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function lazyById($chunkSize = 1000, $column = null, $alias = null)
+    {
+        return $this-&gt;orderedLazyById($chunkSize, $column, $alias);
+    }
+
+    /**
+     * Query lazily, by chunking the results of a query by comparing IDs in descending order.
+     *
+     * @param  int  $chunkSize
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @return \Illuminate\Support\LazyCollection&lt;int, TValue&gt;
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function lazyByIdDesc($chunkSize = 1000, $column = null, $alias = null)
+    {
+        return $this-&gt;orderedLazyById($chunkSize, $column, $alias, true);
+    }
+
+    /**
+     * Query lazily, by chunking the results of a query by comparing IDs in a given order.
+     *
+     * @param  int  $chunkSize
+     * @param  string|null  $column
+     * @param  string|null  $alias
+     * @param  bool  $descending
+     * @return \Illuminate\Support\LazyCollection
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function orderedLazyById($chunkSize = 1000, $column = null, $alias = null, $descending = false)
+    {
+        if ($chunkSize &lt; 1) {
+            throw new InvalidArgumentException(&#039;The chunk size should be at least 1&#039;);
+        }
+
+        $column ??= $this-&gt;defaultKeyName();
+
+        $alias ??= $column;
+
+        return new LazyCollection(function () use ($chunkSize, $column, $alias, $descending) {
+            $lastId = null;
+
+            while (true) {
+                $clone = clone $this;
+
+                if ($descending) {
+                    $results = $clone-&gt;forPageBeforeId($chunkSize, $lastId, $column)-&gt;get();
+                } else {
+                    $results = $clone-&gt;forPageAfterId($chunkSize, $lastId, $column)-&gt;get();
+                }
+
+                foreach ($results as $result) {
+                    yield $result;
+                }
+
+                if ($results-&gt;count() &lt; $chunkSize) {
+                    return;
+                }
+
+                $lastId = $results-&gt;last()-&gt;{$alias};
+
+                if ($lastId === null) {
+                    throw new RuntimeException(&quot;The lazyById operation was aborted because the [{$alias}] column is not present in the query result.&quot;);
+                }
+            }
+        });
+    }
+
+    /**
+     * Execute the query and get the first result.
+     *
+     * @param  array|string  $columns
+     * @return TValue|null
+     */
+    public function first($columns = [&#039;*&#039;])
+    {
+        return $this-&gt;limit(1)-&gt;get($columns)-&gt;first();
+    }
+
+    /**
+     * Execute the query and get the first result or throw an exception.
+     *
+     * @param  array|string  $columns
+     * @param  string|null  $message
+     * @return TValue
+     *
+     * @throws \Illuminate\Database\RecordNotFoundException
+     */
+    public function firstOrFail($columns = [&#039;*&#039;], $message = null)
+    {
+        if (! is_null($result = $this-&gt;first($columns))) {
+            return $result;
+        }
+
+        throw new RecordNotFoundException($message ?: &#039;No record found for the given query.&#039;);
+    }
+
+    /**
+     * Execute the query and get the first result if it&#039;s the sole matching record.
+     *
+     * @param  array|string  $columns
+     * @return TValue
+     *
+     * @throws \Illuminate\Database\RecordsNotFoundException
+     * @throws \Illuminate\Database\MultipleRecordsFoundException
+     */
+    public function sole($columns = [&#039;*&#039;])
+    {
+        $result = $this-&gt;limit(2)-&gt;get($columns);
+
+        $count = $result-&gt;count();
+
+        if ($count === 0) {
+            throw new RecordsNotFoundException;
+        }
+
+        if ($count &gt; 1) {
+            throw new MultipleRecordsFoundException($count);
+        }
+
+        return $result-&gt;first();
+    }
+
+    /**
+     * Paginate the given query using a cursor paginator.
+     *
+     * @param  int  $perPage
+     * @param  array|string  $columns
+     * @param  string  $cursorName
+     * @param  \Illuminate\Pagination\Cursor|string|null  $cursor
+     * @return \Illuminate\Contracts\Pagination\CursorPaginator
+     */
+    protected function paginateUsingCursor($perPage, $columns = [&#039;*&#039;], $cursorName = &#039;cursor&#039;, $cursor = null)
+    {
+        if (! $cursor instanceof Cursor) {
+            $cursor = is_string($cursor)
+                ? Cursor::fromEncoded($cursor)
+                : CursorPaginator::resolveCurrentCursor($cursorName, $cursor);
+        }
+
+        $orders = $this-&gt;ensureOrderForCursorPagination(! is_null($cursor) &amp;&amp; $cursor-&gt;pointsToPreviousItems());
+
+        if (! is_null($cursor)) {
+            // Reset the union bindings so we can add the cursor where in the correct position...
+            $this-&gt;setBindings([], &#039;union&#039;);
+
+            $addCursorConditions = function (self $builder, $previousColumn, $originalColumn, $i) use (&amp;$addCursorConditions, $cursor, $orders) {
+                $unionBuilders = $builder-&gt;getUnionBuilders();
+
+                if (! is_null($previousColumn)) {
+                    $originalColumn ??= $this-&gt;getOriginalColumnNameForCursorPagination($this, $previousColumn);
+
+                    $builder-&gt;where(
+                        Str::contains($originalColumn, [&#039;(&#039;, &#039;)&#039;]) ? new Expression($originalColumn) : $originalColumn,
+                        &#039;=&#039;,
+                        $cursor-&gt;parameter($previousColumn)
+                    );
+
+                    $unionBuilders-&gt;each(function ($unionBuilder) use ($previousColumn, $cursor) {
+                        $unionBuilder-&gt;where(
+                            $this-&gt;getOriginalColumnNameForCursorPagination($unionBuilder, $previousColumn),
+                            &#039;=&#039;,
+                            $cursor-&gt;parameter($previousColumn)
+                        );
+
+                        $this-&gt;addBinding($unionBuilder-&gt;getRawBindings()[&#039;where&#039;], &#039;union&#039;);
+                    });
+                }
+
+                $builder-&gt;where(function (self $secondBuilder) use ($addCursorConditions, $cursor, $orders, $i, $unionBuilders) {
+                    [&#039;column&#039; =&gt; $column, &#039;direction&#039; =&gt; $direction] = $orders[$i];
+
+                    $originalColumn = $this-&gt;getOriginalColumnNameForCursorPagination($this, $column);
+
+                    $secondBuilder-&gt;where(
+                        Str::contains($originalColumn, [&#039;(&#039;, &#039;)&#039;]) ? new Expression($originalColumn) : $originalColumn,
+                        $direction === &#039;asc&#039; ? &#039;&gt;&#039; : &#039;&lt;&#039;,
+                        $cursor-&gt;parameter($column)
+                    );
+
+                    if ($i &lt; $orders-&gt;count() - 1) {
+                        $secondBuilder-&gt;orWhere(function (self $thirdBuilder) use ($addCursorConditions, $column, $originalColumn, $i) {
+                            $addCursorConditions($thirdBuilder, $column, $originalColumn, $i + 1);
+                        });
+                    }
+
+                    $unionBuilders-&gt;each(function ($unionBuilder) use ($column, $direction, $cursor, $i, $orders, $addCursorConditions) {
+                        $unionWheres = $unionBuilder-&gt;getRawBindings()[&#039;where&#039;];
+
+                        $originalColumn = $this-&gt;getOriginalColumnNameForCursorPagination($unionBuilder, $column);
+                        $unionBuilder-&gt;where(function ($unionBuilder) use ($column, $direction, $cursor, $i, $orders, $addCursorConditions, $originalColumn, $unionWheres) {
+                            $unionBuilder-&gt;where(
+                                $originalColumn,
+                                $direction === &#039;asc&#039; ? &#039;&gt;&#039; : &#039;&lt;&#039;,
+                                $cursor-&gt;parameter($column)
+                            );
+
+                            if ($i &lt; $orders-&gt;count() - 1) {
+                                $unionBuilder-&gt;orWhere(function (self $fourthBuilder) use ($addCursorConditions, $column, $originalColumn, $i) {
+                                    $addCursorConditions($fourthBuilder, $column, $originalColumn, $i + 1);
+                                });
+                            }
+
+                            $this-&gt;addBinding($unionWheres, &#039;union&#039;);
+                            $this-&gt;addBinding($unionBuilder-&gt;getRawBindings()[&#039;where&#039;], &#039;union&#039;);
+                        });
+                    });
+                });
+            };
+
+            $addCursorConditions($this, null, null, 0);
+        }
+
+        $this-&gt;limit($perPage + 1);
+
+        return $this-&gt;cursorPaginator($this-&gt;get($columns), $perPage, $cursor, [
+            &#039;path&#039; =&gt; Paginator::resolveCurrentPath(),
+            &#039;cursorName&#039; =&gt; $cursorName,
+            &#039;parameters&#039; =&gt; $orders-&gt;pluck(&#039;column&#039;)-&gt;toArray(),
+        ]);
+    }
+
+    /**
+     * Get the original column name of the given column, without any aliasing.
+     *
+     * @param  \Illuminate\Database\Query\Builder|\Illuminate\Database\Eloquent\Builder&lt;*&gt;  $builder
+     * @param  string  $parameter
+     * @return string
+     */
+    protected function getOriginalColumnNameForCursorPagination($builder, string $parameter)
+    {
+        $columns = $builder instanceof Builder ? $builder-&gt;getQuery()-&gt;getColumns() : $builder-&gt;getColumns();
+
+        if (! is_null($columns)) {
+            foreach ($columns as $column) {
+                if (($position = strripos($column, &#039; as &#039;)) !== false) {
+                    $original = substr($column, 0, $position);
+
+                    $alias = substr($column, $position + 4);
+
+                    if ($parameter === $alias || $builder-&gt;getGrammar()-&gt;wrap($parameter) === $alias) {
+                        return $original;
+                    }
+                }
+            }
+        }
+
+        return $parameter;
+    }
+
+    /**
+     * Create a new length-aware paginator instance.
+     *
+     * @param  \Illuminate\Support\Collection  $items
+     * @param  int  $total
+     * @param  int  $perPage
+     * @param  int  $currentPage
+     * @param  array  $options
+     * @return \Illuminate\Pagination\LengthAwarePaginator
+     */
+    protected function paginator($items, $total, $perPage, $currentPage, $options)
+    {
+        return Container::getInstance()-&gt;makeWith(LengthAwarePaginator::class, compact(
+            &#039;items&#039;, &#039;total&#039;, &#039;perPage&#039;, &#039;currentPage&#039;, &#039;options&#039;
+        ));
+    }
+
+    /**
+     * Create a new simple paginator instance.
+     *
+     * @param  \Illuminate\Support\Collection  $items
+     * @param  int  $perPage
+     * @param  int  $currentPage
+     * @param  array  $options
+     * @return \Illuminate\Pagination\Paginator
+     */
+    protected function simplePaginator($items, $perPage, $currentPage, $options)
+    {
+        return Container::getInstance()-&gt;makeWith(Paginator::class, compact(
+            &#039;items&#039;, &#039;perPage&#039;, &#039;currentPage&#039;, &#039;options&#039;
+        ));
+    }
+
+    /**
+     * Create a new cursor paginator instance.
+     *
+     * @param  \Illuminate\Support\Collection  $items
+     * @param  int  $perPage
+     * @param  \Illuminate\Pagination\Cursor  $cursor
+     * @param  array  $options
+     * @return \Illuminate\Pagination\CursorPaginator
+     */
+    protected function cursorPaginator($items, $perPage, $cursor, $options)
+    {
+        return Container::getInstance()-&gt;makeWith(CursorPaginator::class, compact(
+            &#039;items&#039;, &#039;perPage&#039;, &#039;cursor&#039;, &#039;options&#039;
+        ));
+    }
+
+    /**
+     * Pass the query to a given callback and then return it.
+     *
+     * @param  callable($this): mixed  $callback
+     * @return $this
+     */
+    public function tap($callback)
+    {
+        $callback($this);
+
+        return $this;
+    }
+
+    /**
+     * Pass the query to a given callback and return the result.
+     *
+     * @template TReturn
+     *
+     * @param  (callable($this): TReturn)  $callback
+     * @return (TReturn is null|void ? $this : TReturn)
+     */
+    public function pipe($callback)
+    {
+        return $callback($this) ?? $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Database/Concerns/BuildsWhereDateClauses.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Database/Connectors -->
+
+</body>
+</html>

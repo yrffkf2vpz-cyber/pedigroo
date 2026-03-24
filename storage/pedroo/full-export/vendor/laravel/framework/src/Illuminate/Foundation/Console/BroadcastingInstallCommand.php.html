@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Foundation/Console/BroadcastingInstallCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Foundation\Console;
+
+use Composer\InstalledVersions;
+use Illuminate\Console\Command;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Env;
+use Illuminate\Support\Facades\Process;
+use Symfony\Component\Console\Attribute\AsCommand;
+
+use function Illuminate\Support\artisan_binary;
+use function Illuminate\Support\php_binary;
+use function Laravel\Prompts\confirm;
+use function Laravel\Prompts\password;
+use function Laravel\Prompts\select;
+use function Laravel\Prompts\text;
+
+#[AsCommand(name: &#039;install:broadcasting&#039;)]
+class BroadcastingInstallCommand extends Command
+{
+    use InteractsWithComposerPackages;
+
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = &#039;install:broadcasting
+                    {--composer=global : Absolute path to the Composer binary which should be used to install packages}
+                    {--force : Overwrite any existing broadcasting routes file}
+                    {--without-reverb : Do not prompt to install Laravel Reverb}
+                    {--reverb : Install Laravel Reverb as the default broadcaster}
+                    {--pusher : Install Pusher as the default broadcaster}
+                    {--ably : Install Ably as the default broadcaster}
+                    {--without-node : Do not prompt to install Node dependencies}&#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;Create a broadcasting channel routes file&#039;;
+
+    /**
+     * The broadcasting driver to use.
+     *
+     * @var string|null
+     */
+    protected $driver = null;
+
+    /**
+     * The framework packages to install.
+     *
+     * @var array
+     */
+    protected $frameworkPackages = [
+        &#039;react&#039; =&gt; &#039;@laravel/echo-react&#039;,
+        &#039;vue&#039; =&gt; &#039;@laravel/echo-vue&#039;,
+    ];
+
+    /**
+     * Execute the console command.
+     *
+     * @return void
+     */
+    public function handle()
+    {
+        $this-&gt;call(&#039;config:publish&#039;, [&#039;name&#039; =&gt; &#039;broadcasting&#039;]);
+
+        // Install channel routes file...
+        if (! file_exists($broadcastingRoutesPath = $this-&gt;laravel-&gt;basePath(&#039;routes/channels.php&#039;)) || $this-&gt;option(&#039;force&#039;)) {
+            $this-&gt;components-&gt;info(&quot;Published &#039;channels&#039; route file.&quot;);
+
+            copy(__DIR__.&#039;/stubs/broadcasting-routes.stub&#039;, $broadcastingRoutesPath);
+        }
+
+        $this-&gt;uncommentChannelsRoutesFile();
+        $this-&gt;enableBroadcastServiceProvider();
+
+        $this-&gt;driver = $this-&gt;resolveDriver();
+
+        Env::writeVariable(&#039;BROADCAST_CONNECTION&#039;, $this-&gt;driver, $this-&gt;laravel-&gt;basePath(&#039;.env&#039;), true);
+
+        $this-&gt;collectDriverConfig();
+        $this-&gt;installDriverPackages();
+
+        if ($this-&gt;isUsingSupportedFramework()) {
+            // If this is a supported framework, we will use the framework-specific Echo helpers...
+            $this-&gt;injectFrameworkSpecificConfiguration();
+        } else {
+            // Standard JavaScript implementation...
+            if (! file_exists($echoScriptPath = $this-&gt;laravel-&gt;resourcePath(&#039;js/echo.js&#039;))) {
+                if (! is_dir($directory = $this-&gt;laravel-&gt;resourcePath(&#039;js&#039;))) {
+                    mkdir($directory, 0755, true);
+                }
+
+                $stubPath = __DIR__.&#039;/stubs/echo-js-&#039;.$this-&gt;driver.&#039;.stub&#039;;
+
+                if (! file_exists($stubPath)) {
+                    $stubPath = __DIR__.&#039;/stubs/echo-js-reverb.stub&#039;;
+                }
+
+                copy($stubPath, $echoScriptPath);
+            }
+
+            // Only add the bootstrap import for the standard JS implementation...
+            if (file_exists($bootstrapScriptPath = $this-&gt;laravel-&gt;resourcePath(&#039;js/bootstrap.js&#039;))) {
+                $bootstrapScript = file_get_contents(
+                    $bootstrapScriptPath
+                );
+
+                if (! str_contains($bootstrapScript, &#039;./echo&#039;)) {
+                    file_put_contents(
+                        $bootstrapScriptPath,
+                        trim($bootstrapScript.PHP_EOL.file_get_contents(__DIR__.&#039;/stubs/echo-bootstrap-js.stub&#039;)).PHP_EOL,
+                    );
+                }
+            } elseif (file_exists($appScriptPath = $this-&gt;laravel-&gt;resourcePath(&#039;js/app.js&#039;))) {
+                // If no bootstrap.js, try app.js...
+                $appScript = file_get_contents(
+                    $appScriptPath
+                );
+
+                if (! str_contains($appScript, &#039;./echo&#039;)) {
+                    file_put_contents(
+                        $appScriptPath,
+                        trim($appScript.PHP_EOL.file_get_contents(__DIR__.&#039;/stubs/echo-bootstrap-js.stub&#039;)).PHP_EOL,
+                    );
+                }
+            }
+        }
+
+        $this-&gt;installReverb();
+
+        $this-&gt;installNodeDependencies();
+    }
+
+    /**
+     * Uncomment the &quot;channels&quot; routes file in the application bootstrap file.
+     *
+     * @return void
+     */
+    protected function uncommentChannelsRoutesFile()
+    {
+        $appBootstrapPath = $this-&gt;laravel-&gt;bootstrapPath(&#039;app.php&#039;);
+
+        $content = file_get_contents($appBootstrapPath);
+
+        if (str_contains($content, &#039;// channels: &#039;)) {
+            (new Filesystem)-&gt;replaceInFile(
+                &#039;// channels: &#039;,
+                &#039;channels: &#039;,
+                $appBootstrapPath,
+            );
+        } elseif (str_contains($content, &#039;channels: &#039;)) {
+            return;
+        } elseif (str_contains($content, &#039;commands: __DIR__.\&#039;/../routes/console.php\&#039;,&#039;)) {
+            (new Filesystem)-&gt;replaceInFile(
+                &#039;commands: __DIR__.\&#039;/../routes/console.php\&#039;,&#039;,
+                &#039;commands: __DIR__.\&#039;/../routes/console.php\&#039;,&#039;.PHP_EOL.&#039;        channels: __DIR__.\&#039;/../routes/channels.php\&#039;,&#039;,
+                $appBootstrapPath,
+            );
+        } elseif (str_contains($content, &#039;-&gt;withRouting(&#039;)) {
+            (new Filesystem)-&gt;replaceInFile(
+                &#039;-&gt;withRouting(&#039;,
+                &#039;-&gt;withRouting(&#039;.PHP_EOL.&#039;        channels: __DIR__.\&#039;/../routes/channels.php\&#039;,&#039;,
+                $appBootstrapPath,
+            );
+        } else {
+            $this-&gt;components-&gt;error(&#039;Unable to register broadcast routes. Please register them manually in [&#039;.$appBootstrapPath.&#039;].&#039;);
+        }
+    }
+
+    /**
+     * Uncomment the &quot;BroadcastServiceProvider&quot; in the application configuration.
+     *
+     * @return void
+     */
+    protected function enableBroadcastServiceProvider()
+    {
+        $filesystem = new Filesystem;
+
+        if (
+            ! $filesystem-&gt;exists(app()-&gt;configPath(&#039;app.php&#039;)) ||
+            ! $filesystem-&gt;exists(&#039;app/Providers/BroadcastServiceProvider.php&#039;)
+        ) {
+            return;
+        }
+
+        $config = $filesystem-&gt;get(app()-&gt;configPath(&#039;app.php&#039;));
+
+        if (str_contains($config, &#039;// App\Providers\BroadcastServiceProvider::class&#039;)) {
+            $filesystem-&gt;replaceInFile(
+                &#039;// App\Providers\BroadcastServiceProvider::class&#039;,
+                &#039;App\Providers\BroadcastServiceProvider::class&#039;,
+                app()-&gt;configPath(&#039;app.php&#039;),
+            );
+        }
+    }
+
+    /**
+     * Collect the driver configuration.
+     *
+     * @return void
+     */
+    protected function collectDriverConfig()
+    {
+        $envPath = $this-&gt;laravel-&gt;basePath(&#039;.env&#039;);
+
+        if (! file_exists($envPath)) {
+            return;
+        }
+
+        match ($this-&gt;driver) {
+            &#039;pusher&#039; =&gt; $this-&gt;collectPusherConfig(),
+            &#039;ably&#039; =&gt; $this-&gt;collectAblyConfig(),
+            default =&gt; null,
+        };
+    }
+
+    /**
+     * Install the driver packages.
+     *
+     * @return void
+     */
+    protected function installDriverPackages()
+    {
+        $package = match ($this-&gt;driver) {
+            &#039;pusher&#039; =&gt; &#039;pusher/pusher-php-server&#039;,
+            &#039;ably&#039; =&gt; &#039;ably/ably-php&#039;,
+            default =&gt; null,
+        };
+
+        if (! $package || InstalledVersions::isInstalled($package)) {
+            return;
+        }
+
+        $this-&gt;requireComposerPackages($this-&gt;option(&#039;composer&#039;), [$package]);
+    }
+
+    /**
+     * Collect the Pusher configuration.
+     *
+     * @return void
+     */
+    protected function collectPusherConfig()
+    {
+        $appId = text(&#039;Pusher App ID&#039;, &#039;Enter your Pusher app ID&#039;);
+        $key = password(&#039;Pusher App Key&#039;, &#039;Enter your Pusher app key&#039;);
+        $secret = password(&#039;Pusher App Secret&#039;, &#039;Enter your Pusher app secret&#039;);
+
+        $cluster = select(&#039;Pusher App Cluster&#039;, [
+            &#039;mt1&#039;,
+            &#039;us2&#039;,
+            &#039;us3&#039;,
+            &#039;eu&#039;,
+            &#039;ap1&#039;,
+            &#039;ap2&#039;,
+            &#039;ap3&#039;,
+            &#039;ap4&#039;,
+            &#039;sa1&#039;,
+        ]);
+
+        Env::writeVariables([
+            &#039;PUSHER_APP_ID&#039; =&gt; $appId,
+            &#039;PUSHER_APP_KEY&#039; =&gt; $key,
+            &#039;PUSHER_APP_SECRET&#039; =&gt; $secret,
+            &#039;PUSHER_APP_CLUSTER&#039; =&gt; $cluster,
+            &#039;PUSHER_PORT&#039; =&gt; 443,
+            &#039;PUSHER_SCHEME&#039; =&gt; &#039;https&#039;,
+            &#039;VITE_PUSHER_APP_KEY&#039; =&gt; &#039;${PUSHER_APP_KEY}&#039;,
+            &#039;VITE_PUSHER_APP_CLUSTER&#039; =&gt; &#039;${PUSHER_APP_CLUSTER}&#039;,
+            &#039;VITE_PUSHER_HOST&#039; =&gt; &#039;${PUSHER_HOST}&#039;,
+            &#039;VITE_PUSHER_PORT&#039; =&gt; &#039;${PUSHER_PORT}&#039;,
+            &#039;VITE_PUSHER_SCHEME&#039; =&gt; &#039;${PUSHER_SCHEME}&#039;,
+        ], $this-&gt;laravel-&gt;basePath(&#039;.env&#039;));
+    }
+
+    /**
+     * Collect the Ably configuration.
+     *
+     * @return void
+     */
+    protected function collectAblyConfig()
+    {
+        $this-&gt;components-&gt;warn(&#039;Make sure to enable &quot;Pusher protocol support&quot; in your Ably app settings.&#039;);
+
+        $key = password(&#039;Ably Key&#039;, &#039;Enter your Ably key&#039;);
+
+        $publicKey = explode(&#039;:&#039;, $key)[0] ?? $key;
+
+        Env::writeVariables([
+            &#039;ABLY_KEY&#039; =&gt; $key,
+            &#039;ABLY_PUBLIC_KEY&#039; =&gt; $publicKey,
+            &#039;VITE_ABLY_PUBLIC_KEY&#039; =&gt; &#039;${ABLY_PUBLIC_KEY}&#039;,
+        ], $this-&gt;laravel-&gt;basePath(&#039;.env&#039;));
+    }
+
+    /**
+     * Inject Echo configuration into the application&#039;s main file.
+     *
+     * @return void
+     */
+    protected function injectFrameworkSpecificConfiguration()
+    {
+        if ($this-&gt;appUsesVue()) {
+            $importPath = $this-&gt;frameworkPackages[&#039;vue&#039;];
+
+            $filePaths = [
+                $this-&gt;laravel-&gt;resourcePath(&#039;js/app.ts&#039;),
+                $this-&gt;laravel-&gt;resourcePath(&#039;js/app.js&#039;),
+            ];
+        } else {
+            $importPath = $this-&gt;frameworkPackages[&#039;react&#039;];
+
+            $filePaths = [
+                $this-&gt;laravel-&gt;resourcePath(&#039;js/app.tsx&#039;),
+                $this-&gt;laravel-&gt;resourcePath(&#039;js/app.jsx&#039;),
+            ];
+        }
+
+        $filePath = array_filter($filePaths, function ($path) {
+            return file_exists($path);
+        })[0] ?? null;
+
+        if (! $filePath) {
+            $this-&gt;components-&gt;warn(&quot;Could not find file [{$filePaths[0]}]. Skipping automatic Echo configuration.&quot;);
+
+            return;
+        }
+
+        $contents = file_get_contents($filePath);
+
+        $echoCode = &lt;&lt;&lt;JS
+        import { configureEcho } from &#039;{$importPath}&#039;;
+
+        configureEcho({
+            broadcaster: &#039;{$this-&gt;driver}&#039;,
+        });
+        JS;
+
+        preg_match_all(&#039;/^import .+;$/m&#039;, $contents, $matches);
+
+        if (empty($matches[0])) {
+            // Add the Echo configuration to the top of the file if no import statements are found...
+            $newContents = $echoCode.PHP_EOL.$contents;
+
+            file_put_contents($filePath, $newContents);
+        } else {
+            // Add Echo configuration after the last import...
+            $lastImport = array_last($matches[0]);
+
+            $positionOfLastImport = strrpos($contents, $lastImport);
+
+            if ($positionOfLastImport !== false) {
+                $insertPosition = $positionOfLastImport + strlen($lastImport);
+                $newContents = substr($contents, 0, $insertPosition).PHP_EOL.$echoCode.substr($contents, $insertPosition);
+
+                file_put_contents($filePath, $newContents);
+            }
+        }
+
+        $this-&gt;components-&gt;info(&#039;Echo configuration added to [&#039;.basename($filePath).&#039;].&#039;);
+    }
+
+    /**
+     * Install Laravel Reverb into the application if desired.
+     *
+     * @return void
+     */
+    protected function installReverb()
+    {
+        if ($this-&gt;driver !== &#039;reverb&#039; || $this-&gt;option(&#039;without-reverb&#039;) || InstalledVersions::isInstalled(&#039;laravel/reverb&#039;)) {
+            return;
+        }
+
+        if (! confirm(&#039;Would you like to install Laravel Reverb?&#039;, default: true)) {
+            return;
+        }
+
+        $this-&gt;requireComposerPackages($this-&gt;option(&#039;composer&#039;), [
+            &#039;laravel/reverb:^1.0&#039;,
+        ]);
+
+        Process::run([
+            php_binary(),
+            artisan_binary(),
+            &#039;reverb:install&#039;,
+        ]);
+
+        $this-&gt;components-&gt;info(&#039;Reverb installed successfully.&#039;);
+    }
+
+    /**
+     * Install and build Node dependencies.
+     *
+     * @return void
+     */
+    protected function installNodeDependencies()
+    {
+        if ($this-&gt;option(&#039;without-node&#039;) || ! confirm(&#039;Would you like to install and build the Node dependencies required for broadcasting?&#039;, default: true)) {
+            return;
+        }
+
+        $this-&gt;components-&gt;info(&#039;Installing and building Node dependencies.&#039;);
+
+        if (file_exists(base_path(&#039;pnpm-lock.yaml&#039;))) {
+            $commands = [
+                &#039;pnpm add --save-dev laravel-echo pusher-js&#039;,
+                &#039;pnpm run build&#039;,
+            ];
+        } elseif (file_exists(base_path(&#039;yarn.lock&#039;))) {
+            $commands = [
+                &#039;yarn add --dev laravel-echo pusher-js&#039;,
+                &#039;yarn run build&#039;,
+            ];
+        } elseif (file_exists(base_path(&#039;bun.lock&#039;)) || file_exists(base_path(&#039;bun.lockb&#039;))) {
+            $commands = [
+                &#039;bun add --dev laravel-echo pusher-js&#039;,
+                &#039;bun run build&#039;,
+            ];
+        } else {
+            $commands = [
+                &#039;npm install --save-dev laravel-echo pusher-js&#039;,
+                &#039;npm run build&#039;,
+            ];
+        }
+
+        if ($this-&gt;appUsesVue()) {
+            $commands[0] .= &#039; &#039;.$this-&gt;frameworkPackages[&#039;vue&#039;];
+        } elseif ($this-&gt;appUsesReact()) {
+            $commands[0] .= &#039; &#039;.$this-&gt;frameworkPackages[&#039;react&#039;];
+        }
+
+        $command = Process::command(implode(&#039; &amp;&amp; &#039;, $commands))
+            -&gt;path(base_path());
+
+        if (! windows_os()) {
+            $command-&gt;tty(true);
+        }
+
+        if ($command-&gt;run()-&gt;failed()) {
+            $this-&gt;components-&gt;warn(&quot;Node dependency installation failed. Please run the following commands manually: \n\n&quot;.implode(&#039; &amp;&amp; &#039;, $commands));
+        } else {
+            $this-&gt;components-&gt;info(&#039;Node dependencies installed successfully.&#039;);
+        }
+    }
+
+    /**
+     * Resolve the provider to use based on the user&#039;s choice.
+     *
+     * @return string
+     */
+    protected function resolveDriver(): string
+    {
+        if ($this-&gt;option(&#039;reverb&#039;)) {
+            return &#039;reverb&#039;;
+        }
+
+        if ($this-&gt;option(&#039;pusher&#039;)) {
+            return &#039;pusher&#039;;
+        }
+
+        if ($this-&gt;option(&#039;ably&#039;)) {
+            return &#039;ably&#039;;
+        }
+
+        return select(&#039;Which broadcasting driver would you like to use?&#039;, [
+            &#039;reverb&#039; =&gt; &#039;Laravel Reverb&#039;,
+            &#039;pusher&#039; =&gt; &#039;Pusher&#039;,
+            &#039;ably&#039; =&gt; &#039;Ably&#039;,
+        ]);
+    }
+
+    /**
+     * Detect if the user is using a supported framework (React or Vue).
+     *
+     * @return bool
+     */
+    protected function isUsingSupportedFramework(): bool
+    {
+        return $this-&gt;appUsesReact() || $this-&gt;appUsesVue();
+    }
+
+    /**
+     * Detect if the user is using React.
+     *
+     * @return bool
+     */
+    protected function appUsesReact(): bool
+    {
+        return $this-&gt;packageDependenciesInclude(&#039;react&#039;);
+    }
+
+    /**
+     * Detect if the user is using Vue.
+     *
+     * @return bool
+     */
+    protected function appUsesVue(): bool
+    {
+        return $this-&gt;packageDependenciesInclude(&#039;vue&#039;);
+    }
+
+    /**
+     * Detect if the package is installed.
+     *
+     * @return bool
+     */
+    protected function packageDependenciesInclude(string $package): bool
+    {
+        $packageJsonPath = $this-&gt;laravel-&gt;basePath(&#039;package.json&#039;);
+
+        if (! file_exists($packageJsonPath)) {
+            return false;
+        }
+
+        $packageJson = json_decode(file_get_contents($packageJsonPath), true);
+
+        return isset($packageJson[&#039;dependencies&#039;][$package]) ||
+            isset($packageJson[&#039;devDependencies&#039;][$package]);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Foundation/Console/CastMakeCommand.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Foundation/Console/stubs -->
+
+</body>
+</html>

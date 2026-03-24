@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpstan/phpdoc-parser/src/Parser/TypeParser.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types = 1);
+
+namespace PHPStan\PhpDocParser\Parser;
+
+use LogicException;
+use PHPStan\PhpDocParser\Ast;
+use PHPStan\PhpDocParser\Ast\PhpDoc\TemplateTagValueNode;
+use PHPStan\PhpDocParser\Lexer\Lexer;
+use PHPStan\PhpDocParser\ParserConfig;
+use function in_array;
+use function str_replace;
+use function strlen;
+use function strpos;
+use function substr_compare;
+
+class TypeParser
+{
+
+	private ParserConfig $config;
+
+	private ConstExprParser $constExprParser;
+
+	public function __construct(
+		ParserConfig $config,
+		ConstExprParser $constExprParser
+	)
+	{
+		$this-&gt;config = $config;
+		$this-&gt;constExprParser = $constExprParser;
+	}
+
+	/** @phpstan-impure */
+	public function parse(TokenIterator $tokens): Ast\Type\TypeNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_NULLABLE)) {
+			$type = $this-&gt;parseNullable($tokens);
+
+		} else {
+			$type = $this-&gt;parseAtomic($tokens);
+
+			$tokens-&gt;pushSavePoint();
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+			try {
+				$enrichedType = $this-&gt;enrichTypeOnUnionOrIntersection($tokens, $type);
+
+			} catch (ParserException $parserException) {
+				$enrichedType = null;
+			}
+
+			if ($enrichedType !== null) {
+				$type = $enrichedType;
+				$tokens-&gt;dropSavePoint();
+
+			} else {
+				$tokens-&gt;rollback();
+				$type = $this-&gt;enrichTypeOnUnionOrIntersection($tokens, $type) ?? $type;
+			}
+		}
+
+		return $this-&gt;enrichWithAttributes($tokens, $type, $startLine, $startIndex);
+	}
+
+	/** @phpstan-impure */
+	private function enrichTypeOnUnionOrIntersection(TokenIterator $tokens, Ast\Type\TypeNode $type): ?Ast\Type\TypeNode
+	{
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_UNION)) {
+			return $this-&gt;parseUnion($tokens, $type);
+
+		}
+
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_INTERSECTION)) {
+			return $this-&gt;parseIntersection($tokens, $type);
+		}
+
+		return null;
+	}
+
+	/**
+	 * @internal
+	 * @template T of Ast\Node
+	 * @param T $type
+	 * @return T
+	 */
+	public function enrichWithAttributes(TokenIterator $tokens, Ast\Node $type, int $startLine, int $startIndex): Ast\Node
+	{
+		if ($this-&gt;config-&gt;useLinesAttributes) {
+			$type-&gt;setAttribute(Ast\Attribute::START_LINE, $startLine);
+			$type-&gt;setAttribute(Ast\Attribute::END_LINE, $tokens-&gt;currentTokenLine());
+		}
+
+		$comments = $tokens-&gt;flushComments();
+		if ($this-&gt;config-&gt;useCommentsAttributes) {
+			$type-&gt;setAttribute(Ast\Attribute::COMMENTS, $comments);
+		}
+
+		if ($this-&gt;config-&gt;useIndexAttributes) {
+			$type-&gt;setAttribute(Ast\Attribute::START_INDEX, $startIndex);
+			$type-&gt;setAttribute(Ast\Attribute::END_INDEX, $tokens-&gt;endIndexOfLastRelevantToken());
+		}
+
+		return $type;
+	}
+
+	/** @phpstan-impure */
+	private function subParse(TokenIterator $tokens): Ast\Type\TypeNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_NULLABLE)) {
+			$type = $this-&gt;parseNullable($tokens);
+
+		} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_VARIABLE)) {
+			$type = $this-&gt;parseConditionalForParameter($tokens, $tokens-&gt;currentTokenValue());
+
+		} else {
+			$type = $this-&gt;parseAtomic($tokens);
+
+			if ($tokens-&gt;isCurrentTokenValue(&#039;is&#039;)) {
+				$type = $this-&gt;parseConditional($tokens, $type);
+			} else {
+				$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+				if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_UNION)) {
+					$type = $this-&gt;subParseUnion($tokens, $type);
+
+				} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_INTERSECTION)) {
+					$type = $this-&gt;subParseIntersection($tokens, $type);
+				}
+			}
+		}
+
+		return $this-&gt;enrichWithAttributes($tokens, $type, $startLine, $startIndex);
+	}
+
+	/** @phpstan-impure */
+	private function parseAtomic(TokenIterator $tokens): Ast\Type\TypeNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_OPEN_PARENTHESES)) {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			$type = $this-&gt;subParse($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_PARENTHESES);
+
+			if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+				$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $type);
+			}
+
+			return $this-&gt;enrichWithAttributes($tokens, $type, $startLine, $startIndex);
+		}
+
+		if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_THIS_VARIABLE)) {
+			$type = $this-&gt;enrichWithAttributes($tokens, new Ast\Type\ThisTypeNode(), $startLine, $startIndex);
+
+			if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+				$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $type);
+			}
+
+			return $this-&gt;enrichWithAttributes($tokens, $type, $startLine, $startIndex);
+		}
+
+		$currentTokenValue = $tokens-&gt;currentTokenValue();
+		$tokens-&gt;pushSavePoint(); // because of ConstFetchNode
+		if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_IDENTIFIER)) {
+			$type = $this-&gt;enrichWithAttributes($tokens, new Ast\Type\IdentifierTypeNode($currentTokenValue), $startLine, $startIndex);
+
+			if (!$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_DOUBLE_COLON)) {
+				$tokens-&gt;dropSavePoint(); // because of ConstFetchNode
+				if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET)) {
+					$tokens-&gt;pushSavePoint();
+
+					$isHtml = $this-&gt;isHtml($tokens);
+					$tokens-&gt;rollback();
+					if ($isHtml) {
+						return $type;
+					}
+
+					$origType = $type;
+					$type = $this-&gt;tryParseCallable($tokens, $type, true);
+					if ($type === $origType) {
+						$type = $this-&gt;parseGeneric($tokens, $type);
+
+						if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+							$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $type);
+						}
+					}
+				} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_PARENTHESES)) {
+					$type = $this-&gt;tryParseCallable($tokens, $type, false);
+
+				} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+					$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $type);
+
+				} elseif (in_array($type-&gt;name, [
+					Ast\Type\ArrayShapeNode::KIND_ARRAY,
+					Ast\Type\ArrayShapeNode::KIND_LIST,
+					Ast\Type\ArrayShapeNode::KIND_NON_EMPTY_ARRAY,
+					Ast\Type\ArrayShapeNode::KIND_NON_EMPTY_LIST,
+					&#039;object&#039;,
+				], true) &amp;&amp; $tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_CURLY_BRACKET) &amp;&amp; !$tokens-&gt;isPrecededByHorizontalWhitespace()) {
+					if ($type-&gt;name === &#039;object&#039;) {
+						$type = $this-&gt;parseObjectShape($tokens);
+					} else {
+						$type = $this-&gt;parseArrayShape($tokens, $type, $type-&gt;name);
+					}
+
+					if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+						$type = $this-&gt;tryParseArrayOrOffsetAccess(
+							$tokens,
+							$this-&gt;enrichWithAttributes($tokens, $type, $startLine, $startIndex),
+						);
+					}
+				}
+
+				return $this-&gt;enrichWithAttributes($tokens, $type, $startLine, $startIndex);
+			} else {
+				$tokens-&gt;rollback(); // because of ConstFetchNode
+			}
+		} else {
+			$tokens-&gt;dropSavePoint(); // because of ConstFetchNode
+		}
+
+		$currentTokenValue = $tokens-&gt;currentTokenValue();
+		$currentTokenType = $tokens-&gt;currentTokenType();
+		$currentTokenOffset = $tokens-&gt;currentTokenOffset();
+		$currentTokenLine = $tokens-&gt;currentTokenLine();
+
+		try {
+			$constExpr = $this-&gt;constExprParser-&gt;parse($tokens);
+			if ($constExpr instanceof Ast\ConstExpr\ConstExprArrayNode) {
+				throw new ParserException(
+					$currentTokenValue,
+					$currentTokenType,
+					$currentTokenOffset,
+					Lexer::TOKEN_IDENTIFIER,
+					null,
+					$currentTokenLine,
+				);
+			}
+
+			$type = $this-&gt;enrichWithAttributes(
+				$tokens,
+				new Ast\Type\ConstTypeNode($constExpr),
+				$startLine,
+				$startIndex,
+			);
+			if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+				$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $type);
+			}
+
+			return $type;
+		} catch (LogicException $e) {
+			throw new ParserException(
+				$currentTokenValue,
+				$currentTokenType,
+				$currentTokenOffset,
+				Lexer::TOKEN_IDENTIFIER,
+				null,
+				$currentTokenLine,
+			);
+		}
+	}
+
+	/** @phpstan-impure */
+	private function parseUnion(TokenIterator $tokens, Ast\Type\TypeNode $type): Ast\Type\TypeNode
+	{
+		$types = [$type];
+
+		while ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_UNION)) {
+			$types[] = $this-&gt;parseAtomic($tokens);
+			$tokens-&gt;pushSavePoint();
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			if (!$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_UNION)) {
+				$tokens-&gt;rollback();
+				break;
+			}
+
+			$tokens-&gt;dropSavePoint();
+		}
+
+		return new Ast\Type\UnionTypeNode($types);
+	}
+
+	/** @phpstan-impure */
+	private function subParseUnion(TokenIterator $tokens, Ast\Type\TypeNode $type): Ast\Type\TypeNode
+	{
+		$types = [$type];
+
+		while ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_UNION)) {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			$types[] = $this-&gt;parseAtomic($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		}
+
+		return new Ast\Type\UnionTypeNode($types);
+	}
+
+	/** @phpstan-impure */
+	private function parseIntersection(TokenIterator $tokens, Ast\Type\TypeNode $type): Ast\Type\TypeNode
+	{
+		$types = [$type];
+
+		while ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_INTERSECTION)) {
+			$types[] = $this-&gt;parseAtomic($tokens);
+			$tokens-&gt;pushSavePoint();
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			if (!$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_INTERSECTION)) {
+				$tokens-&gt;rollback();
+				break;
+			}
+
+			$tokens-&gt;dropSavePoint();
+		}
+
+		return new Ast\Type\IntersectionTypeNode($types);
+	}
+
+	/** @phpstan-impure */
+	private function subParseIntersection(TokenIterator $tokens, Ast\Type\TypeNode $type): Ast\Type\TypeNode
+	{
+		$types = [$type];
+
+		while ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_INTERSECTION)) {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			$types[] = $this-&gt;parseAtomic($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		}
+
+		return new Ast\Type\IntersectionTypeNode($types);
+	}
+
+	/** @phpstan-impure */
+	private function parseConditional(TokenIterator $tokens, Ast\Type\TypeNode $subjectType): Ast\Type\TypeNode
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_IDENTIFIER);
+
+		$negated = false;
+		if ($tokens-&gt;isCurrentTokenValue(&#039;not&#039;)) {
+			$negated = true;
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_IDENTIFIER);
+		}
+
+		$targetType = $this-&gt;parse($tokens);
+
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_NULLABLE);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$ifType = $this-&gt;parse($tokens);
+
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_COLON);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$elseType = $this-&gt;subParse($tokens);
+
+		return new Ast\Type\ConditionalTypeNode($subjectType, $targetType, $ifType, $elseType, $negated);
+	}
+
+	/** @phpstan-impure */
+	private function parseConditionalForParameter(TokenIterator $tokens, string $parameterName): Ast\Type\TypeNode
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_VARIABLE);
+		$tokens-&gt;consumeTokenValue(Lexer::TOKEN_IDENTIFIER, &#039;is&#039;);
+
+		$negated = false;
+		if ($tokens-&gt;isCurrentTokenValue(&#039;not&#039;)) {
+			$negated = true;
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_IDENTIFIER);
+		}
+
+		$targetType = $this-&gt;parse($tokens);
+
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_NULLABLE);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$ifType = $this-&gt;parse($tokens);
+
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_COLON);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$elseType = $this-&gt;subParse($tokens);
+
+		return new Ast\Type\ConditionalTypeForParameterNode($parameterName, $targetType, $ifType, $elseType, $negated);
+	}
+
+	/** @phpstan-impure */
+	private function parseNullable(TokenIterator $tokens): Ast\Type\TypeNode
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_NULLABLE);
+
+		$type = $this-&gt;parseAtomic($tokens);
+
+		return new Ast\Type\NullableTypeNode($type);
+	}
+
+	/** @phpstan-impure */
+	public function isHtml(TokenIterator $tokens): bool
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET);
+
+		if (!$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_IDENTIFIER)) {
+			return false;
+		}
+
+		$htmlTagName = $tokens-&gt;currentTokenValue();
+
+		$tokens-&gt;next();
+
+		if (!$tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_CLOSE_ANGLE_BRACKET)) {
+			return false;
+		}
+
+		$endTag = &#039;&lt;/&#039; . $htmlTagName . &#039;&gt;&#039;;
+		$endTagSearchOffset = - strlen($endTag);
+
+		while (!$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_END)) {
+			if (
+				(
+					$tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET)
+					&amp;&amp; strpos($tokens-&gt;currentTokenValue(), &#039;/&#039; . $htmlTagName . &#039;&gt;&#039;) !== false
+				)
+				|| substr_compare($tokens-&gt;currentTokenValue(), $endTag, $endTagSearchOffset) === 0
+			) {
+				return true;
+			}
+
+			$tokens-&gt;next();
+		}
+
+		return false;
+	}
+
+	/** @phpstan-impure */
+	public function parseGeneric(TokenIterator $tokens, Ast\Type\IdentifierTypeNode $baseType): Ast\Type\GenericTypeNode
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$startLine = $baseType-&gt;getAttribute(Ast\Attribute::START_LINE);
+		$startIndex = $baseType-&gt;getAttribute(Ast\Attribute::START_INDEX);
+		$genericTypes = [];
+		$variances = [];
+
+		$isFirst = true;
+		while (
+			$isFirst
+			|| $tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_COMMA)
+		) {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+			// trailing comma case
+			if (!$isFirst &amp;&amp; $tokens-&gt;isCurrentTokenType(Lexer::TOKEN_CLOSE_ANGLE_BRACKET)) {
+				break;
+			}
+			$isFirst = false;
+
+			[$genericTypes[], $variances[]] = $this-&gt;parseGenericTypeArgument($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		}
+
+		$type = new Ast\Type\GenericTypeNode($baseType, $genericTypes, $variances);
+		if ($startLine !== null &amp;&amp; $startIndex !== null) {
+			$type = $this-&gt;enrichWithAttributes($tokens, $type, $startLine, $startIndex);
+		}
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_ANGLE_BRACKET);
+
+		return $type;
+	}
+
+	/**
+	 * @phpstan-impure
+	 * @return array{Ast\Type\TypeNode, Ast\Type\GenericTypeNode::VARIANCE_*}
+	 */
+	public function parseGenericTypeArgument(TokenIterator $tokens): array
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+		if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_WILDCARD)) {
+			return [
+				$this-&gt;enrichWithAttributes($tokens, new Ast\Type\IdentifierTypeNode(&#039;mixed&#039;), $startLine, $startIndex),
+				Ast\Type\GenericTypeNode::VARIANCE_BIVARIANT,
+			];
+		}
+
+		if ($tokens-&gt;tryConsumeTokenValue(&#039;contravariant&#039;)) {
+			$variance = Ast\Type\GenericTypeNode::VARIANCE_CONTRAVARIANT;
+		} elseif ($tokens-&gt;tryConsumeTokenValue(&#039;covariant&#039;)) {
+			$variance = Ast\Type\GenericTypeNode::VARIANCE_COVARIANT;
+		} else {
+			$variance = Ast\Type\GenericTypeNode::VARIANCE_INVARIANT;
+		}
+
+		$type = $this-&gt;parse($tokens);
+		return [$type, $variance];
+	}
+
+	/**
+	 * @throws ParserException
+	 * @param ?callable(TokenIterator): string $parseDescription
+	 */
+	public function parseTemplateTagValue(
+		TokenIterator $tokens,
+		?callable $parseDescription = null
+	): TemplateTagValueNode
+	{
+		$name = $tokens-&gt;currentTokenValue();
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_IDENTIFIER);
+
+		$upperBound = $lowerBound = null;
+
+		if ($tokens-&gt;tryConsumeTokenValue(&#039;of&#039;) || $tokens-&gt;tryConsumeTokenValue(&#039;as&#039;)) {
+			$upperBound = $this-&gt;parse($tokens);
+		}
+
+		if ($tokens-&gt;tryConsumeTokenValue(&#039;super&#039;)) {
+			$lowerBound = $this-&gt;parse($tokens);
+		}
+
+		if ($tokens-&gt;tryConsumeTokenValue(&#039;=&#039;)) {
+			$default = $this-&gt;parse($tokens);
+		} else {
+			$default = null;
+		}
+
+		if ($parseDescription !== null) {
+			$description = $parseDescription($tokens);
+		} else {
+			$description = &#039;&#039;;
+		}
+
+		if ($name === &#039;&#039;) {
+			throw new LogicException(&#039;Template tag name cannot be empty.&#039;);
+		}
+
+		return new Ast\PhpDoc\TemplateTagValueNode($name, $upperBound, $description, $default, $lowerBound);
+	}
+
+	/** @phpstan-impure */
+	private function parseCallable(TokenIterator $tokens, Ast\Type\IdentifierTypeNode $identifier, bool $hasTemplate): Ast\Type\TypeNode
+	{
+		$templates = $hasTemplate
+			? $this-&gt;parseCallableTemplates($tokens)
+			: [];
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_PARENTHESES);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$parameters = [];
+		if (!$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_CLOSE_PARENTHESES)) {
+			$parameters[] = $this-&gt;parseCallableParameter($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			while ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_COMMA)) {
+				$tokens-&gt;skipNewLineTokensAndConsumeComments();
+				if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_CLOSE_PARENTHESES)) {
+					break;
+				}
+				$parameters[] = $this-&gt;parseCallableParameter($tokens);
+				$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			}
+		}
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_PARENTHESES);
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_COLON);
+
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+		$returnType = $this-&gt;enrichWithAttributes($tokens, $this-&gt;parseCallableReturnType($tokens), $startLine, $startIndex);
+
+		return new Ast\Type\CallableTypeNode($identifier, $parameters, $returnType, $templates);
+	}
+
+	/**
+	 * @return Ast\PhpDoc\TemplateTagValueNode[]
+	 *
+	 * @phpstan-impure
+	 */
+	private function parseCallableTemplates(TokenIterator $tokens): array
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET);
+
+		$templates = [];
+
+		$isFirst = true;
+		while ($isFirst || $tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_COMMA)) {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+			// trailing comma case
+			if (!$isFirst &amp;&amp; $tokens-&gt;isCurrentTokenType(Lexer::TOKEN_CLOSE_ANGLE_BRACKET)) {
+				break;
+			}
+			$isFirst = false;
+
+			$templates[] = $this-&gt;parseCallableTemplateArgument($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		}
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_ANGLE_BRACKET);
+
+		return $templates;
+	}
+
+	private function parseCallableTemplateArgument(TokenIterator $tokens): Ast\PhpDoc\TemplateTagValueNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		return $this-&gt;enrichWithAttributes(
+			$tokens,
+			$this-&gt;parseTemplateTagValue($tokens),
+			$startLine,
+			$startIndex,
+		);
+	}
+
+	/** @phpstan-impure */
+	private function parseCallableParameter(TokenIterator $tokens): Ast\Type\CallableTypeParameterNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+		$type = $this-&gt;parse($tokens);
+		$isReference = $tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_REFERENCE);
+		$isVariadic = $tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_VARIADIC);
+
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_VARIABLE)) {
+			$parameterName = $tokens-&gt;currentTokenValue();
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_VARIABLE);
+
+		} else {
+			$parameterName = &#039;&#039;;
+		}
+
+		$isOptional = $tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_EQUAL);
+		return $this-&gt;enrichWithAttributes(
+			$tokens,
+			new Ast\Type\CallableTypeParameterNode($type, $isReference, $isVariadic, $parameterName, $isOptional),
+			$startLine,
+			$startIndex,
+		);
+	}
+
+	/** @phpstan-impure */
+	private function parseCallableReturnType(TokenIterator $tokens): Ast\Type\TypeNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_NULLABLE)) {
+			return $this-&gt;parseNullable($tokens);
+
+		} elseif ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_OPEN_PARENTHESES)) {
+			$type = $this-&gt;subParse($tokens);
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_PARENTHESES);
+			if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+				$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $type);
+			}
+
+			return $type;
+		} elseif ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_THIS_VARIABLE)) {
+			$type = new Ast\Type\ThisTypeNode();
+			if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+				$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $this-&gt;enrichWithAttributes(
+					$tokens,
+					$type,
+					$startLine,
+					$startIndex,
+				));
+			}
+
+			return $type;
+		} else {
+			$currentTokenValue = $tokens-&gt;currentTokenValue();
+			$tokens-&gt;pushSavePoint(); // because of ConstFetchNode
+			if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_IDENTIFIER)) {
+				$type = new Ast\Type\IdentifierTypeNode($currentTokenValue);
+
+				if (!$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_DOUBLE_COLON)) {
+					if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET)) {
+						$type = $this-&gt;parseGeneric(
+							$tokens,
+							$this-&gt;enrichWithAttributes(
+								$tokens,
+								$type,
+								$startLine,
+								$startIndex,
+							),
+						);
+						if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+							$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $this-&gt;enrichWithAttributes(
+								$tokens,
+								$type,
+								$startLine,
+								$startIndex,
+							));
+						}
+
+					} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+						$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $this-&gt;enrichWithAttributes(
+							$tokens,
+							$type,
+							$startLine,
+							$startIndex,
+						));
+
+					} elseif (in_array($type-&gt;name, [
+						Ast\Type\ArrayShapeNode::KIND_ARRAY,
+						Ast\Type\ArrayShapeNode::KIND_LIST,
+						Ast\Type\ArrayShapeNode::KIND_NON_EMPTY_ARRAY,
+						Ast\Type\ArrayShapeNode::KIND_NON_EMPTY_LIST,
+						&#039;object&#039;,
+					], true) &amp;&amp; $tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_CURLY_BRACKET) &amp;&amp; !$tokens-&gt;isPrecededByHorizontalWhitespace()) {
+						if ($type-&gt;name === &#039;object&#039;) {
+							$type = $this-&gt;parseObjectShape($tokens);
+						} else {
+							$type = $this-&gt;parseArrayShape($tokens, $this-&gt;enrichWithAttributes(
+								$tokens,
+								$type,
+								$startLine,
+								$startIndex,
+							), $type-&gt;name);
+						}
+
+						if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+							$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $this-&gt;enrichWithAttributes(
+								$tokens,
+								$type,
+								$startLine,
+								$startIndex,
+							));
+						}
+					}
+
+					return $type;
+				} else {
+					$tokens-&gt;rollback(); // because of ConstFetchNode
+				}
+			} else {
+				$tokens-&gt;dropSavePoint(); // because of ConstFetchNode
+			}
+		}
+
+		$currentTokenValue = $tokens-&gt;currentTokenValue();
+		$currentTokenType = $tokens-&gt;currentTokenType();
+		$currentTokenOffset = $tokens-&gt;currentTokenOffset();
+		$currentTokenLine = $tokens-&gt;currentTokenLine();
+
+		try {
+			$constExpr = $this-&gt;constExprParser-&gt;parse($tokens);
+			if ($constExpr instanceof Ast\ConstExpr\ConstExprArrayNode) {
+				throw new ParserException(
+					$currentTokenValue,
+					$currentTokenType,
+					$currentTokenOffset,
+					Lexer::TOKEN_IDENTIFIER,
+					null,
+					$currentTokenLine,
+				);
+			}
+
+			$type = $this-&gt;enrichWithAttributes(
+				$tokens,
+				new Ast\Type\ConstTypeNode($constExpr),
+				$startLine,
+				$startIndex,
+			);
+			if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+				$type = $this-&gt;tryParseArrayOrOffsetAccess($tokens, $type);
+			}
+
+			return $type;
+		} catch (LogicException $e) {
+			throw new ParserException(
+				$currentTokenValue,
+				$currentTokenType,
+				$currentTokenOffset,
+				Lexer::TOKEN_IDENTIFIER,
+				null,
+				$currentTokenLine,
+			);
+		}
+	}
+
+	/** @phpstan-impure */
+	private function tryParseCallable(TokenIterator $tokens, Ast\Type\IdentifierTypeNode $identifier, bool $hasTemplate): Ast\Type\TypeNode
+	{
+		try {
+			$tokens-&gt;pushSavePoint();
+			$type = $this-&gt;parseCallable($tokens, $identifier, $hasTemplate);
+			$tokens-&gt;dropSavePoint();
+
+		} catch (ParserException $e) {
+			$tokens-&gt;rollback();
+			$type = $identifier;
+		}
+
+		return $type;
+	}
+
+	/** @phpstan-impure */
+	private function tryParseArrayOrOffsetAccess(TokenIterator $tokens, Ast\Type\TypeNode $type): Ast\Type\TypeNode
+	{
+		$startLine = $type-&gt;getAttribute(Ast\Attribute::START_LINE);
+		$startIndex = $type-&gt;getAttribute(Ast\Attribute::START_INDEX);
+		try {
+			while ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET)) {
+				$tokens-&gt;pushSavePoint();
+
+				$canBeOffsetAccessType = !$tokens-&gt;isPrecededByHorizontalWhitespace();
+				$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_SQUARE_BRACKET);
+
+				if ($canBeOffsetAccessType &amp;&amp; !$tokens-&gt;isCurrentTokenType(Lexer::TOKEN_CLOSE_SQUARE_BRACKET)) {
+					$offset = $this-&gt;parse($tokens);
+					$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_SQUARE_BRACKET);
+					$tokens-&gt;dropSavePoint();
+					$type = new Ast\Type\OffsetAccessTypeNode($type, $offset);
+
+					if ($startLine !== null &amp;&amp; $startIndex !== null) {
+						$type = $this-&gt;enrichWithAttributes(
+							$tokens,
+							$type,
+							$startLine,
+							$startIndex,
+						);
+					}
+				} else {
+					$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_SQUARE_BRACKET);
+					$tokens-&gt;dropSavePoint();
+					$type = new Ast\Type\ArrayTypeNode($type);
+
+					if ($startLine !== null &amp;&amp; $startIndex !== null) {
+						$type = $this-&gt;enrichWithAttributes(
+							$tokens,
+							$type,
+							$startLine,
+							$startIndex,
+						);
+					}
+				}
+			}
+
+		} catch (ParserException $e) {
+			$tokens-&gt;rollback();
+		}
+
+		return $type;
+	}
+
+	/**
+	 * @phpstan-impure
+	 * @param Ast\Type\ArrayShapeNode::KIND_* $kind
+	 */
+	private function parseArrayShape(TokenIterator $tokens, Ast\Type\TypeNode $type, string $kind): Ast\Type\ArrayShapeNode
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_CURLY_BRACKET);
+
+		$items = [];
+		$sealed = true;
+		$unsealedType = null;
+
+		$done = false;
+
+		do {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+			if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_CLOSE_CURLY_BRACKET)) {
+				return Ast\Type\ArrayShapeNode::createSealed($items, $kind);
+			}
+
+			if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_VARIADIC)) {
+				$sealed = false;
+
+				$tokens-&gt;skipNewLineTokensAndConsumeComments();
+				if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET)) {
+					if ($kind === Ast\Type\ArrayShapeNode::KIND_ARRAY) {
+						$unsealedType = $this-&gt;parseArrayShapeUnsealedType($tokens);
+					} else {
+						$unsealedType = $this-&gt;parseListShapeUnsealedType($tokens);
+					}
+					$tokens-&gt;skipNewLineTokensAndConsumeComments();
+				}
+
+				$tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_COMMA);
+				break;
+			}
+
+			$items[] = $this-&gt;parseArrayShapeItem($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+			if (!$tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_COMMA)) {
+				$done = true;
+			}
+			if ($tokens-&gt;currentTokenType() !== Lexer::TOKEN_COMMENT) {
+				continue;
+			}
+
+			$tokens-&gt;next();
+
+		} while (!$done);
+
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_CURLY_BRACKET);
+
+		if ($sealed) {
+			return Ast\Type\ArrayShapeNode::createSealed($items, $kind);
+		}
+
+		return Ast\Type\ArrayShapeNode::createUnsealed($items, $unsealedType, $kind);
+	}
+
+	/** @phpstan-impure */
+	private function parseArrayShapeItem(TokenIterator $tokens): Ast\Type\ArrayShapeItemNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		// parse any comments above the item
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		try {
+			$tokens-&gt;pushSavePoint();
+			$key = $this-&gt;parseArrayShapeKey($tokens);
+			$optional = $tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_NULLABLE);
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_COLON);
+			$value = $this-&gt;parse($tokens);
+
+			$tokens-&gt;dropSavePoint();
+
+			return $this-&gt;enrichWithAttributes(
+				$tokens,
+				new Ast\Type\ArrayShapeItemNode($key, $optional, $value),
+				$startLine,
+				$startIndex,
+			);
+		} catch (ParserException $e) {
+			$tokens-&gt;rollback();
+			$value = $this-&gt;parse($tokens);
+
+			return $this-&gt;enrichWithAttributes(
+				$tokens,
+				new Ast\Type\ArrayShapeItemNode(null, false, $value),
+				$startLine,
+				$startIndex,
+			);
+		}
+	}
+
+	/**
+	 * @phpstan-impure
+	 * @return Ast\ConstExpr\ConstExprIntegerNode|Ast\ConstExpr\ConstExprStringNode|Ast\ConstExpr\ConstFetchNode|Ast\Type\IdentifierTypeNode
+	 */
+	private function parseArrayShapeKey(TokenIterator $tokens)
+	{
+		$startIndex = $tokens-&gt;currentTokenIndex();
+		$startLine = $tokens-&gt;currentTokenLine();
+
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_INTEGER)) {
+			$key = new Ast\ConstExpr\ConstExprIntegerNode(str_replace(&#039;_&#039;, &#039;&#039;, $tokens-&gt;currentTokenValue()));
+			$tokens-&gt;next();
+
+		} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_SINGLE_QUOTED_STRING)) {
+			$key = new Ast\ConstExpr\ConstExprStringNode(StringUnescaper::unescapeString($tokens-&gt;currentTokenValue()), Ast\ConstExpr\ConstExprStringNode::SINGLE_QUOTED);
+			$tokens-&gt;next();
+
+		} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_DOUBLE_QUOTED_STRING)) {
+			$key = new Ast\ConstExpr\ConstExprStringNode(StringUnescaper::unescapeString($tokens-&gt;currentTokenValue()), Ast\ConstExpr\ConstExprStringNode::DOUBLE_QUOTED);
+
+			$tokens-&gt;next();
+
+		} else {
+			$identifier = $tokens-&gt;currentTokenValue();
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_IDENTIFIER);
+
+			if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_DOUBLE_COLON)) {
+				$classConstantName = $tokens-&gt;currentTokenValue();
+				$tokens-&gt;consumeTokenType(Lexer::TOKEN_IDENTIFIER);
+
+				$key = new Ast\ConstExpr\ConstFetchNode($identifier, $classConstantName);
+			} else {
+				$key = new Ast\Type\IdentifierTypeNode($identifier);
+			}
+		}
+
+		return $this-&gt;enrichWithAttributes(
+			$tokens,
+			$key,
+			$startLine,
+			$startIndex,
+		);
+	}
+
+	/**
+	 * @phpstan-impure
+	 */
+	private function parseArrayShapeUnsealedType(TokenIterator $tokens): Ast\Type\ArrayShapeUnsealedTypeNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$valueType = $this-&gt;parse($tokens);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$keyType = null;
+		if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_COMMA)) {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+			$keyType = $valueType;
+			$valueType = $this-&gt;parse($tokens);
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		}
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_ANGLE_BRACKET);
+
+		return $this-&gt;enrichWithAttributes(
+			$tokens,
+			new Ast\Type\ArrayShapeUnsealedTypeNode($valueType, $keyType),
+			$startLine,
+			$startIndex,
+		);
+	}
+
+	/**
+	 * @phpstan-impure
+	 */
+	private function parseListShapeUnsealedType(TokenIterator $tokens): Ast\Type\ArrayShapeUnsealedTypeNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_ANGLE_BRACKET);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$valueType = $this-&gt;parse($tokens);
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_ANGLE_BRACKET);
+
+		return $this-&gt;enrichWithAttributes(
+			$tokens,
+			new Ast\Type\ArrayShapeUnsealedTypeNode($valueType, null),
+			$startLine,
+			$startIndex,
+		);
+	}
+
+	/**
+	 * @phpstan-impure
+	 */
+	private function parseObjectShape(TokenIterator $tokens): Ast\Type\ObjectShapeNode
+	{
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_OPEN_CURLY_BRACKET);
+
+		$items = [];
+
+		do {
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+			if ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_CLOSE_CURLY_BRACKET)) {
+				return new Ast\Type\ObjectShapeNode($items);
+			}
+
+			$items[] = $this-&gt;parseObjectShapeItem($tokens);
+
+			$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		} while ($tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_COMMA));
+
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_CLOSE_CURLY_BRACKET);
+
+		return new Ast\Type\ObjectShapeNode($items);
+	}
+
+	/** @phpstan-impure */
+	private function parseObjectShapeItem(TokenIterator $tokens): Ast\Type\ObjectShapeItemNode
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		$tokens-&gt;skipNewLineTokensAndConsumeComments();
+
+		$key = $this-&gt;parseObjectShapeKey($tokens);
+		$optional = $tokens-&gt;tryConsumeTokenType(Lexer::TOKEN_NULLABLE);
+		$tokens-&gt;consumeTokenType(Lexer::TOKEN_COLON);
+		$value = $this-&gt;parse($tokens);
+
+		return $this-&gt;enrichWithAttributes(
+			$tokens,
+			new Ast\Type\ObjectShapeItemNode($key, $optional, $value),
+			$startLine,
+			$startIndex,
+		);
+	}
+
+	/**
+	 * @phpstan-impure
+	 * @return Ast\ConstExpr\ConstExprStringNode|Ast\Type\IdentifierTypeNode
+	 */
+	private function parseObjectShapeKey(TokenIterator $tokens)
+	{
+		$startLine = $tokens-&gt;currentTokenLine();
+		$startIndex = $tokens-&gt;currentTokenIndex();
+
+		if ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_SINGLE_QUOTED_STRING)) {
+			$key = new Ast\ConstExpr\ConstExprStringNode(StringUnescaper::unescapeString($tokens-&gt;currentTokenValue()), Ast\ConstExpr\ConstExprStringNode::SINGLE_QUOTED);
+			$tokens-&gt;next();
+
+		} elseif ($tokens-&gt;isCurrentTokenType(Lexer::TOKEN_DOUBLE_QUOTED_STRING)) {
+			$key = new Ast\ConstExpr\ConstExprStringNode(StringUnescaper::unescapeString($tokens-&gt;currentTokenValue()), Ast\ConstExpr\ConstExprStringNode::DOUBLE_QUOTED);
+			$tokens-&gt;next();
+
+		} else {
+			$key = new Ast\Type\IdentifierTypeNode($tokens-&gt;currentTokenValue());
+			$tokens-&gt;consumeTokenType(Lexer::TOKEN_IDENTIFIER);
+		}
+
+		return $this-&gt;enrichWithAttributes($tokens, $key, $startLine, $startIndex);
+	}
+
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpstan/phpdoc-parser/src/ParserConfig.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpstan/phpdoc-parser/src/Printer -->
+
+</body>
+</html>

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/commonmark/src/Extension/CommonMark/Parser/Inline/CloseBracketParser.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the league/commonmark package.
+ *
+ * (c) Colin O&#039;Dell &lt;colinodell@gmail.com&gt;
+ *
+ * Original code based on the CommonMark JS reference parser (https://bitly.com/commonmark-js)
+ *  - (c) John MacFarlane
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace League\CommonMark\Extension\CommonMark\Parser\Inline;
+
+use League\CommonMark\Delimiter\Bracket;
+use League\CommonMark\Environment\EnvironmentAwareInterface;
+use League\CommonMark\Environment\EnvironmentInterface;
+use League\CommonMark\Extension\CommonMark\Node\Inline\AbstractWebResource;
+use League\CommonMark\Extension\CommonMark\Node\Inline\Image;
+use League\CommonMark\Extension\CommonMark\Node\Inline\Link;
+use League\CommonMark\Extension\Mention\Mention;
+use League\CommonMark\Node\Inline\AdjacentTextMerger;
+use League\CommonMark\Node\Inline\Text;
+use League\CommonMark\Parser\Cursor;
+use League\CommonMark\Parser\Inline\InlineParserInterface;
+use League\CommonMark\Parser\Inline\InlineParserMatch;
+use League\CommonMark\Parser\InlineParserContext;
+use League\CommonMark\Reference\ReferenceInterface;
+use League\CommonMark\Reference\ReferenceMapInterface;
+use League\CommonMark\Util\LinkParserHelper;
+use League\CommonMark\Util\RegexHelper;
+
+final class CloseBracketParser implements InlineParserInterface, EnvironmentAwareInterface
+{
+    /** @psalm-readonly-allow-private-mutation */
+    private EnvironmentInterface $environment;
+
+    public function getMatchDefinition(): InlineParserMatch
+    {
+        return InlineParserMatch::string(&#039;]&#039;);
+    }
+
+    public function parse(InlineParserContext $inlineContext): bool
+    {
+        // Look through stack of delimiters for a [ or !
+        $opener = $inlineContext-&gt;getDelimiterStack()-&gt;getLastBracket();
+        if ($opener === null) {
+            return false;
+        }
+
+        if (! $opener-&gt;isImage() &amp;&amp; ! $opener-&gt;isActive()) {
+            // no matched opener; remove from stack
+            $inlineContext-&gt;getDelimiterStack()-&gt;removeBracket();
+
+            return false;
+        }
+
+        $cursor = $inlineContext-&gt;getCursor();
+
+        $startPos      = $cursor-&gt;getPosition();
+        $previousState = $cursor-&gt;saveState();
+
+        $cursor-&gt;advanceBy(1);
+
+        // Check to see if we have a link/image
+
+        // Inline link?
+        if ($result = $this-&gt;tryParseInlineLinkAndTitle($cursor)) {
+            $link = $result;
+        } elseif ($link = $this-&gt;tryParseReference($cursor, $inlineContext-&gt;getReferenceMap(), $opener, $startPos)) {
+            $reference = $link;
+            $link      = [&#039;url&#039; =&gt; $link-&gt;getDestination(), &#039;title&#039; =&gt; $link-&gt;getTitle()];
+        } else {
+            // No match; remove this opener from stack
+            $inlineContext-&gt;getDelimiterStack()-&gt;removeBracket();
+            $cursor-&gt;restoreState($previousState);
+
+            return false;
+        }
+
+        $inline = $this-&gt;createInline($link[&#039;url&#039;], $link[&#039;title&#039;], $opener-&gt;isImage(), $reference ?? null);
+        $opener-&gt;getNode()-&gt;replaceWith($inline);
+        while (($label = $inline-&gt;next()) !== null) {
+            // Is there a Mention or Link contained within this link?
+            // CommonMark does not allow nested links, so we&#039;ll restore the original text.
+            if ($label instanceof Mention) {
+                $label-&gt;replaceWith($replacement = new Text($label-&gt;getPrefix() . $label-&gt;getIdentifier()));
+                $inline-&gt;appendChild($replacement);
+            } elseif ($label instanceof Link) {
+                foreach ($label-&gt;children() as $child) {
+                    $label-&gt;insertBefore($child);
+                }
+
+                $label-&gt;detach();
+            } else {
+                $inline-&gt;appendChild($label);
+            }
+        }
+
+        // Process delimiters such as emphasis inside link/image
+        $delimiterStack = $inlineContext-&gt;getDelimiterStack();
+        $stackBottom    = $opener-&gt;getPosition();
+        $delimiterStack-&gt;processDelimiters($stackBottom, $this-&gt;environment-&gt;getDelimiterProcessors());
+        $delimiterStack-&gt;removeBracket();
+        $delimiterStack-&gt;removeAll($stackBottom);
+
+        // Merge any adjacent Text nodes together
+        AdjacentTextMerger::mergeChildNodes($inline);
+
+        // processEmphasis will remove this and later delimiters.
+        // Now, for a link, we also remove earlier link openers (no links in links)
+        if (! $opener-&gt;isImage()) {
+            $inlineContext-&gt;getDelimiterStack()-&gt;deactivateLinkOpeners();
+        }
+
+        return true;
+    }
+
+    public function setEnvironment(EnvironmentInterface $environment): void
+    {
+        $this-&gt;environment = $environment;
+    }
+
+    /**
+     * @return array&lt;string, string&gt;|null
+     */
+    private function tryParseInlineLinkAndTitle(Cursor $cursor): ?array
+    {
+        if ($cursor-&gt;getCurrentCharacter() !== &#039;(&#039;) {
+            return null;
+        }
+
+        $previousState = $cursor-&gt;saveState();
+
+        $cursor-&gt;advanceBy(1);
+        $cursor-&gt;advanceToNextNonSpaceOrNewline();
+        if (($dest = LinkParserHelper::parseLinkDestination($cursor)) === null) {
+            $cursor-&gt;restoreState($previousState);
+
+            return null;
+        }
+
+        $cursor-&gt;advanceToNextNonSpaceOrNewline();
+        $previousCharacter = $cursor-&gt;peek(-1);
+        // We know from previous lines that we&#039;ve advanced at least one space so far, so this next call should never be null
+        \assert(\is_string($previousCharacter));
+
+        $title = &#039;&#039;;
+        // make sure there&#039;s a space before the title:
+        if (\preg_match(RegexHelper::REGEX_WHITESPACE_CHAR, $previousCharacter)) {
+            $title = LinkParserHelper::parseLinkTitle($cursor) ?? &#039;&#039;;
+        }
+
+        $cursor-&gt;advanceToNextNonSpaceOrNewline();
+
+        if ($cursor-&gt;getCurrentCharacter() !== &#039;)&#039;) {
+            $cursor-&gt;restoreState($previousState);
+
+            return null;
+        }
+
+        $cursor-&gt;advanceBy(1);
+
+        return [&#039;url&#039; =&gt; $dest, &#039;title&#039; =&gt; $title];
+    }
+
+    private function tryParseReference(Cursor $cursor, ReferenceMapInterface $referenceMap, Bracket $opener, int $startPos): ?ReferenceInterface
+    {
+        $savePos     = $cursor-&gt;saveState();
+        $beforeLabel = $cursor-&gt;getPosition();
+        $n           = LinkParserHelper::parseLinkLabel($cursor);
+        if ($n &gt; 2) {
+            $start  = $beforeLabel + 1;
+            $length = $n - 2;
+        } elseif (! $opener-&gt;hasNext()) {
+            // Empty or missing second label means to use the first label as the reference.
+            // The reference must not contain a bracket. If we know there&#039;s a bracket, we don&#039;t even bother checking it.
+            $start  = $opener-&gt;getPosition();
+            $length = $startPos - $start;
+        } else {
+            $cursor-&gt;restoreState($savePos);
+
+            return null;
+        }
+
+        $referenceLabel = $cursor-&gt;getSubstring($start, $length);
+
+        if ($n === 0) {
+            // If shortcut reference link, rewind before spaces we skipped
+            $cursor-&gt;restoreState($savePos);
+        }
+
+        return $referenceMap-&gt;get($referenceLabel);
+    }
+
+    private function createInline(string $url, string $title, bool $isImage, ?ReferenceInterface $reference = null): AbstractWebResource
+    {
+        if ($isImage) {
+            $inline = new Image($url, null, $title);
+        } else {
+            $inline = new Link($url, null, $title);
+        }
+
+        if ($reference) {
+            $inline-&gt;data-&gt;set(&#039;reference&#039;, $reference);
+        }
+
+        return $inline;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/commonmark/src/Extension/CommonMark/Parser/Inline/EntityParser.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/commonmark/src/Extension/CommonMark/Renderer -->
+
+</body>
+</html>

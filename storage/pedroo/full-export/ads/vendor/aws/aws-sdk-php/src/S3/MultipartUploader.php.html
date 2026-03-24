@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/MultipartUploader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\S3;
+
+use Aws\HashingStream;
+use Aws\Multipart\AbstractUploader;
+use Aws\PhpHash;
+use Aws\ResultInterface;
+use GuzzleHttp\Psr7;
+use Psr\Http\Message\StreamInterface as Stream;
+use Aws\S3\Exception\S3MultipartUploadException;
+
+/**
+ * Encapsulates the execution of a multipart upload to S3 or Glacier.
+ */
+class MultipartUploader extends AbstractUploader
+{
+    use MultipartUploadingTrait;
+
+    const PART_MIN_SIZE = 5242880;
+    const PART_MAX_SIZE = 5368709120;
+    const PART_MAX_NUM = 10000;
+
+    /**
+     * Creates a multipart upload for an S3 object.
+     *
+     * The valid configuration options are as follows:
+     *
+     * - acl: (string) ACL to set on the object being upload. Objects are
+     *   private by default.
+     * - before_complete: (callable) Callback to invoke before the
+     *   `CompleteMultipartUpload` operation. The callback should have a
+     *   function signature like `function (Aws\Command $command) {...}`.
+     * - before_initiate: (callable) Callback to invoke before the
+     *   `CreateMultipartUpload` operation. The callback should have a function
+     *   signature like `function (Aws\Command $command) {...}`.
+     * - before_upload: (callable) Callback to invoke before any `UploadPart`
+     *   operations. The callback should have a function signature like
+     *   `function (Aws\Command $command) {...}`.
+     * - bucket: (string, required) Name of the bucket to which the object is
+     *   being uploaded, or an S3 access point ARN.
+     * - concurrency: (int, default=int(5)) Maximum number of concurrent
+     *   `UploadPart` operations allowed during the multipart upload.
+     * - key: (string, required) Key to use for the object being uploaded.
+     * - params: (array) An array of key/value parameters that will be applied
+     *   to each of the sub-commands run by the uploader as a base.
+     *   Auto-calculated options will override these parameters. If you need
+     *   more granularity over parameters to each sub-command, use the before_*
+     *   options detailed above to update the commands directly.
+     * - part_size: (int, default=int(5242880)) Part size, in bytes, to use when
+     *   doing a multipart upload. This must between 5 MB and 5 GB, inclusive.
+     * - prepare_data_source: (callable) Callback to invoke before starting the
+     *   multipart upload workflow. The callback should have a function
+     *   signature like `function () {...}`.
+     * - state: (Aws\Multipart\UploadState) An object that represents the state
+     *   of the multipart upload and that is used to resume a previous upload.
+     *   When this option is provided, the `bucket`, `key`, and `part_size`
+     *   options are ignored.
+     * - track_upload: (boolean) Set true to track status in 1/8th increments
+     *   for upload.
+     *
+     * @param S3ClientInterface $client Client used for the upload.
+     * @param mixed             $source Source of the data to upload.
+     * @param array             $config Configuration used to perform the upload.
+     */
+    public function __construct(
+        S3ClientInterface $client,
+        $source,
+        array $config = []
+    ) {
+        parent::__construct($client, $source, array_change_key_case($config) + [
+            &#039;bucket&#039; =&gt; null,
+            &#039;key&#039;    =&gt; null,
+            &#039;exception_class&#039; =&gt; S3MultipartUploadException::class,
+        ]);
+
+        if ($this-&gt;displayProgress) {
+            $this-&gt;getState()-&gt;setProgressThresholds($this-&gt;source-&gt;getSize());
+        }
+    }
+
+    protected function loadUploadWorkflowInfo()
+    {
+        return [
+            &#039;command&#039; =&gt; [
+                &#039;initiate&#039; =&gt; &#039;CreateMultipartUpload&#039;,
+                &#039;upload&#039;   =&gt; &#039;UploadPart&#039;,
+                &#039;complete&#039; =&gt; &#039;CompleteMultipartUpload&#039;,
+            ],
+            &#039;id&#039; =&gt; [
+                &#039;bucket&#039;    =&gt; &#039;Bucket&#039;,
+                &#039;key&#039;       =&gt; &#039;Key&#039;,
+                &#039;upload_id&#039; =&gt; &#039;UploadId&#039;,
+            ],
+            &#039;part_num&#039; =&gt; &#039;PartNumber&#039;,
+        ];
+    }
+
+    protected function createPart($seekable, $number)
+    {
+        // Initialize the array of part data that will be returned.
+        $data = [];
+
+        // Apply custom params to UploadPart data
+        $config = $this-&gt;getConfig();
+        $params = isset($config[&#039;params&#039;]) ? $config[&#039;params&#039;] : [];
+        foreach ($params as $k =&gt; $v) {
+            $data[$k] = $v;
+        }
+
+        $data[&#039;PartNumber&#039;] = $number;
+
+        // Read from the source to create the body stream.
+        if ($seekable) {
+            // Case 1: Source is seekable, use lazy stream to defer work.
+            $body = $this-&gt;limitPartStream(
+                new Psr7\LazyOpenStream($this-&gt;source-&gt;getMetadata(&#039;uri&#039;), &#039;r&#039;)
+            );
+        } else {
+            // Case 2: Stream is not seekable; must store in temp stream.
+            $source = $this-&gt;limitPartStream($this-&gt;source);
+            $source = $this-&gt;decorateWithHashes($source, $data);
+            $body = Psr7\Utils::streamFor();
+            Psr7\Utils::copyToStream($source, $body);
+        }
+
+        $contentLength = $body-&gt;getSize();
+
+        // Do not create a part if the body size is zero.
+        if ($contentLength === 0) {
+            return false;
+        }
+
+        $body-&gt;seek(0);
+        $data[&#039;Body&#039;] = $body;
+
+        if (isset($config[&#039;add_content_md5&#039;])
+            &amp;&amp; $config[&#039;add_content_md5&#039;] === true
+        ) {
+            $data[&#039;AddContentMD5&#039;] = true;
+        }
+
+        $data[&#039;ContentLength&#039;] = $contentLength;
+
+        return $data;
+    }
+
+    protected function extractETag(ResultInterface $result)
+    {
+        return $result[&#039;ETag&#039;];
+    }
+
+    protected function getSourceMimeType()
+    {
+        if ($uri = $this-&gt;source-&gt;getMetadata(&#039;uri&#039;)) {
+            return Psr7\MimeType::fromFilename($uri)
+                ?: &#039;application/octet-stream&#039;;
+        }
+    }
+
+    protected function getSourceSize()
+    {
+        return $this-&gt;source-&gt;getSize();
+    }
+
+    /**
+     * Decorates a stream with a sha256 linear hashing stream.
+     *
+     * @param Stream $stream Stream to decorate.
+     * @param array  $data   Part data to augment with the hash result.
+     *
+     * @return Stream
+     */
+    private function decorateWithHashes(Stream $stream, array &amp;$data)
+    {
+        // Decorate source with a hashing stream
+        $hash = new PhpHash(&#039;sha256&#039;);
+        return new HashingStream($stream, $hash, function ($result) use (&amp;$data) {
+            $data[&#039;ContentSHA256&#039;] = bin2hex($result);
+        });
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/MultipartUploadingTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/Crypto -->
+
+</body>
+</html>

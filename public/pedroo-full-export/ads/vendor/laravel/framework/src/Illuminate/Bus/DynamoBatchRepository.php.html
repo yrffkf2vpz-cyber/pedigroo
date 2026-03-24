@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Bus/DynamoBatchRepository.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Bus;
+
+use Aws\DynamoDb\DynamoDbClient;
+use Aws\DynamoDb\Marshaler;
+use Carbon\CarbonImmutable;
+use Closure;
+use Illuminate\Support\Str;
+
+class DynamoBatchRepository implements BatchRepository
+{
+    /**
+     * The batch factory instance.
+     *
+     * @var \Illuminate\Bus\BatchFactory
+     */
+    protected $factory;
+
+    /**
+     * The database connection instance.
+     *
+     * @var \Aws\DynamoDb\DynamoDbClient
+     */
+    protected $dynamoDbClient;
+
+    /**
+     * The application name.
+     *
+     * @var string
+     */
+    protected $applicationName;
+
+    /**
+     * The table to use to store batch information.
+     *
+     * @var string
+     */
+    protected $table;
+
+    /**
+     * The time-to-live value for batch records.
+     *
+     * @var int
+     */
+    protected $ttl;
+
+    /**
+     * The name of the time-to-live attribute for batch records.
+     *
+     * @var string
+     */
+    protected $ttlAttribute;
+
+    /**
+     * The DynamoDB marshaler instance.
+     *
+     * @var \Aws\DynamoDb\Marshaler
+     */
+    protected $marshaler;
+
+    /**
+     * Create a new batch repository instance.
+     */
+    public function __construct(
+        BatchFactory $factory,
+        DynamoDbClient $dynamoDbClient,
+        string $applicationName,
+        string $table,
+        ?int $ttl,
+        ?string $ttlAttribute,
+    ) {
+        $this-&gt;factory = $factory;
+        $this-&gt;dynamoDbClient = $dynamoDbClient;
+        $this-&gt;applicationName = $applicationName;
+        $this-&gt;table = $table;
+        $this-&gt;ttl = $ttl;
+        $this-&gt;ttlAttribute = $ttlAttribute;
+        $this-&gt;marshaler = new Marshaler;
+    }
+
+    /**
+     * Retrieve a list of batches.
+     *
+     * @param  int  $limit
+     * @param  mixed  $before
+     * @return \Illuminate\Bus\Batch[]
+     */
+    public function get($limit = 50, $before = null)
+    {
+        $condition = &#039;application = :application&#039;;
+
+        if ($before) {
+            $condition = &#039;application = :application AND id &lt; :id&#039;;
+        }
+
+        $result = $this-&gt;dynamoDbClient-&gt;query([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;KeyConditionExpression&#039; =&gt; $condition,
+            &#039;ExpressionAttributeValues&#039; =&gt; array_filter([
+                &#039;:application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;:id&#039; =&gt; array_filter([&#039;S&#039; =&gt; $before]),
+            ]),
+            &#039;Limit&#039; =&gt; $limit,
+            &#039;ScanIndexForward&#039; =&gt; false,
+        ]);
+
+        return array_map(
+            fn ($b) =&gt; $this-&gt;toBatch($this-&gt;marshaler-&gt;unmarshalItem($b, mapAsObject: true)),
+            $result[&#039;Items&#039;]
+        );
+    }
+
+    /**
+     * Retrieve information about an existing batch.
+     *
+     * @param  string  $batchId
+     * @return \Illuminate\Bus\Batch|null
+     */
+    public function find(string $batchId)
+    {
+        if (trim($batchId) === &#039;&#039;) {
+            return null;
+        }
+
+        $b = $this-&gt;dynamoDbClient-&gt;getItem([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+            ],
+        ]);
+
+        if (! isset($b[&#039;Item&#039;])) {
+            // If we didn&#039;t find it via a standard read, attempt consistent read...
+            $b = $this-&gt;dynamoDbClient-&gt;getItem([
+                &#039;TableName&#039; =&gt; $this-&gt;table,
+                &#039;Key&#039; =&gt; [
+                    &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                    &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+                ],
+                &#039;ConsistentRead&#039; =&gt; true,
+            ]);
+
+            if (! isset($b[&#039;Item&#039;])) {
+                return null;
+            }
+        }
+
+        $batch = $this-&gt;marshaler-&gt;unmarshalItem($b[&#039;Item&#039;], mapAsObject: true);
+
+        if ($batch) {
+            return $this-&gt;toBatch($batch);
+        }
+    }
+
+    /**
+     * Store a new pending batch.
+     *
+     * @param  \Illuminate\Bus\PendingBatch  $batch
+     * @return \Illuminate\Bus\Batch
+     */
+    public function store(PendingBatch $batch)
+    {
+        $id = (string) Str::orderedUuid();
+
+        $batch = [
+            &#039;id&#039; =&gt; $id,
+            &#039;name&#039; =&gt; $batch-&gt;name,
+            &#039;total_jobs&#039; =&gt; 0,
+            &#039;pending_jobs&#039; =&gt; 0,
+            &#039;failed_jobs&#039; =&gt; 0,
+            &#039;failed_job_ids&#039; =&gt; [],
+            &#039;options&#039; =&gt; $this-&gt;serialize($batch-&gt;options ?? []),
+            &#039;created_at&#039; =&gt; time(),
+            &#039;cancelled_at&#039; =&gt; null,
+            &#039;finished_at&#039; =&gt; null,
+        ];
+
+        if (! is_null($this-&gt;ttl)) {
+            $batch[$this-&gt;ttlAttribute] = time() + $this-&gt;ttl;
+        }
+
+        $this-&gt;dynamoDbClient-&gt;putItem([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Item&#039; =&gt; $this-&gt;marshaler-&gt;marshalItem(
+                array_merge([&#039;application&#039; =&gt; $this-&gt;applicationName], $batch)
+            ),
+        ]);
+
+        return $this-&gt;find($id);
+    }
+
+    /**
+     * Increment the total number of jobs within the batch.
+     *
+     * @param  string  $batchId
+     * @param  int  $amount
+     * @return void
+     */
+    public function incrementTotalJobs(string $batchId, int $amount)
+    {
+        $update = &#039;SET total_jobs = total_jobs + :val, pending_jobs = pending_jobs + :val&#039;;
+
+        if ($this-&gt;ttl) {
+            $update = &quot;SET total_jobs = total_jobs + :val, pending_jobs = pending_jobs + :val, #{$this-&gt;ttlAttribute} = :ttl&quot;;
+        }
+
+        $this-&gt;dynamoDbClient-&gt;updateItem(array_filter([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+            ],
+            &#039;UpdateExpression&#039; =&gt; $update,
+            &#039;ExpressionAttributeValues&#039; =&gt; array_filter([
+                &#039;:val&#039; =&gt; [&#039;N&#039; =&gt; &quot;$amount&quot;],
+                &#039;:ttl&#039; =&gt; array_filter([&#039;N&#039; =&gt; $this-&gt;getExpiryTime()]),
+            ]),
+            &#039;ExpressionAttributeNames&#039; =&gt; $this-&gt;ttlExpressionAttributeName(),
+            &#039;ReturnValues&#039; =&gt; &#039;ALL_NEW&#039;,
+        ]));
+    }
+
+    /**
+     * Decrement the total number of pending jobs for the batch.
+     *
+     * @param  string  $batchId
+     * @param  string  $jobId
+     * @return \Illuminate\Bus\UpdatedBatchJobCounts
+     */
+    public function decrementPendingJobs(string $batchId, string $jobId)
+    {
+        $update = &#039;SET pending_jobs = pending_jobs - :inc&#039;;
+
+        if ($this-&gt;ttl !== null) {
+            $update = &quot;SET pending_jobs = pending_jobs - :inc, #{$this-&gt;ttlAttribute} = :ttl&quot;;
+        }
+
+        $batch = $this-&gt;dynamoDbClient-&gt;updateItem(array_filter([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+            ],
+            &#039;UpdateExpression&#039; =&gt; $update,
+            &#039;ExpressionAttributeValues&#039; =&gt; array_filter([
+                &#039;:inc&#039; =&gt; [&#039;N&#039; =&gt; &#039;1&#039;],
+                &#039;:ttl&#039; =&gt; array_filter([&#039;N&#039; =&gt; $this-&gt;getExpiryTime()]),
+            ]),
+            &#039;ExpressionAttributeNames&#039; =&gt; $this-&gt;ttlExpressionAttributeName(),
+            &#039;ReturnValues&#039; =&gt; &#039;ALL_NEW&#039;,
+        ]));
+
+        $values = $this-&gt;marshaler-&gt;unmarshalItem($batch[&#039;Attributes&#039;]);
+
+        return new UpdatedBatchJobCounts(
+            $values[&#039;pending_jobs&#039;],
+            $values[&#039;failed_jobs&#039;]
+        );
+    }
+
+    /**
+     * Increment the total number of failed jobs for the batch.
+     *
+     * @param  string  $batchId
+     * @param  string  $jobId
+     * @return \Illuminate\Bus\UpdatedBatchJobCounts
+     */
+    public function incrementFailedJobs(string $batchId, string $jobId)
+    {
+        $update = &#039;SET failed_jobs = failed_jobs + :inc, failed_job_ids = list_append(failed_job_ids, :jobId)&#039;;
+
+        if ($this-&gt;ttl !== null) {
+            $update = &quot;SET failed_jobs = failed_jobs + :inc, failed_job_ids = list_append(failed_job_ids, :jobId), #{$this-&gt;ttlAttribute} = :ttl&quot;;
+        }
+
+        $batch = $this-&gt;dynamoDbClient-&gt;updateItem(array_filter([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+            ],
+            &#039;UpdateExpression&#039; =&gt; $update,
+            &#039;ExpressionAttributeValues&#039; =&gt; array_filter([
+                &#039;:jobId&#039; =&gt; $this-&gt;marshaler-&gt;marshalValue([$jobId]),
+                &#039;:inc&#039; =&gt; [&#039;N&#039; =&gt; &#039;1&#039;],
+                &#039;:ttl&#039; =&gt; array_filter([&#039;N&#039; =&gt; $this-&gt;getExpiryTime()]),
+            ]),
+            &#039;ExpressionAttributeNames&#039; =&gt; $this-&gt;ttlExpressionAttributeName(),
+            &#039;ReturnValues&#039; =&gt; &#039;ALL_NEW&#039;,
+        ]));
+
+        $values = $this-&gt;marshaler-&gt;unmarshalItem($batch[&#039;Attributes&#039;]);
+
+        return new UpdatedBatchJobCounts(
+            $values[&#039;pending_jobs&#039;],
+            $values[&#039;failed_jobs&#039;]
+        );
+    }
+
+    /**
+     * Mark the batch that has the given ID as finished.
+     *
+     * @param  string  $batchId
+     * @return void
+     */
+    public function markAsFinished(string $batchId)
+    {
+        $update = &#039;SET finished_at = :timestamp&#039;;
+
+        if ($this-&gt;ttl !== null) {
+            $update = &quot;SET finished_at = :timestamp, #{$this-&gt;ttlAttribute} = :ttl&quot;;
+        }
+
+        $this-&gt;dynamoDbClient-&gt;updateItem(array_filter([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+            ],
+            &#039;UpdateExpression&#039; =&gt; $update,
+            &#039;ExpressionAttributeValues&#039; =&gt; array_filter([
+                &#039;:timestamp&#039; =&gt; [&#039;N&#039; =&gt; (string) time()],
+                &#039;:ttl&#039; =&gt; array_filter([&#039;N&#039; =&gt; $this-&gt;getExpiryTime()]),
+            ]),
+            &#039;ExpressionAttributeNames&#039; =&gt; $this-&gt;ttlExpressionAttributeName(),
+        ]));
+    }
+
+    /**
+     * Cancel the batch that has the given ID.
+     *
+     * @param  string  $batchId
+     * @return void
+     */
+    public function cancel(string $batchId)
+    {
+        $update = &#039;SET cancelled_at = :timestamp, finished_at = :timestamp&#039;;
+
+        if ($this-&gt;ttl !== null) {
+            $update = &quot;SET cancelled_at = :timestamp, finished_at = :timestamp, #{$this-&gt;ttlAttribute} = :ttl&quot;;
+        }
+
+        $this-&gt;dynamoDbClient-&gt;updateItem(array_filter([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+            ],
+            &#039;UpdateExpression&#039; =&gt; $update,
+            &#039;ExpressionAttributeValues&#039; =&gt; array_filter([
+                &#039;:timestamp&#039; =&gt; [&#039;N&#039; =&gt; (string) time()],
+                &#039;:ttl&#039; =&gt; array_filter([&#039;N&#039; =&gt; $this-&gt;getExpiryTime()]),
+            ]),
+            &#039;ExpressionAttributeNames&#039; =&gt; $this-&gt;ttlExpressionAttributeName(),
+        ]));
+    }
+
+    /**
+     * Delete the batch that has the given ID.
+     *
+     * @param  string  $batchId
+     * @return void
+     */
+    public function delete(string $batchId)
+    {
+        $this-&gt;dynamoDbClient-&gt;deleteItem([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;Key&#039; =&gt; [
+                &#039;application&#039; =&gt; [&#039;S&#039; =&gt; $this-&gt;applicationName],
+                &#039;id&#039; =&gt; [&#039;S&#039; =&gt; $batchId],
+            ],
+        ]);
+    }
+
+    /**
+     * Execute the given Closure within a storage specific transaction.
+     *
+     * @param  \Closure  $callback
+     * @return mixed
+     */
+    public function transaction(Closure $callback)
+    {
+        return $callback();
+    }
+
+    /**
+     * Rollback the last database transaction for the connection.
+     *
+     * @return void
+     */
+    public function rollBack()
+    {
+    }
+
+    /**
+     * Convert the given raw batch to a Batch object.
+     *
+     * @param  object  $batch
+     * @return \Illuminate\Bus\Batch
+     */
+    protected function toBatch($batch)
+    {
+        return $this-&gt;factory-&gt;make(
+            $this,
+            $batch-&gt;id,
+            $batch-&gt;name,
+            (int) $batch-&gt;total_jobs,
+            (int) $batch-&gt;pending_jobs,
+            (int) $batch-&gt;failed_jobs,
+            $batch-&gt;failed_job_ids,
+            $this-&gt;unserialize($batch-&gt;options) ?? [],
+            CarbonImmutable::createFromTimestamp($batch-&gt;created_at, date_default_timezone_get()),
+            $batch-&gt;cancelled_at ? CarbonImmutable::createFromTimestamp($batch-&gt;cancelled_at, date_default_timezone_get()) : $batch-&gt;cancelled_at,
+            $batch-&gt;finished_at ? CarbonImmutable::createFromTimestamp($batch-&gt;finished_at, date_default_timezone_get()) : $batch-&gt;finished_at
+        );
+    }
+
+    /**
+     * Create the underlying DynamoDB table.
+     *
+     * @return void
+     */
+    public function createAwsDynamoTable(): void
+    {
+        $definition = [
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+            &#039;AttributeDefinitions&#039; =&gt; [
+                [
+                    &#039;AttributeName&#039; =&gt; &#039;application&#039;,
+                    &#039;AttributeType&#039; =&gt; &#039;S&#039;,
+                ],
+                [
+                    &#039;AttributeName&#039; =&gt; &#039;id&#039;,
+                    &#039;AttributeType&#039; =&gt; &#039;S&#039;,
+                ],
+            ],
+            &#039;KeySchema&#039; =&gt; [
+                [
+                    &#039;AttributeName&#039; =&gt; &#039;application&#039;,
+                    &#039;KeyType&#039; =&gt; &#039;HASH&#039;,
+                ],
+                [
+                    &#039;AttributeName&#039; =&gt; &#039;id&#039;,
+                    &#039;KeyType&#039; =&gt; &#039;RANGE&#039;,
+                ],
+            ],
+            &#039;BillingMode&#039; =&gt; &#039;PAY_PER_REQUEST&#039;,
+        ];
+
+        $this-&gt;dynamoDbClient-&gt;createTable($definition);
+
+        if (! is_null($this-&gt;ttl)) {
+            $this-&gt;dynamoDbClient-&gt;updateTimeToLive([
+                &#039;TableName&#039; =&gt; $this-&gt;table,
+                &#039;TimeToLiveSpecification&#039; =&gt; [
+                    &#039;AttributeName&#039; =&gt; $this-&gt;ttlAttribute,
+                    &#039;Enabled&#039; =&gt; true,
+                ],
+            ]);
+        }
+    }
+
+    /**
+     * Delete the underlying DynamoDB table.
+     */
+    public function deleteAwsDynamoTable(): void
+    {
+        $this-&gt;dynamoDbClient-&gt;deleteTable([
+            &#039;TableName&#039; =&gt; $this-&gt;table,
+        ]);
+    }
+
+    /**
+     * Get the expiry time based on the configured time-to-live.
+     *
+     * @return string|null
+     */
+    protected function getExpiryTime(): ?string
+    {
+        return is_null($this-&gt;ttl) ? null : (string) (time() + $this-&gt;ttl);
+    }
+
+    /**
+     * Get the expression attribute name for the time-to-live attribute.
+     *
+     * @return array
+     */
+    protected function ttlExpressionAttributeName(): array
+    {
+        return is_null($this-&gt;ttl) ? [] : [&quot;#{$this-&gt;ttlAttribute}&quot; =&gt; $this-&gt;ttlAttribute];
+    }
+
+    /**
+     * Serialize the given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    protected function serialize($value)
+    {
+        return serialize($value);
+    }
+
+    /**
+     * Unserialize the given value.
+     *
+     * @param  string  $serialized
+     * @return mixed
+     */
+    protected function unserialize($serialized)
+    {
+        return unserialize($serialized);
+    }
+
+    /**
+     * Get the underlying DynamoDB client instance.
+     *
+     * @return \Aws\DynamoDb\DynamoDbClient
+     */
+    public function getDynamoClient(): DynamoDbClient
+    {
+        return $this-&gt;dynamoDbClient;
+    }
+
+    /**
+     * The name of the table that contains the batch records.
+     *
+     * @return string
+     */
+    public function getTable(): string
+    {
+        return $this-&gt;table;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Bus/Events/BatchDispatched.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Bus/Events -->
+
+</body>
+</html>

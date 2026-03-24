@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/psy/psysh/src/Command/DocCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\Command;
+
+use Psy\Configuration;
+use Psy\Formatter\DocblockFormatter;
+use Psy\Formatter\ManualFormatter;
+use Psy\Formatter\SignatureFormatter;
+use Psy\Input\CodeArgument;
+use Psy\ManualUpdater\ManualUpdate;
+use Psy\Output\ShellOutput;
+use Psy\Reflection\ReflectionConstant;
+use Psy\Reflection\ReflectionLanguageConstruct;
+use Symfony\Component\Console\Exception\RuntimeException;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Input\InputDefinition;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * Read the documentation for an object, class, constant, method or property.
+ */
+class DocCommand extends ReflectingCommand
+{
+    const INHERIT_DOC_TAG = &#039;{@inheritdoc}&#039;;
+
+    private ?Configuration $config = null;
+
+    /**
+     * Set the configuration instance.
+     *
+     * @param \Psy\Configuration $config
+     */
+    public function setConfiguration(Configuration $config)
+    {
+        $this-&gt;config = $config;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function configure(): void
+    {
+        $this
+            -&gt;setName(&#039;doc&#039;)
+            -&gt;setAliases([&#039;rtfm&#039;, &#039;man&#039;])
+            -&gt;setDefinition([
+                new InputOption(&#039;all&#039;, &#039;a&#039;, InputOption::VALUE_NONE, &#039;Show documentation for superclasses as well as the current class.&#039;),
+                new InputOption(&#039;update-manual&#039;, null, InputOption::VALUE_OPTIONAL, &#039;Download and install the latest PHP manual (optional language code)&#039;, false),
+                new CodeArgument(&#039;target&#039;, CodeArgument::OPTIONAL, &#039;Function, class, instance, constant, method or property to document.&#039;),
+            ])
+            -&gt;setDescription(&#039;Read the documentation for an object, class, constant, method or property.&#039;)
+            -&gt;setHelp(
+                &lt;&lt;&lt;HELP
+Read the documentation for an object, class, constant, method or property.
+
+It&#039;s awesome for well-documented code, not quite as awesome for poorly documented code.
+
+e.g.
+&lt;return&gt;&gt;&gt;&gt; doc preg_replace&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; doc Psy\Shell&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; doc Psy\Shell::debug&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; \$s = new Psy\Shell&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; doc \$s-&gt;run&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; doc --update-manual&lt;/return&gt;
+&lt;return&gt;&gt;&gt;&gt; doc --update-manual=fr&lt;/return&gt;
+HELP
+            );
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @return int 0 if everything went fine, or an exit code
+     */
+    protected function execute(InputInterface $input, OutputInterface $output): int
+    {
+        if ($input-&gt;getOption(&#039;update-manual&#039;) !== false) {
+            return $this-&gt;handleUpdateManual($input, $output);
+        }
+
+        $value = $input-&gt;getArgument(&#039;target&#039;);
+        if (!$value) {
+            throw new RuntimeException(&#039;Not enough arguments (missing: &quot;target&quot;).&#039;);
+        }
+
+        if (ReflectionLanguageConstruct::isLanguageConstruct($value)) {
+            $reflector = new ReflectionLanguageConstruct($value);
+            $doc = $this-&gt;getManualDocById($value);
+        } else {
+            list($target, $reflector) = $this-&gt;getTargetAndReflector($value, $output);
+            $doc = $this-&gt;getManualDoc($reflector) ?: DocblockFormatter::format($reflector);
+        }
+
+        $hasManual = $this-&gt;getShell()-&gt;getManual() !== null;
+
+        if ($output instanceof ShellOutput) {
+            $output-&gt;startPaging();
+        }
+
+        // Maybe include the declaring class
+        if ($reflector instanceof \ReflectionMethod || $reflector instanceof \ReflectionProperty) {
+            $output-&gt;writeln(SignatureFormatter::format($reflector-&gt;getDeclaringClass()));
+        }
+
+        $output-&gt;writeln(SignatureFormatter::format($reflector));
+        $output-&gt;writeln(&#039;&#039;);
+
+        if (empty($doc) &amp;&amp; !$hasManual) {
+            $output-&gt;writeln(&#039;&lt;warning&gt;PHP manual not found&lt;/warning&gt;&#039;);
+            $output-&gt;writeln(&#039;    To document core PHP functionality, download the PHP reference manual:&#039;);
+            $output-&gt;writeln(&#039;    https://github.com/bobthecow/psysh/wiki/PHP-manual&#039;);
+        } else {
+            $output-&gt;writeln($doc);
+        }
+
+        // Implicit --all if the original docblock has an {@inheritdoc} tag.
+        if ($input-&gt;getOption(&#039;all&#039;) || ($doc &amp;&amp; \stripos($doc, self::INHERIT_DOC_TAG) !== false)) {
+            $parent = $reflector;
+            foreach ($this-&gt;getParentReflectors($reflector) as $parent) {
+                $output-&gt;writeln(&#039;&#039;);
+                $output-&gt;writeln(&#039;---&#039;);
+                $output-&gt;writeln(&#039;&#039;);
+
+                // Maybe include the declaring class
+                if ($parent instanceof \ReflectionMethod || $parent instanceof \ReflectionProperty) {
+                    $output-&gt;writeln(SignatureFormatter::format($parent-&gt;getDeclaringClass()));
+                }
+
+                $output-&gt;writeln(SignatureFormatter::format($parent));
+                $output-&gt;writeln(&#039;&#039;);
+
+                if ($doc = $this-&gt;getManualDoc($parent) ?: DocblockFormatter::format($parent)) {
+                    $output-&gt;writeln($doc);
+                }
+            }
+        }
+
+        if ($output instanceof ShellOutput) {
+            $output-&gt;stopPaging();
+        }
+
+        // Set some magic local variables
+        $this-&gt;setCommandScopeVariables($reflector);
+
+        return 0;
+    }
+
+    /**
+     * Handle the manual update operation.
+     *
+     * @param InputInterface  $input
+     * @param OutputInterface $output
+     *
+     * @return int 0 if everything went fine, or an exit code
+     */
+    private function handleUpdateManual(InputInterface $input, OutputInterface $output): int
+    {
+        if (!$this-&gt;config) {
+            $output-&gt;writeln(&#039;&lt;error&gt;Configuration not available for manual updates.&lt;/error&gt;&#039;);
+
+            return 1;
+        }
+
+        // Create a synthetic input with the update-manual option
+        $definition = new InputDefinition([
+            new InputOption(&#039;update-manual&#039;, null, InputOption::VALUE_OPTIONAL, &#039;&#039;, false),
+        ]);
+
+        // Get the language value: if true (no value), use null to preserve current language
+        $lang = $input-&gt;getOption(&#039;update-manual&#039;);
+        $updateValue = ($lang === true) ? null : $lang;
+
+        $updateInput = new ArrayInput([&#039;--update-manual&#039; =&gt; $updateValue], $definition);
+        $updateInput-&gt;setInteractive($input-&gt;isInteractive());
+
+        try {
+            $manualUpdate = ManualUpdate::fromConfig($this-&gt;config, $updateInput, $output);
+            $result = $manualUpdate-&gt;run($updateInput, $output);
+
+            if ($result === 0) {
+                $output-&gt;writeln(&#039;&#039;);
+                $output-&gt;writeln(&#039;Restart PsySH to use the updated manual.&#039;);
+            }
+
+            return $result;
+        } catch (\RuntimeException $e) {
+            $output-&gt;writeln(\sprintf(&#039;&lt;error&gt;%s&lt;/error&gt;&#039;, $e-&gt;getMessage()));
+
+            return 1;
+        }
+    }
+
+    private function getManualDoc($reflector)
+    {
+        switch (\get_class($reflector)) {
+            case \ReflectionClass::class:
+            case \ReflectionObject::class:
+            case \ReflectionFunction::class:
+                $id = $reflector-&gt;name;
+                break;
+
+            case \ReflectionMethod::class:
+                $id = $reflector-&gt;class.&#039;::&#039;.$reflector-&gt;name;
+                break;
+
+            case \ReflectionProperty::class:
+                $id = $reflector-&gt;class.&#039;::$&#039;.$reflector-&gt;name;
+                break;
+
+            case \ReflectionClassConstant::class:
+                // @todo this is going to collide with ReflectionMethod ids
+                // someday... start running the query by id + type if the DB
+                // supports it.
+                $id = $reflector-&gt;class.&#039;::&#039;.$reflector-&gt;name;
+                break;
+
+            case ReflectionConstant::class:
+                $id = $reflector-&gt;name;
+                break;
+
+            default:
+                return false;
+        }
+
+        return $this-&gt;getManualDocById($id);
+    }
+
+    /**
+     * Get all all parent Reflectors for a given Reflector.
+     *
+     * For example, passing a Class, Object or TraitReflector will yield all
+     * traits and parent classes. Passing a Method or PropertyReflector will
+     * yield Reflectors for the same-named method or property on all traits and
+     * parent classes.
+     *
+     * @return \Generator a whole bunch of \Reflector instances
+     */
+    private function getParentReflectors($reflector): \Generator
+    {
+        $seenClasses = [];
+
+        switch (\get_class($reflector)) {
+            case \ReflectionClass::class:
+            case \ReflectionObject::class:
+                foreach ($reflector-&gt;getTraits() as $trait) {
+                    if (!\in_array($trait-&gt;getName(), $seenClasses)) {
+                        $seenClasses[] = $trait-&gt;getName();
+                        yield $trait;
+                    }
+                }
+
+                foreach ($reflector-&gt;getInterfaces() as $interface) {
+                    if (!\in_array($interface-&gt;getName(), $seenClasses)) {
+                        $seenClasses[] = $interface-&gt;getName();
+                        yield $interface;
+                    }
+                }
+
+                while ($reflector = $reflector-&gt;getParentClass()) {
+                    yield $reflector;
+
+                    foreach ($reflector-&gt;getTraits() as $trait) {
+                        if (!\in_array($trait-&gt;getName(), $seenClasses)) {
+                            $seenClasses[] = $trait-&gt;getName();
+                            yield $trait;
+                        }
+                    }
+
+                    foreach ($reflector-&gt;getInterfaces() as $interface) {
+                        if (!\in_array($interface-&gt;getName(), $seenClasses)) {
+                            $seenClasses[] = $interface-&gt;getName();
+                            yield $interface;
+                        }
+                    }
+                }
+
+                return;
+
+            case \ReflectionMethod::class:
+                foreach ($this-&gt;getParentReflectors($reflector-&gt;getDeclaringClass()) as $parent) {
+                    if ($parent-&gt;hasMethod($reflector-&gt;getName())) {
+                        $parentMethod = $parent-&gt;getMethod($reflector-&gt;getName());
+                        if (!\in_array($parentMethod-&gt;getDeclaringClass()-&gt;getName(), $seenClasses)) {
+                            $seenClasses[] = $parentMethod-&gt;getDeclaringClass()-&gt;getName();
+                            yield $parentMethod;
+                        }
+                    }
+                }
+
+                return;
+
+            case \ReflectionProperty::class:
+                foreach ($this-&gt;getParentReflectors($reflector-&gt;getDeclaringClass()) as $parent) {
+                    if ($parent-&gt;hasProperty($reflector-&gt;getName())) {
+                        $parentProperty = $parent-&gt;getProperty($reflector-&gt;getName());
+                        if (!\in_array($parentProperty-&gt;getDeclaringClass()-&gt;getName(), $seenClasses)) {
+                            $seenClasses[] = $parentProperty-&gt;getDeclaringClass()-&gt;getName();
+                            yield $parentProperty;
+                        }
+                    }
+                }
+                break;
+        }
+    }
+
+    private function getManualDocById($id)
+    {
+        if ($manual = $this-&gt;getShell()-&gt;getManual()) {
+            switch ($manual-&gt;getVersion()) {
+                case 2:
+                    // v2 manual docs are pre-formatted and should be rendered as-is
+                    return $manual-&gt;get($id);
+
+                case 3:
+                    if ($doc = $manual-&gt;get($id)) {
+                        $width = $this-&gt;getTerminalWidth();
+                        $formatter = new ManualFormatter($width, $manual);
+
+                        return $formatter-&gt;format($doc);
+                    }
+                    break;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Get the current terminal width for text wrapping.
+     *
+     * @return int Terminal width in columns
+     */
+    private function getTerminalWidth(): int
+    {
+        // Query terminal size directly
+        if (\function_exists(&#039;shell_exec&#039;)) {
+            // Output format: &quot;rows cols&quot;
+            $output = @\shell_exec(&#039;stty size &lt;/dev/tty 2&gt;/dev/null&#039;);
+            if ($output &amp;&amp; \preg_match(&#039;/^\d+ (\d+)$/&#039;, \trim($output), $matches)) {
+                return (int) $matches[1];
+            }
+
+            $width = @\shell_exec(&#039;tput cols &lt;/dev/tty 2&gt;/dev/null&#039;);
+            if ($width &amp;&amp; \is_numeric(\trim($width))) {
+                return (int) \trim($width);
+            }
+        }
+
+        // Check COLUMNS environment variable (may be stale after resize)
+        $width = \getenv(&#039;COLUMNS&#039;);
+        if ($width &amp;&amp; \is_numeric(\trim($width))) {
+            return (int) \trim($width);
+        }
+
+        // Fallback to 100 if we can&#039;t detect
+        return 100;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/psy/psysh/src/Command/DumpCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/psy/psysh/src/Command/ListCommand -->
+
+</body>
+</html>

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/EventSourceHttpClient.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient;
+
+use Symfony\Component\HttpClient\Chunk\DataChunk;
+use Symfony\Component\HttpClient\Chunk\ServerSentEvent;
+use Symfony\Component\HttpClient\Exception\EventSourceException;
+use Symfony\Component\HttpClient\Response\AsyncContext;
+use Symfony\Component\HttpClient\Response\AsyncResponse;
+use Symfony\Contracts\HttpClient\ChunkInterface;
+use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+use Symfony\Contracts\Service\ResetInterface;
+
+/**
+ * @author Antoine Bluchet &lt;soyuka@gmail.com&gt;
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ */
+final class EventSourceHttpClient implements HttpClientInterface, ResetInterface
+{
+    use AsyncDecoratorTrait, HttpClientTrait {
+        AsyncDecoratorTrait::withOptions insteadof HttpClientTrait;
+    }
+
+    public function __construct(
+        ?HttpClientInterface $client = null,
+        private float $reconnectionTime = 10.0,
+    ) {
+        $this-&gt;client = $client ?? HttpClient::create();
+    }
+
+    public function connect(string $url, array $options = [], string $method = &#039;GET&#039;): ResponseInterface
+    {
+        return $this-&gt;request($method, $url, self::mergeDefaultOptions($options, [
+            &#039;buffer&#039; =&gt; false,
+            &#039;headers&#039; =&gt; [
+                &#039;Accept&#039; =&gt; &#039;text/event-stream&#039;,
+                &#039;Cache-Control&#039; =&gt; &#039;no-cache&#039;,
+            ],
+        ], true));
+    }
+
+    public function request(string $method, string $url, array $options = []): ResponseInterface
+    {
+        $state = new class {
+            public ?string $buffer = null;
+            public ?string $lastEventId = null;
+            public float $reconnectionTime;
+            public ?float $lastError = null;
+        };
+        $state-&gt;reconnectionTime = $this-&gt;reconnectionTime;
+
+        if ($accept = self::normalizeHeaders($options[&#039;headers&#039;] ?? [])[&#039;accept&#039;] ?? []) {
+            $state-&gt;buffer = \in_array($accept, [[&#039;Accept: text/event-stream&#039;], [&#039;accept: text/event-stream&#039;]], true) ? &#039;&#039; : null;
+
+            if (null !== $state-&gt;buffer) {
+                $options[&#039;extra&#039;][&#039;trace_content&#039;] = false;
+            }
+        }
+
+        return new AsyncResponse($this-&gt;client, $method, $url, $options, static function (ChunkInterface $chunk, AsyncContext $context) use ($state, $method, $url, $options) {
+            if (null !== $state-&gt;buffer) {
+                $context-&gt;setInfo(&#039;reconnection_time&#039;, $state-&gt;reconnectionTime);
+                $isTimeout = false;
+            }
+            $lastError = $state-&gt;lastError;
+            $state-&gt;lastError = null;
+
+            try {
+                $isTimeout = $chunk-&gt;isTimeout();
+
+                if (null !== $chunk-&gt;getInformationalStatus() || $context-&gt;getInfo(&#039;canceled&#039;)) {
+                    yield $chunk;
+
+                    return;
+                }
+            } catch (TransportExceptionInterface) {
+                $state-&gt;lastError = $lastError ?? hrtime(true) / 1E9;
+
+                if (null === $state-&gt;buffer || ($isTimeout &amp;&amp; hrtime(true) / 1E9 - $state-&gt;lastError &lt; $state-&gt;reconnectionTime)) {
+                    yield $chunk;
+                } else {
+                    $options[&#039;headers&#039;][&#039;Last-Event-ID&#039;] = $state-&gt;lastEventId;
+                    $state-&gt;buffer = &#039;&#039;;
+                    $state-&gt;lastError = hrtime(true) / 1E9;
+                    $context-&gt;getResponse()-&gt;cancel();
+                    $context-&gt;replaceRequest($method, $url, $options);
+                    if ($isTimeout) {
+                        yield $chunk;
+                    } else {
+                        $context-&gt;pause($state-&gt;reconnectionTime);
+                    }
+                }
+
+                return;
+            }
+
+            if ($chunk-&gt;isFirst()) {
+                if (preg_match(&#039;/^text\/event-stream(;|$)/i&#039;, $context-&gt;getHeaders()[&#039;content-type&#039;][0] ?? &#039;&#039;)) {
+                    $state-&gt;buffer = &#039;&#039;;
+                } elseif (null !== $lastError || (null !== $state-&gt;buffer &amp;&amp; 200 === $context-&gt;getStatusCode())) {
+                    throw new EventSourceException(\sprintf(&#039;Response content-type is &quot;%s&quot; while &quot;text/event-stream&quot; was expected for &quot;%s&quot;.&#039;, $context-&gt;getHeaders()[&#039;content-type&#039;][0] ?? &#039;&#039;, $context-&gt;getInfo(&#039;url&#039;)));
+                } else {
+                    $context-&gt;passthru();
+                }
+
+                if (null === $lastError) {
+                    yield $chunk;
+                }
+
+                return;
+            }
+
+            if ($chunk-&gt;isLast()) {
+                if (&#039;&#039; !== $content = $state-&gt;buffer) {
+                    $state-&gt;buffer = &#039;&#039;;
+                    yield new DataChunk(-1, $content);
+                }
+
+                yield $chunk;
+
+                return;
+            }
+
+            $content = $state-&gt;buffer.$chunk-&gt;getContent();
+            $events = preg_split(&#039;/((?:\r\n){2,}|\r{2,}|\n{2,})/&#039;, $content, -1, \PREG_SPLIT_DELIM_CAPTURE);
+            $state-&gt;buffer = array_pop($events);
+
+            for ($i = 0; isset($events[$i]); $i += 2) {
+                $content = $events[$i].$events[1 + $i];
+                if (!preg_match(&#039;/(?:^|\r\n|[\r\n])[^:\r\n]/&#039;, $content)) {
+                    yield new DataChunk(-1, $content);
+
+                    continue;
+                }
+
+                $event = new ServerSentEvent($content);
+
+                if (&#039;&#039; !== $event-&gt;getId()) {
+                    $context-&gt;setInfo(&#039;last_event_id&#039;, $state-&gt;lastEventId = $event-&gt;getId());
+                }
+
+                if ($event-&gt;getRetry()) {
+                    $context-&gt;setInfo(&#039;reconnection_time&#039;, $state-&gt;reconnectionTime = $event-&gt;getRetry());
+                }
+
+                yield $event;
+            }
+        });
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Exception/ChunkCacheItemNotFoundException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Caching -->
+
+</body>
+</html>

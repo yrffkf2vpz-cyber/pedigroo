@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/oauth1-client/src/Server/Server.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace League\OAuth1\Client\Server;
+
+use GuzzleHttp\Client as GuzzleHttpClient;
+use GuzzleHttp\Exception\BadResponseException;
+use League\OAuth1\Client\Credentials\ClientCredentials;
+use League\OAuth1\Client\Credentials\ClientCredentialsInterface;
+use League\OAuth1\Client\Credentials\CredentialsException;
+use League\OAuth1\Client\Credentials\CredentialsInterface;
+use League\OAuth1\Client\Credentials\RsaClientCredentials;
+use League\OAuth1\Client\Credentials\TemporaryCredentials;
+use League\OAuth1\Client\Credentials\TokenCredentials;
+use League\OAuth1\Client\Signature\HmacSha1Signature;
+use League\OAuth1\Client\Signature\RsaSha1Signature;
+use League\OAuth1\Client\Signature\SignatureInterface;
+use SimpleXMLElement;
+use Throwable;
+
+abstract class Server
+{
+    /**
+     * Client credentials.
+     *
+     * @var ClientCredentialsInterface
+     */
+    protected $clientCredentials;
+
+    /**
+     * Signature.
+     *
+     * @var SignatureInterface
+     */
+    protected $signature;
+
+    /**
+     * The response type for data returned from API calls.
+     *
+     * @var string
+     */
+    protected $responseType = &#039;json&#039;;
+
+    /**
+     * Cached user details response.
+     *
+     * @var array|SimpleXMLElement
+     */
+    protected $cachedUserDetailsResponse;
+
+    /**
+     * Optional user agent.
+     *
+     * @var string
+     */
+    protected $userAgent;
+
+    /**
+     * Create a new server instance.
+     *
+     * @param ClientCredentialsInterface|array $clientCredentials
+     * @param SignatureInterface               $signature
+     */
+    public function __construct($clientCredentials, ?SignatureInterface $signature = null)
+    {
+        // Pass through an array or client credentials, we don&#039;t care
+        if (is_array($clientCredentials)) {
+            $clientCredentials = $this-&gt;createClientCredentials($clientCredentials);
+        } elseif ( ! $clientCredentials instanceof ClientCredentialsInterface) {
+            throw new \InvalidArgumentException(&#039;Client credentials must be an array or valid object.&#039;);
+        }
+
+        $this-&gt;clientCredentials = $clientCredentials;
+
+        if ( ! $signature &amp;&amp; $clientCredentials instanceof RsaClientCredentials) {
+            $signature = new RsaSha1Signature($clientCredentials);
+        }
+        $this-&gt;signature = $signature ?: new HmacSha1Signature($clientCredentials);
+    }
+
+    /**
+     * Gets temporary credentials by performing a request to
+     * the server.
+     *
+     * @return TemporaryCredentials
+     *
+     * @throws CredentialsException
+     */
+    public function getTemporaryCredentials()
+    {
+        $uri = $this-&gt;urlTemporaryCredentials();
+
+        $client = $this-&gt;createHttpClient();
+
+        $header = $this-&gt;temporaryCredentialsProtocolHeader($uri);
+        $authorizationHeader = [&#039;Authorization&#039; =&gt; $header];
+        $headers = $this-&gt;buildHttpClientHeaders($authorizationHeader);
+
+        try {
+            $response = $client-&gt;post($uri, [
+                &#039;headers&#039; =&gt; $headers,
+            ]);
+
+            return $this-&gt;createTemporaryCredentials((string) $response-&gt;getBody());
+        } catch (BadResponseException $e) {
+            $this-&gt;handleTemporaryCredentialsBadResponse($e);
+        }
+
+        throw new CredentialsException(&#039;Failed to get temporary credentials&#039;);
+    }
+
+    /**
+     * Get the authorization URL by passing in the temporary credentials
+     * identifier or an object instance.
+     *
+     * @param TemporaryCredentials|string $temporaryIdentifier
+     * @param array                       $options
+     *
+     * @return string
+     */
+    public function getAuthorizationUrl($temporaryIdentifier, array $options = [])
+    {
+        // Somebody can pass through an instance of temporary
+        // credentials and we&#039;ll extract the identifier from there.
+        if ($temporaryIdentifier instanceof TemporaryCredentials) {
+            $temporaryIdentifier = $temporaryIdentifier-&gt;getIdentifier();
+        }
+
+        $parameters = array_merge($options, [&#039;oauth_token&#039; =&gt; $temporaryIdentifier]);
+
+        $url = $this-&gt;urlAuthorization();
+        $queryString = http_build_query($parameters);
+
+        return $this-&gt;buildUrl($url, $queryString);
+    }
+
+    /**
+     * Redirect the client to the authorization URL.
+     *
+     * @param TemporaryCredentials|string $temporaryIdentifier
+     *
+     * @return void
+     */
+    public function authorize($temporaryIdentifier)
+    {
+        $url = $this-&gt;getAuthorizationUrl($temporaryIdentifier);
+
+        header(&#039;Location: &#039; . $url);
+    }
+
+    /**
+     * Retrieves token credentials by passing in the temporary credentials,
+     * the temporary credentials identifier as passed back by the server
+     * and finally the verifier code.
+     *
+     * @param TemporaryCredentials $temporaryCredentials
+     * @param string               $temporaryIdentifier
+     * @param string               $verifier
+     *
+     * @return TokenCredentials
+     *
+     * @throws CredentialsException
+     */
+    public function getTokenCredentials(TemporaryCredentials $temporaryCredentials, $temporaryIdentifier, $verifier)
+    {
+        if ($temporaryIdentifier !== $temporaryCredentials-&gt;getIdentifier()) {
+            throw new \InvalidArgumentException(
+                &#039;Temporary identifier passed back by server does not match that of stored temporary credentials.
+                Potential man-in-the-middle.&#039;
+            );
+        }
+
+        $uri = $this-&gt;urlTokenCredentials();
+        $bodyParameters = [&#039;oauth_verifier&#039; =&gt; $verifier];
+
+        $client = $this-&gt;createHttpClient();
+
+        $headers = $this-&gt;getHeaders($temporaryCredentials, &#039;POST&#039;, $uri, $bodyParameters);
+
+        try {
+            $response = $client-&gt;post($uri, [
+                &#039;headers&#039; =&gt; $headers,
+                &#039;form_params&#039; =&gt; $bodyParameters,
+            ]);
+
+            return $this-&gt;createTokenCredentials((string) $response-&gt;getBody());
+        } catch (BadResponseException $e) {
+            $this-&gt;handleTokenCredentialsBadResponse($e);
+        }
+
+        throw new CredentialsException(&#039;Failed to get token credentials.&#039;);
+    }
+
+    /**
+     * Get user details by providing valid token credentials.
+     *
+     * @param TokenCredentials $tokenCredentials
+     * @param bool             $force
+     *
+     * @return \League\OAuth1\Client\Server\User
+     */
+    public function getUserDetails(TokenCredentials $tokenCredentials, $force = false)
+    {
+        $data = $this-&gt;fetchUserDetails($tokenCredentials, $force);
+
+        return $this-&gt;userDetails($data, $tokenCredentials);
+    }
+
+    /**
+     * Get the user&#039;s unique identifier (primary key).
+     *
+     * @param TokenCredentials $tokenCredentials
+     * @param bool             $force
+     *
+     * @return string|int
+     */
+    public function getUserUid(TokenCredentials $tokenCredentials, $force = false)
+    {
+        $data = $this-&gt;fetchUserDetails($tokenCredentials, $force);
+
+        return $this-&gt;userUid($data, $tokenCredentials);
+    }
+
+    /**
+     * Get the user&#039;s email, if available.
+     *
+     * @param TokenCredentials $tokenCredentials
+     * @param bool             $force
+     *
+     * @return string|null
+     */
+    public function getUserEmail(TokenCredentials $tokenCredentials, $force = false)
+    {
+        $data = $this-&gt;fetchUserDetails($tokenCredentials, $force);
+
+        return $this-&gt;userEmail($data, $tokenCredentials);
+    }
+
+    /**
+     * Get the user&#039;s screen name (username), if available.
+     *
+     * @param TokenCredentials $tokenCredentials
+     * @param bool             $force
+     *
+     * @return string
+     */
+    public function getUserScreenName(TokenCredentials $tokenCredentials, $force = false)
+    {
+        $data = $this-&gt;fetchUserDetails($tokenCredentials, $force);
+
+        return $this-&gt;userScreenName($data, $tokenCredentials);
+    }
+
+    /**
+     * Fetch user details from the remote service.
+     *
+     * @param TokenCredentials $tokenCredentials
+     * @param bool             $force
+     *
+     * @return array HTTP client response
+     */
+    protected function fetchUserDetails(TokenCredentials $tokenCredentials, $force = true)
+    {
+        if ( ! $this-&gt;cachedUserDetailsResponse || $force) {
+            $url = $this-&gt;urlUserDetails();
+
+            $client = $this-&gt;createHttpClient();
+
+            $headers = $this-&gt;getHeaders($tokenCredentials, &#039;GET&#039;, $url);
+
+            try {
+                $response = $client-&gt;get($url, [
+                    &#039;headers&#039; =&gt; $headers,
+                ]);
+            } catch (BadResponseException $e) {
+                $response = $e-&gt;getResponse();
+                $body = $response-&gt;getBody();
+                $statusCode = $response-&gt;getStatusCode();
+
+                throw new \Exception(
+                    &quot;Received error [$body] with status code [$statusCode] when retrieving token credentials.&quot;
+                );
+            }
+            switch ($this-&gt;responseType) {
+                case &#039;json&#039;:
+                    $this-&gt;cachedUserDetailsResponse = json_decode((string) $response-&gt;getBody(), true);
+
+                    break;
+
+                case &#039;xml&#039;:
+                    $this-&gt;cachedUserDetailsResponse = simplexml_load_string((string) $response-&gt;getBody());
+
+                    break;
+
+                case &#039;string&#039;:
+                    parse_str((string) $response-&gt;getBody(), $this-&gt;cachedUserDetailsResponse);
+
+                    break;
+
+                default:
+                    throw new \InvalidArgumentException(&quot;Invalid response type [{$this-&gt;responseType}].&quot;);
+            }
+        }
+
+        return $this-&gt;cachedUserDetailsResponse;
+    }
+
+    /**
+     * Get the client credentials associated with the server.
+     *
+     * @return ClientCredentialsInterface
+     */
+    public function getClientCredentials()
+    {
+        return $this-&gt;clientCredentials;
+    }
+
+    /**
+     * Get the signature associated with the server.
+     *
+     * @return SignatureInterface
+     */
+    public function getSignature()
+    {
+        return $this-&gt;signature;
+    }
+
+    /**
+     * Creates a Guzzle HTTP client for the given URL.
+     *
+     * @return GuzzleHttpClient
+     */
+    public function createHttpClient()
+    {
+        return new GuzzleHttpClient();
+    }
+
+    /**
+     * Set the user agent value.
+     *
+     * @param string $userAgent
+     *
+     * @return Server
+     */
+    public function setUserAgent($userAgent = null)
+    {
+        $this-&gt;userAgent = $userAgent;
+
+        return $this;
+    }
+
+    /**
+     * Get all headers required to created an authenticated request.
+     *
+     * @param CredentialsInterface $credentials
+     * @param string               $method
+     * @param string               $url
+     * @param array                $bodyParameters
+     *
+     * @return array
+     */
+    public function getHeaders(CredentialsInterface $credentials, $method, $url, array $bodyParameters = [])
+    {
+        $header = $this-&gt;protocolHeader(strtoupper($method), $url, $credentials, $bodyParameters);
+        $authorizationHeader = [&#039;Authorization&#039; =&gt; $header];
+        $headers = $this-&gt;buildHttpClientHeaders($authorizationHeader);
+
+        return $headers;
+    }
+
+    /**
+     * Get Guzzle HTTP client default headers.
+     *
+     * @return array
+     */
+    protected function getHttpClientDefaultHeaders()
+    {
+        $defaultHeaders = [];
+        if ( ! empty($this-&gt;userAgent)) {
+            $defaultHeaders[&#039;User-Agent&#039;] = $this-&gt;userAgent;
+        }
+
+        return $defaultHeaders;
+    }
+
+    /**
+     * Build Guzzle HTTP client headers.
+     *
+     * @param array $headers
+     *
+     * @return array
+     */
+    protected function buildHttpClientHeaders($headers = [])
+    {
+        $defaultHeaders = $this-&gt;getHttpClientDefaultHeaders();
+
+        return array_merge($headers, $defaultHeaders);
+    }
+
+    /**
+     * Creates a client credentials instance from an array of credentials.
+     *
+     * @param array $clientCredentials
+     *
+     * @return ClientCredentials
+     */
+    protected function createClientCredentials(array $clientCredentials)
+    {
+        $keys = [&#039;identifier&#039;, &#039;secret&#039;];
+
+        foreach ($keys as $key) {
+            if ( ! isset($clientCredentials[$key])) {
+                throw new \InvalidArgumentException(&quot;Missing client credentials key [$key] from options.&quot;);
+            }
+        }
+
+        if (isset($clientCredentials[&#039;rsa_private_key&#039;]) &amp;&amp; isset($clientCredentials[&#039;rsa_public_key&#039;])) {
+            $_clientCredentials = new RsaClientCredentials();
+            $_clientCredentials-&gt;setRsaPrivateKey($clientCredentials[&#039;rsa_private_key&#039;]);
+            $_clientCredentials-&gt;setRsaPublicKey($clientCredentials[&#039;rsa_public_key&#039;]);
+        } else {
+            $_clientCredentials = new ClientCredentials();
+        }
+
+        $_clientCredentials-&gt;setIdentifier($clientCredentials[&#039;identifier&#039;]);
+        $_clientCredentials-&gt;setSecret($clientCredentials[&#039;secret&#039;]);
+
+        if (isset($clientCredentials[&#039;callback_uri&#039;])) {
+            $_clientCredentials-&gt;setCallbackUri($clientCredentials[&#039;callback_uri&#039;]);
+        }
+
+        return $_clientCredentials;
+    }
+
+    /**
+     * Handle a bad response coming back when getting temporary credentials.
+     *
+     * @param BadResponseException $e
+     *
+     * @return void
+     *
+     * @throws CredentialsException
+     */
+    protected function handleTemporaryCredentialsBadResponse(BadResponseException $e)
+    {
+        $response = $e-&gt;getResponse();
+        $body = $response-&gt;getBody();
+        $statusCode = $response-&gt;getStatusCode();
+
+        throw new CredentialsException(
+            &quot;Received HTTP status code [$statusCode] with message \&quot;$body\&quot; when getting temporary credentials.&quot;
+        );
+    }
+
+    /**
+     * Creates temporary credentials from the body response.
+     *
+     * @param string $body
+     *
+     * @return TemporaryCredentials
+     */
+    protected function createTemporaryCredentials($body)
+    {
+        parse_str($body, $data);
+
+        if ( ! $data || ! is_array($data)) {
+            throw new CredentialsException(&#039;Unable to parse temporary credentials response.&#039;);
+        }
+
+        if ( ! isset($data[&#039;oauth_callback_confirmed&#039;]) || $data[&#039;oauth_callback_confirmed&#039;] != &#039;true&#039;) {
+            throw new CredentialsException(&#039;Error in retrieving temporary credentials.&#039;);
+        }
+
+        $temporaryCredentials = new TemporaryCredentials();
+        $temporaryCredentials-&gt;setIdentifier($data[&#039;oauth_token&#039;]);
+        $temporaryCredentials-&gt;setSecret($data[&#039;oauth_token_secret&#039;]);
+
+        return $temporaryCredentials;
+    }
+
+    /**
+     * Handle a bad response coming back when getting token credentials.
+     *
+     * @param BadResponseException $e
+     *
+     * @return void
+     *
+     * @throws CredentialsException
+     */
+    protected function handleTokenCredentialsBadResponse(BadResponseException $e)
+    {
+        $response = $e-&gt;getResponse();
+        $body = $response-&gt;getBody();
+        $statusCode = $response-&gt;getStatusCode();
+
+        throw new CredentialsException(
+            &quot;Received HTTP status code [$statusCode] with message \&quot;$body\&quot; when getting token credentials.&quot;
+        );
+    }
+
+    /**
+     * Creates token credentials from the body response.
+     *
+     * @param string $body
+     *
+     * @return TokenCredentials
+     */
+    protected function createTokenCredentials($body)
+    {
+        parse_str($body, $data);
+
+        if ( ! $data || ! is_array($data)) {
+            throw new CredentialsException(&#039;Unable to parse token credentials response.&#039;);
+        }
+
+        if (isset($data[&#039;error&#039;])) {
+            throw new CredentialsException(&quot;Error [{$data[&#039;error&#039;]}] in retrieving token credentials.&quot;);
+        }
+
+        $tokenCredentials = new TokenCredentials();
+        $tokenCredentials-&gt;setIdentifier($data[&#039;oauth_token&#039;]);
+        $tokenCredentials-&gt;setSecret($data[&#039;oauth_token_secret&#039;]);
+
+        return $tokenCredentials;
+    }
+
+    /**
+     * Get the base protocol parameters for an OAuth request.
+     * Each request builds on these parameters.
+     *
+     * @return array
+     *
+     * @see    OAuth 1.0 RFC 5849 Section 3.1
+     */
+    protected function baseProtocolParameters()
+    {
+        $dateTime = new \DateTime();
+
+        return [
+            &#039;oauth_consumer_key&#039; =&gt; $this-&gt;clientCredentials-&gt;getIdentifier(),
+            &#039;oauth_nonce&#039; =&gt; $this-&gt;nonce(),
+            &#039;oauth_signature_method&#039; =&gt; $this-&gt;signature-&gt;method(),
+            &#039;oauth_timestamp&#039; =&gt; $dateTime-&gt;format(&#039;U&#039;),
+            &#039;oauth_version&#039; =&gt; &#039;1.0&#039;,
+        ];
+    }
+
+    /**
+     * Any additional required protocol parameters for an
+     * OAuth request.
+     *
+     * @return array
+     */
+    protected function additionalProtocolParameters()
+    {
+        return [];
+    }
+
+    /**
+     * Generate the OAuth protocol header for a temporary credentials
+     * request, based on the URI.
+     *
+     * @param string $uri
+     *
+     * @return string
+     */
+    protected function temporaryCredentialsProtocolHeader($uri)
+    {
+        $parameters = array_merge($this-&gt;baseProtocolParameters(), [
+            &#039;oauth_callback&#039; =&gt; $this-&gt;clientCredentials-&gt;getCallbackUri(),
+        ]);
+
+        $parameters[&#039;oauth_signature&#039;] = $this-&gt;signature-&gt;sign($uri, $parameters, &#039;POST&#039;);
+
+        return $this-&gt;normalizeProtocolParameters($parameters);
+    }
+
+    /**
+     * Generate the OAuth protocol header for requests other than temporary
+     * credentials, based on the URI, method, given credentials &amp; body query
+     * string.
+     *
+     * @param string               $method
+     * @param string               $uri
+     * @param CredentialsInterface $credentials
+     * @param array                $bodyParameters
+     *
+     * @return string
+     */
+    protected function protocolHeader($method, $uri, CredentialsInterface $credentials, array $bodyParameters = [])
+    {
+        $parameters = array_merge(
+            $this-&gt;baseProtocolParameters(),
+            $this-&gt;additionalProtocolParameters(),
+            [
+                &#039;oauth_token&#039; =&gt; $credentials-&gt;getIdentifier(),
+            ]
+        );
+
+        $this-&gt;signature-&gt;setCredentials($credentials);
+
+        $parameters[&#039;oauth_signature&#039;] = $this-&gt;signature-&gt;sign(
+            $uri,
+            array_merge($parameters, $bodyParameters),
+            $method
+        );
+
+        return $this-&gt;normalizeProtocolParameters($parameters);
+    }
+
+    /**
+     * Takes an array of protocol parameters and normalizes them
+     * to be used as a HTTP header.
+     *
+     * @param array $parameters
+     *
+     * @return string
+     */
+    protected function normalizeProtocolParameters(array $parameters)
+    {
+        array_walk($parameters, function (&amp;$value, $key) {
+            $value = rawurlencode($key) . &#039;=&quot;&#039; . rawurlencode($value) . &#039;&quot;&#039;;
+        });
+
+        return &#039;OAuth &#039; . implode(&#039;, &#039;, $parameters);
+    }
+
+    /**
+     * Generate a random string.
+     *
+     * @param int $length
+     *
+     * @return string
+     *
+     * @see    OAuth 1.0 RFC 5849 Section 3.3
+     */
+    protected function nonce($length = 32)
+    {
+        $pool = &#039;0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ&#039;;
+
+        return substr(str_shuffle(str_repeat($pool, 5)), 0, $length);
+    }
+
+    /**
+     * Build a url by combining hostname and query string after checking for
+     * exisiting &#039;?&#039; character in host.
+     *
+     * @param string $host
+     * @param string $queryString
+     *
+     * @return string
+     */
+    protected function buildUrl($host, $queryString)
+    {
+        return $host . (strpos($host, &#039;?&#039;) !== false ? &#039;&amp;&#039; : &#039;?&#039;) . $queryString;
+    }
+
+    /**
+     * Get the URL for retrieving temporary credentials.
+     *
+     * @return string
+     */
+    abstract public function urlTemporaryCredentials();
+
+    /**
+     * Get the URL for redirecting the resource owner to authorize the client.
+     *
+     * @return string
+     */
+    abstract public function urlAuthorization();
+
+    /**
+     * Get the URL retrieving token credentials.
+     *
+     * @return string
+     */
+    abstract public function urlTokenCredentials();
+
+    /**
+     * Get the URL for retrieving user details.
+     *
+     * @return string
+     */
+    abstract public function urlUserDetails();
+
+    /**
+     * Take the decoded data from the user details URL and convert
+     * it to a User object.
+     *
+     * @param mixed            $data
+     * @param TokenCredentials $tokenCredentials
+     *
+     * @return User
+     */
+    abstract public function userDetails($data, TokenCredentials $tokenCredentials);
+
+    /**
+     * Take the decoded data from the user details URL and extract
+     * the user&#039;s UID.
+     *
+     * @param mixed            $data
+     * @param TokenCredentials $tokenCredentials
+     *
+     * @return string|int
+     */
+    abstract public function userUid($data, TokenCredentials $tokenCredentials);
+
+    /**
+     * Take the decoded data from the user details URL and extract
+     * the user&#039;s email.
+     *
+     * @param mixed            $data
+     * @param TokenCredentials $tokenCredentials
+     *
+     * @return string|null
+     */
+    abstract public function userEmail($data, TokenCredentials $tokenCredentials);
+
+    /**
+     * Take the decoded data from the user details URL and extract
+     * the user&#039;s screen name.
+     *
+     * @param mixed            $data
+     * @param TokenCredentials $tokenCredentials
+     *
+     * @return string|null
+     */
+    abstract public function userScreenName($data, TokenCredentials $tokenCredentials);
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/oauth1-client/src/Server/Trello.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/oauth1-client/src/Signature -->
+
+</body>
+</html>

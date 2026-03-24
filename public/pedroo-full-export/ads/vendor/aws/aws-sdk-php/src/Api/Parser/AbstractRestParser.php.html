@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Api/Parser/AbstractRestParser.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Api\Parser;
+
+use Aws\Api\DateTimeResult;
+use Aws\Api\Shape;
+use Aws\Api\StructureShape;
+use Aws\Result;
+use Aws\CommandInterface;
+use Psr\Http\Message\ResponseInterface;
+
+/**
+ * @internal
+ */
+abstract class AbstractRestParser extends AbstractParser
+{
+    use PayloadParserTrait;
+
+    /**
+     * Parses a payload from a response.
+     *
+     * @param ResponseInterface $response Response to parse.
+     * @param StructureShape    $member   Member to parse
+     * @param array             $result   Result value
+     *
+     * @return mixed
+     */
+    abstract protected function payload(
+        ResponseInterface $response,
+        StructureShape $member,
+        array &amp;$result
+    );
+
+    public function __invoke(
+        CommandInterface $command,
+        ResponseInterface $response
+    ) {
+        $output = $this-&gt;api-&gt;getOperation($command-&gt;getName())-&gt;getOutput();
+        $result = [];
+
+        if ($payload = $output[&#039;payload&#039;]) {
+            $this-&gt;extractPayload($payload, $output, $response, $result);
+        }
+
+        foreach ($output-&gt;getMembers() as $name =&gt; $member) {
+            switch ($member[&#039;location&#039;]) {
+                case &#039;header&#039;:
+                    $this-&gt;extractHeader($name, $member, $response, $result);
+                    break;
+                case &#039;headers&#039;:
+                    $this-&gt;extractHeaders($name, $member, $response, $result);
+                    break;
+                case &#039;statusCode&#039;:
+                    $this-&gt;extractStatus($name, $response, $result);
+                    break;
+            }
+        }
+
+        $body = $response-&gt;getBody();
+        if (!$payload
+            &amp;&amp; (!$body-&gt;isSeekable() || $body-&gt;getSize())
+            &amp;&amp; count($output-&gt;getMembers()) &gt; 0
+        ) {
+            // if no payload was found, then parse the contents of the body
+            $this-&gt;payload($response, $output, $result);
+        }
+
+        return new Result($result);
+    }
+
+    private function extractPayload(
+        $payload,
+        StructureShape $output,
+        ResponseInterface $response,
+        array &amp;$result
+    ) {
+        $member = $output-&gt;getMember($payload);
+        $body = $response-&gt;getBody();
+
+        if (!empty($member[&#039;eventstream&#039;])) {
+            $result[$payload] = new EventParsingIterator(
+                $body,
+                $member,
+                $this
+            );
+        } elseif ($member instanceof StructureShape) {
+            //Unions must have at least one member set to a non-null value
+            // If the body is empty, we can assume it is unset
+            if (!empty($member[&#039;union&#039;]) &amp;&amp; ($body-&gt;isSeekable() &amp;&amp; !$body-&gt;getSize())) {
+                return;
+            }
+
+            $result[$payload] = [];
+            $this-&gt;payload($response, $member, $result[$payload]);
+        } else {
+            // Always set the payload to the body stream, regardless of content
+            $result[$payload] = $body;
+        }
+    }
+
+    /**
+     * Extract a single header from the response into the result.
+     */
+    private function extractHeader(
+        $name,
+        Shape $shape,
+        ResponseInterface $response,
+        &amp;$result
+    ) {
+        $value = $response-&gt;getHeaderLine($shape[&#039;locationName&#039;] ?: $name);
+        // Empty headers should not be deserialized
+        if ($value === null || $value === &#039;&#039;) {
+            return;
+        }
+
+        switch ($shape-&gt;getType()) {
+            case &#039;float&#039;:
+            case &#039;double&#039;:
+                $value = match ($value) {
+                    &#039;NaN&#039;, &#039;Infinity&#039;, &#039;-Infinity&#039; =&gt; $value,
+                    default =&gt; (float) $value
+                };
+                break;
+            case &#039;long&#039;:
+            case &#039;integer&#039;:
+                $value = (int) $value;
+                break;
+            case &#039;boolean&#039;:
+                $value = filter_var($value, FILTER_VALIDATE_BOOLEAN);
+                break;
+            case &#039;blob&#039;:
+                $value = base64_decode($value);
+                break;
+            case &#039;timestamp&#039;:
+                try {
+                    $value = DateTimeResult::fromTimestamp(
+                        $value,
+                        !empty($shape[&#039;timestampFormat&#039;]) ? $shape[&#039;timestampFormat&#039;] : null
+                    );
+                    break;
+                } catch (\Exception $e) {
+                    // If the value cannot be parsed, then do not add it to the
+                    // output structure.
+                    return;
+                }
+            case &#039;string&#039;:
+                try {
+                    if ($shape[&#039;jsonvalue&#039;]) {
+                        $value = $this-&gt;parseJson(base64_decode($value), $response);
+                    }
+
+                    // If value is not set, do not add to output structure.
+                    if (!isset($value)) {
+                        return;
+                    }
+                    break;
+                } catch (\Exception $e) {
+                    //If the value cannot be parsed, then do not add it to the
+                    //output structure.
+                    return;
+                }
+            case &#039;list&#039;:
+                $listMember = $shape-&gt;getMember();
+                $type = $listMember-&gt;getType();
+
+                // Only boolean lists require special handling
+                // other types can be returned as-is
+                if ($type !== &#039;boolean&#039;) {
+                    break;
+                }
+
+                $items = array_map(&#039;trim&#039;, explode(&#039;,&#039;, $value));
+                $value = array_map(
+                    static fn($item) =&gt; filter_var($item, FILTER_VALIDATE_BOOLEAN),
+                    $items
+                );
+
+                break;
+        }
+
+        $result[$name] = $value;
+    }
+
+    /**
+     * Extract a map of headers with an optional prefix from the response.
+     */
+    private function extractHeaders(
+        $name,
+        Shape $shape,
+        ResponseInterface $response,
+        &amp;$result
+    ) {
+        // Check if the headers are prefixed by a location name
+        $result[$name] = [];
+        $prefix = $shape[&#039;locationName&#039;];
+        $prefixLen = $prefix !== null ? strlen($prefix) : 0;
+
+        foreach ($response-&gt;getHeaders() as $k =&gt; $values) {
+            if (!$prefixLen) {
+                $result[$name][$k] = implode(&#039;, &#039;, $values);
+            } elseif (stripos($k, $prefix) === 0) {
+                $result[$name][substr($k, $prefixLen)] = implode(&#039;, &#039;, $values);
+            }
+        }
+    }
+
+    /**
+     * Places the status code of the response into the result array.
+     */
+    private function extractStatus(
+        $name,
+        ResponseInterface $response,
+        array &amp;$result
+    ) {
+        $result[$name] = (int) $response-&gt;getStatusCode();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Api/Parser/Crc32ValidatingParser.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Api/Parser/Exception -->
+
+</body>
+</html>

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Helpers/Common/HierarchicalData/Library/AdjacentToNested.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Helpers\Common\HierarchicalData\Library;
+
+use App\Exceptions\Custom\CustomException;
+use App\Helpers\Common\Arr;
+use App\Helpers\Common\DBUtils;
+use App\Helpers\Common\DBUtils\DBIndex;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+/*
+ * Convert Adjacent List model to Nested Set model
+ *
+ * DEFINITIONS:
+ * - Adjacency List model uses parent_id column
+ * - Nested Sets model uses left/right (lft/rgt) boundaries
+ *
+ * NOTE: The Adjacent List model root entries&#039; parent_id column need to be set as &#039;null&#039; (instead of 0).
+ */
+
+class AdjacentToNested
+{
+	public string $adjacentTable = &#039;adjacent&#039;;
+	public string $nestedTable = &#039;nested&#039;;
+	public string $primaryKeyColumn = &#039;id&#039;;
+	public string $labelColumn = &#039;name&#039;;
+	
+	public string $parentColumn = &#039;parent_id&#039;;
+	public string $leftColumn = &#039;lft&#039;;
+	public string $rightColumn = &#039;rgt&#039;;
+	public string $depthColumn = &#039;depth&#039;;
+	
+	public bool $ordered = false;
+	
+	private int $iCount;
+	private array $adjacentItemsIdsArray;
+	
+	/**
+	 * @param array $params
+	 */
+	public function __construct(array $params = [])
+	{
+		$this-&gt;adjacentTable = $params[&#039;adjacentTable&#039;] ?? $this-&gt;adjacentTable;
+		$this-&gt;nestedTable = $params[&#039;nestedTable&#039;] ?? $this-&gt;nestedTable;
+		$this-&gt;primaryKeyColumn = $params[&#039;primaryKeyColumn&#039;] ?? $this-&gt;primaryKeyColumn;
+		$this-&gt;labelColumn = $params[&#039;labelColumn&#039;] ?? $this-&gt;getLabelColumn();
+		
+		$this-&gt;parentColumn = $params[&#039;parentColumn&#039;] ?? $this-&gt;parentColumn;
+		$this-&gt;leftColumn = $params[&#039;leftColumn&#039;] ?? $this-&gt;leftColumn;
+		$this-&gt;rightColumn = $params[&#039;rightColumn&#039;] ?? $this-&gt;rightColumn;
+		$this-&gt;depthColumn = $params[&#039;depthColumn&#039;] ?? $this-&gt;depthColumn;
+	}
+	
+	/**
+	 * Get &amp; Set the adjacent table items IDs
+	 *
+	 * @return array
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function getAndSetAdjacentItemsIds(): array
+	{
+		$this-&gt;checkTablesAndColumns();
+		
+		// Get all the adjacent items
+		$adjacentItems = DB::table($this-&gt;adjacentTable);
+		if ($this-&gt;ordered) {
+			$adjacentItems = $adjacentItems-&gt;orderBy($this-&gt;leftColumn);
+		}
+		
+		$tab = [];
+		if ($adjacentItems-&gt;count() &gt; 0) {
+			$adjacentItems = $adjacentItems-&gt;get();
+			foreach ($adjacentItems as $item) {
+				if (!Schema::hasColumn($this-&gt;adjacentTable, $this-&gt;parentColumn)) {
+					continue;
+				}
+				
+				$parentId = $item-&gt;{$this-&gt;parentColumn};
+				$childId = $item-&gt;{$this-&gt;primaryKeyColumn};
+				
+				if ($parentId == 0) {
+					$parentId = null;
+				}
+				
+				if (!array_key_exists($parentId, $tab)) {
+					$tab[$parentId] = [];
+				}
+				
+				$tab[$parentId][] = $childId;
+			}
+		}
+		
+		$this-&gt;setAdjacentItemsIds($tab);
+		
+		return $tab;
+	}
+	
+	/**
+	 * @param $adjacentItemsIdsArray
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function setAdjacentItemsIds($adjacentItemsIdsArray): void
+	{
+		if (!is_array($adjacentItemsIdsArray)) {
+			$msg = &quot;First parameter should be an array. Instead, it was type &#039;&quot; . gettype($adjacentItemsIdsArray) . &quot;&#039;&quot;;
+			throw new CustomException($msg);
+		}
+		
+		$this-&gt;iCount = 1;
+		if (!empty($adjacentItemsIdsArray)) {
+			$this-&gt;adjacentItemsIdsArray = $adjacentItemsIdsArray;
+		}
+	}
+	
+	/**
+	 * Convert the adjacent items to nested set model into the nested table
+	 *
+	 * @param $parentId
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function convertChildrenRecursively($parentId): void
+	{
+		if ($parentId == 0) {
+			$parentId = null;
+		}
+		
+		$iLeft = $this-&gt;iCount;
+		$this-&gt;iCount++;
+		
+		$children = $this-&gt;getChildren($parentId);
+		if (!empty($children)) {
+			foreach ($children as $childId) {
+				$this-&gt;convertChildrenRecursively($childId);
+			}
+		}
+		
+		$iRight = $this-&gt;iCount;
+		$this-&gt;iCount++;
+		
+		// Convert!
+		$this-&gt;updateItem($iLeft, $iRight, $parentId);
+	}
+	
+	/**
+	 * Find and Set the nodes depth
+	 *
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function setNodesDepth(): void
+	{
+		$this-&gt;checkTablesAndColumns();
+		
+		$nestedTable = DBUtils::table($this-&gt;nestedTable);
+		
+		// Finding the Depth of the nodes
+		if (Schema::hasColumn($this-&gt;adjacentTable, $this-&gt;labelColumn)) {
+			$sql = &quot;SELECT node.{$this-&gt;primaryKeyColumn},
+       				node.{$this-&gt;labelColumn},
+       				(COUNT(parent.{$this-&gt;labelColumn}) - 1) AS {$this-&gt;depthColumn}
+				FROM {$nestedTable} AS node, {$nestedTable} AS parent
+				WHERE node.{$this-&gt;leftColumn}
+				    BETWEEN parent.{$this-&gt;leftColumn} AND parent.{$this-&gt;rightColumn}
+				GROUP BY node.{$this-&gt;primaryKeyColumn}, node.{$this-&gt;labelColumn}
+				ORDER BY node.{$this-&gt;primaryKeyColumn};&quot;;
+		} else {
+			$sql = &quot;SELECT node.{$this-&gt;primaryKeyColumn},
+       				(COUNT(parent.{$this-&gt;primaryKeyColumn}) - 1) AS {$this-&gt;depthColumn}
+				FROM {$nestedTable} AS node, {$nestedTable} AS parent
+				WHERE node.{$this-&gt;leftColumn}
+				    BETWEEN parent.{$this-&gt;leftColumn} AND parent.{$this-&gt;rightColumn}
+				GROUP BY node.{$this-&gt;primaryKeyColumn}
+				ORDER BY node.{$this-&gt;primaryKeyColumn};&quot;;
+		}
+		$items = DB::select($sql);
+		
+		if (is_array($items) &amp;&amp; count($items) &gt; 0) {
+			foreach ($items as $item) {
+				$itemArray = Arr::fromObject($item);
+				
+				if (!isset($itemArray[$this-&gt;primaryKeyColumn])) {
+					continue;
+				}
+				
+				$newArray = [
+					$this-&gt;depthColumn =&gt; $itemArray[$this-&gt;depthColumn],
+				];
+				
+				// Set the item&#039;s depth
+				$affected = DB::table($this-&gt;nestedTable)
+					-&gt;where($this-&gt;primaryKeyColumn, $itemArray[$this-&gt;primaryKeyColumn])
+					-&gt;update($newArray);
+			}
+		}
+	}
+	
+	private function getLabelColumn(): string
+	{
+		$possibleLabelColumns = [&#039;name&#039;, &#039;title&#039;, &#039;label&#039;];
+		foreach ($possibleLabelColumns as $labelColumn) {
+			if (Schema::hasColumn($this-&gt;nestedTable, $labelColumn)) {
+				return $labelColumn;
+			}
+		}
+		
+		return &#039;name&#039;;
+	}
+	
+	/**
+	 * Create the Nested Set indexes
+	 *
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function createNestedSetIndexes(): void
+	{
+		$this-&gt;checkTablesAndColumns();
+		
+		// Make the &#039;lft&#039; &amp; &#039;rgt&#039; columns unique and index the &#039;depth&#039; column
+		
+		// Check if a unique indexes key exist, and drop it.
+		DBIndex::dropIndexIfExists($this-&gt;nestedTable, $this-&gt;leftColumn);
+		DBIndex::dropIndexIfExists($this-&gt;nestedTable, $this-&gt;rightColumn);
+		DBIndex::dropIndexIfExists($this-&gt;nestedTable, $this-&gt;depthColumn);
+		
+		// Create indexes
+		DBIndex::createIndexIfNotExists($this-&gt;nestedTable, $this-&gt;leftColumn); // Should be unique
+		DBIndex::createIndexIfNotExists($this-&gt;nestedTable, $this-&gt;rightColumn); // Should be unique
+		DBIndex::createIndexIfNotExists($this-&gt;nestedTable, $this-&gt;depthColumn);
+	}
+	
+	/**
+	 * @param $currentId
+	 * @return mixed
+	 */
+	private function getChildren($currentId): mixed
+	{
+		if (!isset($this-&gt;adjacentItemsIdsArray[$currentId])) {
+			return [];
+		}
+		
+		return $this-&gt;adjacentItemsIdsArray[$currentId];
+	}
+	
+	/**
+	 * @param $iLeft
+	 * @param $iRight
+	 * @param $currentId
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	private function updateItem($iLeft, $iRight, $currentId): void
+	{
+		$this-&gt;checkTablesAndColumns();
+		
+		// Get the adjacent Item
+		$adjacentItem = DB::table($this-&gt;adjacentTable)-&gt;find($currentId);
+		if (empty($adjacentItem)) {
+			return;
+		}
+		
+		$adjacentItem = Arr::fromObject($adjacentItem);
+		
+		// Check the nested table structure &amp; data
+		if ($this-&gt;adjacentTable == $this-&gt;nestedTable) {
+			if (
+				!array_key_exists($this-&gt;leftColumn, $adjacentItem)
+				|| !array_key_exists($this-&gt;rightColumn, $adjacentItem)
+			) {
+				return;
+			}
+			
+			$nestedItem = $adjacentItem;
+		} else {
+			// Get the nested Item (If exists)
+			$nestedItem = DB::table($this-&gt;nestedTable)-&gt;find($currentId);
+		}
+		
+		// Update or Insert
+		if (!empty($nestedItem)) {
+			// Update the adjacentItem&#039;s &#039;lft&#039; &amp; &#039;rgt&#039; values
+			$newArray = [
+				$this-&gt;leftColumn  =&gt; $iLeft,
+				$this-&gt;rightColumn =&gt; $iRight,
+			];
+			
+			// Required column
+			if (array_key_exists(&#039;type&#039;, $adjacentItem)) {
+				if (empty($adjacentItem[&#039;type&#039;])) {
+					$newArray[&#039;type&#039;] = &#039;classified&#039;;
+				}
+			}
+			
+			// Update the Item
+			$affected = DB::table($this-&gt;nestedTable)
+				-&gt;where(&#039;id&#039;, $currentId)
+				-&gt;update($newArray);
+		} else {
+			// Update the adjacentItem&#039;s &#039;lft&#039; &amp; &#039;rgt&#039; values
+			$adjacentItem[$this-&gt;leftColumn] = $iLeft;
+			$adjacentItem[$this-&gt;rightColumn] = $iRight;
+			if (array_key_exists(&#039;type&#039;, $adjacentItem)) {
+				if (empty($adjacentItem[&#039;type&#039;])) {
+					$adjacentItem[&#039;type&#039;] = &#039;classified&#039;;
+				}
+			}
+			
+			// Remove the primary key from the adjacentItem&#039;s array
+			if (isset($adjacentItem[$this-&gt;primaryKeyColumn])) {
+				unset($adjacentItem[$this-&gt;primaryKeyColumn]);
+			}
+			
+			// Insert the Item
+			DB::table($this-&gt;nestedTable)-&gt;insert($adjacentItem);
+		}
+	}
+	
+	/**
+	 * Check the Tables and the Columns
+	 *
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	private function checkTablesAndColumns(): void
+	{
+		$errTable = &#039;The table &quot;%s&quot; does not exist in the database.&#039;;
+		$errColumn = &#039;The column &quot;%s&quot; does not exist in the table &quot;%s&quot;.&#039;;
+		
+		// Check the adjacent table
+		if (!Schema::hasTable($this-&gt;adjacentTable)) {
+			throw new CustomException(sprintf($errTable, $this-&gt;adjacentTable));
+		}
+		if (!Schema::hasColumn($this-&gt;adjacentTable, $this-&gt;primaryKeyColumn)) {
+			throw new CustomException(sprintf($errColumn, $this-&gt;primaryKeyColumn, $this-&gt;adjacentTable));
+		}
+		if (!Schema::hasColumn($this-&gt;adjacentTable, $this-&gt;parentColumn)) {
+			throw new CustomException(sprintf($errColumn, $this-&gt;parentColumn, $this-&gt;adjacentTable));
+		}
+		
+		// Check the nested table
+		if (!Schema::hasTable($this-&gt;nestedTable)) {
+			throw new CustomException(sprintf($errTable, $this-&gt;nestedTable));
+		}
+		if (!Schema::hasColumn($this-&gt;nestedTable, $this-&gt;primaryKeyColumn)) {
+			throw new CustomException(sprintf($errColumn, $this-&gt;primaryKeyColumn, $this-&gt;nestedTable));
+		}
+		if (!Schema::hasColumn($this-&gt;nestedTable, $this-&gt;leftColumn)) {
+			throw new CustomException(sprintf($errColumn, $this-&gt;leftColumn, $this-&gt;nestedTable));
+		}
+		if (!Schema::hasColumn($this-&gt;nestedTable, $this-&gt;rightColumn)) {
+			throw new CustomException(sprintf($errColumn, $this-&gt;rightColumn, $this-&gt;nestedTable));
+		}
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Helpers/Common/HierarchicalData/Library/NestedSetManager.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Helpers/Common/HierarchicalData/Model -->
+
+</body>
+</html>

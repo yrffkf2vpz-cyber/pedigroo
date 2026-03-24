@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest/src/Plugins/Parallel/Paratest/ResultPrinter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Plugins\Parallel\Paratest;
+
+use ParaTest\Options;
+use Pest\Plugins\Parallel\Support\CompactPrinter;
+use Pest\Support\StateGenerator;
+use PHPUnit\TestRunner\TestResult\TestResult;
+use PHPUnit\TextUI\Output\Printer;
+use SebastianBergmann\Timer\Duration;
+use SplFileInfo;
+use Symfony\Component\Console\Formatter\OutputFormatter;
+use Symfony\Component\Console\Output\OutputInterface;
+
+use function assert;
+use function fclose;
+use function feof;
+use function fopen;
+use function fread;
+use function fseek;
+use function ftell;
+use function fwrite;
+use function strlen;
+
+/**
+ * @internal
+ */
+final class ResultPrinter
+{
+    /**
+     * If the test should be marked as todo.
+     */
+    public bool $lastWasTodo = false;
+
+    /**
+     * The &quot;native&quot; printer.
+     */
+    public readonly Printer $printer;
+
+    /**
+     * The state.
+     */
+    public int $passedTests = 0;
+
+    /**
+     * The &quot;compact&quot; printer.
+     */
+    private readonly CompactPrinter $compactPrinter;
+
+    /** @var resource|null */
+    private $teamcityLogFileHandle;
+
+    /** @var array&lt;non-empty-string, int&gt; */
+    private array $tailPositions;
+
+    public function __construct(
+        private readonly OutputInterface $output,
+        private readonly Options $options
+    ) {
+        $this-&gt;printer = new readonly class($this-&gt;output) implements Printer
+        {
+            public function __construct(
+                private OutputInterface $output,
+            ) {}
+
+            public function print(string $buffer): void
+            {
+                $buffer = OutputFormatter::escape($buffer);
+                if (str_starts_with($buffer, &quot;\nGenerating code coverage report&quot;)) {
+                    return;
+                }
+                if (str_starts_with($buffer, &#039;done [&#039;)) {
+                    return;
+                }
+
+                $this-&gt;output-&gt;write(OutputFormatter::escape($buffer));
+            }
+
+            public function flush(): void {}
+        };
+
+        $this-&gt;compactPrinter = CompactPrinter::default();
+
+        if (! $this-&gt;options-&gt;configuration-&gt;hasLogfileTeamcity()) {
+            return;
+        }
+
+        $teamcityLogFileHandle = fopen($this-&gt;options-&gt;configuration-&gt;logfileTeamcity(), &#039;ab+&#039;);
+        assert($teamcityLogFileHandle !== false);
+        $this-&gt;teamcityLogFileHandle = $teamcityLogFileHandle;
+    }
+
+    /** @param  list&lt;SplFileInfo&gt;  $teamcityFiles */
+    public function printFeedback(
+        SplFileInfo $progressFile,
+        SplFileInfo $outputFile,
+        array $teamcityFiles
+    ): void {
+        if ($this-&gt;options-&gt;needsTeamcity) {
+            $teamcityProgress = $this-&gt;tailMultiple($teamcityFiles);
+
+            if ($this-&gt;teamcityLogFileHandle !== null) {
+                fwrite($this-&gt;teamcityLogFileHandle, $teamcityProgress);
+            }
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;outputIsTeamCity()) {
+            assert(isset($teamcityProgress));
+            $this-&gt;output-&gt;write($teamcityProgress);
+
+            return;
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;noProgress()) {
+            return;
+        }
+
+        $unexpectedOutput = $this-&gt;tail($outputFile);
+        if ($unexpectedOutput !== &#039;&#039;) {
+            if (preg_match(&#039;/^T+$/&#039;, $unexpectedOutput) &gt; 0) {
+                return;
+            }
+
+            $this-&gt;output-&gt;write($unexpectedOutput);
+        }
+
+        $feedbackItems = $this-&gt;tail($progressFile);
+        if ($feedbackItems === &#039;&#039;) {
+            return;
+        }
+
+        $feedbackItems = (string) preg_replace(&#039;/ +\\d+ \\/ \\d+ \\( ?\\d+%\\)\\s*/&#039;, &#039;&#039;, $feedbackItems);
+
+        $actualTestCount = strlen($feedbackItems);
+        for ($index = 0; $index &lt; $actualTestCount; $index++) {
+            $this-&gt;printFeedbackItem($feedbackItems[$index]);
+        }
+    }
+
+    /**
+     * @param  list&lt;SplFileInfo&gt;  $teamcityFiles
+     * @param  list&lt;SplFileInfo&gt;  $testdoxFiles
+     */
+    public function printResults(TestResult $testResult, array $teamcityFiles, array $testdoxFiles, Duration $duration): void
+    {
+        if ($this-&gt;options-&gt;needsTeamcity) {
+            $teamcityProgress = $this-&gt;tailMultiple($teamcityFiles);
+
+            if ($this-&gt;teamcityLogFileHandle !== null) {
+                fwrite($this-&gt;teamcityLogFileHandle, $teamcityProgress);
+                $resource = $this-&gt;teamcityLogFileHandle;
+                $this-&gt;teamcityLogFileHandle = null;
+                fclose($resource);
+            }
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;outputIsTeamCity()) {
+            assert(isset($teamcityProgress));
+            $this-&gt;output-&gt;write($teamcityProgress);
+
+            return;
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;outputIsTestDox()) {
+            $this-&gt;output-&gt;write($this-&gt;tailMultiple($testdoxFiles));
+
+            return;
+        }
+
+        $state = (new StateGenerator)-&gt;fromPhpUnitTestResult($this-&gt;passedTests, $testResult);
+
+        $this-&gt;compactPrinter-&gt;errors($state);
+        $this-&gt;compactPrinter-&gt;recap($state, $testResult, $duration, $this-&gt;options);
+    }
+
+    private function printFeedbackItem(string $item): void
+    {
+        if ($this-&gt;lastWasTodo) {
+            $this-&gt;lastWasTodo = false;
+
+            return;
+        }
+
+        if ($item === &#039;T&#039;) {
+            $this-&gt;lastWasTodo = true;
+        }
+
+        if ($item === &#039;.&#039;) {
+            $this-&gt;passedTests++;
+        }
+
+        $this-&gt;compactPrinter-&gt;descriptionItem($item);
+    }
+
+    /** @param  list&lt;SplFileInfo&gt;  $files */
+    private function tailMultiple(array $files): string
+    {
+        $content = &#039;&#039;;
+        foreach ($files as $file) {
+            if (! $file-&gt;isFile()) {
+                continue;
+            }
+
+            $content .= $this-&gt;tail($file);
+        }
+
+        return $content;
+    }
+
+    private function tail(SplFileInfo $file): string
+    {
+        $path = $file-&gt;getPathname();
+        assert($path !== &#039;&#039;);
+        $handle = fopen($path, &#039;r&#039;);
+        assert($handle !== false);
+        $fseek = fseek($handle, $this-&gt;tailPositions[$path] ?? 0);
+        assert($fseek === 0);
+
+        $contents = &#039;&#039;;
+        while (! feof($handle)) {
+            $fread = fread($handle, 8192);
+            assert($fread !== false);
+            $contents .= $fread;
+        }
+
+        $ftell = ftell($handle);
+        assert($ftell !== false);
+        $this-&gt;tailPositions[$path] = $ftell;
+        fclose($handle);
+
+        return $contents;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest/src/Plugins/Parallel/Paratest/WrapperRunner.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest/src/Plugins/Parallel/Support -->
+
+</body>
+</html>

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest-plugin-profanity/src/Plugin.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Profanity;
+
+use Pest\Contracts\Plugins\HandlesOriginalArguments;
+use Pest\Plugins\Concerns\HandleArguments;
+use Pest\Profanity\Contracts\Logger;
+use Pest\Profanity\Logging\JsonLogger;
+use Pest\Profanity\Logging\NullLogger;
+use Pest\Profanity\Support\ConfigurationSourceDetector;
+use Pest\TestSuite;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Finder\Finder;
+
+use function Termwind\renderUsing;
+
+/**
+ * @internal
+ */
+class Plugin implements HandlesOriginalArguments
+{
+    use HandleArguments;
+
+    /**
+     * @var array&lt;string&gt;
+     */
+    private array $excludeWords = [];
+
+    /**
+     * @var array&lt;string&gt;
+     */
+    private array $includeWords = [];
+
+    /**
+     * @var array&lt;string&gt;|null
+     */
+    private $languages = null;
+
+    private bool $compact = false;
+
+    /**
+     * The logger used to output profanity to a file.
+     */
+    private Logger $profanityLogger;
+
+    /**
+     * Creates a new Plugin instance.
+     */
+    public function __construct(
+        private readonly OutputInterface $output
+    ) {
+        $this-&gt;profanityLogger = new NullLogger;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function handleOriginalArguments(array $arguments): void
+    {
+        if (! $this-&gt;hasArgument(&#039;--profanity&#039;, $arguments)) {
+            return;
+        }
+
+        foreach ($arguments as $key =&gt; $argument) {
+            if (str_starts_with($argument, &#039;--exclude=&#039;)) {
+                $words = explode(&#039;,&#039;, substr($argument, strlen(&#039;--exclude=&#039;)));
+                $this-&gt;excludeWords = array_merge($this-&gt;excludeWords, $words);
+                unset($arguments[$key]);
+            }
+
+            if (str_starts_with($argument, &#039;--include=&#039;)) {
+                $words = explode(&#039;,&#039;, substr($argument, strlen(&#039;--include=&#039;)));
+                $this-&gt;includeWords = array_merge($this-&gt;includeWords, $words);
+                unset($arguments[$key]);
+            }
+
+            if (str_starts_with($argument, &#039;--language=&#039;)) {
+                $languageValue = substr($argument, strlen(&#039;--language=&#039;));
+                $this-&gt;languages = explode(&#039;,&#039;, $languageValue);
+                $invalidLanguages = Validator::validateLanguages($this-&gt;languages);
+                unset($arguments[$key]);
+            }
+
+            if (str_starts_with($argument, &#039;--compact&#039;)) {
+                $this-&gt;compact = true;
+                unset($arguments[$key]);
+            }
+
+            if (str_starts_with($argument, &#039;--output=&#039;)) {
+                $outputPath = explode(&#039;=&#039;, $argument)[1] ?? null;
+
+                if (empty($outputPath)) {
+                    Output::errorMessage(&#039;No output path provided for [--profanity-json].&#039;);
+                    $this-&gt;exit(1);
+                }
+
+                $this-&gt;profanityLogger = new JsonLogger(explode(&#039;=&#039;, $argument)[1]);
+            }
+        }
+
+        if (! empty($invalidLanguages)) {
+            $invalidLangsStr = implode(&#039;, &#039;, $invalidLanguages);
+            Output::errorMessage(&quot;The specified language does not exist: $invalidLangsStr&quot;);
+
+            $this-&gt;output-&gt;writeln([&#039;&#039;]);
+            $this-&gt;output-&gt;writeln(&#039;&lt;info&gt;Available languages:&lt;/info&gt;&#039;);
+
+            $profanitiesDir = __DIR__.&#039;/Config/profanities&#039;;
+            $availableLanguages = array_map(
+                fn ($file) =&gt; basename($file, &#039;.php&#039;),
+                glob(&quot;$profanitiesDir/*.php&quot;)
+            );
+
+            $this-&gt;output-&gt;writeln(implode(&#039;, &#039;, $availableLanguages));
+            $this-&gt;output-&gt;writeln([&#039;&#039;]);
+            $this-&gt;exit(1);
+        }
+
+        $source = ConfigurationSourceDetector::detect();
+
+        if ($source === []) {
+            Output::errorMessage(&#039;No source section found. Did you forget to add a `source` section to your `phpunit.xml` file?&#039;);
+
+            $this-&gt;exit(1);
+        }
+
+        $files = Finder::create()
+            -&gt;in($source)
+            -&gt;name(&#039;*.php&#039;)
+            -&gt;notPath(&#039;Config/profanities&#039;)
+            -&gt;notPath(&#039;src/Config/profanities&#039;)
+            -&gt;files();
+        $filesWithProfanity = [];
+        $totalProfanities = 0;
+
+        $this-&gt;output-&gt;writeln([&#039;&#039;]);
+
+        Analyser::analyse(
+            array_keys(iterator_to_array($files)),
+            function (Result $result) use (&amp;$filesWithProfanity, &amp;$totalProfanities): void {
+                $path = str_replace(TestSuite::getInstance()-&gt;rootPath.&#039;/&#039;, &#039;&#039;, $result-&gt;file);
+                $errors = $result-&gt;errors;
+
+                if (empty($errors)) {
+                    if (! $this-&gt;compact) {
+                        renderUsing($this-&gt;output);
+                        Output::pass($path);
+
+                        $this-&gt;profanityLogger-&gt;append($path, []);
+                    }
+                } else {
+                    $filesWithProfanity[] = $path;
+                    $totalProfanities += count($errors);
+
+                    usort($errors, fn ($a, $b): int =&gt; $a-&gt;line &lt;=&gt; $b-&gt;line);
+
+                    $profanityLines = [];
+                    foreach ($errors as $error) {
+                        $profanityLines[] = $error-&gt;getShortType().$error-&gt;line.&#039;(&#039;.$error-&gt;word.&#039;)&#039;;
+                    }
+
+                    $this-&gt;profanityLogger-&gt;append($path, $profanityLines);
+
+                    $profanityLines = implode(&#039;, &#039;, $profanityLines);
+
+                    renderUsing($this-&gt;output);
+                    Output::fail($path, $profanityLines);
+                }
+            },
+            $this-&gt;excludeWords,
+            $this-&gt;includeWords,
+            $this-&gt;languages
+        );
+
+        $filesWithProfanityCount = count($filesWithProfanity);
+        $exitCode = (int) (! empty($filesWithProfanity));
+
+        $this-&gt;profanityLogger-&gt;output();
+
+        if ($exitCode === 1) {
+            $instanceWord = $totalProfanities === 1 ? &#039;instance&#039; : &#039;instances&#039;;
+            $filesWord = $filesWithProfanityCount === 1 ? &#039;file&#039; : &#039;files&#039;;
+            Output::errorMessage(&quot;Found $totalProfanities $instanceWord of profanity in $filesWithProfanityCount $filesWord&quot;);
+        } else {
+            Output::successMessage(&#039;No profanity found in your application!&#039;);
+        }
+
+        $this-&gt;output-&gt;writeln([&#039;&#039;]);
+        $this-&gt;exit($exitCode);
+    }
+
+    /**
+     * Exits the process with the given code.
+     */
+    public function exit(int $code): never
+    {
+        exit($code);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest-plugin-profanity/src/ProfanityAnalyser.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest-plugin-profanity/src/Config -->
+
+</body>
+</html>

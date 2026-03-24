@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/Auth/TwoFactorService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services\Auth;
+
+use App\Helpers\Common\Num;
+use App\Http\Resources\UserResource;
+use App\Models\Permission;
+use App\Models\Scopes\VerifiedScope;
+use App\Models\User;
+use App\Services\Auth\App\Http\Requests\TwoFactorRequest;
+use App\Services\Auth\Traits\Custom\CreateLoginToken;
+use App\Services\Auth\Traits\Custom\TwoFactorCode;
+use App\Services\BaseService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
+
+class TwoFactorService extends BaseService
+{
+	use TwoFactorCode, CreateLoginToken;
+	
+	/**
+	 * Set up 2FA for an authenticated user
+	 *
+	 * @param $userId
+	 * @param \App\Services\Auth\App\Http\Requests\TwoFactorRequest $request
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function setup($userId, TwoFactorRequest $request): JsonResponse
+	{
+		$twoFactorDefaultMethod = &#039;email&#039;;
+		
+		$isInputTwoFactorEnabled = $request-&gt;filled(&#039;two_factor_enabled&#039;);
+		$twoFactorMethod = $request-&gt;input(&#039;two_factor_method&#039;, $twoFactorDefaultMethod);
+		$twoFactorMethod = in_array($twoFactorMethod, [&#039;email&#039;, &#039;sms&#039;]) ? $twoFactorMethod : $twoFactorDefaultMethod;
+		$phone = $request-&gt;input(&#039;phone&#039;);
+		
+		// Get user
+		/** @var User $user */
+		$user = User::query()-&gt;withoutGlobalScopes([VerifiedScope::class])-&gt;where(&#039;id&#039;, $userId)-&gt;first();
+		
+		if (empty($user)) {
+			return apiResponse()-&gt;unauthorized(trans(&#039;auth.invalid_session&#039;));
+		}
+		
+		/** @var User $authUser */
+		$authUser = request()-&gt;user() ?? auth(getAuthGuard())-&gt;user();
+		
+		if (empty($authUser)) {
+			return apiResponse()-&gt;unauthorized();
+		}
+		
+		// Check logged User
+		// Get the User Personal Access Token Object
+		$personalAccess = isApiRoute() ? $authUser-&gt;tokens()-&gt;where(&#039;id&#039;, getApiAuthToken())-&gt;first() : null;
+		if (!empty($personalAccess)) {
+			if ($personalAccess-&gt;tokenable_id != $user-&gt;id) {
+				return apiResponse()-&gt;unauthorized();
+			}
+		} else {
+			if ($authUser-&gt;getAuthIdentifier() != $user-&gt;id) {
+				return apiResponse()-&gt;unauthorized();
+			}
+		}
+		
+		// Store previous 2FA state
+		$wasEnabled = $user-&gt;two_factor_enabled ?? false;
+		
+		// Update 2FA settings based on request
+		if ($isInputTwoFactorEnabled) {
+			$user-&gt;two_factor_enabled = true;
+			$user-&gt;two_factor_method = $twoFactorMethod;
+			if ($twoFactorMethod === &#039;sms&#039; &amp;&amp; empty($user-&gt;phone)) {
+				$user-&gt;phone = $phone;
+			}
+		} else {
+			$user-&gt;two_factor_enabled = false;
+			$user-&gt;two_factor_method = $twoFactorMethod;
+		}
+		
+		// Save
+		$user-&gt;save();
+		
+		$message = $isInputTwoFactorEnabled
+			? trans(&#039;auth.two_factor_has_been_enabled&#039;)
+			: trans(&#039;auth.two_factor_has_been_disabled&#039;);
+		
+		$data = [
+			&#039;success&#039; =&gt; true,
+			&#039;message&#039; =&gt; $message,
+			&#039;result&#039;  =&gt; (new UserResource($user))-&gt;toArray($request),
+		];
+		
+		// If 2FA was newly enabled, log out and initiate 2FA verification
+		if (isTwoFactorChallengeRequiredOnEnable()) {
+			if ($isInputTwoFactorEnabled) {
+				$data = $this-&gt;checkTwoFactorChallenge($user, !$wasEnabled, $data);
+			}
+		}
+		
+		return apiResponse()-&gt;updated($data);
+	}
+	
+	/**
+	 * Verify the submitted 2FA code and log the user in
+	 *
+	 * @param $userId
+	 * @param \Illuminate\Http\Request $request
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function verify($userId, Request $request): JsonResponse
+	{
+		$request-&gt;validate([&#039;code&#039; =&gt; [&#039;required&#039;, &#039;numeric&#039;]]);
+		
+		$code = $request-&gt;input(&#039;code&#039;);
+		
+		/** @var User $user */
+		$user = User::query()-&gt;withoutGlobalScopes([VerifiedScope::class])-&gt;where(&#039;id&#039;, $userId)-&gt;first();
+		
+		if (empty($user)) {
+			return apiResponse()-&gt;unauthorized(trans(&#039;auth.invalid_session&#039;));
+		}
+		
+		// Check if the OTP has expired
+		if ($user-&gt;otp_expires_at &lt; now()) {
+			$user-&gt;resetTwoFactorCode();
+			
+			return apiResponse()-&gt;forbidden(trans(&#039;auth.expired_otp&#039;));
+		}
+		
+		// Verify the code (save like password)
+		if (!Hash::check($code, $user-&gt;two_factor_otp)) {
+			$message = trans(&#039;auth.invalid_otp&#039;);
+			
+			return apiResponse()-&gt;forbidden($message);
+		}
+		
+		// Clear the used code
+		$user-&gt;resetTwoFactorCode();
+		
+		// Get the auth field
+		$authField = ($user-&gt;two_factor_method === &#039;sms&#039;) ? &#039;phone&#039; : &#039;email&#039;;
+		
+		// Bypass the auth field verification step, since user has a valid OTP
+		if ($user-&gt;can(Permission::getStaffPermissions())) {
+			$user-&gt;email_verified_at = now();
+			$user-&gt;phone_verified_at = now();
+		} else {
+			if ($authField == &#039;email&#039;) {
+				$user-&gt;email_verified_at = now();
+			}
+			if ($authField == &#039;phone&#039;) {
+				$user-&gt;phone_verified_at = now();
+			}
+		}
+		if ($user-&gt;isDirty()) {
+			$user-&gt;save();
+		}
+		
+		// Create new auth token
+		return $this-&gt;createNewToken($user, $authField, bypassTwoFactor: true);
+	}
+	
+	/**
+	 * Resend a new 2FA code to the user
+	 *
+	 * @param $userId
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function resend($userId): JsonResponse
+	{
+		$cooldownInSecond = otpCooldownInSeconds();
+		$maxAttempts = otpResendMaxAttempts();
+		
+		// Get user
+		/** @var User $user */
+		$user = User::query()-&gt;withoutGlobalScopes([VerifiedScope::class])-&gt;where(&#039;id&#039;, $userId)-&gt;first();
+		
+		if (empty($user)) {
+			return apiResponse()-&gt;unauthorized(trans(&#039;auth.invalid_session&#039;));
+		}
+		
+		if ($user-&gt;isLocked()) {
+			$message = trans(&#039;auth.account_locked_for_excessive_otp_resend_attempts&#039;);
+			
+			return apiResponse()-&gt;unauthorized($message);
+		}
+		
+		// Check if the user can request a new OTP
+		if (!$user-&gt;canRequestNewOtp()) {
+			$remainingSeconds = $cooldownInSecond - ($user-&gt;last_otp_sent_at ? $user-&gt;last_otp_sent_at-&gt;diffInSeconds(now()) : 0);
+			$humanReadableTime = Num::shortTime($remainingSeconds);
+			
+			$message = ($user-&gt;otp_resend_attempts &gt;= $maxAttempts)
+				? trans(&#039;auth.maximum_otp_resend_attempts_reached&#039;)
+				: trans(&#039;auth.wait_before_request_new_otp&#039;, [&#039;humanReadableTime&#039; =&gt; $humanReadableTime]);
+			
+			return apiResponse()-&gt;forbidden($message);
+		}
+		
+		// Send new OTP
+		$user-&gt;incrementOtpAttempts();
+		$sendCodeData = $this-&gt;sendCode($user, alreadyIncremented: true);
+		
+		if (data_get($sendCodeData, &#039;success&#039;) !== true) {
+			$data = [
+				&#039;success&#039; =&gt; false,
+				&#039;message&#039; =&gt; data_get($sendCodeData, &#039;message&#039;),
+				&#039;extra&#039;   =&gt; [&#039;sendCodeFailed&#039; =&gt; true],
+			];
+			
+			return apiResponse()-&gt;json($data);
+		}
+		
+		$message = trans(&#039;auth.new_otp_sent&#039;);
+		
+		return apiResponse()-&gt;success($message);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/BaseService.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Auth/App -->
+
+</body>
+</html>

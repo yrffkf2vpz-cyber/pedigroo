@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/ThreadService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services;
+
+use App\Helpers\Common\Files\Upload;
+use App\Helpers\Common\PaginationHelper;
+use App\Http\Requests\Front\ReplyMessageRequest;
+use App\Http\Requests\Front\SendMessageRequest;
+use App\Http\Resources\EntityCollection;
+use App\Http\Resources\PostResource;
+use App\Http\Resources\ThreadResource;
+use App\Models\Post;
+use App\Models\Thread;
+use App\Models\ThreadMessage;
+use App\Models\ThreadParticipant;
+use App\Models\User;
+use App\Notifications\ReplySent;
+use App\Notifications\SellerContacted;
+use App\Services\Auth\Traits\Custom\RecognizedUser\FindPostAuthor\FillMissingUserData;
+use App\Services\Thread\UpdateByTypeTrait;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Notification;
+use Throwable;
+
+class ThreadService extends BaseService
+{
+	use FillMissingUserData;
+	use UpdateByTypeTrait;
+	
+	/**
+	 * List threads
+	 *
+	 * Get all logged user&#039;s threads.
+	 * Filters:
+	 * - unread: Get the logged user&#039;s unread threads
+	 * - started: Get the logged user&#039;s started threads
+	 * - important: Get the logged user&#039;s make as important threads
+	 *
+	 * @param array $params
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function getEntries(array $params = []): JsonResponse
+	{
+		$perPage = getNumberOfItemsPerPage(&#039;threads&#039;, $params[&#039;perPage&#039;] ?? null, $this-&gt;perPage);
+		$embed = castCommaSeparatedStrToArray($params[&#039;embed&#039;] ?? []);
+		$filter = $params[&#039;filter&#039;] ?? null;
+		$sort = $params[&#039;sort&#039;] ?? [];
+		
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		// All threads
+		$threads = Thread::whereHas(&#039;post&#039;, function ($query) {
+			$query-&gt;inCountry()-&gt;unarchived();
+		});
+		
+		if (in_array(&#039;post&#039;, $embed)) {
+			$threads-&gt;with(&#039;post&#039;);
+		}
+		
+		if ($filter == &#039;unread&#039;) {
+			// Get threads that have new messages or that are marked as unread
+			$threads-&gt;forUserWithNewMessages($authUser-&gt;getAuthIdentifier());
+		} else {
+			// Get threads that user is participating in
+			$threads-&gt;forUser($authUser-&gt;getAuthIdentifier())-&gt;latest(&#039;updated_at&#039;);
+		}
+		
+		// Get threads started by this user
+		if ($filter == &#039;started&#039;) {
+			$threadTable = (new Thread())-&gt;getTable();
+			$messageTable = (new ThreadMessage())-&gt;getTable();
+			
+			$threads-&gt;where(function ($query) use ($threadTable, $messageTable) {
+				$query-&gt;select(&#039;user_id&#039;)
+					-&gt;from($messageTable)
+					-&gt;whereColumn($messageTable . &#039;.thread_id&#039;, $threadTable . &#039;.id&#039;)
+					-&gt;orderBy($messageTable . &#039;.created_at&#039;)
+					-&gt;limit(1);
+			}, $authUser-&gt;getAuthIdentifier());
+		}
+		
+		// Get this user&#039;s important thread
+		if ($filter == &#039;important&#039;) {
+			$threads-&gt;where(&#039;is_important&#039;, 1);
+		}
+		
+		// Get rows &amp; paginate
+		$threads = $threads-&gt;paginate($perPage);
+		$threads = PaginationHelper::adjustSides($threads);
+		
+		// If the request is made from the app&#039;s Web environment,
+		// use the Web URL as the pagination&#039;s base URL
+		$threads = setPaginationBaseUrl($threads);
+		
+		$collection = new EntityCollection(ThreadResource::class, $threads, $params);
+		
+		$message = ($threads-&gt;count() &lt;= 0) ? trans(&#039;global.no_threads_found&#039;) : null;
+		
+		return apiResponse()-&gt;withCollection($collection, $message);
+	}
+	
+	/**
+	 * Get thread
+	 *
+	 * Get a thread (owned by the logged user) details
+	 *
+	 * @param $id
+	 * @param array $params
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function getEntry($id, array $params = []): JsonResponse
+	{
+		$embed = castCommaSeparatedStrToArray($params[&#039;embed&#039;] ?? []);
+		$perPage = getNumberOfItemsPerPage(&#039;threads&#039;, $params[&#039;perPage&#039;] ?? null, $this-&gt;perPage); // for the thread&#039;s messages
+		
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		$thread = Thread::query();
+		
+		if (in_array(&#039;user&#039;, $embed)) {
+			// See the ThreadResource
+		}
+		
+		if (in_array(&#039;post&#039;, $embed)) {
+			$thread-&gt;with(&#039;post&#039;);
+		}
+		
+		// Call the ThreadMessageController endpoint to get paginated messages
+		if (in_array(&#039;messages&#039;, $embed)) {
+			// See the ThreadResource
+		}
+		
+		if (in_array(&#039;participants&#039;, $embed)) {
+			$thread-&gt;with(&#039;users&#039;);
+		}
+		
+		$threadTable = (new Thread())-&gt;getTable();
+		$thread-&gt;forUser($authUser-&gt;getAuthIdentifier())-&gt;where($threadTable . &#039;.id&#039;, $id);
+		
+		$thread = $thread-&gt;first();
+		
+		abort_if(empty($thread), 404, trans(&#039;global.thread_not_found&#039;));
+		
+		// Mark the Thread as read
+		$thread-&gt;markTheThreadAsRead($authUser-&gt;getAuthIdentifier());
+		
+		$resource = new ThreadResource($thread, $params);
+		
+		return apiResponse()-&gt;withResource($resource);
+	}
+	
+	/**
+	 * Store thread
+	 *
+	 * Start a conversation. Creation of a new thread.
+	 *
+	 * @param $postId
+	 * @param \App\Http\Requests\Front\SendMessageRequest $request
+	 * @return \Illuminate\Http\JsonResponse
+	 * @throws \Illuminate\Contracts\Filesystem\FileNotFoundException
+	 */
+	public function store($postId, SendMessageRequest $request): JsonResponse
+	{
+		$postId = $request-&gt;input(&#039;post_id&#039;, $postId);
+		
+		if (empty($postId)) {
+			$msg = &#039;The &quot;post_id&quot; parameter is required.&#039;;
+			
+			return apiResponse()-&gt;error($msg);
+		}
+		
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		// Get the Post
+		$post = Post::unarchived()-&gt;find($postId);
+		
+		abort_if(empty($post), 404, trans(&#039;global.post_not_found&#039;));
+		
+		// Check and complete missing auth data
+		$missingAuthDataCompleted = $this-&gt;fillMissingUserData();
+		
+		$thread = null;
+		
+		// Create Message Array
+		$messageArray = $request-&gt;all();
+		
+		// Logged User
+		if (!empty($authUser) &amp;&amp; !empty($post-&gt;user)) {
+			// Thread
+			$thread = new Thread();
+			$thread-&gt;post_id = $post-&gt;id;
+			$thread-&gt;subject = $post-&gt;title;
+			$thread-&gt;save();
+			
+			// Message
+			$message = new ThreadMessage();
+			$message-&gt;thread_id = $thread-&gt;id;
+			$message-&gt;user_id = $authUser-&gt;getAuthIdentifier();
+			$message-&gt;body = $request-&gt;input(&#039;body&#039;);
+			$message-&gt;save();
+			
+			// Save and Send user&#039;s résumé
+			if ($request-&gt;hasFile(&#039;file_path&#039;)) {
+				// Upload File
+				$destPath = &#039;files/&#039; . strtolower($post-&gt;country_code) . &#039;/&#039; . $post-&gt;id . &#039;/applications&#039;;
+				$message-&gt;file_path = Upload::file($request-&gt;file(&#039;file_path&#039;), $destPath);
+				
+				$message-&gt;save();
+			}
+			
+			// Update Message Array
+			$messageArray[&#039;name&#039;] = $authUser-&gt;name ?? null;
+			$messageArray[&#039;email&#039;] = $authUser-&gt;email ?? null;
+			$messageArray[&#039;phone&#039;] = $authUser-&gt;phone ?? null;
+			$messageArray[&#039;country_code&#039;] = $post-&gt;country_code ?? config(&#039;country.code&#039;);
+			if (!empty($message-&gt;file_path)) {
+				$messageArray[&#039;file_path&#039;] = $message-&gt;file_path;
+			}
+			
+			// Sender
+			$sender = new ThreadParticipant();
+			$sender-&gt;thread_id = $thread-&gt;id;
+			$sender-&gt;user_id = $authUser-&gt;getAuthIdentifier();
+			$sender-&gt;last_read = now();
+			$sender-&gt;save();
+			
+			// Recipients
+			if ($request-&gt;has(&#039;recipients&#039;)) {
+				$thread-&gt;addParticipant($request-&gt;input(&#039;recipients&#039;));
+			} else {
+				$thread-&gt;addParticipant($post-&gt;user-&gt;id);
+			}
+		} else {
+			// Guest (Non Logged User)
+			// Update the filename
+			if ($request-&gt;hasFile(&#039;file_path&#039;)) {
+				$file = $request-&gt;file(&#039;file_path&#039;);
+				$messageArray[&#039;file_path&#039;] = $file-&gt;getClientOriginalName(); // Caution: Only filename is retrieved here
+				$messageArray[&#039;file_data&#039;] = base64_encode(File::get($file-&gt;getRealPath()));
+			}
+		}
+		
+		// Remove input file to prevent Laravel Queue serialization issue
+		if (isset($messageArray[&#039;file_path&#039;])) {
+			if (!is_string($messageArray[&#039;file_path&#039;])) {
+				unset($messageArray[&#039;file_path&#039;]);
+			}
+		}
+		
+		// Send a message to publisher
+		if (isset($messageArray[&#039;post_id&#039;], $messageArray[&#039;email&#039;], $messageArray[&#039;name&#039;], $messageArray[&#039;body&#039;])) {
+			try {
+				$post-&gt;notify(new SellerContacted($post, $messageArray));
+			} catch (Throwable $e) {
+				return apiResponse()-&gt;internalError($e-&gt;getMessage());
+			}
+		}
+		
+		$msg = trans(&#039;global.message_has_sent_successfully_to&#039;, [&#039;contact_name&#039; =&gt; $post-&gt;contact_name]);
+		
+		$data = [
+			&#039;success&#039; =&gt; true,
+			&#039;message&#039; =&gt; $msg,
+		];
+		
+		if (!empty($thread)) {
+			$data[&#039;result&#039;] = (new ThreadResource($thread))-&gt;toArray($request);
+		} else {
+			$data[&#039;result&#039;] = null;
+		}
+		
+		$extra = [];
+		
+		$extra[&#039;post&#039;] = (new PostResource($post))-&gt;toArray($request);
+		$extra[&#039;missingAuthDataCompleted&#039;] = $missingAuthDataCompleted;
+		
+		$data[&#039;extra&#039;] = $extra;
+		
+		return apiResponse()-&gt;created($data);
+	}
+	
+	/**
+	 * Update thread
+	 *
+	 * @param $id
+	 * @param \App\Http\Requests\Front\ReplyMessageRequest $request
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function update($id, ReplyMessageRequest $request): JsonResponse
+	{
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		try {
+			// We use with([users =&gt; fn()]) to prevent email sending
+			// to the message sender (which is the current user)
+			/** @var Thread $thread */
+			$thread = Thread::with([
+				&#039;post&#039;,
+				&#039;users&#039; =&gt; function ($query) use ($authUser) {
+					$query-&gt;where((new User())-&gt;getTable() . &#039;.id&#039;, &#039;!=&#039;, $authUser-&gt;getAuthIdentifier());
+				},
+			])-&gt;findOrFail($id);
+		} catch (ModelNotFoundException $e) {
+			return apiResponse()-&gt;notFound(trans(&#039;global.thread_not_found&#039;, [&#039;id&#039; =&gt; $id]));
+		}
+		
+		// Re-activate the Thread for all participants
+		$thread-&gt;deleted_by = null;
+		$thread-&gt;save();
+		
+		$thread-&gt;activateAllParticipants();
+		
+		// Create Message Array
+		$messageArray = $request-&gt;all();
+		
+		// Message
+		$message = new ThreadMessage();
+		$message-&gt;thread_id = $thread-&gt;id;
+		$message-&gt;user_id = $authUser-&gt;getAuthIdentifier();
+		$message-&gt;body = $request-&gt;input(&#039;body&#039;);
+		$message-&gt;save();
+		
+		// Save and Send user&#039;s resume
+		if ($request-&gt;hasFile(&#039;file_path&#039;)) {
+			// Upload File
+			if (!empty($thread-&gt;post)) {
+				$post = $thread-&gt;post;
+				$destPath = &#039;files/&#039; . strtolower($post-&gt;country_code) . &#039;/&#039; . $post-&gt;id . &#039;/applications&#039;;
+				$message-&gt;file_path = Upload::file($request-&gt;file(&#039;file_path&#039;), $destPath);
+				
+				$message-&gt;save();
+			}
+		}
+		
+		// Update Message Array
+		$messageArray[&#039;country_code&#039;] = !empty($thread-&gt;post) ? $thread-&gt;post-&gt;country_code : config(&#039;country.code&#039;);
+		$messageArray[&#039;post_id&#039;] = !empty($thread-&gt;post) ? $thread-&gt;post-&gt;id : null;
+		$messageArray[&#039;name&#039;] = $authUser-&gt;name ?? null;
+		$messageArray[&#039;email&#039;] = $authUser-&gt;email ?? null;
+		$messageArray[&#039;phone&#039;] = $authUser-&gt;phone ?? null;
+		$messageArray[&#039;subject&#039;] = trans(&#039;global.New message about&#039;) . &#039;: &#039; . $thread-&gt;post-&gt;title;
+		if (!empty($message-&gt;file_path)) {
+			$messageArray[&#039;file_path&#039;] = $message-&gt;file_path;
+		}
+		
+		// Get the listing&#039;s auth field
+		$authField = $authUser-&gt;auth_field ?? getAuthField();
+		$messageArray[&#039;auth_field&#039;] = $authField;
+		$messageArray[&#039;to_auth_field&#039;] = $authField;
+		if (
+			!empty($thread-&gt;post) &amp;&amp; isset($thread-&gt;post-&gt;user_id)
+			&amp;&amp; ($authUser-&gt;getAuthIdentifier() == $thread-&gt;post-&gt;user_id)
+			&amp;&amp; isset($thread-&gt;post-&gt;auth_field) &amp;&amp; !empty($thread-&gt;post-&gt;auth_field)
+		) {
+			$messageArray[&#039;to_auth_field&#039;] = $thread-&gt;post-&gt;auth_field;
+		}
+		
+		// Add replier as a participant
+		$participant = ThreadParticipant::firstOrCreate([
+			&#039;thread_id&#039; =&gt; $thread-&gt;id,
+			&#039;user_id&#039;   =&gt; $authUser-&gt;getAuthIdentifier(),
+		]);
+		$participant-&gt;last_read = now();
+		$participant-&gt;save();
+		
+		// Recipients
+		if ($request-&gt;has(&#039;recipients&#039;)) {
+			$thread-&gt;addParticipant($request-&gt;input(&#039;recipients&#039;));
+		} else {
+			$thread-&gt;addParticipant($thread-&gt;post-&gt;user-&gt;id);
+		}
+		
+		// Remove input file to prevent Laravel Queue serialization issue
+		if (isset($messageArray[&#039;file_path&#039;])) {
+			if (!is_string($messageArray[&#039;file_path&#039;])) {
+				unset($messageArray[&#039;file_path&#039;]);
+			}
+		}
+		
+		// Send Reply Notification (Email|SMS?)
+		if (
+			isset($messageArray[&#039;post_id&#039;])
+			&amp;&amp; array_key_exists(&#039;email&#039;, $messageArray)
+			&amp;&amp; isset($messageArray[&#039;name&#039;])
+			&amp;&amp; isset($messageArray[&#039;body&#039;])
+		) {
+			try {
+				if (!isDemoDomain()) {
+					if (isset($thread-&gt;users) &amp;&amp; $thread-&gt;users-&gt;count() &gt; 0) {
+						foreach ($thread-&gt;users as $threadUser) {
+							if (
+								!empty($thread-&gt;post) &amp;&amp; isset($thread-&gt;post-&gt;user_id)
+								&amp;&amp; ($threadUser-&gt;id == $thread-&gt;post-&gt;user_id)
+								&amp;&amp; isset($thread-&gt;post-&gt;auth_field) &amp;&amp; !empty($thread-&gt;post-&gt;auth_field)
+							) {
+								// Update the listing&#039;s auth field
+								$messageArray[&#039;to_auth_field&#039;] = $thread-&gt;post-&gt;auth_field;
+							}
+							$messageArray[&#039;to_email&#039;] = $threadUser-&gt;email ?? null;
+							$messageArray[&#039;to_phone&#039;] = $threadUser-&gt;phone ?? null;
+							$messageArray[&#039;to_phone_hidden&#039;] = $threadUser-&gt;phone_hidden ?? 0;
+							Notification::send($threadUser, new ReplySent($messageArray));
+						}
+					}
+				}
+			} catch (Throwable $e) {
+				return apiResponse()-&gt;internalError($e-&gt;getMessage());
+			}
+		}
+		
+		$data = [
+			&#039;success&#039; =&gt; true,
+			&#039;message&#039; =&gt; trans(&#039;global.Your reply has been sent&#039;),
+			&#039;result&#039;  =&gt; (new ThreadResource($thread))-&gt;toArray($request),
+		];
+		
+		return apiResponse()-&gt;updated($data);
+	}
+	
+	/**
+	 * Bulk updates (i.e. Bulk actions)
+	 *
+	 * @param string|null $ids
+	 * @param string|null $actionType
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function bulkUpdate(?string $ids = null, ?string $actionType = null): JsonResponse
+	{
+		// Get Selected Entries ID (IDs separated by comma accepted)
+		$ids = explode(&#039;,&#039;, $ids);
+		
+		return $this-&gt;updateByType($ids, $actionType);
+	}
+	
+	/**
+	 * Delete thread(s)
+	 *
+	 * @param string $ids
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function destroy(string $ids): JsonResponse
+	{
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		// Get Entries ID (IDs separated by comma accepted)
+		$ids = explode(&#039;,&#039;, $ids);
+		
+		// Delete
+		$res = false;
+		foreach ($ids as $id) {
+			// Get the Thread
+			$thread = Thread::where((new Thread)-&gt;getTable() . &#039;.id&#039;, $id)
+				-&gt;forUser($authUser-&gt;getAuthIdentifier())
+				-&gt;first();
+			
+			if (!empty($thread)) {
+				if (empty($thread-&gt;deleted_by)) {
+					// Delete the Entry for current user
+					// (by updating the &#039;deleted_by&#039; column without updating the &#039;update_at&#039;)
+					Thread::withoutTimestamps(
+						fn () =&gt; $thread-&gt;where(&#039;id&#039;, $thread-&gt;id)-&gt;update([&#039;deleted_by&#039; =&gt; $authUser-&gt;getAuthIdentifier()])
+					);
+					
+					$res = true;
+				} else {
+					// If the 2nd user deletes the Entry,
+					// Delete the Entry (definitely)
+					if ($thread-&gt;deleted_by != $authUser-&gt;getAuthIdentifier()) {
+						$res = $thread-&gt;forceDelete();
+					}
+				}
+			}
+		}
+		if (!$res) {
+			return apiResponse()-&gt;noContent(trans(&#039;global.no_deletion_is_done&#039;));
+		}
+		
+		// Confirmation
+		$count = count($ids);
+		if ($count &gt; 1) {
+			$msg = trans(&#039;global.x entities have been deleted successfully&#039;, [
+				&#039;entities&#039; =&gt; trans(&#039;global.messages&#039;),
+				&#039;count&#039;    =&gt; $count,
+			]);
+		} else {
+			$msg = trans(&#039;global.1 entity has been deleted successfully&#039;, [
+				&#039;entity&#039; =&gt; trans(&#039;global.message&#039;),
+			]);
+		}
+		
+		return apiResponse()-&gt;success($msg);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/User/Delete.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Auth -->
+
+</body>
+</html>

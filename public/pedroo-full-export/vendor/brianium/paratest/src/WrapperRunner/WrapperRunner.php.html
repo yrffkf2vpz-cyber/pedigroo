@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/brianium/paratest/src/WrapperRunner/WrapperRunner.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace ParaTest\WrapperRunner;
+
+use ParaTest\Coverage\CoverageMerger;
+use ParaTest\JUnit\LogMerger;
+use ParaTest\JUnit\Writer;
+use ParaTest\Options;
+use ParaTest\RunnerInterface;
+use ParaTest\TestDox\TestDoxResultsMerger;
+use PHPUnit\Logging\TestDox\HtmlRenderer as TestDoxHtmlRenderer;
+use PHPUnit\Logging\TestDox\PlainTextRenderer as TestDoxPlainTextRenderer;
+use PHPUnit\Logging\TestDox\TestResultCollection as TestDoxTestResultCollection;
+use PHPUnit\Runner\CodeCoverage;
+use PHPUnit\Runner\ResultCache\DefaultResultCache;
+use PHPUnit\TestRunner\TestResult\Facade as TestResultFacade;
+use PHPUnit\TestRunner\TestResult\TestResult;
+use PHPUnit\TextUI\Configuration\CodeCoverageFilterRegistry;
+use PHPUnit\TextUI\Output\DefaultPrinter;
+use PHPUnit\TextUI\ShellExitCodeCalculator;
+use PHPUnit\Util\ExcludeList;
+use SplFileInfo;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Process\PhpExecutableFinder;
+
+use function array_merge;
+use function array_merge_recursive;
+use function array_shift;
+use function assert;
+use function count;
+use function dirname;
+use function file_get_contents;
+use function filesize;
+use function is_file;
+use function max;
+use function realpath;
+use function unlink;
+use function unserialize;
+use function usleep;
+
+use const DIRECTORY_SEPARATOR;
+
+/** @internal */
+final class WrapperRunner implements RunnerInterface
+{
+    private const int CYCLE_SLEEP = 10000;
+    private readonly ResultPrinter $printer;
+
+    /** @var list&lt;non-empty-string&gt; */
+    private array $pending = [];
+    private int $exitcode  = -1;
+    /** @var array&lt;positive-int,WrapperWorker&gt; */
+    private array $workers = [];
+    /** @var array&lt;int,int&gt; */
+    private array $batches = [];
+    /** @var array&lt;non-empty-string,true&gt; */
+    private array $requiredTestResultFiles = [];
+    /** @var array&lt;non-empty-string,true&gt; */
+    private array $requiredCoverageFiles = [];
+
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $statusFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $progressFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $unexpectedOutputFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $resultCacheFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $testResultFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $coverageFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $junitFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $teamcityFiles = [];
+    /** @var list&lt;SplFileInfo&gt; */
+    private array $testdoxFiles = [];
+    /** @var array&lt;non-empty-string&gt; */
+    private readonly array $parameters;
+    private CodeCoverageFilterRegistry $codeCoverageFilterRegistry;
+
+    public function __construct(
+        private readonly Options $options,
+        private readonly OutputInterface $output
+    ) {
+        $this-&gt;printer = new ResultPrinter($output, $options);
+
+        $wrapper = realpath(
+            dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . &#039;bin&#039; . DIRECTORY_SEPARATOR . &#039;phpunit-wrapper.php&#039;,
+        );
+        assert($wrapper !== false);
+        $phpFinder = new PhpExecutableFinder();
+        $phpBin    = $phpFinder-&gt;find(false);
+        assert($phpBin !== false);
+        assert($phpBin !== &#039;&#039;);
+        $parameters = [$phpBin];
+        /** @var array&lt;non-empty-string&gt; $arguments */
+        $arguments  = $phpFinder-&gt;findArguments();
+        $parameters = array_merge($parameters, $arguments);
+
+        if ($options-&gt;passthruPhp !== null) {
+            $parameters = array_merge($parameters, $options-&gt;passthruPhp);
+        }
+
+        $parameters[] = $wrapper;
+
+        $this-&gt;parameters                 = $parameters;
+        $this-&gt;codeCoverageFilterRegistry = new CodeCoverageFilterRegistry();
+    }
+
+    public function run(): int
+    {
+        $directory = dirname(__DIR__);
+        assert($directory !== &#039;&#039;);
+        ExcludeList::addDirectory($directory);
+        $suiteLoader = new SuiteLoader(
+            $this-&gt;options,
+            $this-&gt;output,
+            $this-&gt;codeCoverageFilterRegistry,
+        );
+        $result      = TestResultFacade::result();
+
+        $this-&gt;pending = $suiteLoader-&gt;tests;
+        $this-&gt;printer-&gt;setTestCount($suiteLoader-&gt;testCount);
+        $this-&gt;printer-&gt;start();
+        $this-&gt;startWorkers();
+        $this-&gt;assignAllPendingTests();
+        $this-&gt;waitForAllToFinish();
+
+        return $this-&gt;complete($result);
+    }
+
+    private function startWorkers(): void
+    {
+        for ($token = 1; $token &lt;= $this-&gt;options-&gt;processes; ++$token) {
+            $this-&gt;startWorker($token);
+        }
+    }
+
+    private function assignAllPendingTests(): void
+    {
+        $batchSize = $this-&gt;options-&gt;maxBatchSize;
+
+        while (count($this-&gt;pending) &gt; 0 &amp;&amp; count($this-&gt;workers) &gt; 0) {
+            foreach ($this-&gt;workers as $token =&gt; $worker) {
+                if (! $worker-&gt;isRunning()) {
+                    throw $worker-&gt;getWorkerCrashedException();
+                }
+
+                if (! $worker-&gt;isFree()) {
+                    continue;
+                }
+
+                $this-&gt;flushWorker($worker);
+
+                if ($batchSize !== 0 &amp;&amp; $this-&gt;batches[$token] === $batchSize) {
+                    $this-&gt;destroyWorker($token);
+                    $worker = $this-&gt;startWorker($token);
+                }
+
+                if (
+                    $this-&gt;exitcode &gt; 0
+                    &amp;&amp; $this-&gt;options-&gt;configuration-&gt;stopOnFailure()
+                ) {
+                    $this-&gt;pending = [];
+                } elseif (($pending = array_shift($this-&gt;pending)) !== null) {
+                    $worker-&gt;assign($pending);
+                    $this-&gt;batches[$token]++;
+                }
+            }
+
+            usleep(self::CYCLE_SLEEP);
+        }
+    }
+
+    private function flushWorker(WrapperWorker $worker): void
+    {
+        if ($worker-&gt;hasExecutedTests()) {
+            $testResultFile = $worker-&gt;testResultFile-&gt;getPathname();
+            if ($testResultFile !== &#039;&#039;) {
+                $this-&gt;requiredTestResultFiles[$testResultFile] = true;
+            }
+
+            if (isset($worker-&gt;coverageFile) &amp;&amp; $worker-&gt;coverageFile-&gt;getPathname() !== &#039;&#039;) {
+                $this-&gt;requiredCoverageFiles[$worker-&gt;coverageFile-&gt;getPathname()] = true;
+            }
+        }
+
+        $this-&gt;exitcode = max($this-&gt;exitcode, $worker-&gt;getExitCode());
+        $this-&gt;printer-&gt;printFeedback(
+            $worker-&gt;progressFile,
+            $worker-&gt;unexpectedOutputFile,
+            $worker-&gt;teamcityFile ?? null,
+        );
+        $worker-&gt;reset();
+    }
+
+    private function waitForAllToFinish(): void
+    {
+        $stopped = [];
+        while (count($this-&gt;workers) &gt; 0) {
+            foreach ($this-&gt;workers as $index =&gt; $worker) {
+                if ($worker-&gt;isRunning()) {
+                    if (! isset($stopped[$index]) &amp;&amp; $worker-&gt;isFree()) {
+                        $worker-&gt;stop();
+                        $stopped[$index] = true;
+                    }
+
+                    continue;
+                }
+
+                if (! $worker-&gt;isFree()) {
+                    throw $worker-&gt;getWorkerCrashedException();
+                }
+
+                $this-&gt;flushWorker($worker);
+                unset($this-&gt;workers[$index]);
+            }
+
+            usleep(self::CYCLE_SLEEP);
+        }
+    }
+
+    /** @param positive-int $token */
+    private function startWorker(int $token): WrapperWorker
+    {
+        $worker = new WrapperWorker(
+            $this-&gt;output,
+            $this-&gt;options,
+            $this-&gt;parameters,
+            $token,
+        );
+        $worker-&gt;start();
+        $this-&gt;batches[$token] = 0;
+
+        $this-&gt;statusFiles[]           = $worker-&gt;statusFile;
+        $this-&gt;progressFiles[]         = $worker-&gt;progressFile;
+        $this-&gt;unexpectedOutputFiles[] = $worker-&gt;unexpectedOutputFile;
+        $this-&gt;testResultFiles[]       = $worker-&gt;testResultFile;
+
+        if (isset($worker-&gt;resultCacheFile)) {
+            $this-&gt;resultCacheFiles[] = $worker-&gt;resultCacheFile;
+        }
+
+        if (isset($worker-&gt;junitFile)) {
+            $this-&gt;junitFiles[] = $worker-&gt;junitFile;
+        }
+
+        if (isset($worker-&gt;coverageFile)) {
+            $this-&gt;coverageFiles[] = $worker-&gt;coverageFile;
+        }
+
+        if (isset($worker-&gt;teamcityFile)) {
+            $this-&gt;teamcityFiles[] = $worker-&gt;teamcityFile;
+        }
+
+        if (isset($worker-&gt;testdoxFile)) {
+            $this-&gt;testdoxFiles[] = $worker-&gt;testdoxFile;
+        }
+
+        return $this-&gt;workers[$token] = $worker;
+    }
+
+    private function destroyWorker(int $token): void
+    {
+        $this-&gt;workers[$token]-&gt;stop();
+        // We need to wait for ApplicationForWrapperWorker::end to end
+        while ($this-&gt;workers[$token]-&gt;isRunning()) {
+            usleep(self::CYCLE_SLEEP);
+        }
+
+        unset($this-&gt;workers[$token]);
+    }
+
+    private function complete(TestResult $testResultSum): int
+    {
+        // Validate test result files for workers that executed tests
+        $missingTestResultFiles = [];
+        foreach ($this-&gt;requiredTestResultFiles as $filePath =&gt; $true) {
+            if (is_file($filePath)) {
+                continue;
+            }
+
+            $missingTestResultFiles[] = $filePath;
+        }
+
+        if ($missingTestResultFiles !== []) {
+            throw MissingResultsException::create($missingTestResultFiles, &#039;test_result&#039;);
+        }
+
+        foreach ($this-&gt;testResultFiles as $testresultFile) {
+            if (! $testresultFile-&gt;isFile()) {
+                continue;
+            }
+
+            $contents = file_get_contents($testresultFile-&gt;getPathname());
+            assert($contents !== false);
+            $testResult = unserialize($contents);
+            assert($testResult instanceof TestResult);
+
+            $testResultSum = new TestResult(
+                (int) $testResultSum-&gt;hasTests() + (int) $testResult-&gt;hasTests(),
+                $testResultSum-&gt;numberOfTestsRun() + $testResult-&gt;numberOfTestsRun(),
+                $testResultSum-&gt;numberOfAssertions() + $testResult-&gt;numberOfAssertions(),
+                array_merge_recursive($testResultSum-&gt;testErroredEvents(), $testResult-&gt;testErroredEvents()),
+                array_merge_recursive($testResultSum-&gt;testFailedEvents(), $testResult-&gt;testFailedEvents()),
+                array_merge_recursive($testResultSum-&gt;testConsideredRiskyEvents(), $testResult-&gt;testConsideredRiskyEvents()),
+                array_merge_recursive($testResultSum-&gt;testSuiteSkippedEvents(), $testResult-&gt;testSuiteSkippedEvents()),
+                array_merge_recursive($testResultSum-&gt;testSkippedEvents(), $testResult-&gt;testSkippedEvents()),
+                array_merge_recursive($testResultSum-&gt;testMarkedIncompleteEvents(), $testResult-&gt;testMarkedIncompleteEvents()),
+                array_merge_recursive($testResultSum-&gt;testTriggeredPhpunitDeprecationEvents(), $testResult-&gt;testTriggeredPhpunitDeprecationEvents()),
+                array_merge_recursive($testResultSum-&gt;testTriggeredPhpunitErrorEvents(), $testResult-&gt;testTriggeredPhpunitErrorEvents()),
+                array_merge_recursive($testResultSum-&gt;testTriggeredPhpunitNoticeEvents(), $testResult-&gt;testTriggeredPhpunitNoticeEvents()),
+                array_merge_recursive($testResultSum-&gt;testTriggeredPhpunitWarningEvents(), $testResult-&gt;testTriggeredPhpunitWarningEvents()),
+                array_merge_recursive($testResultSum-&gt;testRunnerTriggeredDeprecationEvents(), $testResult-&gt;testRunnerTriggeredDeprecationEvents()),
+                array_merge_recursive($testResultSum-&gt;testRunnerTriggeredNoticeEvents(), $testResult-&gt;testRunnerTriggeredNoticeEvents()),
+                array_merge_recursive($testResultSum-&gt;testRunnerTriggeredWarningEvents(), $testResult-&gt;testRunnerTriggeredWarningEvents()),
+                array_merge_recursive($testResultSum-&gt;errors(), $testResult-&gt;errors()),
+                array_merge_recursive($testResultSum-&gt;deprecations(), $testResult-&gt;deprecations()),
+                array_merge_recursive($testResultSum-&gt;notices(), $testResult-&gt;notices()),
+                array_merge_recursive($testResultSum-&gt;warnings(), $testResult-&gt;warnings()),
+                array_merge_recursive($testResultSum-&gt;phpDeprecations(), $testResult-&gt;phpDeprecations()),
+                array_merge_recursive($testResultSum-&gt;phpNotices(), $testResult-&gt;phpNotices()),
+                array_merge_recursive($testResultSum-&gt;phpWarnings(), $testResult-&gt;phpWarnings()),
+                $testResultSum-&gt;numberOfIssuesIgnoredByBaseline() + $testResult-&gt;numberOfIssuesIgnoredByBaseline(),
+            );
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;cacheResult()) {
+            $resultCacheSum = new DefaultResultCache($this-&gt;options-&gt;configuration-&gt;testResultCacheFile());
+            foreach ($this-&gt;resultCacheFiles as $resultCacheFile) {
+                $resultCache = new DefaultResultCache($resultCacheFile-&gt;getPathname());
+                $resultCache-&gt;load();
+
+                $resultCacheSum-&gt;mergeWith($resultCache);
+            }
+
+            $resultCacheSum-&gt;persist();
+        }
+
+        $testdoxResults = (new TestDoxResultsMerger())-&gt;getResultsFromTestdoxFiles($this-&gt;testdoxFiles);
+
+        $this-&gt;printer-&gt;printResults(
+            $testResultSum,
+            $this-&gt;teamcityFiles,
+            $testdoxResults,
+        );
+        $this-&gt;generateCodeCoverageReports();
+        $this-&gt;generateJunitLog();
+        $this-&gt;generateTestDoxLogs($testdoxResults);
+
+        $exitcode = (new ShellExitCodeCalculator())-&gt;calculate(
+            $this-&gt;options-&gt;configuration,
+            $testResultSum,
+        );
+
+        $this-&gt;clearFiles($this-&gt;statusFiles);
+        $this-&gt;clearFiles($this-&gt;progressFiles);
+        $this-&gt;clearFiles($this-&gt;unexpectedOutputFiles);
+        $this-&gt;clearFiles($this-&gt;testResultFiles);
+        $this-&gt;clearFiles($this-&gt;resultCacheFiles);
+        $this-&gt;clearFiles($this-&gt;coverageFiles);
+        $this-&gt;clearFiles($this-&gt;junitFiles);
+        $this-&gt;clearFiles($this-&gt;teamcityFiles);
+        $this-&gt;clearFiles($this-&gt;testdoxFiles);
+
+        return $exitcode;
+    }
+
+    protected function generateCodeCoverageReports(): void
+    {
+        if ($this-&gt;coverageFiles === []) {
+            return;
+        }
+
+        // Validate coverage files for workers that executed tests
+        $missingCoverageFiles = [];
+        foreach ($this-&gt;requiredCoverageFiles as $filePath =&gt; $true) {
+            if (is_file($filePath) &amp;&amp; filesize($filePath) !== 0) {
+                continue;
+            }
+
+            $missingCoverageFiles[] = $filePath;
+        }
+
+        if ($missingCoverageFiles !== []) {
+            throw MissingResultsException::create($missingCoverageFiles, &#039;coverage&#039;);
+        }
+
+        $coverageManager = new CodeCoverage();
+        $coverageManager-&gt;init(
+            $this-&gt;options-&gt;configuration,
+            $this-&gt;codeCoverageFilterRegistry,
+            false,
+        );
+        $coverageMerger = new CoverageMerger($coverageManager-&gt;codeCoverage());
+        foreach ($this-&gt;coverageFiles as $coverageFile) {
+            $coverageMerger-&gt;addCoverageFromFile($coverageFile);
+        }
+
+        $coverageManager-&gt;generateReports(
+            $this-&gt;printer-&gt;printer,
+            $this-&gt;options-&gt;configuration,
+        );
+    }
+
+    private function generateJunitLog(): void
+    {
+        if ($this-&gt;junitFiles === []) {
+            return;
+        }
+
+        $testSuite = (new LogMerger())-&gt;merge($this-&gt;junitFiles);
+        if ($testSuite === null) {
+            return;
+        }
+
+        (new Writer())-&gt;write(
+            $testSuite,
+            $this-&gt;options-&gt;configuration-&gt;logfileJunit(),
+        );
+    }
+
+    /** @param array&lt;string,TestDoxTestResultCollection&gt; $testdoxResults */
+    private function generateTestDoxLogs(array $testdoxResults): void
+    {
+        if ($this-&gt;options-&gt;configuration-&gt;hasLogfileTestdoxText()) {
+            $testdoxTextContent = (new TestDoxPlainTextRenderer())-&gt;render($testdoxResults);
+            DefaultPrinter::from($this-&gt;options-&gt;configuration-&gt;logfileTestdoxText())-&gt;print($testdoxTextContent);
+        }
+
+        if (! $this-&gt;options-&gt;configuration-&gt;hasLogfileTestdoxHtml()) {
+            return;
+        }
+
+        $testdoxHtmlContent = (new TestDoxHtmlRenderer())-&gt;render($testdoxResults);
+        DefaultPrinter::from($this-&gt;options-&gt;configuration-&gt;logfileTestdoxHtml())-&gt;print($testdoxHtmlContent);
+    }
+
+    /** @param list&lt;SplFileInfo&gt; $files */
+    private function clearFiles(array $files): void
+    {
+        foreach ($files as $file) {
+            if (! $file-&gt;isFile()) {
+                continue;
+            }
+
+            unlink($file-&gt;getPathname());
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/brianium/paratest/src/WrapperRunner/WrapperWorker.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/brick -->
+
+</body>
+</html>

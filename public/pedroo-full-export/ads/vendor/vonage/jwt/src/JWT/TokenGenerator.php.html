@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/vonage/jwt/src/JWT/TokenGenerator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+declare(strict_types=1);
+
+namespace Vonage\JWT;
+
+use Ramsey\Uuid\Uuid;
+use RuntimeException;
+use Lcobucci\JWT\Configuration;
+use Lcobucci\JWT\Encoding\JoseEncoder;
+use Lcobucci\JWT\Parser;
+use Lcobucci\JWT\Signer\Rsa\Sha256;
+use Lcobucci\JWT\Signer\Hmac\Sha256 as Sha256HMAC;
+use Lcobucci\JWT\Signer\Key\InMemory;
+use stdClass;
+use Lcobucci\JWT\Token\Parser as TokenParser;
+use Lcobucci\JWT\Validation\Constraint\SignedWith;
+use Lcobucci\JWT\Validation\Validator;
+use Vonage\JWT\Exception\InvalidJTIException;
+
+class TokenGenerator
+{
+    /**
+     * UUID of the application we are generating a UUID for
+     */
+    protected string $applicationId;
+
+    /**
+     * Set of generic claims to add to a JWT
+     * @var array&lt;mixed&gt;
+     */
+    protected array $claims = [];
+
+    /**
+     * Configuration of the token we are using
+     */
+    protected Configuration $config;
+
+    /**
+     * Number of seconds to expire in, defaults to 15 minutes
+     */
+    protected int $ttl = 900;
+
+    /**
+     * UUIDv4 ID for the JWT
+     */
+    protected string $jti;
+
+    /**
+     * Unix Timestamp at which this token becomes valid
+     */
+    protected \DateTimeImmutable $nbf;
+
+    /**
+     * ACL Path information
+     * @var array&lt;string, stdClass&gt;
+     */
+    protected array $paths = [];
+
+    /**
+     * Private key text used for signing
+     */
+    protected InMemory $privateKey;
+
+    /**
+     * Subject to use in the JWT
+     */
+    protected string $subject;
+
+    public function __construct(string $applicationId, string $privateKey)
+    {
+        $this-&gt;applicationId = $applicationId;
+        $this-&gt;privateKey = InMemory::plainText($privateKey);
+
+        $this-&gt;config = Configuration::forSymmetricSigner(new Sha256(), $this-&gt;privateKey);
+    }
+
+    /**
+     * @param array&lt;string, array&lt;string, string&gt;&gt; $options
+     */
+    public function addPath(string $path, array $options = []) : self
+    {
+        $this-&gt;paths[$path] = (object) $options;
+        return $this;
+    }
+
+    /**
+     * Factory to create a token in one call
+     * $options format:
+     *  - ttl: string
+     *  - jti: string
+     *  - paths: array&lt;string, \stdClass&gt;
+     *  - not_before: int|\DateTimeImmutable
+     *  - sub: string
+     *
+     * @param array&lt;string, mixed&gt; $options
+     */
+    public static function factory(string $applicationId, string $privateKey, array $options = []) : string
+    {
+        $generator = new self($applicationId, $privateKey);
+
+        if (array_key_exists(&#039;ttl&#039;, $options)) {
+            $generator-&gt;setTTL($options[&#039;ttl&#039;]);
+            unset($options[&#039;ttl&#039;]);
+        }
+
+        if (array_key_exists(&#039;jti&#039;, $options)) {
+            $generator-&gt;setJTI($options[&#039;jti&#039;]);
+            unset($options[&#039;jti&#039;]);
+        }
+
+        if (array_key_exists(&#039;paths&#039;, $options)) {
+            $generator-&gt;setPaths($options[&#039;paths&#039;]);
+            unset($options[&#039;paths&#039;]);
+        }
+
+        if (array_key_exists(&#039;not_before&#039;, $options)) {
+            if (is_int($options[&#039;not_before&#039;])) {
+                $options[&#039;not_before&#039;] = (new \DateTimeImmutable())-&gt;setTimestamp($options[&#039;not_before&#039;]);
+            }
+            $generator-&gt;setNotBefore($options[&#039;not_before&#039;]);
+            unset($options[&#039;not_before&#039;]);
+        }
+
+        if (array_key_exists(&#039;sub&#039;, $options)) {
+            $generator-&gt;setSubject($options[&#039;sub&#039;]);
+            unset($options[&#039;sub&#039;]);
+        }
+
+        foreach ($options as $key =&gt; $value) {
+            $generator-&gt;addClaim($key, $value);
+        }
+
+        return $generator-&gt;generate();
+    }
+
+    public function generate() : string
+    {
+        $iat = time();
+        $exp = $iat + $this-&gt;ttl;
+
+        $builder = $this-&gt;config-&gt;builder()
+            -&gt;issuedAt((new \DateTimeImmutable())-&gt;setTimestamp($iat))
+            -&gt;expiresAt((new \DateTimeImmutable())-&gt;setTimestamp($exp))
+            -&gt;identifiedBy($this-&gt;getJTI())
+            -&gt;withClaim(&#039;application_id&#039;, $this-&gt;applicationId);
+
+        if (!empty($this-&gt;getPaths())) {
+            $builder = $builder-&gt;withClaim(&#039;acl&#039;, [&#039;paths&#039; =&gt; $this-&gt;getPaths()]);
+        }
+
+        try {
+            $builder = $builder-&gt;canOnlyBeUsedAfter($this-&gt;getNotBefore());
+        } catch (RuntimeException $e) {
+            // This is fine, NBF isn&#039;t required
+        }
+
+        try {
+            $builder = $builder-&gt;relatedTo($this-&gt;getSubject());
+        } catch (RuntimeException $e) {
+            // This is fine, Subject isn&#039;t required
+        }
+
+        foreach ($this-&gt;claims as $key =&gt; $value) {
+            $builder = $builder-&gt;withClaim($key, $value);
+        }
+
+        return $builder-&gt;getToken($this-&gt;config-&gt;signer(), $this-&gt;config-&gt;signingKey())-&gt;toString();
+    }
+
+    public function getJTI() : string
+    {
+        if (!isset($this-&gt;jti)) {
+            $this-&gt;jti = Uuid::uuid4()-&gt;toString();
+        }
+
+        return $this-&gt;jti;
+    }
+
+    public function getNotBefore() : \DateTimeImmutable
+    {
+        if (!isset($this-&gt;nbf)) {
+            throw new RuntimeException(&#039;Not Before time has not been set&#039;);
+        }
+
+        return $this-&gt;nbf;
+    }
+
+    public function getParser(): Parser
+    {
+        return $this-&gt;config-&gt;parser();
+    }
+
+    /**
+     * @return array&lt;string, stdClass&gt;
+     */
+    public function getPaths() : array
+    {
+        return $this-&gt;paths;
+    }
+
+    public function getSubject() : string
+    {
+        if (!isset($this-&gt;subject)) {
+            throw new RuntimeException(&#039;Subject has not been set&#039;);
+        }
+
+        return $this-&gt;subject;
+    }
+
+    public function addClaim(string $claim, mixed $value): self
+    {
+        $this-&gt;claims[$claim] = $value;
+        return $this;
+    }
+
+    public function setTTL(int $seconds) : self
+    {
+        $this-&gt;ttl = $seconds;
+        return $this;
+    }
+
+    public function setJTI(string $uuid) : self
+    {
+        if (!Uuid::isValid($uuid)) {
+            throw new InvalidJTIException(&#039;JTI must be a UUIDv4 string&#039;);
+        }
+
+        $this-&gt;jti = $uuid;
+        return $this;
+    }
+
+    public function setNotBefore(\DateTimeImmutable $timestamp) : self
+    {
+        $this-&gt;nbf = $timestamp;
+        return $this;
+    }
+
+    /**
+     * Sets the ACL path information for this token
+     * WARNING: This will reset the paths to the new list, overriding any
+     * existing paths.
+     *
+     * @param array&lt;string|int, array&lt;string, mixed&gt;|string&gt; $pathData
+     */
+    public function setPaths(array $pathData) : self
+    {
+        $this-&gt;paths = [];
+        foreach ($pathData as $key =&gt; $data) {
+            if (is_string($key)) {
+                $this-&gt;addPath($key, $data);
+            } else {
+                $this-&gt;addPath($data);
+            }
+        }
+
+        return $this;
+    }
+
+    public function setSubject(string $subject) : self
+    {
+        $this-&gt;subject = $subject;
+        return $this;
+    }
+
+    public function getTTL() : int
+    {
+        return $this-&gt;ttl;
+    }
+
+    public static function verifySignature(string $token, string $secret): bool
+    {
+        $parser = new TokenParser(new JoseEncoder());
+        $validator = new Validator();
+
+        $token = $parser-&gt;parse($token);
+
+        return $validator-&gt;validate(
+            $token, new SignedWith(
+                new Sha256HMAC(),
+                InMemory::plainText($secret)
+            ));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/vonage/jwt/test/JWT/TokenGeneratorTest.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/vonage/jwt/src/JWT/Exception -->
+
+</body>
+</html>

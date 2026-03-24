@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/filesystem/Path.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Filesystem;
+
+use Symfony\Component\Filesystem\Exception\InvalidArgumentException;
+use Symfony\Component\Filesystem\Exception\RuntimeException;
+
+/**
+ * Contains utility methods for handling path strings.
+ *
+ * The methods in this class are able to deal with both UNIX and Windows paths
+ * with both forward and backward slashes. All methods return normalized parts
+ * containing only forward slashes and no excess &quot;.&quot; and &quot;..&quot; segments.
+ *
+ * @author Bernhard Schussek &lt;bschussek@gmail.com&gt;
+ * @author Thomas Schulz &lt;mail@king2500.net&gt;
+ * @author Théo Fidry &lt;theo.fidry@gmail.com&gt;
+ */
+final class Path
+{
+    /**
+     * The number of buffer entries that triggers a cleanup operation.
+     */
+    private const CLEANUP_THRESHOLD = 1250;
+
+    /**
+     * The buffer size after the cleanup operation.
+     */
+    private const CLEANUP_SIZE = 1000;
+
+    /**
+     * Buffers input/output of {@link canonicalize()}.
+     *
+     * @var array&lt;string, string&gt;
+     */
+    private static array $buffer = [];
+
+    private static int $bufferSize = 0;
+
+    /**
+     * Canonicalizes the given path.
+     *
+     * During normalization, all slashes are replaced by forward slashes (&quot;/&quot;).
+     * Furthermore, all &quot;.&quot; and &quot;..&quot; segments are removed as far as possible.
+     * &quot;..&quot; segments at the beginning of relative paths are not removed.
+     *
+     * ```php
+     * echo Path::canonicalize(&quot;\symfony\puli\..\css\style.css&quot;);
+     * // =&gt; /symfony/css/style.css
+     *
+     * echo Path::canonicalize(&quot;../css/./style.css&quot;);
+     * // =&gt; ../css/style.css
+     * ```
+     *
+     * This method is able to deal with both UNIX and Windows paths.
+     */
+    public static function canonicalize(string $path): string
+    {
+        if (&#039;&#039; === $path) {
+            return &#039;&#039;;
+        }
+
+        // This method is called by many other methods in this class. Buffer
+        // the canonicalized paths to make up for the severe performance
+        // decrease.
+        if (isset(self::$buffer[$path])) {
+            return self::$buffer[$path];
+        }
+
+        // Replace &quot;~&quot; with user&#039;s home directory.
+        if (&#039;~&#039; === $path[0]) {
+            $path = self::getHomeDirectory().substr($path, 1);
+        }
+
+        $path = self::normalize($path);
+
+        [$root, $pathWithoutRoot] = self::split($path);
+
+        $canonicalParts = self::findCanonicalParts($root, $pathWithoutRoot);
+
+        // Add the root directory again
+        self::$buffer[$path] = $canonicalPath = $root.implode(&#039;/&#039;, $canonicalParts);
+        ++self::$bufferSize;
+
+        // Clean up regularly to prevent memory leaks
+        if (self::$bufferSize &gt; self::CLEANUP_THRESHOLD) {
+            self::$buffer = \array_slice(self::$buffer, -self::CLEANUP_SIZE, null, true);
+            self::$bufferSize = self::CLEANUP_SIZE;
+        }
+
+        return $canonicalPath;
+    }
+
+    /**
+     * Normalizes the given path.
+     *
+     * During normalization, all slashes are replaced by forward slashes (&quot;/&quot;).
+     * Contrary to {@link canonicalize()}, this method does not remove invalid
+     * or dot path segments. Consequently, it is much more efficient and should
+     * be used whenever the given path is known to be a valid, absolute system
+     * path.
+     *
+     * This method is able to deal with both UNIX and Windows paths.
+     */
+    public static function normalize(string $path): string
+    {
+        return str_replace(&#039;\\&#039;, &#039;/&#039;, $path);
+    }
+
+    /**
+     * Returns the directory part of the path.
+     *
+     * This method is similar to PHP&#039;s dirname(), but handles various cases
+     * where dirname() returns a weird result:
+     *
+     *  - dirname() does not accept backslashes on UNIX
+     *  - dirname(&quot;C:/symfony&quot;) returns &quot;C:&quot;, not &quot;C:/&quot;
+     *  - dirname(&quot;C:/&quot;) returns &quot;.&quot;, not &quot;C:/&quot;
+     *  - dirname(&quot;C:&quot;) returns &quot;.&quot;, not &quot;C:/&quot;
+     *  - dirname(&quot;symfony&quot;) returns &quot;.&quot;, not &quot;&quot;
+     *  - dirname() does not canonicalize the result
+     *
+     * This method fixes these shortcomings and behaves like dirname()
+     * otherwise.
+     *
+     * The result is a canonical path.
+     *
+     * @return string The canonical directory part. Returns the root directory
+     *                if the root directory is passed. Returns an empty string
+     *                if a relative path is passed that contains no slashes.
+     *                Returns an empty string if an empty string is passed.
+     */
+    public static function getDirectory(string $path): string
+    {
+        if (&#039;&#039; === $path) {
+            return &#039;&#039;;
+        }
+
+        $path = self::canonicalize($path);
+
+        // Maintain scheme
+        if (false !== $schemeSeparatorPosition = strpos($path, &#039;://&#039;)) {
+            $scheme = substr($path, 0, $schemeSeparatorPosition + 3);
+            $path = substr($path, $schemeSeparatorPosition + 3);
+        } else {
+            $scheme = &#039;&#039;;
+        }
+
+        if (false === $dirSeparatorPosition = strrpos($path, &#039;/&#039;)) {
+            return &#039;&#039;;
+        }
+
+        // Directory equals root directory &quot;/&quot;
+        if (0 === $dirSeparatorPosition) {
+            return $scheme.&#039;/&#039;;
+        }
+
+        // Directory equals Windows root &quot;C:/&quot;
+        if (2 === $dirSeparatorPosition &amp;&amp; ctype_alpha($path[0]) &amp;&amp; &#039;:&#039; === $path[1]) {
+            return $scheme.substr($path, 0, 3);
+        }
+
+        return $scheme.substr($path, 0, $dirSeparatorPosition);
+    }
+
+    /**
+     * Returns canonical path of the user&#039;s home directory.
+     *
+     * Supported operating systems:
+     *
+     *  - UNIX
+     *  - Windows8 and upper
+     *
+     * If your operating system or environment isn&#039;t supported, an exception is thrown.
+     *
+     * The result is a canonical path.
+     *
+     * @throws RuntimeException If your operating system or environment isn&#039;t supported
+     */
+    public static function getHomeDirectory(): string
+    {
+        // For UNIX support
+        if (getenv(&#039;HOME&#039;)) {
+            return self::canonicalize(getenv(&#039;HOME&#039;));
+        }
+
+        // For &gt;= Windows8 support
+        if (getenv(&#039;HOMEDRIVE&#039;) &amp;&amp; getenv(&#039;HOMEPATH&#039;)) {
+            return self::canonicalize(getenv(&#039;HOMEDRIVE&#039;).getenv(&#039;HOMEPATH&#039;));
+        }
+
+        throw new RuntimeException(&quot;Cannot find the home directory path: Your environment or operating system isn&#039;t supported.&quot;);
+    }
+
+    /**
+     * Returns the root directory of a path.
+     *
+     * The result is a canonical path.
+     *
+     * @return string The canonical root directory. Returns an empty string if
+     *                the given path is relative or empty.
+     */
+    public static function getRoot(string $path): string
+    {
+        if (&#039;&#039; === $path) {
+            return &#039;&#039;;
+        }
+
+        // Maintain scheme
+        if (false !== $schemeSeparatorPosition = strpos($path, &#039;://&#039;)) {
+            $scheme = substr($path, 0, $schemeSeparatorPosition + 3);
+            $path = substr($path, $schemeSeparatorPosition + 3);
+        } else {
+            $scheme = &#039;&#039;;
+        }
+
+        $firstCharacter = $path[0];
+
+        // UNIX root &quot;/&quot; or &quot;\&quot; (Windows style)
+        if (&#039;/&#039; === $firstCharacter || &#039;\\&#039; === $firstCharacter) {
+            return $scheme.&#039;/&#039;;
+        }
+
+        $length = \strlen($path);
+
+        // Windows root
+        if ($length &gt; 1 &amp;&amp; &#039;:&#039; === $path[1] &amp;&amp; ctype_alpha($firstCharacter)) {
+            // Special case: &quot;C:&quot;
+            if (2 === $length) {
+                return $scheme.$path.&#039;/&#039;;
+            }
+
+            // Normal case: &quot;C:/ or &quot;C:\&quot;
+            if (&#039;/&#039; === $path[2] || &#039;\\&#039; === $path[2]) {
+                return $scheme.$firstCharacter.$path[1].&#039;/&#039;;
+            }
+        }
+
+        return &#039;&#039;;
+    }
+
+    /**
+     * Returns the file name without the extension from a file path.
+     *
+     * @param string|null $extension if specified, only that extension is cut
+     *                               off (may contain leading dot)
+     */
+    public static function getFilenameWithoutExtension(string $path, ?string $extension = null): string
+    {
+        if (&#039;&#039; === $path) {
+            return &#039;&#039;;
+        }
+
+        if (null !== $extension) {
+            // remove extension and trailing dot
+            return rtrim(basename($path, $extension), &#039;.&#039;);
+        }
+
+        return pathinfo($path, \PATHINFO_FILENAME);
+    }
+
+    /**
+     * Returns the extension from a file path (without leading dot).
+     *
+     * @param bool $forceLowerCase forces the extension to be lower-case
+     */
+    public static function getExtension(string $path, bool $forceLowerCase = false): string
+    {
+        if (&#039;&#039; === $path) {
+            return &#039;&#039;;
+        }
+
+        $extension = pathinfo($path, \PATHINFO_EXTENSION);
+
+        if ($forceLowerCase) {
+            $extension = self::toLower($extension);
+        }
+
+        return $extension;
+    }
+
+    /**
+     * Returns whether the path has an (or the specified) extension.
+     *
+     * @param string               $path       the path string
+     * @param string|string[]|null $extensions if null or not provided, checks if
+     *                                         an extension exists, otherwise
+     *                                         checks for the specified extension
+     *                                         or array of extensions (with or
+     *                                         without leading dot)
+     * @param bool                 $ignoreCase whether to ignore case-sensitivity
+     */
+    public static function hasExtension(string $path, $extensions = null, bool $ignoreCase = false): bool
+    {
+        if (&#039;&#039; === $path) {
+            return false;
+        }
+
+        $actualExtension = self::getExtension($path, $ignoreCase);
+
+        // Only check if path has any extension
+        if ([] === $extensions || null === $extensions) {
+            return &#039;&#039; !== $actualExtension;
+        }
+
+        if (\is_string($extensions)) {
+            $extensions = [$extensions];
+        }
+
+        foreach ($extensions as $key =&gt; $extension) {
+            if ($ignoreCase) {
+                $extension = self::toLower($extension);
+            }
+
+            // remove leading &#039;.&#039; in extensions array
+            $extensions[$key] = ltrim($extension, &#039;.&#039;);
+        }
+
+        return \in_array($actualExtension, $extensions, true);
+    }
+
+    /**
+     * Changes the extension of a path string.
+     *
+     * @param string $path      The path string with filename.ext to change.
+     * @param string $extension new extension (with or without leading dot)
+     *
+     * @return string the path string with new file extension
+     */
+    public static function changeExtension(string $path, string $extension): string
+    {
+        if (&#039;&#039; === $path) {
+            return &#039;&#039;;
+        }
+
+        $actualExtension = self::getExtension($path);
+        $extension = ltrim($extension, &#039;.&#039;);
+
+        // No extension for paths
+        if (str_ends_with($path, &#039;/&#039;)) {
+            return $path;
+        }
+
+        // No actual extension in path
+        if (!$actualExtension) {
+            return $path.(str_ends_with($path, &#039;.&#039;) ? &#039;&#039; : &#039;.&#039;).$extension;
+        }
+
+        return substr($path, 0, -\strlen($actualExtension)).$extension;
+    }
+
+    /**
+     * Returns whether the given path is absolute.
+     */
+    public static function isAbsolute(string $path): bool
+    {
+        return &#039;&#039; !== $path &amp;&amp; (strspn($path, &#039;/\\&#039;, 0, 1)
+            || (\strlen($path) &gt; 3 &amp;&amp; ctype_alpha($path[0])
+                &amp;&amp; &#039;:&#039; === $path[1]
+                &amp;&amp; strspn($path, &#039;/\\&#039;, 2, 1)
+            )
+            || null !== parse_url($path, \PHP_URL_SCHEME)
+        );
+    }
+
+    public static function isRelative(string $path): bool
+    {
+        return !self::isAbsolute($path);
+    }
+
+    /**
+     * Turns a relative path into an absolute path in canonical form.
+     *
+     * Usually, the relative path is appended to the given base path. Dot
+     * segments (&quot;.&quot; and &quot;..&quot;) are removed/collapsed and all slashes turned
+     * into forward slashes.
+     *
+     * ```php
+     * echo Path::makeAbsolute(&quot;../style.css&quot;, &quot;/symfony/puli/css&quot;);
+     * // =&gt; /symfony/puli/style.css
+     * ```
+     *
+     * If an absolute path is passed, that path is returned unless its root
+     * directory is different than the one of the base path. In that case, an
+     * exception is thrown.
+     *
+     * ```php
+     * Path::makeAbsolute(&quot;/style.css&quot;, &quot;/symfony/puli/css&quot;);
+     * // =&gt; /style.css
+     *
+     * Path::makeAbsolute(&quot;C:/style.css&quot;, &quot;C:/symfony/puli/css&quot;);
+     * // =&gt; C:/style.css
+     *
+     * Path::makeAbsolute(&quot;C:/style.css&quot;, &quot;/symfony/puli/css&quot;);
+     * // InvalidArgumentException
+     * ```
+     *
+     * If the base path is not an absolute path, an exception is thrown.
+     *
+     * The result is a canonical path.
+     *
+     * @param string $basePath an absolute base path
+     *
+     * @throws InvalidArgumentException if the base path is not absolute or if
+     *                                  the given path is an absolute path with
+     *                                  a different root than the base path
+     */
+    public static function makeAbsolute(string $path, string $basePath): string
+    {
+        if (&#039;&#039; === $basePath) {
+            throw new InvalidArgumentException(\sprintf(&#039;The base path must be a non-empty string. Got: &quot;%s&quot;.&#039;, $basePath));
+        }
+
+        if (!self::isAbsolute($basePath)) {
+            throw new InvalidArgumentException(\sprintf(&#039;The base path &quot;%s&quot; is not an absolute path.&#039;, $basePath));
+        }
+
+        if (self::isAbsolute($path)) {
+            return self::canonicalize($path);
+        }
+
+        if (false !== $schemeSeparatorPosition = strpos($basePath, &#039;://&#039;)) {
+            $scheme = substr($basePath, 0, $schemeSeparatorPosition + 3);
+            $basePath = substr($basePath, $schemeSeparatorPosition + 3);
+        } else {
+            $scheme = &#039;&#039;;
+        }
+
+        return $scheme.self::canonicalize(rtrim($basePath, &#039;/\\&#039;).&#039;/&#039;.$path);
+    }
+
+    /**
+     * Turns a path into a relative path.
+     *
+     * The relative path is created relative to the given base path:
+     *
+     * ```php
+     * echo Path::makeRelative(&quot;/symfony/style.css&quot;, &quot;/symfony/puli&quot;);
+     * // =&gt; ../style.css
+     * ```
+     *
+     * If a relative path is passed and the base path is absolute, the relative
+     * path is returned unchanged:
+     *
+     * ```php
+     * Path::makeRelative(&quot;style.css&quot;, &quot;/symfony/puli/css&quot;);
+     * // =&gt; style.css
+     * ```
+     *
+     * If both paths are relative, the relative path is created with the
+     * assumption that both paths are relative to the same directory:
+     *
+     * ```php
+     * Path::makeRelative(&quot;style.css&quot;, &quot;symfony/puli/css&quot;);
+     * // =&gt; ../../../style.css
+     * ```
+     *
+     * If both paths are absolute, their root directory must be the same,
+     * otherwise an exception is thrown:
+     *
+     * ```php
+     * Path::makeRelative(&quot;C:/symfony/style.css&quot;, &quot;/symfony/puli&quot;);
+     * // InvalidArgumentException
+     * ```
+     *
+     * If the passed path is absolute, but the base path is not, an exception
+     * is thrown as well:
+     *
+     * ```php
+     * Path::makeRelative(&quot;/symfony/style.css&quot;, &quot;symfony/puli&quot;);
+     * // InvalidArgumentException
+     * ```
+     *
+     * If the base path is not an absolute path, an exception is thrown.
+     *
+     * The result is a canonical path.
+     *
+     * @throws InvalidArgumentException if the base path is not absolute or if
+     *                                  the given path has a different root
+     *                                  than the base path
+     */
+    public static function makeRelative(string $path, string $basePath): string
+    {
+        $path = self::canonicalize($path);
+        $basePath = self::canonicalize($basePath);
+
+        [$root, $relativePath] = self::split($path);
+        [$baseRoot, $relativeBasePath] = self::split($basePath);
+
+        // If the base path is given as absolute path and the path is already
+        // relative, consider it to be relative to the given absolute path
+        // already
+        if (&#039;&#039; === $root &amp;&amp; &#039;&#039; !== $baseRoot) {
+            // If base path is already in its root
+            if (&#039;&#039; === $relativeBasePath) {
+                $relativePath = ltrim($relativePath, &#039;./\\&#039;);
+            }
+
+            return $relativePath;
+        }
+
+        // If the passed path is absolute, but the base path is not, we
+        // cannot generate a relative path
+        if (&#039;&#039; !== $root &amp;&amp; &#039;&#039; === $baseRoot) {
+            throw new InvalidArgumentException(\sprintf(&#039;The absolute path &quot;%s&quot; cannot be made relative to the relative path &quot;%s&quot;. You should provide an absolute base path instead.&#039;, $path, $basePath));
+        }
+
+        // Fail if the roots of the two paths are different
+        if ($baseRoot &amp;&amp; $root !== $baseRoot) {
+            throw new InvalidArgumentException(\sprintf(&#039;The path &quot;%s&quot; cannot be made relative to &quot;%s&quot;, because they have different roots (&quot;%s&quot; and &quot;%s&quot;).&#039;, $path, $basePath, $root, $baseRoot));
+        }
+
+        if (&#039;&#039; === $relativeBasePath) {
+            return $relativePath;
+        }
+
+        // Build a &quot;../../&quot; prefix with as many &quot;../&quot; parts as necessary
+        $parts = explode(&#039;/&#039;, $relativePath);
+        $baseParts = explode(&#039;/&#039;, $relativeBasePath);
+        $dotDotPrefix = &#039;&#039;;
+
+        // Once we found a non-matching part in the prefix, we need to add
+        // &quot;../&quot; parts for all remaining parts
+        $match = true;
+
+        foreach ($baseParts as $index =&gt; $basePart) {
+            if ($match &amp;&amp; isset($parts[$index]) &amp;&amp; $basePart === $parts[$index]) {
+                unset($parts[$index]);
+
+                continue;
+            }
+
+            $match = false;
+            $dotDotPrefix .= &#039;../&#039;;
+        }
+
+        return rtrim($dotDotPrefix.implode(&#039;/&#039;, $parts), &#039;/&#039;);
+    }
+
+    /**
+     * Returns whether the given path is on the local filesystem.
+     */
+    public static function isLocal(string $path): bool
+    {
+        return &#039;&#039; !== $path &amp;&amp; !str_contains($path, &#039;://&#039;);
+    }
+
+    /**
+     * Returns the longest common base path in canonical form of a set of paths or
+     * `null` if the paths are on different Windows partitions.
+     *
+     * Dot segments (&quot;.&quot; and &quot;..&quot;) are removed/collapsed and all slashes turned
+     * into forward slashes.
+     *
+     * ```php
+     * $basePath = Path::getLongestCommonBasePath(
+     *     &#039;/symfony/css/style.css&#039;,
+     *     &#039;/symfony/css/..&#039;
+     * );
+     * // =&gt; /symfony
+     * ```
+     *
+     * The root is returned if no common base path can be found:
+     *
+     * ```php
+     * $basePath = Path::getLongestCommonBasePath(
+     *     &#039;/symfony/css/style.css&#039;,
+     *     &#039;/puli/css/..&#039;
+     * );
+     * // =&gt; /
+     * ```
+     *
+     * If the paths are located on different Windows partitions, `null` is
+     * returned.
+     *
+     * ```php
+     * $basePath = Path::getLongestCommonBasePath(
+     *     &#039;C:/symfony/css/style.css&#039;,
+     *     &#039;D:/symfony/css/..&#039;
+     * );
+     * // =&gt; null
+     * ```
+     */
+    public static function getLongestCommonBasePath(string ...$paths): ?string
+    {
+        [$bpRoot, $basePath] = self::split(self::canonicalize(reset($paths)));
+
+        for (next($paths); null !== key($paths) &amp;&amp; &#039;&#039; !== $basePath; next($paths)) {
+            [$root, $path] = self::split(self::canonicalize(current($paths)));
+
+            // If we deal with different roots (e.g. C:/ vs. D:/), it&#039;s time
+            // to quit
+            if ($root !== $bpRoot) {
+                return null;
+            }
+
+            // Make the base path shorter until it fits into path
+            while (true) {
+                if (&#039;.&#039; === $basePath) {
+                    // No more base paths
+                    $basePath = &#039;&#039;;
+
+                    // next path
+                    continue 2;
+                }
+
+                // Prevent false positives for common prefixes
+                // see isBasePath()
+                if (str_starts_with($path.&#039;/&#039;, $basePath.&#039;/&#039;)) {
+                    // next path
+                    continue 2;
+                }
+
+                $basePath = \dirname($basePath);
+            }
+        }
+
+        return $bpRoot.$basePath;
+    }
+
+    /**
+     * Joins two or more path strings into a canonical path.
+     */
+    public static function join(string ...$paths): string
+    {
+        $finalPath = null;
+        $wasScheme = false;
+
+        foreach ($paths as $path) {
+            if (&#039;&#039; === $path) {
+                continue;
+            }
+
+            if (null === $finalPath) {
+                // For first part we keep slashes, like &#039;/top&#039;, &#039;C:\&#039; or &#039;phar://&#039;
+                $finalPath = $path;
+                $wasScheme = str_contains($path, &#039;://&#039;);
+                continue;
+            }
+
+            // Only add slash if previous part didn&#039;t end with &#039;/&#039; or &#039;\&#039;
+            if (!\in_array(substr($finalPath, -1), [&#039;/&#039;, &#039;\\&#039;], true)) {
+                $finalPath .= &#039;/&#039;;
+            }
+
+            // If first part included a scheme like &#039;phar://&#039; we allow \current part to start with &#039;/&#039;, otherwise trim
+            $finalPath .= $wasScheme ? $path : ltrim($path, &#039;/&#039;);
+            $wasScheme = false;
+        }
+
+        if (null === $finalPath) {
+            return &#039;&#039;;
+        }
+
+        return self::canonicalize($finalPath);
+    }
+
+    /**
+     * Returns whether a path is a base path of another path.
+     *
+     * Dot segments (&quot;.&quot; and &quot;..&quot;) are removed/collapsed and all slashes turned
+     * into forward slashes.
+     *
+     * ```php
+     * Path::isBasePath(&#039;/symfony&#039;, &#039;/symfony/css&#039;);
+     * // =&gt; true
+     *
+     * Path::isBasePath(&#039;/symfony&#039;, &#039;/symfony&#039;);
+     * // =&gt; true
+     *
+     * Path::isBasePath(&#039;/symfony&#039;, &#039;/symfony/..&#039;);
+     * // =&gt; false
+     *
+     * Path::isBasePath(&#039;/symfony&#039;, &#039;/puli&#039;);
+     * // =&gt; false
+     * ```
+     */
+    public static function isBasePath(string $basePath, string $ofPath): bool
+    {
+        $basePath = self::canonicalize($basePath);
+        $ofPath = self::canonicalize($ofPath);
+
+        // Append slashes to prevent false positives when two paths have
+        // a common prefix, for example /base/foo and /base/foobar.
+        // Don&#039;t append a slash for the root &quot;/&quot;, because then that root
+        // won&#039;t be discovered as common prefix (&quot;//&quot; is not a prefix of
+        // &quot;/foobar/&quot;).
+        return str_starts_with($ofPath.&#039;/&#039;, rtrim($basePath, &#039;/&#039;).&#039;/&#039;);
+    }
+
+    /**
+     * @return string[]
+     */
+    private static function findCanonicalParts(string $root, string $pathWithoutRoot): array
+    {
+        $parts = explode(&#039;/&#039;, $pathWithoutRoot);
+
+        $canonicalParts = [];
+
+        // Collapse &quot;.&quot; and &quot;..&quot;, if possible
+        foreach ($parts as $part) {
+            if (&#039;.&#039; === $part || &#039;&#039; === $part) {
+                continue;
+            }
+
+            // Collapse &quot;..&quot; with the previous part, if one exists
+            // Don&#039;t collapse &quot;..&quot; if the previous part is also &quot;..&quot;
+            if (&#039;..&#039; === $part &amp;&amp; \count($canonicalParts) &gt; 0 &amp;&amp; &#039;..&#039; !== $canonicalParts[\count($canonicalParts) - 1]) {
+                array_pop($canonicalParts);
+
+                continue;
+            }
+
+            // Only add &quot;..&quot; prefixes for relative paths
+            if (&#039;..&#039; !== $part || &#039;&#039; === $root) {
+                $canonicalParts[] = $part;
+            }
+        }
+
+        return $canonicalParts;
+    }
+
+    /**
+     * Splits a canonical path into its root directory and the remainder.
+     *
+     * If the path has no root directory, an empty root directory will be
+     * returned.
+     *
+     * If the root directory is a Windows style partition, the resulting root
+     * will always contain a trailing slash.
+     *
+     * list ($root, $path) = Path::split(&quot;C:/symfony&quot;)
+     * // =&gt; [&quot;C:/&quot;, &quot;symfony&quot;]
+     *
+     * list ($root, $path) = Path::split(&quot;C:&quot;)
+     * // =&gt; [&quot;C:/&quot;, &quot;&quot;]
+     *
+     * @return array{string, string} an array with the root directory and the remaining relative path
+     */
+    private static function split(string $path): array
+    {
+        if (&#039;&#039; === $path) {
+            return [&#039;&#039;, &#039;&#039;];
+        }
+
+        // Remember scheme as part of the root, if any
+        if (false !== $schemeSeparatorPosition = strpos($path, &#039;://&#039;)) {
+            $root = substr($path, 0, $schemeSeparatorPosition + 3);
+            $path = substr($path, $schemeSeparatorPosition + 3);
+        } else {
+            $root = &#039;&#039;;
+        }
+
+        $length = \strlen($path);
+
+        // Remove and remember root directory
+        if (str_starts_with($path, &#039;/&#039;)) {
+            $root .= &#039;/&#039;;
+            $path = $length &gt; 1 ? substr($path, 1) : &#039;&#039;;
+        } elseif ($length &gt; 1 &amp;&amp; ctype_alpha($path[0]) &amp;&amp; &#039;:&#039; === $path[1]) {
+            if (2 === $length) {
+                // Windows special case: &quot;C:&quot;
+                $root .= $path.&#039;/&#039;;
+                $path = &#039;&#039;;
+            } elseif (&#039;/&#039; === $path[2]) {
+                // Windows normal case: &quot;C:/&quot;..
+                $root .= substr($path, 0, 3);
+                $path = $length &gt; 3 ? substr($path, 3) : &#039;&#039;;
+            }
+        }
+
+        return [$root, $path];
+    }
+
+    private static function toLower(string $string): string
+    {
+        if (false !== $encoding = mb_detect_encoding($string, null, true)) {
+            return mb_strtolower($string, $encoding);
+        }
+
+        return strtolower($string);
+    }
+
+    private function __construct()
+    {
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/filesystem/README.md -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/filesystem/Exception -->
+
+</body>
+</html>

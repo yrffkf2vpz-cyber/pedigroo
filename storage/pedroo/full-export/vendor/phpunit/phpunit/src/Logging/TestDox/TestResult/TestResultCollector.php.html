@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpunit/phpunit/src/Logging/TestDox/TestResult/TestResultCollector.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of PHPUnit.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace PHPUnit\Logging\TestDox;
+
+use function array_merge;
+use function assert;
+use function is_subclass_of;
+use function ksort;
+use function uksort;
+use function usort;
+use PHPUnit\Event\Code\TestMethod;
+use PHPUnit\Event\Code\Throwable;
+use PHPUnit\Event\Facade;
+use PHPUnit\Event\InvalidArgumentException;
+use PHPUnit\Event\Test\ConsideredRisky;
+use PHPUnit\Event\Test\DeprecationTriggered;
+use PHPUnit\Event\Test\Errored;
+use PHPUnit\Event\Test\Failed;
+use PHPUnit\Event\Test\Finished;
+use PHPUnit\Event\Test\MarkedIncomplete;
+use PHPUnit\Event\Test\NoticeTriggered;
+use PHPUnit\Event\Test\Passed;
+use PHPUnit\Event\Test\PhpDeprecationTriggered;
+use PHPUnit\Event\Test\PhpNoticeTriggered;
+use PHPUnit\Event\Test\PhpunitDeprecationTriggered;
+use PHPUnit\Event\Test\PhpunitErrorTriggered;
+use PHPUnit\Event\Test\PhpunitWarningTriggered;
+use PHPUnit\Event\Test\PhpWarningTriggered;
+use PHPUnit\Event\Test\Prepared;
+use PHPUnit\Event\Test\Skipped;
+use PHPUnit\Event\Test\WarningTriggered;
+use PHPUnit\Framework\TestStatus\TestStatus;
+use PHPUnit\Logging\TestDox\TestResult as TestDoxTestMethod;
+use PHPUnit\TestRunner\IssueFilter;
+use ReflectionMethod;
+
+/**
+ * @no-named-arguments Parameter names are not covered by the backward compatibility promise for PHPUnit
+ *
+ * @internal This class is not covered by the backward compatibility promise for PHPUnit
+ */
+final class TestResultCollector
+{
+    private readonly IssueFilter $issueFilter;
+
+    /**
+     * @var array&lt;string, list&lt;TestDoxTestMethod&gt;&gt;
+     */
+    private array $tests          = [];
+    private ?TestStatus $status   = null;
+    private ?Throwable $throwable = null;
+    private bool $prepared        = false;
+
+    public function __construct(Facade $facade, IssueFilter $issueFilter)
+    {
+        $this-&gt;issueFilter = $issueFilter;
+
+        $this-&gt;registerSubscribers($facade);
+    }
+
+    /**
+     * @return array&lt;string, TestResultCollection&gt;
+     */
+    public function testMethodsGroupedByClass(): array
+    {
+        $result = [];
+
+        foreach ($this-&gt;tests as $prettifiedClassName =&gt; $tests) {
+            $testsByDeclaringClass = [];
+
+            foreach ($tests as $test) {
+                $declaringClassName = (new ReflectionMethod($test-&gt;test()-&gt;className(), $test-&gt;test()-&gt;methodName()))-&gt;getDeclaringClass()-&gt;getName();
+
+                if (!isset($testsByDeclaringClass[$declaringClassName])) {
+                    $testsByDeclaringClass[$declaringClassName] = [];
+                }
+
+                $testsByDeclaringClass[$declaringClassName][] = $test;
+            }
+
+            foreach ($testsByDeclaringClass as $declaringClassName) {
+                usort(
+                    $declaringClassName,
+                    static function (TestDoxTestMethod $a, TestDoxTestMethod $b): int
+                    {
+                        return $a-&gt;test()-&gt;line() &lt;=&gt; $b-&gt;test()-&gt;line();
+                    },
+                );
+            }
+
+            uksort(
+                $testsByDeclaringClass,
+                /**
+                 * @param class-string $a
+                 * @param class-string $b
+                 */
+                static function (string $a, string $b): int
+                {
+                    if (is_subclass_of($b, $a)) {
+                        return -1;
+                    }
+
+                    if (is_subclass_of($a, $b)) {
+                        return 1;
+                    }
+
+                    return 0;
+                },
+            );
+
+            $tests = [];
+
+            foreach ($testsByDeclaringClass as $_tests) {
+                $tests = array_merge($tests, $_tests);
+            }
+
+            $result[$prettifiedClassName] = TestResultCollection::fromArray($tests);
+        }
+
+        ksort($result);
+
+        return $result;
+    }
+
+    public function testPrepared(Prepared $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;status    = TestStatus::unknown();
+        $this-&gt;throwable = null;
+        $this-&gt;prepared  = true;
+    }
+
+    public function testErrored(Errored $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;status    = TestStatus::error($event-&gt;throwable()-&gt;message());
+        $this-&gt;throwable = $event-&gt;throwable();
+
+        if (!$this-&gt;prepared) {
+            $test = $event-&gt;test();
+
+            assert($test instanceof TestMethod);
+
+            $this-&gt;process($test);
+        }
+    }
+
+    public function testFailed(Failed $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;status    = TestStatus::failure($event-&gt;throwable()-&gt;message());
+        $this-&gt;throwable = $event-&gt;throwable();
+    }
+
+    public function testPassed(Passed $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::success());
+    }
+
+    public function testSkipped(Skipped $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::skipped($event-&gt;message()));
+    }
+
+    public function testMarkedIncomplete(MarkedIncomplete $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::incomplete($event-&gt;throwable()-&gt;message()));
+
+        $this-&gt;throwable = $event-&gt;throwable();
+    }
+
+    public function testConsideredRisky(ConsideredRisky $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::risky());
+    }
+
+    public function testTriggeredDeprecation(DeprecationTriggered $event): void
+    {
+        if (!$this-&gt;issueFilter-&gt;shouldBeProcessed($event, true)) {
+            return;
+        }
+
+        if ($event-&gt;ignoredByBaseline()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::deprecation());
+    }
+
+    public function testTriggeredNotice(NoticeTriggered $event): void
+    {
+        if (!$this-&gt;issueFilter-&gt;shouldBeProcessed($event, true)) {
+            return;
+        }
+
+        if ($event-&gt;ignoredByBaseline()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::notice());
+    }
+
+    public function testTriggeredWarning(WarningTriggered $event): void
+    {
+        if (!$this-&gt;issueFilter-&gt;shouldBeProcessed($event, true)) {
+            return;
+        }
+
+        if ($event-&gt;ignoredByBaseline()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::warning());
+    }
+
+    public function testTriggeredPhpDeprecation(PhpDeprecationTriggered $event): void
+    {
+        if (!$this-&gt;issueFilter-&gt;shouldBeProcessed($event, true)) {
+            return;
+        }
+
+        if ($event-&gt;ignoredByBaseline()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::deprecation());
+    }
+
+    public function testTriggeredPhpNotice(PhpNoticeTriggered $event): void
+    {
+        if (!$this-&gt;issueFilter-&gt;shouldBeProcessed($event, true)) {
+            return;
+        }
+
+        if ($event-&gt;ignoredByBaseline()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::notice());
+    }
+
+    public function testTriggeredPhpWarning(PhpWarningTriggered $event): void
+    {
+        if (!$this-&gt;issueFilter-&gt;shouldBeProcessed($event, true)) {
+            return;
+        }
+
+        if ($event-&gt;ignoredByBaseline()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::warning());
+    }
+
+    public function testTriggeredPhpunitDeprecation(PhpunitDeprecationTriggered $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::deprecation());
+    }
+
+    public function testTriggeredPhpunitError(PhpunitErrorTriggered $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::error());
+    }
+
+    public function testTriggeredPhpunitWarning(PhpunitWarningTriggered $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        if ($event-&gt;ignoredByTest()) {
+            return;
+        }
+
+        $this-&gt;updateTestStatus(TestStatus::warning());
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testFinished(Finished $event): void
+    {
+        if (!$event-&gt;test()-&gt;isTestMethod()) {
+            return;
+        }
+
+        $test = $event-&gt;test();
+
+        assert($test instanceof TestMethod);
+
+        $this-&gt;process($test);
+
+        $this-&gt;status    = null;
+        $this-&gt;throwable = null;
+        $this-&gt;prepared  = false;
+    }
+
+    private function registerSubscribers(Facade $facade): void
+    {
+        $facade-&gt;registerSubscribers(
+            new TestConsideredRiskySubscriber($this),
+            new TestErroredSubscriber($this),
+            new TestFailedSubscriber($this),
+            new TestFinishedSubscriber($this),
+            new TestMarkedIncompleteSubscriber($this),
+            new TestPassedSubscriber($this),
+            new TestPreparedSubscriber($this),
+            new TestSkippedSubscriber($this),
+            new TestTriggeredDeprecationSubscriber($this),
+            new TestTriggeredNoticeSubscriber($this),
+            new TestTriggeredPhpDeprecationSubscriber($this),
+            new TestTriggeredPhpNoticeSubscriber($this),
+            new TestTriggeredPhpunitDeprecationSubscriber($this),
+            new TestTriggeredPhpunitErrorSubscriber($this),
+            new TestTriggeredPhpunitWarningSubscriber($this),
+            new TestTriggeredPhpWarningSubscriber($this),
+            new TestTriggeredWarningSubscriber($this),
+        );
+    }
+
+    private function updateTestStatus(TestStatus $status): void
+    {
+        if ($this-&gt;status !== null &amp;&amp;
+            $this-&gt;status-&gt;isMoreImportantThan($status)) {
+            return;
+        }
+
+        $this-&gt;status = $status;
+    }
+
+    private function process(TestMethod $test): void
+    {
+        if (!isset($this-&gt;tests[$test-&gt;testDox()-&gt;prettifiedClassName()])) {
+            $this-&gt;tests[$test-&gt;testDox()-&gt;prettifiedClassName()] = [];
+        }
+
+        $this-&gt;tests[$test-&gt;testDox()-&gt;prettifiedClassName()][] = new TestDoxTestMethod(
+            $test,
+            $this-&gt;status,
+            $this-&gt;throwable,
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpunit/phpunit/src/Metadata/After.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpunit/phpunit/src/Logging/TestDox/TestResult/Subscriber -->
+
+</body>
+</html>

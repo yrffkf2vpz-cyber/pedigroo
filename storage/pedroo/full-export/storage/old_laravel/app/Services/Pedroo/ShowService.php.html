@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/storage/old_laravel/app/Services/Pedroo/ShowService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Services\Pedroo;
+
+use Illuminate\Support\Facades\DB;
+
+class ShowService
+{
+    /**
+     * Show feldolgozás
+     *
+     * @param object $parsedShow
+     * Kötelező mezők:
+     *   - name
+     *   - country_id
+     *   - city
+     *   - date
+     *
+     * Opcionális:
+     *   - external_id
+     *   - source
+     *   - judges (tömb)
+     *
+     * @return int show_id
+     */
+    public function processShow(object $parsedShow): int
+    {
+        $name       = trim($parsedShow-&gt;name ?? &#039;&#039;);
+        $countryId  = $parsedShow-&gt;country_id ?? null;
+        $city       = trim($parsedShow-&gt;city ?? &#039;&#039;);
+        $date       = $parsedShow-&gt;date ?? null;
+        $externalId = $parsedShow-&gt;external_id ?? null;
+        $source     = $parsedShow-&gt;source ?? &#039;pedroo&#039;;
+        $judges     = $parsedShow-&gt;judges ?? [];
+
+        if (!$name || !$countryId || !$city || !$date) {
+            throw new \InvalidArgumentException(&#039;Hiányos show adatok (name, country_id, city, date kötelező).&#039;);
+        }
+
+        // 1) LOCATION FELDOLGOZÁS
+        $locationId = $this-&gt;processLocation($countryId, $city);
+
+        // 2) HASH A SHOWHOZ
+        $hash = hash(&#039;sha256&#039;, strtolower(
+            $name . &#039;|&#039; . $date . &#039;|&#039; . $city . &#039;|&#039; . $countryId . &#039;|&#039; . $source
+        ));
+
+        // 3) KERESÉS HASH ALAPJÁN
+        $show = DB::table(&#039;show_shows&#039;)
+            -&gt;where(&#039;hash&#039;, $hash)
+            -&gt;first();
+
+        // 4) KERESÉS external_id + source ALAPJÁN
+        if (!$show &amp;&amp; $externalId) {
+            $show = DB::table(&#039;show_shows&#039;)
+                -&gt;where(&#039;external_id&#039;, $externalId)
+                -&gt;where(&#039;source&#039;, $source)
+                -&gt;first();
+        }
+
+        // 5) HA NINCS → BESZÚRÁS
+        if (!$show) {
+            $showId = DB::table(&#039;show_shows&#039;)-&gt;insertGetId([
+                &#039;name&#039;        =&gt; $name,
+                &#039;location_id&#039; =&gt; $locationId,
+                &#039;date&#039;        =&gt; $date,
+                &#039;hash&#039;        =&gt; $hash,
+                &#039;external_id&#039; =&gt; $externalId,
+                &#039;source&#039;      =&gt; $source,
+                &#039;created_at&#039;  =&gt; now(),
+                &#039;updated_at&#039;  =&gt; now(),
+            ]);
+        } else {
+            // 6) HA VAN → FRISSÍTÉS
+            DB::table(&#039;show_shows&#039;)
+                -&gt;where(&#039;id&#039;, $show-&gt;id)
+                -&gt;update([
+                    &#039;name&#039;       =&gt; strlen($name) &gt; strlen($show-&gt;name) ? $name : $show-&gt;name,
+                    &#039;updated_at&#039; =&gt; now(),
+                ]);
+
+            $showId = $show-&gt;id;
+        }
+
+        // 7) BÍRÓK FELDOLGOZÁSA
+        foreach ($judges as $judgeNameRaw) {
+            $judgeId = $this-&gt;processJudge($judgeNameRaw);
+
+            DB::table(&#039;show_show_judges&#039;)-&gt;updateOrInsert(
+                [
+                    &#039;show_id&#039;  =&gt; $showId,
+                    &#039;judge_id&#039; =&gt; $judgeId,
+                ],
+                [
+                    &#039;updated_at&#039; =&gt; now(),
+                ]
+            );
+        }
+
+        return $showId;
+    }
+
+    /**
+     * Helyszín feldolgozás
+     */
+    protected function processLocation(int $countryId, string $city): int
+    {
+        $location = DB::table(&#039;show_locations&#039;)
+            -&gt;where(&#039;country_id&#039;, $countryId)
+            -&gt;whereRaw(&#039;LOWER(city) = ?&#039;, [strtolower($city)])
+            -&gt;first();
+
+        if ($location) {
+            return $location-&gt;id;
+        }
+
+        return DB::table(&#039;show_locations&#039;)-&gt;insertGetId([
+            &#039;country_id&#039; =&gt; $countryId,
+            &#039;city&#039;       =&gt; $city,
+            &#039;created_at&#039; =&gt; now(),
+            &#039;updated_at&#039; =&gt; now(),
+        ]);
+    }
+
+    /**
+     * Bíró normalizálás + beszúrás
+     */
+    protected function processJudge(string $rawName): int
+    {
+        if (!$rawName) {
+            return null;
+        }
+
+        // Országkód kinyerése (pl. &quot;John Smith (ROU)&quot;)
+        preg_match(&#039;/\((.*?)\)$/&#039;, $rawName, $m);
+        $countryCode = $m[1] ?? null;
+
+        // Név megtisztítása
+        $cleanName = trim(preg_replace(&#039;/\((.*?)\)$/&#039;, &#039;&#039;, $rawName));
+
+        // Bíró keresése
+        $judge = DB::table(&#039;show_judges&#039;)
+            -&gt;whereRaw(&#039;LOWER(name) = ?&#039;, [strtolower($cleanName)])
+            -&gt;first();
+
+        if ($judge) {
+            return $judge-&gt;id;
+        }
+
+        // Ország ID lekérése
+        $countryId = null;
+        if ($countryCode) {
+            $countryId = DB::table(&#039;countries&#039;)
+                -&gt;where(&#039;iso_code&#039;, $countryCode)
+                -&gt;value(&#039;id&#039;);
+        }
+
+        // Bíró létrehozása
+        return DB::table(&#039;show_judges&#039;)-&gt;insertGetId([
+            &#039;name&#039;       =&gt; $cleanName,
+            &#039;country_id&#039; =&gt; $countryId,
+            &#039;created_at&#039; =&gt; now(),
+            &#039;updated_at&#039; =&gt; now(),
+        ]);
+    }
+}
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /storage/old_laravel/app/Services/PedrooDogFetcher.php -->
+<!-- PEDROO_NEXT_DIR: /storage/old_laravel/app/Services/Pipeline -->
+
+</body>
+</html>

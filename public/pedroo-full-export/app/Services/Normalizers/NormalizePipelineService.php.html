@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/app/Services/Normalizers/NormalizePipelineService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Services\Normalizers;
+
+use App\Models\PedrooDog;
+use App\Models\PdDog;
+use Illuminate\Support\Facades\DB;
+
+// INGEST
+use App\Services\Ingest\DogRecordBuilder;
+
+// NORMALIZE
+use App\Services\Normalizers\NormalizeDogService;
+use App\Services\Normalizers\NormalizeParentService;
+use App\Services\Normalizers\NormalizeResultsService;
+use App\Services\Normalizers\NormalizeHealthService;
+use App\Services\Normalizers\NormalizeBreederService;
+use App\Services\Normalizers\NormalizeOwnerService;
+use App\Services\Normalizers\NormalizeKennelService;
+use App\Services\Normalizers\NormalizeColorService;
+use App\Services\Normalizers\NormalizeBreedService;
+use App\Services\Normalizers\NormalizeCountryService;
+use App\Services\Normalizers\RegNo\RegNoService;
+
+// PROMOTION
+use App\Services\Normalizers\PromotionNormalizer;
+use App\Services\Normalizers\TitleNormalizer;
+use App\Services\Normalizers\ChampionPointCalculator;
+
+// ARCHIVE
+use App\Services\Normalizers\HistoryWriter;
+use App\Services\Normalizers\ChangeDetector;
+use App\Services\Normalizers\DuplicateResolver;
+use App\Services\Normalizers\ParentMatchingService;
+
+&lt;?php
+
+namespace App\Services\Normalize;
+
+use App\DTO\Normalize\NormalizedDogDataDTO;
+
+class NormalizePipelineService
+{
+    public function __construct(
+        protected RegNumNormalizeEngine $regNumEngine,
+        protected NameNormalizeEngine $nameEngine,
+        protected KennelNormalizeEngine $kennelEngine,
+        protected ColorNormalizeEngine $colorEngine,
+        protected DiagnosisNormalizeEngine $diagnosisEngine,
+    ) {}
+
+    public function process(array $rawDogData): NormalizedDogDataDTO
+    {
+        $breedCode = $rawDogData[&#039;breed_code&#039;] ?? &#039;unknown&#039;;
+
+        // RegNum, name, kennel, color stb. már megvannak…
+        // Itt csak a diagnózis részre fókuszálok:
+
+        $diagnosisResult = $this-&gt;diagnosisEngine-&gt;normalize(
+            rawDiagnoses: [
+                &#039;hd&#039;    =&gt; $rawDogData[&#039;diagnosis_hd&#039;]    ?? null,
+                &#039;ed&#039;    =&gt; $rawDogData[&#039;diagnosis_ed&#039;]    ?? null,
+                &#039;other&#039; =&gt; $rawDogData[&#039;diagnosis_other&#039;] ?? null,
+            ],
+            breedCode: $breedCode,
+        );
+
+        // … a többi engine eredményével együtt áll össze a DTO:
+        return new NormalizedDogDataDTO(
+            breedCode: $breedCode,
+            nameNormalized: $rawDogData[&#039;name_normalized&#039;] ?? null,
+            sex: $rawDogData[&#039;sex&#039;] ?? null,
+            birthDateNormalized: $rawDogData[&#039;birth_date_normalized&#039;] ?? null,
+            deathDateNormalized: $rawDogData[&#039;death_date_normalized&#039;] ?? null,
+            countryCodeNormalized: $rawDogData[&#039;country_code_normalized&#039;] ?? null,
+            kennelNameNormalized: $rawDogData[&#039;kennel_name_normalized&#039;] ?? null,
+            regNumNormalized: $rawDogData[&#039;regnum_normalized&#039;] ?? null,
+            chipNumberNormalized: $rawDogData[&#039;chip_number_normalized&#039;] ?? null,
+
+            colorMainNormalized: $rawDogData[&#039;color_main_normalized&#039;] ?? null,
+            colorAltNormalized: $rawDogData[&#039;color_alt_normalized&#039;] ?? null,
+
+            diagnosisHdNormalized: $diagnosisResult[&#039;diagnosisHdNormalized&#039;],
+            diagnosisEdNormalized: $diagnosisResult[&#039;diagnosisEdNormalized&#039;],
+            diagnosisOtherNormalized: $diagnosisResult[&#039;diagnosisOtherNormalized&#039;],
+
+            fatherRegNumNormalized: $rawDogData[&#039;father_regnum_normalized&#039;] ?? null,
+            motherRegNumNormalized: $rawDogData[&#039;mother_regnum_normalized&#039;] ?? null,
+
+            rawData: $rawDogData,
+            fuzzyMatches: $rawDogData[&#039;fuzzy_matches&#039;] ?? [],
+        );
+    }
+}
+{
+    public function __construct(
+        // INGEST
+        protected DogRecordBuilder $builder,
+
+        // NORMALIZE
+        protected NormalizeDogService $normalizeDog,
+        protected NormalizeParentService $normalizeParents,
+        protected NormalizeResultsService $normalizeResults,
+        protected ParentMatchingService $parentMatcher,
+        protected NormalizeHealthService $normalizeHealth,
+        protected NormalizeBreederService $normalizeBreeder,
+        protected NormalizeOwnerService $normalizeOwner,
+        protected NormalizeKennelService $normalizeKennel,
+        protected NormalizeColorService $normalizeColor,
+        protected NormalizeBreedService $normalizeBreed,
+        protected NormalizeCountryService $normalizeCountry,
+        protected RegNoService $regNoService,
+
+        // PROMOTION
+        protected PromotionNormalizer $promotionNormalizer,
+        protected TitleNormalizer $titleNormalizer,
+        protected ChampionPointCalculator $championPoints,
+
+        // ARCHIVE
+        protected HistoryWriter $historyWriter,
+        protected ChangeDetector $changeDetector,
+        protected DuplicateResolver $duplicateResolver,
+    ) {}
+
+    /**
+     * Teljes ingest → normalize → promote → archive → decision pipeline.
+     */
+    public function process(array $rawDogRecord, bool $debug = false): array
+    {
+        // ---------------------------------------------------------
+        // 1) INGEST
+        // ---------------------------------------------------------
+        $raw = $this-&gt;builder-&gt;fromExcelRow($rawDogRecord);
+
+        // ---------------------------------------------------------
+        // 2) NORMALIZE – alap kutya mezők
+        // ---------------------------------------------------------
+        $dog = $this-&gt;normalizeDog-&gt;normalize($raw, $debug);
+
+        // ---------------------------------------------------------
+        // SZÜLŐK
+        // ---------------------------------------------------------
+        $fatherRaw = $raw[&#039;raw_father&#039;] ?? null;
+        $motherRaw = $raw[&#039;raw_mother&#039;] ?? null;
+
+        $father = $this-&gt;normalizeParents-&gt;normalize($fatherRaw);
+        $mother = $this-&gt;normalizeParents-&gt;normalize($motherRaw);
+
+        $fatherMatch = $this-&gt;parentMatcher-&gt;match($father);
+        $motherMatch = $this-&gt;parentMatcher-&gt;match($mother);
+
+        $dog[&#039;sire_id&#039;] = $fatherMatch[&#039;matched_id&#039;] ?? null;
+        $dog[&#039;dam_id&#039;]  = $motherMatch[&#039;matched_id&#039;] ?? null;
+
+        // ---------------------------------------------------------
+        // TOVÁBBI NORMALIZÁLÁSOK
+        // ---------------------------------------------------------
+        $results  = $this-&gt;normalizeResults-&gt;normalize($raw);
+        $health   = $this-&gt;normalizeHealth-&gt;normalize($raw[&#039;health&#039;] ?? [], $debug);
+        $breeder  = $this-&gt;normalizeBreeder-&gt;normalize($raw);
+        $owner    = $this-&gt;normalizeOwner-&gt;normalize($raw);
+        $kennel   = $this-&gt;normalizeKennel-&gt;normalize($raw);
+        $color    = $this-&gt;normalizeColor-&gt;normalize($raw);
+        $breed    = $this-&gt;normalizeBreed-&gt;normalize($raw);
+        $country  = $this-&gt;normalizeCountry-&gt;normalize($raw);
+
+        // ---------------------------------------------------------
+        // REGISZTRÁCIÓS SZÁM NORMALIZÁLÁS
+        // ---------------------------------------------------------
+        $regno = $this-&gt;regNoService-&gt;process($raw[&#039;raw_reg_no&#039;] ?? null);
+        $dog[&#039;regno&#039;] = $regno;
+
+        // ---------------------------------------------------------
+        // SZÍNEK ÁTVÉTELE
+        // ---------------------------------------------------------
+        $dog[&#039;color&#039;]          = $color[&#039;color&#039;] ?? null;
+        $dog[&#039;official_color&#039;] = $color[&#039;official_color&#039;] ?? null;
+        $dog[&#039;birth_color&#039;]    = $color[&#039;birth_color&#039;] ?? null;
+
+        // ---------------------------------------------------------
+        // FAJTA ID
+        // ---------------------------------------------------------
+        $dog[&#039;breed_id&#039;] = $breed[&#039;breed_id&#039;] ?? null;
+
+        // ---------------------------------------------------------
+        // ORSZÁGOK
+        // ---------------------------------------------------------
+        $dog[&#039;origin_country&#039;]   = $country[&#039;origin&#039;]   ?? $dog[&#039;origin_country&#039;];
+        $dog[&#039;standing_country&#039;] = $country[&#039;standing&#039;] ?? $dog[&#039;standing_country&#039;];
+
+        // ---------------------------------------------------------
+        // TULAJDONOS / TENYÉSZTŐ / KENNEL
+        // ---------------------------------------------------------
+        $dog[&#039;owner_id&#039;]   = $owner[&#039;owner_id&#039;]   ?? null;
+        $dog[&#039;breeder_id&#039;] = $breeder[&#039;breeder_id&#039;] ?? null;
+        $dog[&#039;kennel_id&#039;]  = $kennel[&#039;kennel_id&#039;]  ?? null;
+
+        // ---------------------------------------------------------
+        // 3) PROMOTION
+        // ---------------------------------------------------------
+        $promotions = $this-&gt;promotionNormalizer-&gt;normalize($results);
+        $titles     = $this-&gt;titleNormalizer-&gt;normalize($promotions);
+        $points     = $this-&gt;championPoints-&gt;calculate($results);
+
+        // ---------------------------------------------------------
+        // 4) ARCHIVE
+        // ---------------------------------------------------------
+        $parents = [
+            &#039;father&#039; =&gt; $father,
+            &#039;mother&#039; =&gt; $mother,
+        ];
+
+        $history    = $this-&gt;historyWriter-&gt;write($dog, $parents, $results);
+        $changes    = $this-&gt;changeDetector-&gt;detect($dog);
+        $duplicates = $this-&gt;duplicateResolver-&gt;resolve($dog);
+
+        // történeti korszak beírása
+        $dog[&#039;history_classification&#039;] = $history[&#039;history_classification&#039;];
+
+        // ---------------------------------------------------------
+        // 5) DÖNTÉS: pedroo_* → pd_*
+        // ---------------------------------------------------------
+        $decision = $this-&gt;evaluateConfidence($dog, $regno);
+
+        if ($decision === &#039;invalid&#039;) {
+            return $this-&gt;handleInvalid($raw, $dog, $debug);
+        }
+
+        if ($decision === &#039;uncertain&#039;) {
+            return $this-&gt;handleUncertain($raw, $dog, $debug);
+        }
+
+        return $this-&gt;saveToPd($raw, $dog, $debug);
+    }
+
+    /**
+     * Confidence értékelése.
+     */
+    protected function evaluateConfidence(array $dog, array $regno): string
+    {
+        if (($regno[&#039;status&#039;] ?? null) === &#039;invalid&#039;) {
+            return &#039;invalid&#039;;
+        }
+
+        foreach ($dog as $value) {
+            if ($value === &#039;UNKNOWN&#039;) {
+                return &#039;uncertain&#039;;
+            }
+        }
+
+        return &#039;ok&#039;;
+    }
+
+    /**
+     * Bizonytalan eset → pedroo_dogs-ban marad.
+     */
+    protected function handleUncertain(array $raw, array $dog, bool $debug): array
+    {
+        PedrooDog::where(&#039;id&#039;, $raw[&#039;id&#039;])-&gt;update([
+            &#039;status&#039;          =&gt; &#039;pending&#039;,
+            &#039;normalized_data&#039; =&gt; $dog,
+            &#039;pipeline_result&#039; =&gt; [
+                &#039;status&#039; =&gt; &#039;pending&#039;,
+                &#039;dog&#039;    =&gt; $dog,
+            ],
+        ]);
+
+        return [
+            &#039;status&#039; =&gt; &#039;pending&#039;,
+            &#039;dog&#039;    =&gt; $dog,
+        ];
+    }
+
+    /**
+     * Hibás eset → pedroo_dogs-ban marad.
+     */
+    protected function handleInvalid(array $raw, array $dog, bool $debug): array
+    {
+        PedrooDog::where(&#039;id&#039;, $raw[&#039;id&#039;])-&gt;update([
+            &#039;status&#039;          =&gt; &#039;invalid&#039;,
+            &#039;normalized_data&#039; =&gt; $dog,
+            &#039;pipeline_result&#039; =&gt; [
+                &#039;status&#039; =&gt; &#039;invalid&#039;,
+                &#039;dog&#039;    =&gt; $dog,
+            ],
+        ]);
+
+        return [
+            &#039;status&#039; =&gt; &#039;invalid&#039;,
+            &#039;dog&#039;    =&gt; $dog,
+        ];
+    }
+
+    /**
+     * Biztos eset → pd_dogs táblába mentés.
+     */
+    protected function saveToPd(array $raw, array $dog, bool $debug): array
+{
+    DB::transaction(function () use ($raw, $dog) {
+
+        // 1) Kutya mentése
+        $pdDog = PdDog::updateOrCreate(
+            [&#039;reg_no&#039; =&gt; $dog[&#039;reg_no&#039;]],
+            $dog
+        );
+
+        // 2) Owner normalizálás → pivot rekordok előállítása
+        $ownerResult = $this-&gt;normalizeOwner-&gt;normalize($raw);
+
+        // 3) Régi pivot rekordok törlése (ha újraimport történik)
+        PdDogOwner::where(&#039;dog_id&#039;, $pdDog-&gt;id)-&gt;delete();
+
+        // 4) Új pivot rekordok mentése
+        foreach ($ownerResult[&#039;owners&#039;] as $ownerPivot) {
+            PdDogOwner::create(array_merge($ownerPivot, [
+                &#039;dog_id&#039; =&gt; $pdDog-&gt;id,
+            ]));
+        }
+
+        // 5) PedrooDog frissítése
+        PedrooDog::where(&#039;id&#039;, $raw[&#039;id&#039;])-&gt;update([
+            &#039;status&#039;          =&gt; &#039;done&#039;,
+            &#039;normalized_data&#039; =&gt; $dog,
+            &#039;pipeline_result&#039; =&gt; [
+                &#039;status&#039; =&gt; &#039;done&#039;,
+                &#039;dog&#039;    =&gt; $dog,
+            ],
+        ]);
+    });
+
+    return [
+        &#039;status&#039; =&gt; &#039;done&#039;,
+        &#039;dog&#039;    =&gt; $dog,
+    ];
+}
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /app/Services/Normalizers/NormalizeResultsService.php -->
+<!-- PEDROO_NEXT_DIR: /app/Services/Normalizers/Color -->
+
+</body>
+</html>

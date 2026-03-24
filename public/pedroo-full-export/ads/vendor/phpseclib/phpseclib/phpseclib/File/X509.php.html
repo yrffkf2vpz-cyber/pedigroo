@@ -1,0 +1,4047 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/File/X509.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Pure-PHP X.509 Parser
+ *
+ * PHP version 5
+ *
+ * Encode and decode X.509 certificates.
+ *
+ * The extensions are from {@link http://tools.ietf.org/html/rfc5280 RFC5280} and
+ * {@link http://web.archive.org/web/19961027104704/http://www3.netscape.com/eng/security/cert-exts.html Netscape Certificate Extensions}.
+ *
+ * Note that loading an X.509 certificate and resaving it may invalidate the signature.  The reason being that the signature is based on a
+ * portion of the certificate that contains optional parameters with default values.  ie. if the parameter isn&#039;t there the default value is
+ * used.  Problem is, if the parameter is there and it just so happens to have the default value there are two ways that that parameter can
+ * be encoded.  It can be encoded explicitly or left out all together.  This would effect the signature value and thus may invalidate the
+ * the certificate all together unless the certificate is re-signed.
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2012 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\File;
+
+use phpseclib3\Common\Functions\Strings;
+use phpseclib3\Crypt\Common\PrivateKey;
+use phpseclib3\Crypt\Common\PublicKey;
+use phpseclib3\Crypt\DSA;
+use phpseclib3\Crypt\EC;
+use phpseclib3\Crypt\Hash;
+use phpseclib3\Crypt\PublicKeyLoader;
+use phpseclib3\Crypt\Random;
+use phpseclib3\Crypt\RSA;
+use phpseclib3\Crypt\RSA\Formats\Keys\PSS;
+use phpseclib3\Exception\UnsupportedAlgorithmException;
+use phpseclib3\File\ASN1\Element;
+use phpseclib3\File\ASN1\Maps;
+use phpseclib3\Math\BigInteger;
+
+/**
+ * Pure-PHP X.509 Parser
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+class X509
+{
+    /**
+     * Flag to only accept signatures signed by certificate authorities
+     *
+     * Not really used anymore but retained all the same to suppress E_NOTICEs from old installs
+     *
+     */
+    const VALIDATE_SIGNATURE_BY_CA = 1;
+
+    /**
+     * Return internal array representation
+     *
+     * @see \phpseclib3\File\X509::getDN()
+     */
+    const DN_ARRAY = 0;
+    /**
+     * Return string
+     *
+     * @see \phpseclib3\File\X509::getDN()
+     */
+    const DN_STRING = 1;
+    /**
+     * Return ASN.1 name string
+     *
+     * @see \phpseclib3\File\X509::getDN()
+     */
+    const DN_ASN1 = 2;
+    /**
+     * Return OpenSSL compatible array
+     *
+     * @see \phpseclib3\File\X509::getDN()
+     */
+    const DN_OPENSSL = 3;
+    /**
+     * Return canonical ASN.1 RDNs string
+     *
+     * @see \phpseclib3\File\X509::getDN()
+     */
+    const DN_CANON = 4;
+    /**
+     * Return name hash for file indexing
+     *
+     * @see \phpseclib3\File\X509::getDN()
+     */
+    const DN_HASH = 5;
+
+    /**
+     * Save as PEM
+     *
+     * ie. a base64-encoded PEM with a header and a footer
+     *
+     * @see \phpseclib3\File\X509::saveX509()
+     * @see \phpseclib3\File\X509::saveCSR()
+     * @see \phpseclib3\File\X509::saveCRL()
+     */
+    const FORMAT_PEM = 0;
+    /**
+     * Save as DER
+     *
+     * @see \phpseclib3\File\X509::saveX509()
+     * @see \phpseclib3\File\X509::saveCSR()
+     * @see \phpseclib3\File\X509::saveCRL()
+     */
+    const FORMAT_DER = 1;
+    /**
+     * Save as a SPKAC
+     *
+     * @see \phpseclib3\File\X509::saveX509()
+     * @see \phpseclib3\File\X509::saveCSR()
+     * @see \phpseclib3\File\X509::saveCRL()
+     *
+     * Only works on CSRs. Not currently supported.
+     */
+    const FORMAT_SPKAC = 2;
+    /**
+     * Auto-detect the format
+     *
+     * Used only by the load*() functions
+     *
+     * @see \phpseclib3\File\X509::saveX509()
+     * @see \phpseclib3\File\X509::saveCSR()
+     * @see \phpseclib3\File\X509::saveCRL()
+     */
+    const FORMAT_AUTO_DETECT = 3;
+
+    /**
+     * Attribute value disposition.
+     * If disposition is &gt;= 0, this is the index of the target value.
+     */
+    const ATTR_ALL = -1; // All attribute values (array).
+    const ATTR_APPEND = -2; // Add a value.
+    const ATTR_REPLACE = -3; // Clear first, then add a value.
+
+    /**
+     * Distinguished Name
+     *
+     * @var array
+     */
+    private $dn;
+
+    /**
+     * Public key
+     *
+     * @var string|PublicKey
+     */
+    private $publicKey;
+
+    /**
+     * Private key
+     *
+     * @var string|PrivateKey
+     */
+    private $privateKey;
+
+    /**
+     * The certificate authorities
+     *
+     * @var array
+     */
+    private $CAs = [];
+
+    /**
+     * The currently loaded certificate
+     *
+     * @var array
+     */
+    private $currentCert;
+
+    /**
+     * The signature subject
+     *
+     * There&#039;s no guarantee \phpseclib3\File\X509 is going to re-encode an X.509 cert in the same way it was originally
+     * encoded so we take save the portion of the original cert that the signature would have made for.
+     *
+     * @var string
+     */
+    private $signatureSubject;
+
+    /**
+     * Certificate Start Date
+     *
+     * @var string
+     */
+    private $startDate;
+
+    /**
+     * Certificate End Date
+     *
+     * @var string|Element
+     */
+    private $endDate;
+
+    /**
+     * Serial Number
+     *
+     * @var string
+     */
+    private $serialNumber;
+
+    /**
+     * Key Identifier
+     *
+     * See {@link http://tools.ietf.org/html/rfc5280#section-4.2.1.1 RFC5280#section-4.2.1.1} and
+     * {@link http://tools.ietf.org/html/rfc5280#section-4.2.1.2 RFC5280#section-4.2.1.2}.
+     *
+     * @var string
+     */
+    private $currentKeyIdentifier;
+
+    /**
+     * CA Flag
+     *
+     * @var bool
+     */
+    private $caFlag = false;
+
+    /**
+     * SPKAC Challenge
+     *
+     * @var string
+     */
+    private $challenge;
+
+    /**
+     * @var array
+     */
+    private $extensionValues = [];
+
+    /**
+     * OIDs loaded
+     *
+     * @var bool
+     */
+    private static $oidsLoaded = false;
+
+    /**
+     * Recursion Limit
+     *
+     * @var int
+     */
+    private static $recur_limit = 5;
+
+    /**
+     * URL fetch flag
+     *
+     * @var bool
+     */
+    private static $disable_url_fetch = false;
+
+    /**
+     * @var array
+     */
+    private static $extensions = [];
+
+    /**
+     * @var ?array
+     */
+    private $ipAddresses = null;
+
+    /**
+     * @var ?array
+     */
+    private $domains = null;
+
+    /**
+     * Default Constructor.
+     *
+     * @return X509
+     */
+    public function __construct()
+    {
+        // Explicitly Tagged Module, 1988 Syntax
+        // http://tools.ietf.org/html/rfc5280#appendix-A.1
+
+        if (!self::$oidsLoaded) {
+            // OIDs from RFC5280 and those RFCs mentioned in RFC5280#section-4.1.1.2
+            ASN1::loadOIDs([
+                //&#039;id-pkix&#039; =&gt; &#039;1.3.6.1.5.5.7&#039;,
+                //&#039;id-pe&#039; =&gt; &#039;1.3.6.1.5.5.7.1&#039;,
+                //&#039;id-qt&#039; =&gt; &#039;1.3.6.1.5.5.7.2&#039;,
+                //&#039;id-kp&#039; =&gt; &#039;1.3.6.1.5.5.7.3&#039;,
+                //&#039;id-ad&#039; =&gt; &#039;1.3.6.1.5.5.7.48&#039;,
+                &#039;id-qt-cps&#039; =&gt; &#039;1.3.6.1.5.5.7.2.1&#039;,
+                &#039;id-qt-unotice&#039; =&gt; &#039;1.3.6.1.5.5.7.2.2&#039;,
+                &#039;id-ad-ocsp&#039; =&gt; &#039;1.3.6.1.5.5.7.48.1&#039;,
+                &#039;id-ad-caIssuers&#039; =&gt; &#039;1.3.6.1.5.5.7.48.2&#039;,
+                &#039;id-ad-timeStamping&#039; =&gt; &#039;1.3.6.1.5.5.7.48.3&#039;,
+                &#039;id-ad-caRepository&#039; =&gt; &#039;1.3.6.1.5.5.7.48.5&#039;,
+                //&#039;id-at&#039; =&gt; &#039;2.5.4&#039;,
+                &#039;id-at-name&#039; =&gt; &#039;2.5.4.41&#039;,
+                &#039;id-at-surname&#039; =&gt; &#039;2.5.4.4&#039;,
+                &#039;id-at-givenName&#039; =&gt; &#039;2.5.4.42&#039;,
+                &#039;id-at-initials&#039; =&gt; &#039;2.5.4.43&#039;,
+                &#039;id-at-generationQualifier&#039; =&gt; &#039;2.5.4.44&#039;,
+                &#039;id-at-commonName&#039; =&gt; &#039;2.5.4.3&#039;,
+                &#039;id-at-localityName&#039; =&gt; &#039;2.5.4.7&#039;,
+                &#039;id-at-stateOrProvinceName&#039; =&gt; &#039;2.5.4.8&#039;,
+                &#039;id-at-organizationName&#039; =&gt; &#039;2.5.4.10&#039;,
+                &#039;id-at-organizationalUnitName&#039; =&gt; &#039;2.5.4.11&#039;,
+                &#039;id-at-title&#039; =&gt; &#039;2.5.4.12&#039;,
+                &#039;id-at-description&#039; =&gt; &#039;2.5.4.13&#039;,
+                &#039;id-at-dnQualifier&#039; =&gt; &#039;2.5.4.46&#039;,
+                &#039;id-at-countryName&#039; =&gt; &#039;2.5.4.6&#039;,
+                &#039;id-at-serialNumber&#039; =&gt; &#039;2.5.4.5&#039;,
+                &#039;id-at-pseudonym&#039; =&gt; &#039;2.5.4.65&#039;,
+                &#039;id-at-postalCode&#039; =&gt; &#039;2.5.4.17&#039;,
+                &#039;id-at-streetAddress&#039; =&gt; &#039;2.5.4.9&#039;,
+                &#039;id-at-uniqueIdentifier&#039; =&gt; &#039;2.5.4.45&#039;,
+                &#039;id-at-role&#039; =&gt; &#039;2.5.4.72&#039;,
+                &#039;id-at-postalAddress&#039; =&gt; &#039;2.5.4.16&#039;,
+                &#039;jurisdictionOfIncorporationCountryName&#039; =&gt; &#039;1.3.6.1.4.1.311.60.2.1.3&#039;,
+                &#039;jurisdictionOfIncorporationStateOrProvinceName&#039; =&gt; &#039;1.3.6.1.4.1.311.60.2.1.2&#039;,
+                &#039;jurisdictionLocalityName&#039; =&gt; &#039;1.3.6.1.4.1.311.60.2.1.1&#039;,
+                &#039;id-at-businessCategory&#039; =&gt; &#039;2.5.4.15&#039;,
+
+                //&#039;id-domainComponent&#039; =&gt; &#039;0.9.2342.19200300.100.1.25&#039;,
+                //&#039;pkcs-9&#039; =&gt; &#039;1.2.840.113549.1.9&#039;,
+                &#039;pkcs-9-at-emailAddress&#039; =&gt; &#039;1.2.840.113549.1.9.1&#039;,
+                //&#039;id-ce&#039; =&gt; &#039;2.5.29&#039;,
+                &#039;id-ce-authorityKeyIdentifier&#039; =&gt; &#039;2.5.29.35&#039;,
+                &#039;id-ce-subjectKeyIdentifier&#039; =&gt; &#039;2.5.29.14&#039;,
+                &#039;id-ce-keyUsage&#039; =&gt; &#039;2.5.29.15&#039;,
+                &#039;id-ce-privateKeyUsagePeriod&#039; =&gt; &#039;2.5.29.16&#039;,
+                &#039;id-ce-certificatePolicies&#039; =&gt; &#039;2.5.29.32&#039;,
+                //&#039;anyPolicy&#039; =&gt; &#039;2.5.29.32.0&#039;,
+
+                &#039;id-ce-policyMappings&#039; =&gt; &#039;2.5.29.33&#039;,
+
+                &#039;id-ce-subjectAltName&#039; =&gt; &#039;2.5.29.17&#039;,
+                &#039;id-ce-issuerAltName&#039; =&gt; &#039;2.5.29.18&#039;,
+                &#039;id-ce-subjectDirectoryAttributes&#039; =&gt; &#039;2.5.29.9&#039;,
+                &#039;id-ce-basicConstraints&#039; =&gt; &#039;2.5.29.19&#039;,
+                &#039;id-ce-nameConstraints&#039; =&gt; &#039;2.5.29.30&#039;,
+                &#039;id-ce-policyConstraints&#039; =&gt; &#039;2.5.29.36&#039;,
+                &#039;id-ce-cRLDistributionPoints&#039; =&gt; &#039;2.5.29.31&#039;,
+                &#039;id-ce-extKeyUsage&#039; =&gt; &#039;2.5.29.37&#039;,
+                //&#039;anyExtendedKeyUsage&#039; =&gt; &#039;2.5.29.37.0&#039;,
+                &#039;id-kp-serverAuth&#039; =&gt; &#039;1.3.6.1.5.5.7.3.1&#039;,
+                &#039;id-kp-clientAuth&#039; =&gt; &#039;1.3.6.1.5.5.7.3.2&#039;,
+                &#039;id-kp-codeSigning&#039; =&gt; &#039;1.3.6.1.5.5.7.3.3&#039;,
+                &#039;id-kp-emailProtection&#039; =&gt; &#039;1.3.6.1.5.5.7.3.4&#039;,
+                &#039;id-kp-timeStamping&#039; =&gt; &#039;1.3.6.1.5.5.7.3.8&#039;,
+                &#039;id-kp-OCSPSigning&#039; =&gt; &#039;1.3.6.1.5.5.7.3.9&#039;,
+                &#039;id-ce-inhibitAnyPolicy&#039; =&gt; &#039;2.5.29.54&#039;,
+                &#039;id-ce-freshestCRL&#039; =&gt; &#039;2.5.29.46&#039;,
+                &#039;id-pe-authorityInfoAccess&#039; =&gt; &#039;1.3.6.1.5.5.7.1.1&#039;,
+                &#039;id-pe-subjectInfoAccess&#039; =&gt; &#039;1.3.6.1.5.5.7.1.11&#039;,
+                &#039;id-ce-cRLNumber&#039; =&gt; &#039;2.5.29.20&#039;,
+                &#039;id-ce-issuingDistributionPoint&#039; =&gt; &#039;2.5.29.28&#039;,
+                &#039;id-ce-deltaCRLIndicator&#039; =&gt; &#039;2.5.29.27&#039;,
+                &#039;id-ce-cRLReasons&#039; =&gt; &#039;2.5.29.21&#039;,
+                &#039;id-ce-certificateIssuer&#039; =&gt; &#039;2.5.29.29&#039;,
+                &#039;id-ce-holdInstructionCode&#039; =&gt; &#039;2.5.29.23&#039;,
+                //&#039;holdInstruction&#039; =&gt; &#039;1.2.840.10040.2&#039;,
+                &#039;id-holdinstruction-none&#039; =&gt; &#039;1.2.840.10040.2.1&#039;,
+                &#039;id-holdinstruction-callissuer&#039; =&gt; &#039;1.2.840.10040.2.2&#039;,
+                &#039;id-holdinstruction-reject&#039; =&gt; &#039;1.2.840.10040.2.3&#039;,
+                &#039;id-ce-invalidityDate&#039; =&gt; &#039;2.5.29.24&#039;,
+
+                &#039;rsaEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.1&#039;,
+                &#039;md2WithRSAEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.2&#039;,
+                &#039;md5WithRSAEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.4&#039;,
+                &#039;sha1WithRSAEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.5&#039;,
+                &#039;sha224WithRSAEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.14&#039;,
+                &#039;sha256WithRSAEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.11&#039;,
+                &#039;sha384WithRSAEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.12&#039;,
+                &#039;sha512WithRSAEncryption&#039; =&gt; &#039;1.2.840.113549.1.1.13&#039;,
+
+                &#039;id-ecPublicKey&#039; =&gt; &#039;1.2.840.10045.2.1&#039;,
+                &#039;ecdsa-with-SHA1&#039; =&gt; &#039;1.2.840.10045.4.1&#039;,
+                // from https://tools.ietf.org/html/rfc5758#section-3.2
+                &#039;ecdsa-with-SHA224&#039; =&gt; &#039;1.2.840.10045.4.3.1&#039;,
+                &#039;ecdsa-with-SHA256&#039; =&gt; &#039;1.2.840.10045.4.3.2&#039;,
+                &#039;ecdsa-with-SHA384&#039; =&gt; &#039;1.2.840.10045.4.3.3&#039;,
+                &#039;ecdsa-with-SHA512&#039; =&gt; &#039;1.2.840.10045.4.3.4&#039;,
+
+                &#039;id-dsa&#039; =&gt; &#039;1.2.840.10040.4.1&#039;,
+                &#039;id-dsa-with-sha1&#039; =&gt; &#039;1.2.840.10040.4.3&#039;,
+                // from https://tools.ietf.org/html/rfc5758#section-3.1
+                &#039;id-dsa-with-sha224&#039; =&gt; &#039;2.16.840.1.101.3.4.3.1&#039;,
+                &#039;id-dsa-with-sha256&#039; =&gt; &#039;2.16.840.1.101.3.4.3.2&#039;,
+
+                // from https://tools.ietf.org/html/rfc8410:
+                &#039;id-Ed25519&#039; =&gt; &#039;1.3.101.112&#039;,
+                &#039;id-Ed448&#039; =&gt; &#039;1.3.101.113&#039;,
+
+                &#039;id-RSASSA-PSS&#039; =&gt; &#039;1.2.840.113549.1.1.10&#039;,
+
+                //&#039;id-sha224&#039; =&gt; &#039;2.16.840.1.101.3.4.2.4&#039;,
+                //&#039;id-sha256&#039; =&gt; &#039;2.16.840.1.101.3.4.2.1&#039;,
+                //&#039;id-sha384&#039; =&gt; &#039;2.16.840.1.101.3.4.2.2&#039;,
+                //&#039;id-sha512&#039; =&gt; &#039;2.16.840.1.101.3.4.2.3&#039;,
+                //&#039;id-GostR3411-94-with-GostR3410-94&#039; =&gt; &#039;1.2.643.2.2.4&#039;,
+                //&#039;id-GostR3411-94-with-GostR3410-2001&#039; =&gt; &#039;1.2.643.2.2.3&#039;,
+                //&#039;id-GostR3410-2001&#039; =&gt; &#039;1.2.643.2.2.20&#039;,
+                //&#039;id-GostR3410-94&#039; =&gt; &#039;1.2.643.2.2.19&#039;,
+                // Netscape Object Identifiers from &quot;Netscape Certificate Extensions&quot;
+                &#039;netscape&#039; =&gt; &#039;2.16.840.1.113730&#039;,
+                &#039;netscape-cert-extension&#039; =&gt; &#039;2.16.840.1.113730.1&#039;,
+                &#039;netscape-cert-type&#039; =&gt; &#039;2.16.840.1.113730.1.1&#039;,
+                &#039;netscape-comment&#039; =&gt; &#039;2.16.840.1.113730.1.13&#039;,
+                &#039;netscape-ca-policy-url&#039; =&gt; &#039;2.16.840.1.113730.1.8&#039;,
+                // the following are X.509 extensions not supported by phpseclib
+                &#039;id-pe-logotype&#039; =&gt; &#039;1.3.6.1.5.5.7.1.12&#039;,
+                &#039;entrustVersInfo&#039; =&gt; &#039;1.2.840.113533.7.65.0&#039;,
+                &#039;verisignPrivate&#039; =&gt; &#039;2.16.840.1.113733.1.6.9&#039;,
+                // for Certificate Signing Requests
+                // see http://tools.ietf.org/html/rfc2985
+                &#039;pkcs-9-at-unstructuredName&#039; =&gt; &#039;1.2.840.113549.1.9.2&#039;, // PKCS #9 unstructured name
+                &#039;pkcs-9-at-challengePassword&#039; =&gt; &#039;1.2.840.113549.1.9.7&#039;, // Challenge password for certificate revocations
+                &#039;pkcs-9-at-extensionRequest&#039; =&gt; &#039;1.2.840.113549.1.9.14&#039; // Certificate extension request
+            ]);
+        }
+    }
+
+    /**
+     * Load X.509 certificate
+     *
+     * Returns an associative array describing the X.509 cert or a false if the cert failed to load
+     *
+     * @param array|string $cert
+     * @param int $mode
+     * @return mixed
+     */
+    public function loadX509($cert, $mode = self::FORMAT_AUTO_DETECT)
+    {
+        if (is_array($cert) &amp;&amp; isset($cert[&#039;tbsCertificate&#039;])) {
+            unset($this-&gt;currentCert);
+            unset($this-&gt;currentKeyIdentifier);
+            $this-&gt;dn = $cert[&#039;tbsCertificate&#039;][&#039;subject&#039;];
+            if (!isset($this-&gt;dn)) {
+                return false;
+            }
+            $this-&gt;currentCert = $cert;
+
+            $currentKeyIdentifier = $this-&gt;getExtension(&#039;id-ce-subjectKeyIdentifier&#039;);
+            $this-&gt;currentKeyIdentifier = is_string($currentKeyIdentifier) ? $currentKeyIdentifier : null;
+
+            unset($this-&gt;signatureSubject);
+
+            return $cert;
+        }
+
+        if ($mode != self::FORMAT_DER) {
+            $newcert = ASN1::extractBER($cert);
+            if ($mode == self::FORMAT_PEM &amp;&amp; $cert == $newcert) {
+                return false;
+            }
+            $cert = $newcert;
+        }
+
+        if ($cert === false) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $decoded = ASN1::decodeBER($cert);
+
+        if ($decoded) {
+            $x509 = ASN1::asn1map($decoded[0], Maps\Certificate::MAP);
+        }
+        if (!isset($x509) || $x509 === false) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $this-&gt;signatureSubject = substr($cert, $decoded[0][&#039;content&#039;][0][&#039;start&#039;], $decoded[0][&#039;content&#039;][0][&#039;length&#039;]);
+
+        if ($this-&gt;isSubArrayValid($x509, &#039;tbsCertificate/extensions&#039;)) {
+            $this-&gt;mapInExtensions($x509, &#039;tbsCertificate/extensions&#039;);
+        }
+        $this-&gt;mapInDNs($x509, &#039;tbsCertificate/issuer/rdnSequence&#039;);
+        $this-&gt;mapInDNs($x509, &#039;tbsCertificate/subject/rdnSequence&#039;);
+
+        $key = $x509[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;];
+        $key = ASN1::encodeDER($key, Maps\SubjectPublicKeyInfo::MAP);
+        $x509[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;subjectPublicKey&#039;] =
+            &quot;-----BEGIN PUBLIC KEY-----\r\n&quot; .
+            chunk_split(base64_encode($key), 64) .
+            &quot;-----END PUBLIC KEY-----&quot;;
+
+        $this-&gt;currentCert = $x509;
+        $this-&gt;dn = $x509[&#039;tbsCertificate&#039;][&#039;subject&#039;];
+
+        $currentKeyIdentifier = $this-&gt;getExtension(&#039;id-ce-subjectKeyIdentifier&#039;);
+        $this-&gt;currentKeyIdentifier = is_string($currentKeyIdentifier) ? $currentKeyIdentifier : null;
+
+        return $x509;
+    }
+
+    /**
+     * Save X.509 certificate
+     *
+     * @param array $cert
+     * @param int $format optional
+     * @return string
+     */
+    public function saveX509(array $cert, $format = self::FORMAT_PEM)
+    {
+        if (!is_array($cert) || !isset($cert[&#039;tbsCertificate&#039;])) {
+            return false;
+        }
+
+        switch (true) {
+            // &quot;case !$a: case !$b: break; default: whatever();&quot; is the same thing as &quot;if ($a &amp;&amp; $b) whatever()&quot;
+            case !($algorithm = $this-&gt;subArray($cert, &#039;tbsCertificate/subjectPublicKeyInfo/algorithm/algorithm&#039;)):
+            case is_object($cert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;subjectPublicKey&#039;]):
+                break;
+            default:
+                $cert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;] = new Element(
+                    base64_decode(preg_replace(&#039;#-.+-|[\r\n]#&#039;, &#039;&#039;, $cert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;subjectPublicKey&#039;]))
+                );
+        }
+
+        $filters = [];
+        $type_utf8_string = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+        $filters[&#039;tbsCertificate&#039;][&#039;signature&#039;][&#039;parameters&#039;] = $type_utf8_string;
+        $filters[&#039;tbsCertificate&#039;][&#039;signature&#039;][&#039;issuer&#039;][&#039;rdnSequence&#039;][&#039;value&#039;] = $type_utf8_string;
+        $filters[&#039;tbsCertificate&#039;][&#039;issuer&#039;][&#039;rdnSequence&#039;][&#039;value&#039;] = $type_utf8_string;
+        $filters[&#039;tbsCertificate&#039;][&#039;subject&#039;][&#039;rdnSequence&#039;][&#039;value&#039;] = $type_utf8_string;
+        $filters[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;algorithm&#039;][&#039;parameters&#039;] = $type_utf8_string;
+        $filters[&#039;signatureAlgorithm&#039;][&#039;parameters&#039;] = $type_utf8_string;
+        $filters[&#039;authorityCertIssuer&#039;][&#039;directoryName&#039;][&#039;rdnSequence&#039;][&#039;value&#039;] = $type_utf8_string;
+        //$filters[&#039;policyQualifiers&#039;][&#039;qualifier&#039;] = $type_utf8_string;
+        $filters[&#039;distributionPoint&#039;][&#039;fullName&#039;][&#039;directoryName&#039;][&#039;rdnSequence&#039;][&#039;value&#039;] = $type_utf8_string;
+        $filters[&#039;directoryName&#039;][&#039;rdnSequence&#039;][&#039;value&#039;] = $type_utf8_string;
+
+        foreach (self::$extensions as $extension) {
+            $filters[&#039;tbsCertificate&#039;][&#039;extensions&#039;][] = $extension;
+        }
+
+        /* in the case of policyQualifiers/qualifier, the type has to be \phpseclib3\File\ASN1::TYPE_IA5_STRING.
+           \phpseclib3\File\ASN1::TYPE_PRINTABLE_STRING will cause OpenSSL&#039;s X.509 parser to spit out random
+           characters.
+         */
+        $filters[&#039;policyQualifiers&#039;][&#039;qualifier&#039;]
+            = [&#039;type&#039; =&gt; ASN1::TYPE_IA5_STRING];
+
+        ASN1::setFilters($filters);
+
+        $this-&gt;mapOutExtensions($cert, &#039;tbsCertificate/extensions&#039;);
+        $this-&gt;mapOutDNs($cert, &#039;tbsCertificate/issuer/rdnSequence&#039;);
+        $this-&gt;mapOutDNs($cert, &#039;tbsCertificate/subject/rdnSequence&#039;);
+
+        $cert = ASN1::encodeDER($cert, Maps\Certificate::MAP);
+
+        switch ($format) {
+            case self::FORMAT_DER:
+                return $cert;
+            // case self::FORMAT_PEM:
+            default:
+                return &quot;-----BEGIN CERTIFICATE-----\r\n&quot; . chunk_split(Strings::base64_encode($cert), 64) . &#039;-----END CERTIFICATE-----&#039;;
+        }
+    }
+
+    /**
+     * Map extension values from octet string to extension-specific internal
+     *   format.
+     *
+     * @param array $root (by reference)
+     * @param string $path
+     */
+    private function mapInExtensions(array &amp;$root, $path)
+    {
+        $extensions = &amp;$this-&gt;subArrayUnchecked($root, $path);
+
+        if ($extensions) {
+            for ($i = 0; $i &lt; count($extensions); $i++) {
+                $id = $extensions[$i][&#039;extnId&#039;];
+                $value = &amp;$extensions[$i][&#039;extnValue&#039;];
+                /* [extnValue] contains the DER encoding of an ASN.1 value
+                   corresponding to the extension type identified by extnID */
+                $map = $this-&gt;getMapping($id);
+                if (!is_bool($map)) {
+                    $decoder = $id == &#039;id-ce-nameConstraints&#039; ?
+                        [static::class, &#039;decodeNameConstraintIP&#039;] :
+                        [static::class, &#039;decodeIP&#039;];
+                    $decoded = ASN1::decodeBER($value);
+                    if (!$decoded) {
+                        continue;
+                    }
+                    $mapped = ASN1::asn1map($decoded[0], $map, [&#039;iPAddress&#039; =&gt; $decoder]);
+                    $value = $mapped === false ? $decoded[0] : $mapped;
+
+                    if ($id == &#039;id-ce-certificatePolicies&#039;) {
+                        for ($j = 0; $j &lt; count($value); $j++) {
+                            if (!isset($value[$j][&#039;policyQualifiers&#039;])) {
+                                continue;
+                            }
+                            for ($k = 0; $k &lt; count($value[$j][&#039;policyQualifiers&#039;]); $k++) {
+                                $subid = $value[$j][&#039;policyQualifiers&#039;][$k][&#039;policyQualifierId&#039;];
+                                $map = $this-&gt;getMapping($subid);
+                                $subvalue = &amp;$value[$j][&#039;policyQualifiers&#039;][$k][&#039;qualifier&#039;];
+                                if ($map !== false) {
+                                    $decoded = ASN1::decodeBER($subvalue);
+                                    if (!$decoded) {
+                                        continue;
+                                    }
+                                    $mapped = ASN1::asn1map($decoded[0], $map);
+                                    $subvalue = $mapped === false ? $decoded[0] : $mapped;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Map extension values from extension-specific internal format to
+     *   octet string.
+     *
+     * @param array $root (by reference)
+     * @param string $path
+     */
+    private function mapOutExtensions(array &amp;$root, $path)
+    {
+        $extensions = &amp;$this-&gt;subArray($root, $path, !empty($this-&gt;extensionValues));
+
+        foreach ($this-&gt;extensionValues as $id =&gt; $data) {
+            $critical = $data[&#039;critical&#039;];
+            $replace = $data[&#039;replace&#039;];
+            $value = $data[&#039;value&#039;];
+            $newext = [
+                &#039;extnId&#039; =&gt; $id,
+                &#039;extnValue&#039; =&gt; $value,
+                &#039;critical&#039; =&gt; $critical
+            ];
+            if ($replace) {
+                foreach ($extensions as $key =&gt; $value) {
+                    if ($value[&#039;extnId&#039;] == $id) {
+                        $extensions[$key] = $newext;
+                        continue 2;
+                    }
+                }
+            }
+            $extensions[] = $newext;
+        }
+
+        if (is_array($extensions)) {
+            $size = count($extensions);
+            for ($i = 0; $i &lt; $size; $i++) {
+                if ($extensions[$i] instanceof Element) {
+                    continue;
+                }
+
+                $id = $extensions[$i][&#039;extnId&#039;];
+                $value = &amp;$extensions[$i][&#039;extnValue&#039;];
+
+                switch ($id) {
+                    case &#039;id-ce-certificatePolicies&#039;:
+                        for ($j = 0; $j &lt; count($value); $j++) {
+                            if (!isset($value[$j][&#039;policyQualifiers&#039;])) {
+                                continue;
+                            }
+                            for ($k = 0; $k &lt; count($value[$j][&#039;policyQualifiers&#039;]); $k++) {
+                                $subid = $value[$j][&#039;policyQualifiers&#039;][$k][&#039;policyQualifierId&#039;];
+                                $map = $this-&gt;getMapping($subid);
+                                $subvalue = &amp;$value[$j][&#039;policyQualifiers&#039;][$k][&#039;qualifier&#039;];
+                                if ($map !== false) {
+                                    // by default \phpseclib3\File\ASN1 will try to render qualifier as a \phpseclib3\File\ASN1::TYPE_IA5_STRING since it&#039;s
+                                    // actual type is \phpseclib3\File\ASN1::TYPE_ANY
+                                    $subvalue = new Element(ASN1::encodeDER($subvalue, $map));
+                                }
+                            }
+                        }
+                        break;
+                    case &#039;id-ce-authorityKeyIdentifier&#039;: // use 00 as the serial number instead of an empty string
+                        if (isset($value[&#039;authorityCertSerialNumber&#039;])) {
+                            if ($value[&#039;authorityCertSerialNumber&#039;]-&gt;toBytes() == &#039;&#039;) {
+                                $temp = chr((ASN1::CLASS_CONTEXT_SPECIFIC &lt;&lt; 6) | 2) . &quot;\1\0&quot;;
+                                $value[&#039;authorityCertSerialNumber&#039;] = new Element($temp);
+                            }
+                        }
+                }
+
+                /* [extnValue] contains the DER encoding of an ASN.1 value
+                   corresponding to the extension type identified by extnID */
+                $map = $this-&gt;getMapping($id);
+                if (is_bool($map)) {
+                    if (!$map) {
+                        //user_error($id . &#039; is not a currently supported extension&#039;);
+                        unset($extensions[$i]);
+                    }
+                } else {
+                    $value = ASN1::encodeDER($value, $map, [&#039;iPAddress&#039; =&gt; [static::class, &#039;encodeIP&#039;]]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Map attribute values from ANY type to attribute-specific internal
+     *   format.
+     *
+     * @param array $root (by reference)
+     * @param string $path
+     */
+    private function mapInAttributes(&amp;$root, $path)
+    {
+        $attributes = &amp;$this-&gt;subArray($root, $path);
+
+        if (is_array($attributes)) {
+            for ($i = 0; $i &lt; count($attributes); $i++) {
+                $id = $attributes[$i][&#039;type&#039;];
+                /* $value contains the DER encoding of an ASN.1 value
+                   corresponding to the attribute type identified by type */
+                $map = $this-&gt;getMapping($id);
+                if (is_array($attributes[$i][&#039;value&#039;])) {
+                    $values = &amp;$attributes[$i][&#039;value&#039;];
+                    for ($j = 0; $j &lt; count($values); $j++) {
+                        $value = ASN1::encodeDER($values[$j], Maps\AttributeValue::MAP);
+                        $decoded = ASN1::decodeBER($value);
+                        if (!is_bool($map)) {
+                            if (!$decoded) {
+                                continue;
+                            }
+                            $mapped = ASN1::asn1map($decoded[0], $map);
+                            if ($mapped !== false) {
+                                $values[$j] = $mapped;
+                            }
+                            if ($id == &#039;pkcs-9-at-extensionRequest&#039; &amp;&amp; $this-&gt;isSubArrayValid($values, $j)) {
+                                $this-&gt;mapInExtensions($values, $j);
+                            }
+                        } elseif ($map) {
+                            $values[$j] = $value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Map attribute values from attribute-specific internal format to
+     *   ANY type.
+     *
+     * @param array $root (by reference)
+     * @param string $path
+     */
+    private function mapOutAttributes(&amp;$root, $path)
+    {
+        $attributes = &amp;$this-&gt;subArray($root, $path);
+
+        if (is_array($attributes)) {
+            $size = count($attributes);
+            for ($i = 0; $i &lt; $size; $i++) {
+                /* [value] contains the DER encoding of an ASN.1 value
+                   corresponding to the attribute type identified by type */
+                $id = $attributes[$i][&#039;type&#039;];
+                $map = $this-&gt;getMapping($id);
+                if ($map === false) {
+                    //user_error($id . &#039; is not a currently supported attribute&#039;, E_USER_NOTICE);
+                    unset($attributes[$i]);
+                } elseif (is_array($attributes[$i][&#039;value&#039;])) {
+                    $values = &amp;$attributes[$i][&#039;value&#039;];
+                    for ($j = 0; $j &lt; count($values); $j++) {
+                        switch ($id) {
+                            case &#039;pkcs-9-at-extensionRequest&#039;:
+                                $this-&gt;mapOutExtensions($values, $j);
+                                break;
+                        }
+
+                        if (!is_bool($map)) {
+                            $temp = ASN1::encodeDER($values[$j], $map);
+                            $decoded = ASN1::decodeBER($temp);
+                            if (!$decoded) {
+                                continue;
+                            }
+                            $values[$j] = ASN1::asn1map($decoded[0], Maps\AttributeValue::MAP);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Map DN values from ANY type to DN-specific internal
+     *   format.
+     *
+     * @param array $root (by reference)
+     * @param string $path
+     */
+    private function mapInDNs(array &amp;$root, $path)
+    {
+        $dns = &amp;$this-&gt;subArray($root, $path);
+
+        if (is_array($dns)) {
+            for ($i = 0; $i &lt; count($dns); $i++) {
+                for ($j = 0; $j &lt; count($dns[$i]); $j++) {
+                    $type = $dns[$i][$j][&#039;type&#039;];
+                    $value = &amp;$dns[$i][$j][&#039;value&#039;];
+                    if (is_object($value) &amp;&amp; $value instanceof Element) {
+                        $map = $this-&gt;getMapping($type);
+                        if (!is_bool($map)) {
+                            $decoded = ASN1::decodeBER($value);
+                            if (!$decoded) {
+                                continue;
+                            }
+                            $value = ASN1::asn1map($decoded[0], $map);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Map DN values from DN-specific internal format to
+     *   ANY type.
+     *
+     * @param array $root (by reference)
+     * @param string $path
+     */
+    private function mapOutDNs(array &amp;$root, $path)
+    {
+        $dns = &amp;$this-&gt;subArray($root, $path);
+
+        if (is_array($dns)) {
+            $size = count($dns);
+            for ($i = 0; $i &lt; $size; $i++) {
+                for ($j = 0; $j &lt; count($dns[$i]); $j++) {
+                    $type = $dns[$i][$j][&#039;type&#039;];
+                    $value = &amp;$dns[$i][$j][&#039;value&#039;];
+                    if (is_object($value) &amp;&amp; $value instanceof Element) {
+                        continue;
+                    }
+
+                    $map = $this-&gt;getMapping($type);
+                    if (!is_bool($map)) {
+                        $value = new Element(ASN1::encodeDER($value, $map));
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Associate an extension ID to an extension mapping
+     *
+     * @param string $extnId
+     * @return mixed
+     */
+    private function getMapping($extnId)
+    {
+        if (!is_string($extnId)) { // eg. if it&#039;s a \phpseclib3\File\ASN1\Element object
+            return true;
+        }
+
+        if (isset(self::$extensions[$extnId])) {
+            return self::$extensions[$extnId];
+        }
+
+        switch ($extnId) {
+            case &#039;id-ce-keyUsage&#039;:
+                return Maps\KeyUsage::MAP;
+            case &#039;id-ce-basicConstraints&#039;:
+                return Maps\BasicConstraints::MAP;
+            case &#039;id-ce-subjectKeyIdentifier&#039;:
+                return Maps\KeyIdentifier::MAP;
+            case &#039;id-ce-cRLDistributionPoints&#039;:
+                return Maps\CRLDistributionPoints::MAP;
+            case &#039;id-ce-authorityKeyIdentifier&#039;:
+                return Maps\AuthorityKeyIdentifier::MAP;
+            case &#039;id-ce-certificatePolicies&#039;:
+                return Maps\CertificatePolicies::MAP;
+            case &#039;id-ce-extKeyUsage&#039;:
+                return Maps\ExtKeyUsageSyntax::MAP;
+            case &#039;id-pe-authorityInfoAccess&#039;:
+                return Maps\AuthorityInfoAccessSyntax::MAP;
+            case &#039;id-ce-subjectAltName&#039;:
+                return Maps\SubjectAltName::MAP;
+            case &#039;id-ce-subjectDirectoryAttributes&#039;:
+                return Maps\SubjectDirectoryAttributes::MAP;
+            case &#039;id-ce-privateKeyUsagePeriod&#039;:
+                return Maps\PrivateKeyUsagePeriod::MAP;
+            case &#039;id-ce-issuerAltName&#039;:
+                return Maps\IssuerAltName::MAP;
+            case &#039;id-ce-policyMappings&#039;:
+                return Maps\PolicyMappings::MAP;
+            case &#039;id-ce-nameConstraints&#039;:
+                return Maps\NameConstraints::MAP;
+
+            case &#039;netscape-cert-type&#039;:
+                return Maps\netscape_cert_type::MAP;
+            case &#039;netscape-comment&#039;:
+                return Maps\netscape_comment::MAP;
+            case &#039;netscape-ca-policy-url&#039;:
+                return Maps\netscape_ca_policy_url::MAP;
+
+            // since id-qt-cps isn&#039;t a constructed type it will have already been decoded as a string by the time it gets
+            // back around to asn1map() and we don&#039;t want it decoded again.
+            //case &#039;id-qt-cps&#039;:
+            //    return Maps\CPSuri::MAP;
+            case &#039;id-qt-unotice&#039;:
+                return Maps\UserNotice::MAP;
+
+            // the following OIDs are unsupported but we don&#039;t want them to give notices when calling saveX509().
+            case &#039;id-pe-logotype&#039;: // http://www.ietf.org/rfc/rfc3709.txt
+            case &#039;entrustVersInfo&#039;:
+            // http://support.microsoft.com/kb/287547
+            case &#039;1.3.6.1.4.1.311.20.2&#039;: // szOID_ENROLL_CERTTYPE_EXTENSION
+            case &#039;1.3.6.1.4.1.311.21.1&#039;: // szOID_CERTSRV_CA_VERSION
+            // &quot;SET Secure Electronic Transaction Specification&quot;
+            // http://www.maithean.com/docs/set_bk3.pdf
+            case &#039;2.23.42.7.0&#039;: // id-set-hashedRootKey
+            // &quot;Certificate Transparency&quot;
+            // https://tools.ietf.org/html/rfc6962
+            case &#039;1.3.6.1.4.1.11129.2.4.2&#039;:
+            // &quot;Qualified Certificate statements&quot;
+            // https://tools.ietf.org/html/rfc3739#section-3.2.6
+            case &#039;1.3.6.1.5.5.7.1.3&#039;:
+                return true;
+
+            // CSR attributes
+            case &#039;pkcs-9-at-unstructuredName&#039;:
+                return Maps\PKCS9String::MAP;
+            case &#039;pkcs-9-at-challengePassword&#039;:
+                return Maps\DirectoryString::MAP;
+            case &#039;pkcs-9-at-extensionRequest&#039;:
+                return Maps\Extensions::MAP;
+
+            // CRL extensions.
+            case &#039;id-ce-cRLNumber&#039;:
+                return Maps\CRLNumber::MAP;
+            case &#039;id-ce-deltaCRLIndicator&#039;:
+                return Maps\CRLNumber::MAP;
+            case &#039;id-ce-issuingDistributionPoint&#039;:
+                return Maps\IssuingDistributionPoint::MAP;
+            case &#039;id-ce-freshestCRL&#039;:
+                return Maps\CRLDistributionPoints::MAP;
+            case &#039;id-ce-cRLReasons&#039;:
+                return Maps\CRLReason::MAP;
+            case &#039;id-ce-invalidityDate&#039;:
+                return Maps\InvalidityDate::MAP;
+            case &#039;id-ce-certificateIssuer&#039;:
+                return Maps\CertificateIssuer::MAP;
+            case &#039;id-ce-holdInstructionCode&#039;:
+                return Maps\HoldInstructionCode::MAP;
+            case &#039;id-at-postalAddress&#039;:
+                return Maps\PostalAddress::MAP;
+        }
+
+        return false;
+    }
+
+    /**
+     * Load an X.509 certificate as a certificate authority
+     *
+     * @param string $cert
+     * @return bool
+     */
+    public function loadCA($cert)
+    {
+        $olddn = $this-&gt;dn;
+        $oldcert = $this-&gt;currentCert;
+        $oldsigsubj = $this-&gt;signatureSubject;
+        $oldkeyid = $this-&gt;currentKeyIdentifier;
+
+        $cert = $this-&gt;loadX509($cert);
+        if (!$cert) {
+            $this-&gt;dn = $olddn;
+            $this-&gt;currentCert = $oldcert;
+            $this-&gt;signatureSubject = $oldsigsubj;
+            $this-&gt;currentKeyIdentifier = $oldkeyid;
+
+            return false;
+        }
+
+        /* From RFC5280 &quot;PKIX Certificate and CRL Profile&quot;:
+
+           If the keyUsage extension is present, then the subject public key
+           MUST NOT be used to verify signatures on certificates or CRLs unless
+           the corresponding keyCertSign or cRLSign bit is set. */
+        //$keyUsage = $this-&gt;getExtension(&#039;id-ce-keyUsage&#039;);
+        //if ($keyUsage &amp;&amp; !in_array(&#039;keyCertSign&#039;, $keyUsage)) {
+        //    return false;
+        //}
+
+        /* From RFC5280 &quot;PKIX Certificate and CRL Profile&quot;:
+
+           The cA boolean indicates whether the certified public key may be used
+           to verify certificate signatures.  If the cA boolean is not asserted,
+           then the keyCertSign bit in the key usage extension MUST NOT be
+           asserted.  If the basic constraints extension is not present in a
+           version 3 certificate, or the extension is present but the cA boolean
+           is not asserted, then the certified public key MUST NOT be used to
+           verify certificate signatures. */
+        //$basicConstraints = $this-&gt;getExtension(&#039;id-ce-basicConstraints&#039;);
+        //if (!$basicConstraints || !$basicConstraints[&#039;cA&#039;]) {
+        //    return false;
+        //}
+
+        $this-&gt;CAs[] = $cert;
+
+        $this-&gt;dn = $olddn;
+        $this-&gt;currentCert = $oldcert;
+        $this-&gt;signatureSubject = $oldsigsubj;
+
+        return true;
+    }
+
+    /**
+     * Validate an X.509 certificate against a URL
+     *
+     * From RFC2818 &quot;HTTP over TLS&quot;:
+     *
+     * Matching is performed using the matching rules specified by
+     * [RFC2459].  If more than one identity of a given type is present in
+     * the certificate (e.g., more than one dNSName name, a match in any one
+     * of the set is considered acceptable.) Names may contain the wildcard
+     * character * which is considered to match any single domain name
+     * component or component fragment. E.g., *.a.com matches foo.a.com but
+     * not bar.foo.a.com. f*.com matches foo.com but not bar.com.
+     *
+     * @param string $url
+     * @return bool
+     */
+    public function validateURL($url)
+    {
+        if (!is_array($this-&gt;currentCert) || !isset($this-&gt;currentCert[&#039;tbsCertificate&#039;])) {
+            return false;
+        }
+
+        $components = parse_url($url);
+        if (!isset($components[&#039;host&#039;])) {
+            return false;
+        }
+
+        if ($names = $this-&gt;getExtension(&#039;id-ce-subjectAltName&#039;)) {
+            foreach ($names as $name) {
+                foreach ($name as $key =&gt; $value) {
+                    $value = preg_quote($value);
+                    $value = str_replace(&#039;\*&#039;, &#039;[^.]*&#039;, $value);
+                    switch ($key) {
+                        case &#039;dNSName&#039;:
+                            /* From RFC2818 &quot;HTTP over TLS&quot;:
+
+                               If a subjectAltName extension of type dNSName is present, that MUST
+                               be used as the identity. Otherwise, the (most specific) Common Name
+                               field in the Subject field of the certificate MUST be used. Although
+                               the use of the Common Name is existing practice, it is deprecated and
+                               Certification Authorities are encouraged to use the dNSName instead. */
+                            if (preg_match(&#039;#^&#039; . $value . &#039;$#&#039;, $components[&#039;host&#039;])) {
+                                return true;
+                            }
+                            break;
+                        case &#039;iPAddress&#039;:
+                            /* From RFC2818 &quot;HTTP over TLS&quot;:
+
+                               In some cases, the URI is specified as an IP address rather than a
+                               hostname. In this case, the iPAddress subjectAltName must be present
+                               in the certificate and must exactly match the IP in the URI. */
+                            if (preg_match(&#039;#(?:\d{1-3}\.){4}#&#039;, $components[&#039;host&#039;] . &#039;.&#039;) &amp;&amp; preg_match(&#039;#^&#039; . $value . &#039;$#&#039;, $components[&#039;host&#039;])) {
+                                return true;
+                            }
+                    }
+                }
+            }
+            return false;
+        }
+
+        if ($value = $this-&gt;getDNProp(&#039;id-at-commonName&#039;)) {
+            $value = str_replace([&#039;.&#039;, &#039;*&#039;], [&#039;\.&#039;, &#039;[^.]*&#039;], $value[0]);
+            return preg_match(&#039;#^&#039; . $value . &#039;$#&#039;, $components[&#039;host&#039;]) === 1;
+        }
+
+        return false;
+    }
+
+    /**
+     * Validate a date
+     *
+     * If $date isn&#039;t defined it is assumed to be the current date.
+     *
+     * @param \DateTimeInterface|string $date optional
+     * @return bool
+     */
+    public function validateDate($date = null)
+    {
+        if (!is_array($this-&gt;currentCert) || !isset($this-&gt;currentCert[&#039;tbsCertificate&#039;])) {
+            return false;
+        }
+
+        if (!isset($date)) {
+            $date = new \DateTimeImmutable(&#039;now&#039;, new \DateTimeZone(@date_default_timezone_get()));
+        }
+
+        $notBefore = $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;validity&#039;][&#039;notBefore&#039;];
+        $notBefore = isset($notBefore[&#039;generalTime&#039;]) ? $notBefore[&#039;generalTime&#039;] : $notBefore[&#039;utcTime&#039;];
+
+        $notAfter = $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;validity&#039;][&#039;notAfter&#039;];
+        $notAfter = isset($notAfter[&#039;generalTime&#039;]) ? $notAfter[&#039;generalTime&#039;] : $notAfter[&#039;utcTime&#039;];
+
+        if (is_string($date)) {
+            $date = new \DateTimeImmutable($date, new \DateTimeZone(@date_default_timezone_get()));
+        }
+
+        $notBefore = new \DateTimeImmutable($notBefore, new \DateTimeZone(@date_default_timezone_get()));
+        $notAfter = new \DateTimeImmutable($notAfter, new \DateTimeZone(@date_default_timezone_get()));
+
+        return $date &gt;= $notBefore &amp;&amp; $date &lt;= $notAfter;
+    }
+
+    /**
+     * Fetches a URL
+     *
+     * @param string $url
+     * @return bool|string
+     */
+    private static function fetchURL($url)
+    {
+        if (self::$disable_url_fetch) {
+            return false;
+        }
+
+        $parts = parse_url($url);
+        $data = &#039;&#039;;
+        switch ($parts[&#039;scheme&#039;]) {
+            case &#039;http&#039;:
+                $fsock = @fsockopen($parts[&#039;host&#039;], isset($parts[&#039;port&#039;]) ? $parts[&#039;port&#039;] : 80);
+                if (!$fsock) {
+                    return false;
+                }
+                $path = $parts[&#039;path&#039;];
+                if (isset($parts[&#039;query&#039;])) {
+                    $path .= &#039;?&#039; . $parts[&#039;query&#039;];
+                }
+                fputs($fsock, &quot;GET $path HTTP/1.0\r\n&quot;);
+                fputs($fsock, &quot;Host: $parts[host]\r\n\r\n&quot;);
+                $line = fgets($fsock, 1024);
+                if (strlen($line) &lt; 3) {
+                    return false;
+                }
+                preg_match(&#039;#HTTP/1.\d (\d{3})#&#039;, $line, $temp);
+                if ($temp[1] != &#039;200&#039;) {
+                    return false;
+                }
+
+                // skip the rest of the headers in the http response
+                while (!feof($fsock) &amp;&amp; fgets($fsock, 1024) != &quot;\r\n&quot;) {
+                }
+
+                while (!feof($fsock)) {
+                    $temp = fread($fsock, 1024);
+                    if ($temp === false) {
+                        return false;
+                    }
+                    $data .= $temp;
+                }
+
+                break;
+            //case &#039;ftp&#039;:
+            //case &#039;ldap&#039;:
+            //default:
+        }
+
+        return $data;
+    }
+
+    /**
+     * Validates an intermediate cert as identified via authority info access extension
+     *
+     * See https://tools.ietf.org/html/rfc4325 for more info
+     *
+     * @param bool $caonly
+     * @param int $count
+     * @return bool
+     */
+    private function testForIntermediate($caonly, $count)
+    {
+        $opts = $this-&gt;getExtension(&#039;id-pe-authorityInfoAccess&#039;);
+        if (!is_array($opts)) {
+            return false;
+        }
+        foreach ($opts as $opt) {
+            if ($opt[&#039;accessMethod&#039;] == &#039;id-ad-caIssuers&#039;) {
+                // accessLocation is a GeneralName. GeneralName fields support stuff like email addresses, IP addresses, LDAP,
+                // etc, but we&#039;re only supporting URI&#039;s. URI&#039;s and LDAP are the only thing https://tools.ietf.org/html/rfc4325
+                // discusses
+                if (isset($opt[&#039;accessLocation&#039;][&#039;uniformResourceIdentifier&#039;])) {
+                    $url = $opt[&#039;accessLocation&#039;][&#039;uniformResourceIdentifier&#039;];
+                    break;
+                }
+            }
+        }
+
+        if (!isset($url)) {
+            return false;
+        }
+
+        $cert = static::fetchURL($url);
+        if (!is_string($cert)) {
+            return false;
+        }
+
+        $parent = new static();
+        $parent-&gt;CAs = $this-&gt;CAs;
+        /*
+         &quot;Conforming applications that support HTTP or FTP for accessing
+          certificates MUST be able to accept .cer files and SHOULD be able
+          to accept .p7c files.&quot; -- https://tools.ietf.org/html/rfc4325
+
+         A .p7c file is &#039;a &quot;certs-only&quot; CMS message as specified in RFC 2797&quot;
+
+         These are currently unsupported
+        */
+        if (!is_array($parent-&gt;loadX509($cert))) {
+            return false;
+        }
+
+        if (!$parent-&gt;validateSignatureCountable($caonly, ++$count)) {
+            return false;
+        }
+
+        $this-&gt;CAs[] = $parent-&gt;currentCert;
+        //$this-&gt;loadCA($cert);
+
+        return true;
+    }
+
+    /**
+     * Validate a signature
+     *
+     * Works on X.509 certs, CSR&#039;s and CRL&#039;s.
+     * Returns true if the signature is verified, false if it is not correct or null on error
+     *
+     * By default returns false for self-signed certs. Call validateSignature(false) to make this support
+     * self-signed.
+     *
+     * The behavior of this function is inspired by {@link http://php.net/openssl-verify openssl_verify}.
+     *
+     * @param bool $caonly optional
+     * @return mixed
+     */
+    public function validateSignature($caonly = true)
+    {
+        return $this-&gt;validateSignatureCountable($caonly, 0);
+    }
+
+    /**
+     * Validate a signature
+     *
+     * Performs said validation whilst keeping track of how many times validation method is called
+     *
+     * @param bool $caonly
+     * @param int $count
+     * @return mixed
+     */
+    private function validateSignatureCountable($caonly, $count)
+    {
+        if (!is_array($this-&gt;currentCert) || !isset($this-&gt;signatureSubject)) {
+            return null;
+        }
+
+        if ($count == self::$recur_limit) {
+            return false;
+        }
+
+        /* TODO:
+           &quot;emailAddress attribute values are not case-sensitive (e.g., &quot;subscriber@example.com&quot; is the same as &quot;SUBSCRIBER@EXAMPLE.COM&quot;).&quot;
+            -- http://tools.ietf.org/html/rfc5280#section-4.1.2.6
+
+           implement pathLenConstraint in the id-ce-basicConstraints extension */
+
+        switch (true) {
+            case isset($this-&gt;currentCert[&#039;tbsCertificate&#039;]):
+                // self-signed cert
+                switch (true) {
+                    case !defined(&#039;FILE_X509_IGNORE_TYPE&#039;) &amp;&amp; $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;issuer&#039;] === $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;subject&#039;]:
+                    case defined(&#039;FILE_X509_IGNORE_TYPE&#039;) &amp;&amp; $this-&gt;getIssuerDN(self::DN_STRING) === $this-&gt;getDN(self::DN_STRING):
+                        $authorityKey = $this-&gt;getExtension(&#039;id-ce-authorityKeyIdentifier&#039;);
+                        $subjectKeyID = $this-&gt;getExtension(&#039;id-ce-subjectKeyIdentifier&#039;);
+                        switch (true) {
+                            case !is_array($authorityKey):
+                            case !$subjectKeyID:
+                            case isset($authorityKey[&#039;keyIdentifier&#039;]) &amp;&amp; $authorityKey[&#039;keyIdentifier&#039;] === $subjectKeyID:
+                                $signingCert = $this-&gt;currentCert; // working cert
+                        }
+                }
+
+                if (!empty($this-&gt;CAs)) {
+                    for ($i = 0; $i &lt; count($this-&gt;CAs); $i++) {
+                        // even if the cert is a self-signed one we still want to see if it&#039;s a CA;
+                        // if not, we&#039;ll conditionally return an error
+                        $ca = $this-&gt;CAs[$i];
+                        switch (true) {
+                            case !defined(&#039;FILE_X509_IGNORE_TYPE&#039;) &amp;&amp; $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;issuer&#039;] === $ca[&#039;tbsCertificate&#039;][&#039;subject&#039;]:
+                            case defined(&#039;FILE_X509_IGNORE_TYPE&#039;) &amp;&amp; $this-&gt;getDN(self::DN_STRING, $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;issuer&#039;]) === $this-&gt;getDN(self::DN_STRING, $ca[&#039;tbsCertificate&#039;][&#039;subject&#039;]):
+                                $authorityKey = $this-&gt;getExtension(&#039;id-ce-authorityKeyIdentifier&#039;);
+                                $subjectKeyID = $this-&gt;getExtension(&#039;id-ce-subjectKeyIdentifier&#039;, $ca);
+                                switch (true) {
+                                    case !is_array($authorityKey):
+                                    case !$subjectKeyID:
+                                    case isset($authorityKey[&#039;keyIdentifier&#039;]) &amp;&amp; $authorityKey[&#039;keyIdentifier&#039;] === $subjectKeyID:
+                                        if (is_array($authorityKey) &amp;&amp; isset($authorityKey[&#039;authorityCertSerialNumber&#039;]) &amp;&amp; !$authorityKey[&#039;authorityCertSerialNumber&#039;]-&gt;equals($ca[&#039;tbsCertificate&#039;][&#039;serialNumber&#039;])) {
+                                            break 2; // serial mismatch - check other ca
+                                        }
+                                        $signingCert = $ca; // working cert
+                                        break 3;
+                                }
+                        }
+                    }
+                    if (count($this-&gt;CAs) == $i &amp;&amp; $caonly) {
+                        return $this-&gt;testForIntermediate($caonly, $count) &amp;&amp; $this-&gt;validateSignature($caonly);
+                    }
+                } elseif (!isset($signingCert) || $caonly) {
+                    return $this-&gt;testForIntermediate($caonly, $count) &amp;&amp; $this-&gt;validateSignature($caonly);
+                }
+                return $this-&gt;validateSignatureHelper(
+                    $signingCert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;algorithm&#039;][&#039;algorithm&#039;],
+                    $signingCert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;subjectPublicKey&#039;],
+                    $this-&gt;currentCert[&#039;signatureAlgorithm&#039;][&#039;algorithm&#039;],
+                    substr($this-&gt;currentCert[&#039;signature&#039;], 1),
+                    $this-&gt;signatureSubject
+                );
+            case isset($this-&gt;currentCert[&#039;certificationRequestInfo&#039;]):
+                return $this-&gt;validateSignatureHelper(
+                    $this-&gt;currentCert[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;][&#039;algorithm&#039;][&#039;algorithm&#039;],
+                    $this-&gt;currentCert[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;][&#039;subjectPublicKey&#039;],
+                    $this-&gt;currentCert[&#039;signatureAlgorithm&#039;][&#039;algorithm&#039;],
+                    substr($this-&gt;currentCert[&#039;signature&#039;], 1),
+                    $this-&gt;signatureSubject
+                );
+            case isset($this-&gt;currentCert[&#039;publicKeyAndChallenge&#039;]):
+                return $this-&gt;validateSignatureHelper(
+                    $this-&gt;currentCert[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;][&#039;algorithm&#039;][&#039;algorithm&#039;],
+                    $this-&gt;currentCert[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;][&#039;subjectPublicKey&#039;],
+                    $this-&gt;currentCert[&#039;signatureAlgorithm&#039;][&#039;algorithm&#039;],
+                    substr($this-&gt;currentCert[&#039;signature&#039;], 1),
+                    $this-&gt;signatureSubject
+                );
+            case isset($this-&gt;currentCert[&#039;tbsCertList&#039;]):
+                if (!empty($this-&gt;CAs)) {
+                    for ($i = 0; $i &lt; count($this-&gt;CAs); $i++) {
+                        $ca = $this-&gt;CAs[$i];
+                        switch (true) {
+                            case !defined(&#039;FILE_X509_IGNORE_TYPE&#039;) &amp;&amp; $this-&gt;currentCert[&#039;tbsCertList&#039;][&#039;issuer&#039;] === $ca[&#039;tbsCertificate&#039;][&#039;subject&#039;]:
+                            case defined(&#039;FILE_X509_IGNORE_TYPE&#039;) &amp;&amp; $this-&gt;getDN(self::DN_STRING, $this-&gt;currentCert[&#039;tbsCertList&#039;][&#039;issuer&#039;]) === $this-&gt;getDN(self::DN_STRING, $ca[&#039;tbsCertificate&#039;][&#039;subject&#039;]):
+                                $authorityKey = $this-&gt;getExtension(&#039;id-ce-authorityKeyIdentifier&#039;);
+                                $subjectKeyID = $this-&gt;getExtension(&#039;id-ce-subjectKeyIdentifier&#039;, $ca);
+                                switch (true) {
+                                    case !is_array($authorityKey):
+                                    case !$subjectKeyID:
+                                    case isset($authorityKey[&#039;keyIdentifier&#039;]) &amp;&amp; $authorityKey[&#039;keyIdentifier&#039;] === $subjectKeyID:
+                                        if (is_array($authorityKey) &amp;&amp; isset($authorityKey[&#039;authorityCertSerialNumber&#039;]) &amp;&amp; !$authorityKey[&#039;authorityCertSerialNumber&#039;]-&gt;equals($ca[&#039;tbsCertificate&#039;][&#039;serialNumber&#039;])) {
+                                            break 2; // serial mismatch - check other ca
+                                        }
+                                        $signingCert = $ca; // working cert
+                                        break 3;
+                                }
+                        }
+                    }
+                }
+                if (!isset($signingCert)) {
+                    return false;
+                }
+                return $this-&gt;validateSignatureHelper(
+                    $signingCert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;algorithm&#039;][&#039;algorithm&#039;],
+                    $signingCert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;subjectPublicKey&#039;],
+                    $this-&gt;currentCert[&#039;signatureAlgorithm&#039;][&#039;algorithm&#039;],
+                    substr($this-&gt;currentCert[&#039;signature&#039;], 1),
+                    $this-&gt;signatureSubject
+                );
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Validates a signature
+     *
+     * Returns true if the signature is verified and false if it is not correct.
+     * If the algorithms are unsupposed an exception is thrown.
+     *
+     * @param string $publicKeyAlgorithm
+     * @param string $publicKey
+     * @param string $signatureAlgorithm
+     * @param string $signature
+     * @param string $signatureSubject
+     * @throws UnsupportedAlgorithmException if the algorithm is unsupported
+     * @return bool
+     */
+    private function validateSignatureHelper($publicKeyAlgorithm, $publicKey, $signatureAlgorithm, $signature, $signatureSubject)
+    {
+        switch ($publicKeyAlgorithm) {
+            case &#039;id-RSASSA-PSS&#039;:
+                $key = RSA::loadFormat(&#039;PSS&#039;, $publicKey);
+                break;
+            case &#039;rsaEncryption&#039;:
+                $key = RSA::loadFormat(&#039;PKCS8&#039;, $publicKey);
+                switch ($signatureAlgorithm) {
+                    case &#039;id-RSASSA-PSS&#039;:
+                        break;
+                    case &#039;md2WithRSAEncryption&#039;:
+                    case &#039;md5WithRSAEncryption&#039;:
+                    case &#039;sha1WithRSAEncryption&#039;:
+                    case &#039;sha224WithRSAEncryption&#039;:
+                    case &#039;sha256WithRSAEncryption&#039;:
+                    case &#039;sha384WithRSAEncryption&#039;:
+                    case &#039;sha512WithRSAEncryption&#039;:
+                        $key = $key
+                            -&gt;withHash(preg_replace(&#039;#WithRSAEncryption$#&#039;, &#039;&#039;, $signatureAlgorithm))
+                            -&gt;withPadding(RSA::SIGNATURE_PKCS1);
+                        break;
+                    default:
+                        throw new UnsupportedAlgorithmException(&#039;Signature algorithm unsupported&#039;);
+                }
+                break;
+            case &#039;id-Ed25519&#039;:
+            case &#039;id-Ed448&#039;:
+                $key = EC::loadFormat(&#039;PKCS8&#039;, $publicKey);
+                break;
+            case &#039;id-ecPublicKey&#039;:
+                $key = EC::loadFormat(&#039;PKCS8&#039;, $publicKey);
+                switch ($signatureAlgorithm) {
+                    case &#039;ecdsa-with-SHA1&#039;:
+                    case &#039;ecdsa-with-SHA224&#039;:
+                    case &#039;ecdsa-with-SHA256&#039;:
+                    case &#039;ecdsa-with-SHA384&#039;:
+                    case &#039;ecdsa-with-SHA512&#039;:
+                        $key = $key
+                            -&gt;withHash(preg_replace(&#039;#^ecdsa-with-#&#039;, &#039;&#039;, strtolower($signatureAlgorithm)));
+                        break;
+                    default:
+                        throw new UnsupportedAlgorithmException(&#039;Signature algorithm unsupported&#039;);
+                }
+                break;
+            case &#039;id-dsa&#039;:
+                $key = DSA::loadFormat(&#039;PKCS8&#039;, $publicKey);
+                switch ($signatureAlgorithm) {
+                    case &#039;id-dsa-with-sha1&#039;:
+                    case &#039;id-dsa-with-sha224&#039;:
+                    case &#039;id-dsa-with-sha256&#039;:
+                        $key = $key
+                            -&gt;withHash(preg_replace(&#039;#^id-dsa-with-#&#039;, &#039;&#039;, strtolower($signatureAlgorithm)));
+                        break;
+                    default:
+                        throw new UnsupportedAlgorithmException(&#039;Signature algorithm unsupported&#039;);
+                }
+                break;
+            default:
+                throw new UnsupportedAlgorithmException(&#039;Public key algorithm unsupported&#039;);
+        }
+
+        return $key-&gt;verify($signatureSubject, $signature);
+    }
+
+    /**
+     * Sets the recursion limit
+     *
+     * When validating a signature it may be necessary to download intermediate certs from URI&#039;s.
+     * An intermediate cert that linked to itself would result in an infinite loop so to prevent
+     * that we set a recursion limit. A negative number means that there is no recursion limit.
+     *
+     * @param int $count
+     */
+    public static function setRecurLimit($count)
+    {
+        self::$recur_limit = $count;
+    }
+
+    /**
+     * Prevents URIs from being automatically retrieved
+     *
+     */
+    public static function disableURLFetch()
+    {
+        self::$disable_url_fetch = true;
+    }
+
+    /**
+     * Allows URIs to be automatically retrieved
+     *
+     */
+    public static function enableURLFetch()
+    {
+        self::$disable_url_fetch = false;
+    }
+
+    /**
+     * Decodes an IP address
+     *
+     * Takes in a base64 encoded &quot;blob&quot; and returns a human readable IP address
+     *
+     * @param string $ip
+     * @return string
+     */
+    public static function decodeIP($ip)
+    {
+        return inet_ntop($ip);
+    }
+
+    /**
+     * Decodes an IP address in a name constraints extension
+     *
+     * Takes in a base64 encoded &quot;blob&quot; and returns a human readable IP address / mask
+     *
+     * @param string $ip
+     * @return array
+     */
+    public static function decodeNameConstraintIP($ip)
+    {
+        $size = strlen($ip) &gt;&gt; 1;
+        $mask = substr($ip, $size);
+        $ip = substr($ip, 0, $size);
+        return [inet_ntop($ip), inet_ntop($mask)];
+    }
+
+    /**
+     * Encodes an IP address
+     *
+     * Takes a human readable IP address into a base64-encoded &quot;blob&quot;
+     *
+     * @param string|array $ip
+     * @return string
+     */
+    public static function encodeIP($ip)
+    {
+        return is_string($ip) ?
+            inet_pton($ip) :
+            inet_pton($ip[0]) . inet_pton($ip[1]);
+    }
+
+    /**
+     * &quot;Normalizes&quot; a Distinguished Name property
+     *
+     * @param string $propName
+     * @return mixed
+     */
+    private function translateDNProp($propName)
+    {
+        switch (strtolower($propName)) {
+            case &#039;jurisdictionofincorporationcountryname&#039;:
+            case &#039;jurisdictioncountryname&#039;:
+            case &#039;jurisdictionc&#039;:
+                return &#039;jurisdictionOfIncorporationCountryName&#039;;
+            case &#039;jurisdictionofincorporationstateorprovincename&#039;:
+            case &#039;jurisdictionstateorprovincename&#039;:
+            case &#039;jurisdictionst&#039;:
+                return &#039;jurisdictionOfIncorporationStateOrProvinceName&#039;;
+            case &#039;jurisdictionlocalityname&#039;:
+            case &#039;jurisdictionl&#039;:
+                return &#039;jurisdictionLocalityName&#039;;
+            case &#039;id-at-businesscategory&#039;:
+            case &#039;businesscategory&#039;:
+                return &#039;id-at-businessCategory&#039;;
+            case &#039;id-at-countryname&#039;:
+            case &#039;countryname&#039;:
+            case &#039;c&#039;:
+                return &#039;id-at-countryName&#039;;
+            case &#039;id-at-organizationname&#039;:
+            case &#039;organizationname&#039;:
+            case &#039;o&#039;:
+                return &#039;id-at-organizationName&#039;;
+            case &#039;id-at-dnqualifier&#039;:
+            case &#039;dnqualifier&#039;:
+                return &#039;id-at-dnQualifier&#039;;
+            case &#039;id-at-commonname&#039;:
+            case &#039;commonname&#039;:
+            case &#039;cn&#039;:
+                return &#039;id-at-commonName&#039;;
+            case &#039;id-at-stateorprovincename&#039;:
+            case &#039;stateorprovincename&#039;:
+            case &#039;state&#039;:
+            case &#039;province&#039;:
+            case &#039;provincename&#039;:
+            case &#039;st&#039;:
+                return &#039;id-at-stateOrProvinceName&#039;;
+            case &#039;id-at-localityname&#039;:
+            case &#039;localityname&#039;:
+            case &#039;l&#039;:
+                return &#039;id-at-localityName&#039;;
+            case &#039;id-emailaddress&#039;:
+            case &#039;emailaddress&#039;:
+                return &#039;pkcs-9-at-emailAddress&#039;;
+            case &#039;id-at-serialnumber&#039;:
+            case &#039;serialnumber&#039;:
+                return &#039;id-at-serialNumber&#039;;
+            case &#039;id-at-postalcode&#039;:
+            case &#039;postalcode&#039;:
+                return &#039;id-at-postalCode&#039;;
+            case &#039;id-at-streetaddress&#039;:
+            case &#039;streetaddress&#039;:
+                return &#039;id-at-streetAddress&#039;;
+            case &#039;id-at-name&#039;:
+            case &#039;name&#039;:
+                return &#039;id-at-name&#039;;
+            case &#039;id-at-givenname&#039;:
+            case &#039;givenname&#039;:
+                return &#039;id-at-givenName&#039;;
+            case &#039;id-at-surname&#039;:
+            case &#039;surname&#039;:
+            case &#039;sn&#039;:
+                return &#039;id-at-surname&#039;;
+            case &#039;id-at-initials&#039;:
+            case &#039;initials&#039;:
+                return &#039;id-at-initials&#039;;
+            case &#039;id-at-generationqualifier&#039;:
+            case &#039;generationqualifier&#039;:
+                return &#039;id-at-generationQualifier&#039;;
+            case &#039;id-at-organizationalunitname&#039;:
+            case &#039;organizationalunitname&#039;:
+            case &#039;ou&#039;:
+                return &#039;id-at-organizationalUnitName&#039;;
+            case &#039;id-at-pseudonym&#039;:
+            case &#039;pseudonym&#039;:
+                return &#039;id-at-pseudonym&#039;;
+            case &#039;id-at-title&#039;:
+            case &#039;title&#039;:
+                return &#039;id-at-title&#039;;
+            case &#039;id-at-description&#039;:
+            case &#039;description&#039;:
+                return &#039;id-at-description&#039;;
+            case &#039;id-at-role&#039;:
+            case &#039;role&#039;:
+                return &#039;id-at-role&#039;;
+            case &#039;id-at-uniqueidentifier&#039;:
+            case &#039;uniqueidentifier&#039;:
+            case &#039;x500uniqueidentifier&#039;:
+                return &#039;id-at-uniqueIdentifier&#039;;
+            case &#039;postaladdress&#039;:
+            case &#039;id-at-postaladdress&#039;:
+                return &#039;id-at-postalAddress&#039;;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Set a Distinguished Name property
+     *
+     * @param string $propName
+     * @param mixed $propValue
+     * @param string $type optional
+     * @return bool
+     */
+    public function setDNProp($propName, $propValue, $type = &#039;utf8String&#039;)
+    {
+        if (empty($this-&gt;dn)) {
+            $this-&gt;dn = [&#039;rdnSequence&#039; =&gt; []];
+        }
+
+        if (($propName = $this-&gt;translateDNProp($propName)) === false) {
+            return false;
+        }
+
+        foreach ((array) $propValue as $v) {
+            if (!is_array($v) &amp;&amp; isset($type)) {
+                $v = [$type =&gt; $v];
+            }
+            $this-&gt;dn[&#039;rdnSequence&#039;][] = [
+                [
+                    &#039;type&#039; =&gt; $propName,
+                    &#039;value&#039; =&gt; $v
+                ]
+            ];
+        }
+
+        return true;
+    }
+
+    /**
+     * Remove Distinguished Name properties
+     *
+     * @param string $propName
+     */
+    public function removeDNProp($propName)
+    {
+        if (empty($this-&gt;dn)) {
+            return;
+        }
+
+        if (($propName = $this-&gt;translateDNProp($propName)) === false) {
+            return;
+        }
+
+        $dn = &amp;$this-&gt;dn[&#039;rdnSequence&#039;];
+        $size = count($dn);
+        for ($i = 0; $i &lt; $size; $i++) {
+            if ($dn[$i][0][&#039;type&#039;] == $propName) {
+                unset($dn[$i]);
+            }
+        }
+
+        $dn = array_values($dn);
+        // fix for https://bugs.php.net/75433 affecting PHP 7.2
+        if (!isset($dn[0])) {
+            $dn = array_splice($dn, 0, 0);
+        }
+    }
+
+    /**
+     * Get Distinguished Name properties
+     *
+     * @param string $propName
+     * @param array $dn optional
+     * @param bool $withType optional
+     * @return mixed
+     */
+    public function getDNProp($propName, $dn = null, $withType = false)
+    {
+        if (!isset($dn)) {
+            $dn = $this-&gt;dn;
+        }
+
+        if (empty($dn)) {
+            return false;
+        }
+
+        if (($propName = $this-&gt;translateDNProp($propName)) === false) {
+            return false;
+        }
+
+        $filters = [];
+        $filters[&#039;value&#039;] = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+        ASN1::setFilters($filters);
+        $this-&gt;mapOutDNs($dn, &#039;rdnSequence&#039;);
+        $dn = $dn[&#039;rdnSequence&#039;];
+        $result = [];
+        for ($i = 0; $i &lt; count($dn); $i++) {
+            if ($dn[$i][0][&#039;type&#039;] == $propName) {
+                $v = $dn[$i][0][&#039;value&#039;];
+                if (!$withType) {
+                    if (is_array($v)) {
+                        foreach ($v as $type =&gt; $s) {
+                            $type = array_search($type, ASN1::ANY_MAP);
+                            if ($type !== false &amp;&amp; array_key_exists($type, ASN1::STRING_TYPE_SIZE)) {
+                                $s = ASN1::convert($s, $type);
+                                if ($s !== false) {
+                                    $v = $s;
+                                    break;
+                                }
+                            }
+                        }
+                        if (is_array($v)) {
+                            $v = array_pop($v); // Always strip data type.
+                        }
+                    } elseif (is_object($v) &amp;&amp; $v instanceof Element) {
+                        $map = $this-&gt;getMapping($propName);
+                        if (!is_bool($map)) {
+                            $decoded = ASN1::decodeBER($v);
+                            if (!$decoded) {
+                                return false;
+                            }
+                            $v = ASN1::asn1map($decoded[0], $map);
+                        }
+                    }
+                }
+                $result[] = $v;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Set a Distinguished Name
+     *
+     * @param mixed $dn
+     * @param bool $merge optional
+     * @param string $type optional
+     * @return bool
+     */
+    public function setDN($dn, $merge = false, $type = &#039;utf8String&#039;)
+    {
+        if (!$merge) {
+            $this-&gt;dn = null;
+        }
+
+        if (is_array($dn)) {
+            if (isset($dn[&#039;rdnSequence&#039;])) {
+                $this-&gt;dn = $dn; // No merge here.
+                return true;
+            }
+
+            // handles stuff generated by openssl_x509_parse()
+            foreach ($dn as $prop =&gt; $value) {
+                if (!$this-&gt;setDNProp($prop, $value, $type)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // handles everything else
+        $results = preg_split(&#039;#((?:^|, *|/)(?:C=|O=|OU=|CN=|L=|ST=|SN=|postalCode=|streetAddress=|emailAddress=|serialNumber=|organizationalUnitName=|title=|description=|role=|x500UniqueIdentifier=|postalAddress=))#&#039;, $dn, -1, PREG_SPLIT_DELIM_CAPTURE);
+        for ($i = 1; $i &lt; count($results); $i += 2) {
+            $prop = trim($results[$i], &#039;, =/&#039;);
+            $value = $results[$i + 1];
+            if (!$this-&gt;setDNProp($prop, $value, $type)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Get the Distinguished Name for a certificates subject
+     *
+     * @param mixed $format optional
+     * @param array $dn optional
+     * @return array|bool|string
+     */
+    public function getDN($format = self::DN_ARRAY, $dn = null)
+    {
+        if (!isset($dn)) {
+            $dn = isset($this-&gt;currentCert[&#039;tbsCertList&#039;]) ? $this-&gt;currentCert[&#039;tbsCertList&#039;][&#039;issuer&#039;] : $this-&gt;dn;
+        }
+
+        switch ((int) $format) {
+            case self::DN_ARRAY:
+                return $dn;
+            case self::DN_ASN1:
+                $filters = [];
+                $filters[&#039;rdnSequence&#039;][&#039;value&#039;] = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+                ASN1::setFilters($filters);
+                $this-&gt;mapOutDNs($dn, &#039;rdnSequence&#039;);
+                return ASN1::encodeDER($dn, Maps\Name::MAP);
+            case self::DN_CANON:
+                //  No SEQUENCE around RDNs and all string values normalized as
+                // trimmed lowercase UTF-8 with all spacing as one blank.
+                // constructed RDNs will not be canonicalized
+                $filters = [];
+                $filters[&#039;value&#039;] = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+                ASN1::setFilters($filters);
+                $result = &#039;&#039;;
+                $this-&gt;mapOutDNs($dn, &#039;rdnSequence&#039;);
+                foreach ($dn[&#039;rdnSequence&#039;] as $rdn) {
+                    foreach ($rdn as $i =&gt; $attr) {
+                        $attr = &amp;$rdn[$i];
+                        if (is_array($attr[&#039;value&#039;])) {
+                            foreach ($attr[&#039;value&#039;] as $type =&gt; $v) {
+                                $type = array_search($type, ASN1::ANY_MAP, true);
+                                if ($type !== false &amp;&amp; array_key_exists($type, ASN1::STRING_TYPE_SIZE)) {
+                                    $v = ASN1::convert($v, $type);
+                                    if ($v !== false) {
+                                        $v = preg_replace(&#039;/\s+/&#039;, &#039; &#039;, $v);
+                                        $attr[&#039;value&#039;] = strtolower(trim($v));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    $result .= ASN1::encodeDER($rdn, Maps\RelativeDistinguishedName::MAP);
+                }
+                return $result;
+            case self::DN_HASH:
+                $dn = $this-&gt;getDN(self::DN_CANON, $dn);
+                $hash = new Hash(&#039;sha1&#039;);
+                $hash = $hash-&gt;hash($dn);
+                $hash = unpack(&#039;Vhash&#039;, $hash)[&#039;hash&#039;];
+                return strtolower(Strings::bin2hex(pack(&#039;N&#039;, $hash)));
+        }
+
+        // Default is to return a string.
+        $start = true;
+        $output = &#039;&#039;;
+
+        $result = [];
+        $filters = [];
+        $filters[&#039;rdnSequence&#039;][&#039;value&#039;] = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+        ASN1::setFilters($filters);
+        $this-&gt;mapOutDNs($dn, &#039;rdnSequence&#039;);
+
+        foreach ($dn[&#039;rdnSequence&#039;] as $field) {
+            $prop = $field[0][&#039;type&#039;];
+            $value = $field[0][&#039;value&#039;];
+
+            $delim = &#039;, &#039;;
+            switch ($prop) {
+                case &#039;id-at-countryName&#039;:
+                    $desc = &#039;C&#039;;
+                    break;
+                case &#039;id-at-stateOrProvinceName&#039;:
+                    $desc = &#039;ST&#039;;
+                    break;
+                case &#039;id-at-organizationName&#039;:
+                    $desc = &#039;O&#039;;
+                    break;
+                case &#039;id-at-organizationalUnitName&#039;:
+                    $desc = &#039;OU&#039;;
+                    break;
+                case &#039;id-at-commonName&#039;:
+                    $desc = &#039;CN&#039;;
+                    break;
+                case &#039;id-at-localityName&#039;:
+                    $desc = &#039;L&#039;;
+                    break;
+                case &#039;id-at-surname&#039;:
+                    $desc = &#039;SN&#039;;
+                    break;
+                case &#039;id-at-uniqueIdentifier&#039;:
+                    $delim = &#039;/&#039;;
+                    $desc = &#039;x500UniqueIdentifier&#039;;
+                    break;
+                case &#039;id-at-postalAddress&#039;:
+                    $delim = &#039;/&#039;;
+                    $desc = &#039;postalAddress&#039;;
+                    break;
+                default:
+                    $delim = &#039;/&#039;;
+                    $desc = preg_replace(&#039;#.+-([^-]+)$#&#039;, &#039;$1&#039;, $prop);
+            }
+
+            if (!$start) {
+                $output .= $delim;
+            }
+            if (is_array($value)) {
+                foreach ($value as $type =&gt; $v) {
+                    $type = array_search($type, ASN1::ANY_MAP, true);
+                    if ($type !== false &amp;&amp; array_key_exists($type, ASN1::STRING_TYPE_SIZE)) {
+                        $v = ASN1::convert($v, $type);
+                        if ($v !== false) {
+                            $value = $v;
+                            break;
+                        }
+                    }
+                }
+                if (is_array($value)) {
+                    $value = array_pop($value); // Always strip data type.
+                }
+            } elseif (is_object($value) &amp;&amp; $value instanceof Element) {
+                $callback = function ($x) {
+                    return &#039;\x&#039; . bin2hex($x[0]);
+                };
+                $value = strtoupper(preg_replace_callback(&#039;#[^\x20-\x7E]#&#039;, $callback, $value-&gt;element));
+            }
+            $output .= $desc . &#039;=&#039; . $value;
+            $result[$desc] = isset($result[$desc]) ?
+                array_merge((array) $result[$desc], [$value]) :
+                $value;
+            $start = false;
+        }
+
+        return $format == self::DN_OPENSSL ? $result : $output;
+    }
+
+    /**
+     * Get the Distinguished Name for a certificate/crl issuer
+     *
+     * @param int $format optional
+     * @return mixed
+     */
+    public function getIssuerDN($format = self::DN_ARRAY)
+    {
+        switch (true) {
+            case !isset($this-&gt;currentCert) || !is_array($this-&gt;currentCert):
+                break;
+            case isset($this-&gt;currentCert[&#039;tbsCertificate&#039;]):
+                return $this-&gt;getDN($format, $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;issuer&#039;]);
+            case isset($this-&gt;currentCert[&#039;tbsCertList&#039;]):
+                return $this-&gt;getDN($format, $this-&gt;currentCert[&#039;tbsCertList&#039;][&#039;issuer&#039;]);
+        }
+
+        return false;
+    }
+
+    /**
+     * Get the Distinguished Name for a certificate/csr subject
+     * Alias of getDN()
+     *
+     * @param int $format optional
+     * @return mixed
+     */
+    public function getSubjectDN($format = self::DN_ARRAY)
+    {
+        switch (true) {
+            case !empty($this-&gt;dn):
+                return $this-&gt;getDN($format);
+            case !isset($this-&gt;currentCert) || !is_array($this-&gt;currentCert):
+                break;
+            case isset($this-&gt;currentCert[&#039;tbsCertificate&#039;]):
+                return $this-&gt;getDN($format, $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;subject&#039;]);
+            case isset($this-&gt;currentCert[&#039;certificationRequestInfo&#039;]):
+                return $this-&gt;getDN($format, $this-&gt;currentCert[&#039;certificationRequestInfo&#039;][&#039;subject&#039;]);
+        }
+
+        return false;
+    }
+
+    /**
+     * Get an individual Distinguished Name property for a certificate/crl issuer
+     *
+     * @param string $propName
+     * @param bool $withType optional
+     * @return mixed
+     */
+    public function getIssuerDNProp($propName, $withType = false)
+    {
+        switch (true) {
+            case !isset($this-&gt;currentCert) || !is_array($this-&gt;currentCert):
+                break;
+            case isset($this-&gt;currentCert[&#039;tbsCertificate&#039;]):
+                return $this-&gt;getDNProp($propName, $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;issuer&#039;], $withType);
+            case isset($this-&gt;currentCert[&#039;tbsCertList&#039;]):
+                return $this-&gt;getDNProp($propName, $this-&gt;currentCert[&#039;tbsCertList&#039;][&#039;issuer&#039;], $withType);
+        }
+
+        return false;
+    }
+
+    /**
+     * Get an individual Distinguished Name property for a certificate/csr subject
+     *
+     * @param string $propName
+     * @param bool $withType optional
+     * @return mixed
+     */
+    public function getSubjectDNProp($propName, $withType = false)
+    {
+        switch (true) {
+            case !empty($this-&gt;dn):
+                return $this-&gt;getDNProp($propName, null, $withType);
+            case !isset($this-&gt;currentCert) || !is_array($this-&gt;currentCert):
+                break;
+            case isset($this-&gt;currentCert[&#039;tbsCertificate&#039;]):
+                return $this-&gt;getDNProp($propName, $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;subject&#039;], $withType);
+            case isset($this-&gt;currentCert[&#039;certificationRequestInfo&#039;]):
+                return $this-&gt;getDNProp($propName, $this-&gt;currentCert[&#039;certificationRequestInfo&#039;][&#039;subject&#039;], $withType);
+        }
+
+        return false;
+    }
+
+    /**
+     * Get the certificate chain for the current cert
+     *
+     * @return mixed
+     */
+    public function getChain()
+    {
+        $chain = [$this-&gt;currentCert];
+
+        if (!is_array($this-&gt;currentCert) || !isset($this-&gt;currentCert[&#039;tbsCertificate&#039;])) {
+            return false;
+        }
+        while (true) {
+            $currentCert = $chain[count($chain) - 1];
+            for ($i = 0; $i &lt; count($this-&gt;CAs); $i++) {
+                $ca = $this-&gt;CAs[$i];
+                if ($currentCert[&#039;tbsCertificate&#039;][&#039;issuer&#039;] === $ca[&#039;tbsCertificate&#039;][&#039;subject&#039;]) {
+                    $authorityKey = $this-&gt;getExtension(&#039;id-ce-authorityKeyIdentifier&#039;, $currentCert);
+                    $subjectKeyID = $this-&gt;getExtension(&#039;id-ce-subjectKeyIdentifier&#039;, $ca);
+                    switch (true) {
+                        case !is_array($authorityKey):
+                        case is_array($authorityKey) &amp;&amp; isset($authorityKey[&#039;keyIdentifier&#039;]) &amp;&amp; $authorityKey[&#039;keyIdentifier&#039;] === $subjectKeyID:
+                            if ($currentCert === $ca) {
+                                break 3;
+                            }
+                            $chain[] = $ca;
+                            break 2;
+                    }
+                }
+            }
+            if ($i == count($this-&gt;CAs)) {
+                break;
+            }
+        }
+        foreach ($chain as $key =&gt; $value) {
+            $chain[$key] = new X509();
+            $chain[$key]-&gt;loadX509($value);
+        }
+        return $chain;
+    }
+
+    /**
+     * Returns the current cert
+     *
+     * @return array|bool
+     */
+    public function &amp;getCurrentCert()
+    {
+        return $this-&gt;currentCert;
+    }
+
+    /**
+     * Set public key
+     *
+     * Key needs to be a \phpseclib3\Crypt\RSA object
+     *
+     * @param PublicKey $key
+     * @return void
+     */
+    public function setPublicKey(PublicKey $key)
+    {
+        $this-&gt;publicKey = $key;
+    }
+
+    /**
+     * Set private key
+     *
+     * Key needs to be a \phpseclib3\Crypt\RSA object
+     *
+     * @param PrivateKey $key
+     */
+    public function setPrivateKey(PrivateKey $key)
+    {
+        $this-&gt;privateKey = $key;
+    }
+
+    /**
+     * Set challenge
+     *
+     * Used for SPKAC CSR&#039;s
+     *
+     * @param string $challenge
+     */
+    public function setChallenge($challenge)
+    {
+        $this-&gt;challenge = $challenge;
+    }
+
+    /**
+     * Gets the public key
+     *
+     * Returns a \phpseclib3\Crypt\RSA object or a false.
+     *
+     * @return mixed
+     */
+    public function getPublicKey()
+    {
+        if (isset($this-&gt;publicKey)) {
+            return $this-&gt;publicKey;
+        }
+
+        if (isset($this-&gt;currentCert) &amp;&amp; is_array($this-&gt;currentCert)) {
+            $paths = [
+                &#039;tbsCertificate/subjectPublicKeyInfo&#039;,
+                &#039;certificationRequestInfo/subjectPKInfo&#039;,
+                &#039;publicKeyAndChallenge/spki&#039;
+            ];
+            foreach ($paths as $path) {
+                $keyinfo = $this-&gt;subArray($this-&gt;currentCert, $path);
+                if (!empty($keyinfo)) {
+                    break;
+                }
+            }
+        }
+        if (empty($keyinfo)) {
+            return false;
+        }
+
+        $key = $keyinfo[&#039;subjectPublicKey&#039;];
+
+        switch ($keyinfo[&#039;algorithm&#039;][&#039;algorithm&#039;]) {
+            case &#039;id-RSASSA-PSS&#039;:
+                return RSA::loadFormat(&#039;PSS&#039;, $key);
+            case &#039;rsaEncryption&#039;:
+                return RSA::loadFormat(&#039;PKCS8&#039;, $key)-&gt;withPadding(RSA::SIGNATURE_PKCS1);
+            case &#039;id-ecPublicKey&#039;:
+            case &#039;id-Ed25519&#039;:
+            case &#039;id-Ed448&#039;:
+                return EC::loadFormat(&#039;PKCS8&#039;, $key);
+            case &#039;id-dsa&#039;:
+                return DSA::loadFormat(&#039;PKCS8&#039;, $key);
+        }
+
+        return false;
+    }
+
+    /**
+     * Load a Certificate Signing Request
+     *
+     * @param string $csr
+     * @param int $mode
+     * @return mixed
+     */
+    public function loadCSR($csr, $mode = self::FORMAT_AUTO_DETECT)
+    {
+        if (is_array($csr) &amp;&amp; isset($csr[&#039;certificationRequestInfo&#039;])) {
+            unset($this-&gt;currentCert);
+            unset($this-&gt;currentKeyIdentifier);
+            unset($this-&gt;signatureSubject);
+            $this-&gt;dn = $csr[&#039;certificationRequestInfo&#039;][&#039;subject&#039;];
+            if (!isset($this-&gt;dn)) {
+                return false;
+            }
+
+            $this-&gt;currentCert = $csr;
+            return $csr;
+        }
+
+        // see http://tools.ietf.org/html/rfc2986
+
+        if ($mode != self::FORMAT_DER) {
+            $newcsr = ASN1::extractBER($csr);
+            if ($mode == self::FORMAT_PEM &amp;&amp; $csr == $newcsr) {
+                return false;
+            }
+            $csr = $newcsr;
+        }
+        $orig = $csr;
+
+        if ($csr === false) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $decoded = ASN1::decodeBER($csr);
+
+        if (!$decoded) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $csr = ASN1::asn1map($decoded[0], Maps\CertificationRequest::MAP);
+        if (!isset($csr) || $csr === false) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $this-&gt;mapInAttributes($csr, &#039;certificationRequestInfo/attributes&#039;);
+        $this-&gt;mapInDNs($csr, &#039;certificationRequestInfo/subject/rdnSequence&#039;);
+
+        $this-&gt;dn = $csr[&#039;certificationRequestInfo&#039;][&#039;subject&#039;];
+
+        $this-&gt;signatureSubject = substr($orig, $decoded[0][&#039;content&#039;][0][&#039;start&#039;], $decoded[0][&#039;content&#039;][0][&#039;length&#039;]);
+
+        $key = $csr[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;];
+        $key = ASN1::encodeDER($key, Maps\SubjectPublicKeyInfo::MAP);
+        $csr[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;][&#039;subjectPublicKey&#039;] =
+            &quot;-----BEGIN PUBLIC KEY-----\r\n&quot; .
+            chunk_split(base64_encode($key), 64) .
+            &quot;-----END PUBLIC KEY-----&quot;;
+
+        $this-&gt;currentKeyIdentifier = null;
+        $this-&gt;currentCert = $csr;
+
+        $this-&gt;publicKey = null;
+        $this-&gt;publicKey = $this-&gt;getPublicKey();
+
+        return $csr;
+    }
+
+    /**
+     * Save CSR request
+     *
+     * @param array $csr
+     * @param int $format optional
+     * @return string
+     */
+    public function saveCSR(array $csr, $format = self::FORMAT_PEM)
+    {
+        if (!is_array($csr) || !isset($csr[&#039;certificationRequestInfo&#039;])) {
+            return false;
+        }
+
+        switch (true) {
+            case !($algorithm = $this-&gt;subArray($csr, &#039;certificationRequestInfo/subjectPKInfo/algorithm/algorithm&#039;)):
+            case is_object($csr[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;][&#039;subjectPublicKey&#039;]):
+                break;
+            default:
+                $csr[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;] = new Element(
+                    base64_decode(preg_replace(&#039;#-.+-|[\r\n]#&#039;, &#039;&#039;, $csr[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;][&#039;subjectPublicKey&#039;]))
+                );
+        }
+
+        $filters = [];
+        $filters[&#039;certificationRequestInfo&#039;][&#039;subject&#039;][&#039;rdnSequence&#039;][&#039;value&#039;]
+            = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+
+        ASN1::setFilters($filters);
+
+        $this-&gt;mapOutDNs($csr, &#039;certificationRequestInfo/subject/rdnSequence&#039;);
+        $this-&gt;mapOutAttributes($csr, &#039;certificationRequestInfo/attributes&#039;);
+        $csr = ASN1::encodeDER($csr, Maps\CertificationRequest::MAP);
+
+        switch ($format) {
+            case self::FORMAT_DER:
+                return $csr;
+            // case self::FORMAT_PEM:
+            default:
+                return &quot;-----BEGIN CERTIFICATE REQUEST-----\r\n&quot; . chunk_split(Strings::base64_encode($csr), 64) . &#039;-----END CERTIFICATE REQUEST-----&#039;;
+        }
+    }
+
+    /**
+     * Load a SPKAC CSR
+     *
+     * SPKAC&#039;s are produced by the HTML5 keygen element:
+     *
+     * https://developer.mozilla.org/en-US/docs/HTML/Element/keygen
+     *
+     * @param string $spkac
+     * @return mixed
+     */
+    public function loadSPKAC($spkac)
+    {
+        if (is_array($spkac) &amp;&amp; isset($spkac[&#039;publicKeyAndChallenge&#039;])) {
+            unset($this-&gt;currentCert);
+            unset($this-&gt;currentKeyIdentifier);
+            unset($this-&gt;signatureSubject);
+            $this-&gt;currentCert = $spkac;
+            return $spkac;
+        }
+
+        // see http://www.w3.org/html/wg/drafts/html/master/forms.html#signedpublickeyandchallenge
+
+        // OpenSSL produces SPKAC&#039;s that are preceded by the string SPKAC=
+        $temp = preg_replace(&#039;#(?:SPKAC=)|[ \r\n\\\]#&#039;, &#039;&#039;, $spkac);
+        $temp = preg_match(&#039;#^[a-zA-Z\d/+]*={0,2}$#&#039;, $temp) ? Strings::base64_decode($temp) : false;
+        if ($temp != false) {
+            $spkac = $temp;
+        }
+        $orig = $spkac;
+
+        if ($spkac === false) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $decoded = ASN1::decodeBER($spkac);
+
+        if (!$decoded) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $spkac = ASN1::asn1map($decoded[0], Maps\SignedPublicKeyAndChallenge::MAP);
+
+        if (!isset($spkac) || !is_array($spkac)) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $this-&gt;signatureSubject = substr($orig, $decoded[0][&#039;content&#039;][0][&#039;start&#039;], $decoded[0][&#039;content&#039;][0][&#039;length&#039;]);
+
+        $key = $spkac[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;];
+        $key = ASN1::encodeDER($key, Maps\SubjectPublicKeyInfo::MAP);
+        $spkac[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;][&#039;subjectPublicKey&#039;] =
+            &quot;-----BEGIN PUBLIC KEY-----\r\n&quot; .
+            chunk_split(base64_encode($key), 64) .
+            &quot;-----END PUBLIC KEY-----&quot;;
+
+        $this-&gt;currentKeyIdentifier = null;
+        $this-&gt;currentCert = $spkac;
+
+        $this-&gt;publicKey = null;
+        $this-&gt;publicKey = $this-&gt;getPublicKey();
+
+        return $spkac;
+    }
+
+    /**
+     * Save a SPKAC CSR request
+     *
+     * @param array $spkac
+     * @param int $format optional
+     * @return string
+     */
+    public function saveSPKAC(array $spkac, $format = self::FORMAT_PEM)
+    {
+        if (!is_array($spkac) || !isset($spkac[&#039;publicKeyAndChallenge&#039;])) {
+            return false;
+        }
+
+        $algorithm = $this-&gt;subArray($spkac, &#039;publicKeyAndChallenge/spki/algorithm/algorithm&#039;);
+        switch (true) {
+            case !$algorithm:
+            case is_object($spkac[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;][&#039;subjectPublicKey&#039;]):
+                break;
+            default:
+                $spkac[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;] = new Element(
+                    base64_decode(preg_replace(&#039;#-.+-|[\r\n]#&#039;, &#039;&#039;, $spkac[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;][&#039;subjectPublicKey&#039;]))
+                );
+        }
+
+        $spkac = ASN1::encodeDER($spkac, Maps\SignedPublicKeyAndChallenge::MAP);
+
+        switch ($format) {
+            case self::FORMAT_DER:
+                return $spkac;
+            // case self::FORMAT_PEM:
+            default:
+                // OpenSSL&#039;s implementation of SPKAC requires the SPKAC be preceded by SPKAC= and since there are pretty much
+                // no other SPKAC decoders phpseclib will use that same format
+                return &#039;SPKAC=&#039; . Strings::base64_encode($spkac);
+        }
+    }
+
+    /**
+     * Load a Certificate Revocation List
+     *
+     * @param string $crl
+     * @param int $mode
+     * @return mixed
+     */
+    public function loadCRL($crl, $mode = self::FORMAT_AUTO_DETECT)
+    {
+        if (is_array($crl) &amp;&amp; isset($crl[&#039;tbsCertList&#039;])) {
+            $this-&gt;currentCert = $crl;
+            unset($this-&gt;signatureSubject);
+            return $crl;
+        }
+
+        if ($mode != self::FORMAT_DER) {
+            $newcrl = ASN1::extractBER($crl);
+            if ($mode == self::FORMAT_PEM &amp;&amp; $crl == $newcrl) {
+                return false;
+            }
+            $crl = $newcrl;
+        }
+        $orig = $crl;
+
+        if ($crl === false) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $decoded = ASN1::decodeBER($crl);
+
+        if (!$decoded) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $crl = ASN1::asn1map($decoded[0], Maps\CertificateList::MAP);
+        if (!isset($crl) || $crl === false) {
+            $this-&gt;currentCert = false;
+            return false;
+        }
+
+        $this-&gt;signatureSubject = substr($orig, $decoded[0][&#039;content&#039;][0][&#039;start&#039;], $decoded[0][&#039;content&#039;][0][&#039;length&#039;]);
+
+        $this-&gt;mapInDNs($crl, &#039;tbsCertList/issuer/rdnSequence&#039;);
+        if ($this-&gt;isSubArrayValid($crl, &#039;tbsCertList/crlExtensions&#039;)) {
+            $this-&gt;mapInExtensions($crl, &#039;tbsCertList/crlExtensions&#039;);
+        }
+        if ($this-&gt;isSubArrayValid($crl, &#039;tbsCertList/revokedCertificates&#039;)) {
+            $rclist_ref = &amp;$this-&gt;subArrayUnchecked($crl, &#039;tbsCertList/revokedCertificates&#039;);
+            if ($rclist_ref) {
+                $rclist = $crl[&#039;tbsCertList&#039;][&#039;revokedCertificates&#039;];
+                foreach ($rclist as $i =&gt; $extension) {
+                    if ($this-&gt;isSubArrayValid($rclist, &quot;$i/crlEntryExtensions&quot;)) {
+                        $this-&gt;mapInExtensions($rclist_ref, &quot;$i/crlEntryExtensions&quot;);
+                    }
+                }
+            }
+        }
+
+        $this-&gt;currentKeyIdentifier = null;
+        $this-&gt;currentCert = $crl;
+
+        return $crl;
+    }
+
+    /**
+     * Save Certificate Revocation List.
+     *
+     * @param array $crl
+     * @param int $format optional
+     * @return string
+     */
+    public function saveCRL(array $crl, $format = self::FORMAT_PEM)
+    {
+        if (!is_array($crl) || !isset($crl[&#039;tbsCertList&#039;])) {
+            return false;
+        }
+
+        $filters = [];
+        $filters[&#039;tbsCertList&#039;][&#039;issuer&#039;][&#039;rdnSequence&#039;][&#039;value&#039;]
+            = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+        $filters[&#039;tbsCertList&#039;][&#039;signature&#039;][&#039;parameters&#039;]
+            = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+        $filters[&#039;signatureAlgorithm&#039;][&#039;parameters&#039;]
+            = [&#039;type&#039; =&gt; ASN1::TYPE_UTF8_STRING];
+
+        if (empty($crl[&#039;tbsCertList&#039;][&#039;signature&#039;][&#039;parameters&#039;])) {
+            $filters[&#039;tbsCertList&#039;][&#039;signature&#039;][&#039;parameters&#039;]
+                = [&#039;type&#039; =&gt; ASN1::TYPE_NULL];
+        }
+
+        if (empty($crl[&#039;signatureAlgorithm&#039;][&#039;parameters&#039;])) {
+            $filters[&#039;signatureAlgorithm&#039;][&#039;parameters&#039;]
+                = [&#039;type&#039; =&gt; ASN1::TYPE_NULL];
+        }
+
+        ASN1::setFilters($filters);
+
+        $this-&gt;mapOutDNs($crl, &#039;tbsCertList/issuer/rdnSequence&#039;);
+        $this-&gt;mapOutExtensions($crl, &#039;tbsCertList/crlExtensions&#039;);
+        $rclist = &amp;$this-&gt;subArray($crl, &#039;tbsCertList/revokedCertificates&#039;);
+        if (is_array($rclist)) {
+            foreach ($rclist as $i =&gt; $extension) {
+                $this-&gt;mapOutExtensions($rclist, &quot;$i/crlEntryExtensions&quot;);
+            }
+        }
+
+        $crl = ASN1::encodeDER($crl, Maps\CertificateList::MAP);
+
+        switch ($format) {
+            case self::FORMAT_DER:
+                return $crl;
+            // case self::FORMAT_PEM:
+            default:
+                return &quot;-----BEGIN X509 CRL-----\r\n&quot; . chunk_split(Strings::base64_encode($crl), 64) . &#039;-----END X509 CRL-----&#039;;
+        }
+    }
+
+    /**
+     * Helper function to build a time field according to RFC 3280 section
+     *  - 4.1.2.5 Validity
+     *  - 5.1.2.4 This Update
+     *  - 5.1.2.5 Next Update
+     *  - 5.1.2.6 Revoked Certificates
+     * by choosing utcTime iff year of date given is before 2050 and generalTime else.
+     *
+     * @param string $date in format date(&#039;D, d M Y H:i:s O&#039;)
+     * @return array|Element
+     */
+    private function timeField($date)
+    {
+        if ($date instanceof Element) {
+            return $date;
+        }
+        $dateObj = new \DateTimeImmutable($date, new \DateTimeZone(&#039;GMT&#039;));
+        $year = $dateObj-&gt;format(&#039;Y&#039;); // the same way ASN1.php parses this
+        if ($year &lt; 2050) {
+            return [&#039;utcTime&#039; =&gt; $date];
+        } else {
+            return [&#039;generalTime&#039; =&gt; $date];
+        }
+    }
+
+    /**
+     * Sign an X.509 certificate
+     *
+     * $issuer&#039;s private key needs to be loaded.
+     * $subject can be either an existing X.509 cert (if you want to resign it),
+     * a CSR or something with the DN and public key explicitly set.
+     *
+     * @return mixed
+     */
+    public function sign(X509 $issuer, X509 $subject)
+    {
+        if (!is_object($issuer-&gt;privateKey) || empty($issuer-&gt;dn)) {
+            return false;
+        }
+
+        if (isset($subject-&gt;publicKey) &amp;&amp; !($subjectPublicKey = $subject-&gt;formatSubjectPublicKey())) {
+            return false;
+        }
+
+        $currentCert = isset($this-&gt;currentCert) ? $this-&gt;currentCert : null;
+        $signatureSubject = isset($this-&gt;signatureSubject) ? $this-&gt;signatureSubject : null;
+        $signatureAlgorithm = self::identifySignatureAlgorithm($issuer-&gt;privateKey);
+
+        if (isset($subject-&gt;currentCert) &amp;&amp; is_array($subject-&gt;currentCert) &amp;&amp; isset($subject-&gt;currentCert[&#039;tbsCertificate&#039;])) {
+            $this-&gt;currentCert = $subject-&gt;currentCert;
+            $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;signature&#039;] = $signatureAlgorithm;
+            $this-&gt;currentCert[&#039;signatureAlgorithm&#039;] = $signatureAlgorithm;
+
+            if (!empty($this-&gt;startDate)) {
+                $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;validity&#039;][&#039;notBefore&#039;] = $this-&gt;timeField($this-&gt;startDate);
+            }
+            if (!empty($this-&gt;endDate)) {
+                $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;validity&#039;][&#039;notAfter&#039;] = $this-&gt;timeField($this-&gt;endDate);
+            }
+            if (!empty($this-&gt;serialNumber)) {
+                $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;serialNumber&#039;] = $this-&gt;serialNumber;
+            }
+            if (!empty($subject-&gt;dn)) {
+                $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;subject&#039;] = $subject-&gt;dn;
+            }
+            if (!empty($subject-&gt;publicKey)) {
+                $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;] = $subjectPublicKey;
+            }
+            $this-&gt;removeExtension(&#039;id-ce-authorityKeyIdentifier&#039;);
+            if (isset($subject-&gt;domains)) {
+                $this-&gt;removeExtension(&#039;id-ce-subjectAltName&#039;);
+            }
+        } elseif (isset($subject-&gt;currentCert) &amp;&amp; is_array($subject-&gt;currentCert) &amp;&amp; isset($subject-&gt;currentCert[&#039;tbsCertList&#039;])) {
+            return false;
+        } else {
+            if (!isset($subject-&gt;publicKey)) {
+                return false;
+            }
+
+            $startDate = new \DateTimeImmutable(&#039;now&#039;, new \DateTimeZone(@date_default_timezone_get()));
+            $startDate = !empty($this-&gt;startDate) ? $this-&gt;startDate : $startDate-&gt;format(&#039;D, d M Y H:i:s O&#039;);
+
+            $endDate = new \DateTimeImmutable(&#039;+1 year&#039;, new \DateTimeZone(@date_default_timezone_get()));
+            $endDate = !empty($this-&gt;endDate) ? $this-&gt;endDate : $endDate-&gt;format(&#039;D, d M Y H:i:s O&#039;);
+
+            /* &quot;The serial number MUST be a positive integer&quot;
+               &quot;Conforming CAs MUST NOT use serialNumber values longer than 20 octets.&quot;
+                -- https://tools.ietf.org/html/rfc5280#section-4.1.2.2
+
+               for the integer to be positive the leading bit needs to be 0 hence the
+               application of a bitmap
+            */
+            $serialNumber = !empty($this-&gt;serialNumber) ?
+                $this-&gt;serialNumber :
+                new BigInteger(Random::string(20) &amp; (&quot;\x7F&quot; . str_repeat(&quot;\xFF&quot;, 19)), 256);
+
+            $this-&gt;currentCert = [
+                &#039;tbsCertificate&#039; =&gt;
+                    [
+                        &#039;version&#039; =&gt; &#039;v3&#039;,
+                        &#039;serialNumber&#039; =&gt; $serialNumber, // $this-&gt;setSerialNumber()
+                        &#039;signature&#039; =&gt; $signatureAlgorithm,
+                        &#039;issuer&#039; =&gt; false, // this is going to be overwritten later
+                        &#039;validity&#039; =&gt; [
+                            &#039;notBefore&#039; =&gt; $this-&gt;timeField($startDate), // $this-&gt;setStartDate()
+                            &#039;notAfter&#039; =&gt; $this-&gt;timeField($endDate)   // $this-&gt;setEndDate()
+                        ],
+                        &#039;subject&#039; =&gt; $subject-&gt;dn,
+                        &#039;subjectPublicKeyInfo&#039; =&gt; $subjectPublicKey
+                    ],
+                    &#039;signatureAlgorithm&#039; =&gt; $signatureAlgorithm,
+                    &#039;signature&#039;          =&gt; false // this is going to be overwritten later
+            ];
+
+            // Copy extensions from CSR.
+            $csrexts = $subject-&gt;getAttribute(&#039;pkcs-9-at-extensionRequest&#039;, 0);
+
+            if (!empty($csrexts)) {
+                $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;extensions&#039;] = $csrexts;
+            }
+        }
+
+        $this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;issuer&#039;] = $issuer-&gt;dn;
+
+        if (isset($issuer-&gt;currentKeyIdentifier)) {
+            $this-&gt;setExtension(&#039;id-ce-authorityKeyIdentifier&#039;, [
+                    //&#039;authorityCertIssuer&#039; =&gt; array(
+                    //    array(
+                    //        &#039;directoryName&#039; =&gt; $issuer-&gt;dn
+                    //    )
+                    //),
+                    &#039;keyIdentifier&#039; =&gt; $issuer-&gt;currentKeyIdentifier
+                ]);
+            //$extensions = &amp;$this-&gt;currentCert[&#039;tbsCertificate&#039;][&#039;extensions&#039;];
+            //if (isset($issuer-&gt;serialNumber)) {
+            //    $extensions[count($extensions) - 1][&#039;authorityCertSerialNumber&#039;] = $issuer-&gt;serialNumber;
+            //}
+            //unset($extensions);
+        }
+
+        if (isset($subject-&gt;currentKeyIdentifier)) {
+            $this-&gt;setExtension(&#039;id-ce-subjectKeyIdentifier&#039;, $subject-&gt;currentKeyIdentifier);
+        }
+
+        $altName = [];
+
+        if (isset($subject-&gt;domains) &amp;&amp; count($subject-&gt;domains)) {
+            $altName = array_map([&#039;\phpseclib3\File\X509&#039;, &#039;dnsName&#039;], $subject-&gt;domains);
+        }
+
+        if (isset($subject-&gt;ipAddresses) &amp;&amp; count($subject-&gt;ipAddresses)) {
+            // should an IP address appear as the CN if no domain name is specified? idk
+            //$ips = count($subject-&gt;domains) ? $subject-&gt;ipAddresses : array_slice($subject-&gt;ipAddresses, 1);
+            $ipAddresses = [];
+            foreach ($subject-&gt;ipAddresses as $ipAddress) {
+                $encoded = $subject-&gt;ipAddress($ipAddress);
+                if ($encoded !== false) {
+                    $ipAddresses[] = $encoded;
+                }
+            }
+            if (count($ipAddresses)) {
+                $altName = array_merge($altName, $ipAddresses);
+            }
+        }
+
+        if (!empty($altName)) {
+            $this-&gt;setExtension(&#039;id-ce-subjectAltName&#039;, $altName);
+        }
+
+        if ($this-&gt;caFlag) {
+            $keyUsage = $this-&gt;getExtension(&#039;id-ce-keyUsage&#039;);
+            if (!$keyUsage) {
+                $keyUsage = [];
+            }
+
+            $this-&gt;setExtension(
+                &#039;id-ce-keyUsage&#039;,
+                array_values(array_unique(array_merge($keyUsage, [&#039;cRLSign&#039;, &#039;keyCertSign&#039;])))
+            );
+
+            $basicConstraints = $this-&gt;getExtension(&#039;id-ce-basicConstraints&#039;);
+            if (!$basicConstraints) {
+                $basicConstraints = [];
+            }
+
+            $this-&gt;setExtension(
+                &#039;id-ce-basicConstraints&#039;,
+                array_merge([&#039;cA&#039; =&gt; true], $basicConstraints),
+                true
+            );
+
+            if (!isset($subject-&gt;currentKeyIdentifier)) {
+                $this-&gt;setExtension(&#039;id-ce-subjectKeyIdentifier&#039;, $this-&gt;computeKeyIdentifier($this-&gt;currentCert), false, false);
+            }
+        }
+
+        // resync $this-&gt;signatureSubject
+        // save $tbsCertificate in case there are any \phpseclib3\File\ASN1\Element objects in it
+        $tbsCertificate = $this-&gt;currentCert[&#039;tbsCertificate&#039;];
+        $this-&gt;loadX509($this-&gt;saveX509($this-&gt;currentCert));
+
+        $result = $this-&gt;currentCert;
+        $this-&gt;currentCert[&#039;signature&#039;] = $result[&#039;signature&#039;] = &quot;\0&quot; . $issuer-&gt;privateKey-&gt;sign($this-&gt;signatureSubject);
+        $result[&#039;tbsCertificate&#039;] = $tbsCertificate;
+
+        $this-&gt;currentCert = $currentCert;
+        $this-&gt;signatureSubject = $signatureSubject;
+
+        return $result;
+    }
+
+    /**
+     * Sign a CSR
+     *
+     * @return mixed
+     */
+    public function signCSR()
+    {
+        if (!is_object($this-&gt;privateKey) || empty($this-&gt;dn)) {
+            return false;
+        }
+
+        $origPublicKey = $this-&gt;publicKey;
+        $this-&gt;publicKey = $this-&gt;privateKey-&gt;getPublicKey();
+        $publicKey = $this-&gt;formatSubjectPublicKey();
+        $this-&gt;publicKey = $origPublicKey;
+
+        $currentCert = isset($this-&gt;currentCert) ? $this-&gt;currentCert : null;
+        $signatureSubject = isset($this-&gt;signatureSubject) ? $this-&gt;signatureSubject : null;
+        $signatureAlgorithm = self::identifySignatureAlgorithm($this-&gt;privateKey);
+
+        if (isset($this-&gt;currentCert) &amp;&amp; is_array($this-&gt;currentCert) &amp;&amp; isset($this-&gt;currentCert[&#039;certificationRequestInfo&#039;])) {
+            $this-&gt;currentCert[&#039;signatureAlgorithm&#039;] = $signatureAlgorithm;
+            if (!empty($this-&gt;dn)) {
+                $this-&gt;currentCert[&#039;certificationRequestInfo&#039;][&#039;subject&#039;] = $this-&gt;dn;
+            }
+            $this-&gt;currentCert[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;] = $publicKey;
+        } else {
+            $this-&gt;currentCert = [
+                &#039;certificationRequestInfo&#039; =&gt;
+                    [
+                        &#039;version&#039; =&gt; &#039;v1&#039;,
+                        &#039;subject&#039; =&gt; $this-&gt;dn,
+                        &#039;subjectPKInfo&#039; =&gt; $publicKey,
+                        &#039;attributes&#039; =&gt; []
+                    ],
+                    &#039;signatureAlgorithm&#039; =&gt; $signatureAlgorithm,
+                    &#039;signature&#039;          =&gt; false // this is going to be overwritten later
+            ];
+        }
+
+        // resync $this-&gt;signatureSubject
+        // save $certificationRequestInfo in case there are any \phpseclib3\File\ASN1\Element objects in it
+        $certificationRequestInfo = $this-&gt;currentCert[&#039;certificationRequestInfo&#039;];
+        $this-&gt;loadCSR($this-&gt;saveCSR($this-&gt;currentCert));
+
+        $result = $this-&gt;currentCert;
+        $this-&gt;currentCert[&#039;signature&#039;] = $result[&#039;signature&#039;] = &quot;\0&quot; . $this-&gt;privateKey-&gt;sign($this-&gt;signatureSubject);
+        $result[&#039;certificationRequestInfo&#039;] = $certificationRequestInfo;
+
+        $this-&gt;currentCert = $currentCert;
+        $this-&gt;signatureSubject = $signatureSubject;
+
+        return $result;
+    }
+
+    /**
+     * Sign a SPKAC
+     *
+     * @return mixed
+     */
+    public function signSPKAC()
+    {
+        if (!is_object($this-&gt;privateKey)) {
+            return false;
+        }
+
+        $origPublicKey = $this-&gt;publicKey;
+        $this-&gt;publicKey = $this-&gt;privateKey-&gt;getPublicKey();
+        $publicKey = $this-&gt;formatSubjectPublicKey();
+        $this-&gt;publicKey = $origPublicKey;
+
+        $currentCert = isset($this-&gt;currentCert) ? $this-&gt;currentCert : null;
+        $signatureSubject = isset($this-&gt;signatureSubject) ? $this-&gt;signatureSubject : null;
+        $signatureAlgorithm = self::identifySignatureAlgorithm($this-&gt;privateKey);
+
+        // re-signing a SPKAC seems silly but since everything else supports re-signing why not?
+        if (isset($this-&gt;currentCert) &amp;&amp; is_array($this-&gt;currentCert) &amp;&amp; isset($this-&gt;currentCert[&#039;publicKeyAndChallenge&#039;])) {
+            $this-&gt;currentCert[&#039;signatureAlgorithm&#039;] = $signatureAlgorithm;
+            $this-&gt;currentCert[&#039;publicKeyAndChallenge&#039;][&#039;spki&#039;] = $publicKey;
+            if (!empty($this-&gt;challenge)) {
+                // the bitwise AND ensures that the output is a valid IA5String
+                $this-&gt;currentCert[&#039;publicKeyAndChallenge&#039;][&#039;challenge&#039;] = $this-&gt;challenge &amp; str_repeat(&quot;\x7F&quot;, strlen($this-&gt;challenge));
+            }
+        } else {
+            $this-&gt;currentCert = [
+                &#039;publicKeyAndChallenge&#039; =&gt;
+                    [
+                        &#039;spki&#039; =&gt; $publicKey,
+                        // quoting &lt;https://developer.mozilla.org/en-US/docs/Web/HTML/Element/keygen&gt;,
+                        // &quot;A challenge string that is submitted along with the public key. Defaults to an empty string if not specified.&quot;
+                        // both Firefox and OpenSSL (&quot;openssl spkac -key private.key&quot;) behave this way
+                        // we could alternatively do this instead if we ignored the specs:
+                        // Random::string(8) &amp; str_repeat(&quot;\x7F&quot;, 8)
+                        &#039;challenge&#039; =&gt; !empty($this-&gt;challenge) ? $this-&gt;challenge : &#039;&#039;
+                    ],
+                    &#039;signatureAlgorithm&#039; =&gt; $signatureAlgorithm,
+                    &#039;signature&#039;          =&gt; false // this is going to be overwritten later
+            ];
+        }
+
+        // resync $this-&gt;signatureSubject
+        // save $publicKeyAndChallenge in case there are any \phpseclib3\File\ASN1\Element objects in it
+        $publicKeyAndChallenge = $this-&gt;currentCert[&#039;publicKeyAndChallenge&#039;];
+        $this-&gt;loadSPKAC($this-&gt;saveSPKAC($this-&gt;currentCert));
+
+        $result = $this-&gt;currentCert;
+        $this-&gt;currentCert[&#039;signature&#039;] = $result[&#039;signature&#039;] = &quot;\0&quot; . $this-&gt;privateKey-&gt;sign($this-&gt;signatureSubject);
+        $result[&#039;publicKeyAndChallenge&#039;] = $publicKeyAndChallenge;
+
+        $this-&gt;currentCert = $currentCert;
+        $this-&gt;signatureSubject = $signatureSubject;
+
+        return $result;
+    }
+
+    /**
+     * Sign a CRL
+     *
+     * $issuer&#039;s private key needs to be loaded.
+     *
+     * @return mixed
+     */
+    public function signCRL(X509 $issuer, X509 $crl)
+    {
+        if (!is_object($issuer-&gt;privateKey) || empty($issuer-&gt;dn)) {
+            return false;
+        }
+
+        $currentCert = isset($this-&gt;currentCert) ? $this-&gt;currentCert : null;
+        $signatureSubject = isset($this-&gt;signatureSubject) ? $this-&gt;signatureSubject : null;
+        $signatureAlgorithm = self::identifySignatureAlgorithm($issuer-&gt;privateKey);
+
+        $thisUpdate = new \DateTimeImmutable(&#039;now&#039;, new \DateTimeZone(@date_default_timezone_get()));
+        $thisUpdate = !empty($this-&gt;startDate) ? $this-&gt;startDate : $thisUpdate-&gt;format(&#039;D, d M Y H:i:s O&#039;);
+
+        if (isset($crl-&gt;currentCert) &amp;&amp; is_array($crl-&gt;currentCert) &amp;&amp; isset($crl-&gt;currentCert[&#039;tbsCertList&#039;])) {
+            $this-&gt;currentCert = $crl-&gt;currentCert;
+            $this-&gt;currentCert[&#039;tbsCertList&#039;][&#039;signature&#039;] = $signatureAlgorithm;
+            $this-&gt;currentCert[&#039;signatureAlgorithm&#039;] = $signatureAlgorithm;
+        } else {
+            $this-&gt;currentCert = [
+                &#039;tbsCertList&#039; =&gt;
+                    [
+                        &#039;version&#039; =&gt; &#039;v2&#039;,
+                        &#039;signature&#039; =&gt; $signatureAlgorithm,
+                        &#039;issuer&#039; =&gt; false, // this is going to be overwritten later
+                        &#039;thisUpdate&#039; =&gt; $this-&gt;timeField($thisUpdate) // $this-&gt;setStartDate()
+                    ],
+                    &#039;signatureAlgorithm&#039; =&gt; $signatureAlgorithm,
+                    &#039;signature&#039;          =&gt; false // this is going to be overwritten later
+            ];
+        }
+
+        $tbsCertList = &amp;$this-&gt;currentCert[&#039;tbsCertList&#039;];
+        $tbsCertList[&#039;issuer&#039;] = $issuer-&gt;dn;
+        $tbsCertList[&#039;thisUpdate&#039;] = $this-&gt;timeField($thisUpdate);
+
+        if (!empty($this-&gt;endDate)) {
+            $tbsCertList[&#039;nextUpdate&#039;] = $this-&gt;timeField($this-&gt;endDate); // $this-&gt;setEndDate()
+        } else {
+            unset($tbsCertList[&#039;nextUpdate&#039;]);
+        }
+
+        if (!empty($this-&gt;serialNumber)) {
+            $crlNumber = $this-&gt;serialNumber;
+        } else {
+            $crlNumber = $this-&gt;getExtension(&#039;id-ce-cRLNumber&#039;);
+            // &quot;The CRL number is a non-critical CRL extension that conveys a
+            //  monotonically increasing sequence number for a given CRL scope and
+            //  CRL issuer.  This extension allows users to easily determine when a
+            //  particular CRL supersedes another CRL.&quot;
+            // -- https://tools.ietf.org/html/rfc5280#section-5.2.3
+            $crlNumber = $crlNumber !== false ? $crlNumber-&gt;add(new BigInteger(1)) : null;
+        }
+
+        $this-&gt;removeExtension(&#039;id-ce-authorityKeyIdentifier&#039;);
+        $this-&gt;removeExtension(&#039;id-ce-issuerAltName&#039;);
+
+        // Be sure version &gt;= v2 if some extension found.
+        $version = isset($tbsCertList[&#039;version&#039;]) ? $tbsCertList[&#039;version&#039;] : 0;
+        if (!$version) {
+            if (!empty($tbsCertList[&#039;crlExtensions&#039;])) {
+                $version = &#039;v2&#039;; // v2.
+            } elseif (!empty($tbsCertList[&#039;revokedCertificates&#039;])) {
+                foreach ($tbsCertList[&#039;revokedCertificates&#039;] as $cert) {
+                    if (!empty($cert[&#039;crlEntryExtensions&#039;])) {
+                        $version = &#039;v2&#039;; // v2.
+                    }
+                }
+            }
+
+            if ($version) {
+                $tbsCertList[&#039;version&#039;] = $version;
+            }
+        }
+
+        // Store additional extensions.
+        if (!empty($tbsCertList[&#039;version&#039;])) { // At least v2.
+            if (!empty($crlNumber)) {
+                $this-&gt;setExtension(&#039;id-ce-cRLNumber&#039;, $crlNumber);
+            }
+
+            if (isset($issuer-&gt;currentKeyIdentifier)) {
+                $this-&gt;setExtension(&#039;id-ce-authorityKeyIdentifier&#039;, [
+                        //&#039;authorityCertIssuer&#039; =&gt; array(
+                        //    ]
+                        //        &#039;directoryName&#039; =&gt; $issuer-&gt;dn
+                        //    ]
+                        //),
+                        &#039;keyIdentifier&#039; =&gt; $issuer-&gt;currentKeyIdentifier
+                    ]);
+                //$extensions = &amp;$tbsCertList[&#039;crlExtensions&#039;];
+                //if (isset($issuer-&gt;serialNumber)) {
+                //    $extensions[count($extensions) - 1][&#039;authorityCertSerialNumber&#039;] = $issuer-&gt;serialNumber;
+                //}
+                //unset($extensions);
+            }
+
+            $issuerAltName = $this-&gt;getExtension(&#039;id-ce-subjectAltName&#039;, $issuer-&gt;currentCert);
+
+            if ($issuerAltName !== false) {
+                $this-&gt;setExtension(&#039;id-ce-issuerAltName&#039;, $issuerAltName);
+            }
+        }
+
+        if (empty($tbsCertList[&#039;revokedCertificates&#039;])) {
+            unset($tbsCertList[&#039;revokedCertificates&#039;]);
+        }
+
+        unset($tbsCertList);
+
+        // resync $this-&gt;signatureSubject
+        // save $tbsCertList in case there are any \phpseclib3\File\ASN1\Element objects in it
+        $tbsCertList = $this-&gt;currentCert[&#039;tbsCertList&#039;];
+        $this-&gt;loadCRL($this-&gt;saveCRL($this-&gt;currentCert));
+
+        $result = $this-&gt;currentCert;
+        $this-&gt;currentCert[&#039;signature&#039;] = $result[&#039;signature&#039;] = &quot;\0&quot; . $issuer-&gt;privateKey-&gt;sign($this-&gt;signatureSubject);
+        $result[&#039;tbsCertList&#039;] = $tbsCertList;
+
+        $this-&gt;currentCert = $currentCert;
+        $this-&gt;signatureSubject = $signatureSubject;
+
+        return $result;
+    }
+
+    /**
+     * Identify signature algorithm from key settings
+     *
+     * @param PrivateKey $key
+     * @throws UnsupportedAlgorithmException if the algorithm is unsupported
+     * @return array
+     */
+    private static function identifySignatureAlgorithm(PrivateKey $key)
+    {
+        if ($key instanceof RSA) {
+            if ($key-&gt;getPadding() &amp; RSA::SIGNATURE_PSS) {
+                $r = PSS::load($key-&gt;withPassword()-&gt;toString(&#039;PSS&#039;));
+                return [
+                    &#039;algorithm&#039; =&gt; &#039;id-RSASSA-PSS&#039;,
+                    &#039;parameters&#039; =&gt; PSS::savePSSParams($r)
+                ];
+            }
+            switch ($key-&gt;getHash()) {
+                case &#039;md2&#039;:
+                case &#039;md5&#039;:
+                case &#039;sha1&#039;:
+                case &#039;sha224&#039;:
+                case &#039;sha256&#039;:
+                case &#039;sha384&#039;:
+                case &#039;sha512&#039;:
+                    return [
+                        &#039;algorithm&#039; =&gt; $key-&gt;getHash() . &#039;WithRSAEncryption&#039;,
+                        &#039;parameters&#039; =&gt; null
+                    ];
+            }
+            throw new UnsupportedAlgorithmException(&#039;The only supported hash algorithms for RSA are: md2, md5, sha1, sha224, sha256, sha384, sha512&#039;);
+        }
+
+        if ($key instanceof DSA) {
+            switch ($key-&gt;getHash()) {
+                case &#039;sha1&#039;:
+                case &#039;sha224&#039;:
+                case &#039;sha256&#039;:
+                    return [&#039;algorithm&#039; =&gt; &#039;id-dsa-with-&#039; . $key-&gt;getHash()];
+            }
+            throw new UnsupportedAlgorithmException(&#039;The only supported hash algorithms for DSA are: sha1, sha224, sha256&#039;);
+        }
+
+        if ($key instanceof EC) {
+            switch ($key-&gt;getCurve()) {
+                case &#039;Ed25519&#039;:
+                case &#039;Ed448&#039;:
+                    return [&#039;algorithm&#039; =&gt; &#039;id-&#039; . $key-&gt;getCurve()];
+            }
+            switch ($key-&gt;getHash()) {
+                case &#039;sha1&#039;:
+                case &#039;sha224&#039;:
+                case &#039;sha256&#039;:
+                case &#039;sha384&#039;:
+                case &#039;sha512&#039;:
+                    return [&#039;algorithm&#039; =&gt; &#039;ecdsa-with-&#039; . strtoupper($key-&gt;getHash())];
+            }
+            throw new UnsupportedAlgorithmException(&#039;The only supported hash algorithms for EC are: sha1, sha224, sha256, sha384, sha512&#039;);
+        }
+
+        throw new UnsupportedAlgorithmException(&#039;The only supported public key classes are: RSA, DSA, EC&#039;);
+    }
+
+    /**
+     * Set certificate start date
+     *
+     * @param \DateTimeInterface|string $date
+     */
+    public function setStartDate($date)
+    {
+        if (!is_object($date) || !($date instanceof \DateTimeInterface)) {
+            $date = new \DateTimeImmutable($date, new \DateTimeZone(@date_default_timezone_get()));
+        }
+
+        $this-&gt;startDate = $date-&gt;format(&#039;D, d M Y H:i:s O&#039;);
+    }
+
+    /**
+     * Set certificate end date
+     *
+     * @param \DateTimeInterface|string $date
+     */
+    public function setEndDate($date)
+    {
+        /*
+          To indicate that a certificate has no well-defined expiration date,
+          the notAfter SHOULD be assigned the GeneralizedTime value of
+          99991231235959Z.
+
+          -- http://tools.ietf.org/html/rfc5280#section-4.1.2.5
+        */
+        if (is_string($date) &amp;&amp; strtolower($date) === &#039;lifetime&#039;) {
+            $temp = &#039;99991231235959Z&#039;;
+            $temp = chr(ASN1::TYPE_GENERALIZED_TIME) . ASN1::encodeLength(strlen($temp)) . $temp;
+            $this-&gt;endDate = new Element($temp);
+        } else {
+            if (!is_object($date) || !($date instanceof \DateTimeInterface)) {
+                $date = new \DateTimeImmutable($date, new \DateTimeZone(@date_default_timezone_get()));
+            }
+
+            $this-&gt;endDate = $date-&gt;format(&#039;D, d M Y H:i:s O&#039;);
+        }
+    }
+
+    /**
+     * Set Serial Number
+     *
+     * @param string $serial
+     * @param int $base optional
+     */
+    public function setSerialNumber($serial, $base = -256)
+    {
+        $this-&gt;serialNumber = new BigInteger($serial, $base);
+    }
+
+    /**
+     * Turns the certificate into a certificate authority
+     *
+     */
+    public function makeCA()
+    {
+        $this-&gt;caFlag = true;
+    }
+
+    /**
+     * Check for validity of subarray
+     *
+     * This is intended for use in conjunction with _subArrayUnchecked(),
+     * implementing the checks included in _subArray() but without copying
+     * a potentially large array by passing its reference by-value to is_array().
+     *
+     * @param array $root
+     * @param string $path
+     * @return boolean
+     */
+    private function isSubArrayValid(array $root, $path)
+    {
+        if (!is_array($root)) {
+            return false;
+        }
+
+        foreach (explode(&#039;/&#039;, $path) as $i) {
+            if (!is_array($root)) {
+                return false;
+            }
+
+            if (!isset($root[$i])) {
+                return true;
+            }
+
+            $root = $root[$i];
+        }
+
+        return true;
+    }
+
+    /**
+     * Get a reference to a subarray
+     *
+     * This variant of _subArray() does no is_array() checking,
+     * so $root should be checked with _isSubArrayValid() first.
+     *
+     * This is here for performance reasons:
+     * Passing a reference (i.e. $root) by-value (i.e. to is_array())
+     * creates a copy. If $root is an especially large array, this is expensive.
+     *
+     * @param array $root
+     * @param string $path  absolute path with / as component separator
+     * @param bool $create optional
+     * @return array|false
+     */
+    private function &amp;subArrayUnchecked(array &amp;$root, $path, $create = false)
+    {
+        $false = false;
+
+        foreach (explode(&#039;/&#039;, $path) as $i) {
+            if (!isset($root[$i])) {
+                if (!$create) {
+                    return $false;
+                }
+
+                $root[$i] = [];
+            }
+
+            $root = &amp;$root[$i];
+        }
+
+        return $root;
+    }
+
+    /**
+     * Get a reference to a subarray
+     *
+     * @param array $root
+     * @param string $path  absolute path with / as component separator
+     * @param bool $create optional
+     * @return array|false
+     */
+    private function &amp;subArray(&amp;$root, $path, $create = false)
+    {
+        $false = false;
+
+        if (!is_array($root)) {
+            return $false;
+        }
+
+        foreach (explode(&#039;/&#039;, $path) as $i) {
+            if (!is_array($root)) {
+                return $false;
+            }
+
+            if (!isset($root[$i])) {
+                if (!$create) {
+                    return $false;
+                }
+
+                $root[$i] = [];
+            }
+
+            $root = &amp;$root[$i];
+        }
+
+        return $root;
+    }
+
+    /**
+     * Get a reference to an extension subarray
+     *
+     * @param array $root
+     * @param string $path optional absolute path with / as component separator
+     * @param bool $create optional
+     * @return array|false
+     */
+    private function &amp;extensions(&amp;$root, $path = null, $create = false)
+    {
+        if (!isset($root)) {
+            $root = $this-&gt;currentCert;
+        }
+
+        switch (true) {
+            case !empty($path):
+            case !is_array($root):
+                break;
+            case isset($root[&#039;tbsCertificate&#039;]):
+                $path = &#039;tbsCertificate/extensions&#039;;
+                break;
+            case isset($root[&#039;tbsCertList&#039;]):
+                $path = &#039;tbsCertList/crlExtensions&#039;;
+                break;
+            case isset($root[&#039;certificationRequestInfo&#039;]):
+                $pth = &#039;certificationRequestInfo/attributes&#039;;
+                $attributes = &amp;$this-&gt;subArray($root, $pth, $create);
+
+                if (is_array($attributes)) {
+                    foreach ($attributes as $key =&gt; $value) {
+                        if ($value[&#039;type&#039;] == &#039;pkcs-9-at-extensionRequest&#039;) {
+                            $path = &quot;$pth/$key/value/0&quot;;
+                            break 2;
+                        }
+                    }
+                    if ($create) {
+                        $key = count($attributes);
+                        $attributes[] = [&#039;type&#039; =&gt; &#039;pkcs-9-at-extensionRequest&#039;, &#039;value&#039; =&gt; []];
+                        $path = &quot;$pth/$key/value/0&quot;;
+                    }
+                }
+                break;
+        }
+
+        $extensions = &amp;$this-&gt;subArray($root, $path, $create);
+
+        if (!is_array($extensions)) {
+            $false = false;
+            return $false;
+        }
+
+        return $extensions;
+    }
+
+    /**
+     * Remove an Extension
+     *
+     * @param string $id
+     * @param string $path optional
+     * @return bool
+     */
+    private function removeExtensionHelper($id, $path = null)
+    {
+        $extensions = &amp;$this-&gt;extensions($this-&gt;currentCert, $path);
+
+        if (!is_array($extensions)) {
+            return false;
+        }
+
+        $result = false;
+        foreach ($extensions as $key =&gt; $value) {
+            if ($value[&#039;extnId&#039;] == $id) {
+                unset($extensions[$key]);
+                $result = true;
+            }
+        }
+
+        $extensions = array_values($extensions);
+        // fix for https://bugs.php.net/75433 affecting PHP 7.2
+        if (!isset($extensions[0])) {
+            $extensions = array_splice($extensions, 0, 0);
+        }
+        return $result;
+    }
+
+    /**
+     * Get an Extension
+     *
+     * Returns the extension if it exists and false if not
+     *
+     * @param string $id
+     * @param array $cert optional
+     * @param string $path optional
+     * @return mixed
+     */
+    private function getExtensionHelper($id, $cert = null, $path = null)
+    {
+        $extensions = $this-&gt;extensions($cert, $path);
+
+        if (!is_array($extensions)) {
+            return false;
+        }
+
+        foreach ($extensions as $key =&gt; $value) {
+            if ($value[&#039;extnId&#039;] == $id) {
+                return $value[&#039;extnValue&#039;];
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns a list of all extensions in use
+     *
+     * @param array $cert optional
+     * @param string $path optional
+     * @return array
+     */
+    private function getExtensionsHelper($cert = null, $path = null)
+    {
+        $exts = $this-&gt;extensions($cert, $path);
+        $extensions = [];
+
+        if (is_array($exts)) {
+            foreach ($exts as $extension) {
+                $extensions[] = $extension[&#039;extnId&#039;];
+            }
+        }
+
+        return $extensions;
+    }
+
+    /**
+     * Set an Extension
+     *
+     * @param string $id
+     * @param mixed $value
+     * @param bool $critical optional
+     * @param bool $replace optional
+     * @param string $path optional
+     * @return bool
+     */
+    private function setExtensionHelper($id, $value, $critical = false, $replace = true, $path = null)
+    {
+        $extensions = &amp;$this-&gt;extensions($this-&gt;currentCert, $path, true);
+
+        if (!is_array($extensions)) {
+            return false;
+        }
+
+        $newext = [&#039;extnId&#039;  =&gt; $id, &#039;critical&#039; =&gt; $critical, &#039;extnValue&#039; =&gt; $value];
+
+        foreach ($extensions as $key =&gt; $value) {
+            if ($value[&#039;extnId&#039;] == $id) {
+                if (!$replace) {
+                    return false;
+                }
+
+                $extensions[$key] = $newext;
+                return true;
+            }
+        }
+
+        $extensions[] = $newext;
+        return true;
+    }
+
+    /**
+     * Remove a certificate, CSR or CRL Extension
+     *
+     * @param string $id
+     * @return bool
+     */
+    public function removeExtension($id)
+    {
+        return $this-&gt;removeExtensionHelper($id);
+    }
+
+    /**
+     * Get a certificate, CSR or CRL Extension
+     *
+     * Returns the extension if it exists and false if not
+     *
+     * @param string $id
+     * @param array $cert optional
+     * @param string $path
+     * @return mixed
+     */
+    public function getExtension($id, $cert = null, $path = null)
+    {
+        return $this-&gt;getExtensionHelper($id, $cert, $path);
+    }
+
+    /**
+     * Returns a list of all extensions in use in certificate, CSR or CRL
+     *
+     * @param array $cert optional
+     * @param string $path optional
+     * @return array
+     */
+    public function getExtensions($cert = null, $path = null)
+    {
+        return $this-&gt;getExtensionsHelper($cert, $path);
+    }
+
+    /**
+     * Set a certificate, CSR or CRL Extension
+     *
+     * @param string $id
+     * @param mixed $value
+     * @param bool $critical optional
+     * @param bool $replace optional
+     * @return bool
+     */
+    public function setExtension($id, $value, $critical = false, $replace = true)
+    {
+        return $this-&gt;setExtensionHelper($id, $value, $critical, $replace);
+    }
+
+    /**
+     * Remove a CSR attribute.
+     *
+     * @param string $id
+     * @param int $disposition optional
+     * @return bool
+     */
+    public function removeAttribute($id, $disposition = self::ATTR_ALL)
+    {
+        $attributes = &amp;$this-&gt;subArray($this-&gt;currentCert, &#039;certificationRequestInfo/attributes&#039;);
+
+        if (!is_array($attributes)) {
+            return false;
+        }
+
+        $result = false;
+        foreach ($attributes as $key =&gt; $attribute) {
+            if ($attribute[&#039;type&#039;] == $id) {
+                $n = count($attribute[&#039;value&#039;]);
+                switch (true) {
+                    case $disposition == self::ATTR_APPEND:
+                    case $disposition == self::ATTR_REPLACE:
+                        return false;
+                    case $disposition &gt;= $n:
+                        $disposition -= $n;
+                        break;
+                    case $disposition == self::ATTR_ALL:
+                    case $n == 1:
+                        unset($attributes[$key]);
+                        $result = true;
+                        break;
+                    default:
+                        unset($attributes[$key][&#039;value&#039;][$disposition]);
+                        $attributes[$key][&#039;value&#039;] = array_values($attributes[$key][&#039;value&#039;]);
+                        $result = true;
+                        break;
+                }
+                if ($result &amp;&amp; $disposition != self::ATTR_ALL) {
+                    break;
+                }
+            }
+        }
+
+        $attributes = array_values($attributes);
+        return $result;
+    }
+
+    /**
+     * Get a CSR attribute
+     *
+     * Returns the attribute if it exists and false if not
+     *
+     * @param string $id
+     * @param int $disposition optional
+     * @param array $csr optional
+     * @return mixed
+     */
+    public function getAttribute($id, $disposition = self::ATTR_ALL, $csr = null)
+    {
+        if (empty($csr)) {
+            $csr = $this-&gt;currentCert;
+        }
+
+        $attributes = $this-&gt;subArray($csr, &#039;certificationRequestInfo/attributes&#039;);
+
+        if (!is_array($attributes)) {
+            return false;
+        }
+
+        foreach ($attributes as $key =&gt; $attribute) {
+            if ($attribute[&#039;type&#039;] == $id) {
+                $n = count($attribute[&#039;value&#039;]);
+                switch (true) {
+                    case $disposition == self::ATTR_APPEND:
+                    case $disposition == self::ATTR_REPLACE:
+                        return false;
+                    case $disposition == self::ATTR_ALL:
+                        return $attribute[&#039;value&#039;];
+                    case $disposition &gt;= $n:
+                        $disposition -= $n;
+                        break;
+                    default:
+                        return $attribute[&#039;value&#039;][$disposition];
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Get all requested CSR extensions
+     *
+     * Returns the list of extensions if there are any and false if not
+     *
+     * @param array $csr optional
+     * @return mixed
+     */
+    public function getRequestedCertificateExtensions($csr = null)
+    {
+        if (empty($csr)) {
+            $csr = $this-&gt;currentCert;
+        }
+
+        $requestedExtensions = $this-&gt;getAttribute(&#039;pkcs-9-at-extensionRequest&#039;);
+        if ($requestedExtensions === false) {
+            return false;
+        }
+
+        return $this-&gt;getAttribute(&#039;pkcs-9-at-extensionRequest&#039;)[0];
+    }
+
+    /**
+     * Returns a list of all CSR attributes in use
+     *
+     * @param array $csr optional
+     * @return array
+     */
+    public function getAttributes($csr = null)
+    {
+        if (empty($csr)) {
+            $csr = $this-&gt;currentCert;
+        }
+
+        $attributes = $this-&gt;subArray($csr, &#039;certificationRequestInfo/attributes&#039;);
+        $attrs = [];
+
+        if (is_array($attributes)) {
+            foreach ($attributes as $attribute) {
+                $attrs[] = $attribute[&#039;type&#039;];
+            }
+        }
+
+        return $attrs;
+    }
+
+    /**
+     * Set a CSR attribute
+     *
+     * @param string $id
+     * @param mixed $value
+     * @param int $disposition optional
+     * @return bool
+     */
+    public function setAttribute($id, $value, $disposition = self::ATTR_ALL)
+    {
+        $attributes = &amp;$this-&gt;subArray($this-&gt;currentCert, &#039;certificationRequestInfo/attributes&#039;, true);
+
+        if (!is_array($attributes)) {
+            return false;
+        }
+
+        switch ($disposition) {
+            case self::ATTR_REPLACE:
+                $disposition = self::ATTR_APPEND;
+                // fall-through
+            case self::ATTR_ALL:
+                $this-&gt;removeAttribute($id);
+                break;
+        }
+
+        foreach ($attributes as $key =&gt; $attribute) {
+            if ($attribute[&#039;type&#039;] == $id) {
+                $n = count($attribute[&#039;value&#039;]);
+                switch (true) {
+                    case $disposition == self::ATTR_APPEND:
+                        $last = $key;
+                        break;
+                    case $disposition &gt;= $n:
+                        $disposition -= $n;
+                        break;
+                    default:
+                        $attributes[$key][&#039;value&#039;][$disposition] = $value;
+                        return true;
+                }
+            }
+        }
+
+        switch (true) {
+            case $disposition &gt;= 0:
+                return false;
+            case isset($last):
+                $attributes[$last][&#039;value&#039;][] = $value;
+                break;
+            default:
+                $attributes[] = [&#039;type&#039; =&gt; $id, &#039;value&#039; =&gt; $disposition == self::ATTR_ALL ? $value : [$value]];
+                break;
+        }
+
+        return true;
+    }
+
+    /**
+     * Sets the subject key identifier
+     *
+     * This is used by the id-ce-authorityKeyIdentifier and the id-ce-subjectKeyIdentifier extensions.
+     *
+     * @param string $value
+     */
+    public function setKeyIdentifier($value)
+    {
+        if (empty($value)) {
+            unset($this-&gt;currentKeyIdentifier);
+        } else {
+            $this-&gt;currentKeyIdentifier = $value;
+        }
+    }
+
+    /**
+     * Compute a public key identifier.
+     *
+     * Although key identifiers may be set to any unique value, this function
+     * computes key identifiers from public key according to the two
+     * recommended methods (4.2.1.2 RFC 3280).
+     * Highly polymorphic: try to accept all possible forms of key:
+     * - Key object
+     * - \phpseclib3\File\X509 object with public or private key defined
+     * - Certificate or CSR array
+     * - \phpseclib3\File\ASN1\Element object
+     * - PEM or DER string
+     *
+     * @param mixed $key optional
+     * @param int $method optional
+     * @return string binary key identifier
+     */
+    public function computeKeyIdentifier($key = null, $method = 1)
+    {
+        if (is_null($key)) {
+            $key = $this;
+        }
+
+        switch (true) {
+            case is_string($key):
+                break;
+            case is_array($key) &amp;&amp; isset($key[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;subjectPublicKey&#039;]):
+                return $this-&gt;computeKeyIdentifier($key[&#039;tbsCertificate&#039;][&#039;subjectPublicKeyInfo&#039;][&#039;subjectPublicKey&#039;], $method);
+            case is_array($key) &amp;&amp; isset($key[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;][&#039;subjectPublicKey&#039;]):
+                return $this-&gt;computeKeyIdentifier($key[&#039;certificationRequestInfo&#039;][&#039;subjectPKInfo&#039;][&#039;subjectPublicKey&#039;], $method);
+            case !is_object($key):
+                return false;
+            case $key instanceof Element:
+                // Assume the element is a bitstring-packed key.
+                $decoded = ASN1::decodeBER($key-&gt;element);
+                if (!$decoded) {
+                    return false;
+                }
+                $raw = ASN1::asn1map($decoded[0], [&#039;type&#039; =&gt; ASN1::TYPE_BIT_STRING]);
+                if (empty($raw)) {
+                    return false;
+                }
+                // If the key is private, compute identifier from its corresponding public key.
+                $key = PublicKeyLoader::load($raw);
+                if ($key instanceof PrivateKey) {  // If private.
+                    return $this-&gt;computeKeyIdentifier($key, $method);
+                }
+                $key = $raw; // Is a public key.
+                break;
+            case $key instanceof X509:
+                if (isset($key-&gt;publicKey)) {
+                    return $this-&gt;computeKeyIdentifier($key-&gt;publicKey, $method);
+                }
+                if (isset($key-&gt;privateKey)) {
+                    return $this-&gt;computeKeyIdentifier($key-&gt;privateKey, $method);
+                }
+                if (isset($key-&gt;currentCert[&#039;tbsCertificate&#039;]) || isset($key-&gt;currentCert[&#039;certificationRequestInfo&#039;])) {
+                    return $this-&gt;computeKeyIdentifier($key-&gt;currentCert, $method);
+                }
+                return false;
+            default: // Should be a key object (i.e.: \phpseclib3\Crypt\RSA).
+                $key = $key-&gt;getPublicKey();
+                break;
+        }
+
+        // If in PEM format, convert to binary.
+        $key = ASN1::extractBER($key);
+
+        // Now we have the key string: compute its sha-1 sum.
+        $hash = new Hash(&#039;sha1&#039;);
+        $hash = $hash-&gt;hash($key);
+
+        if ($method == 2) {
+            $hash = substr($hash, -8);
+            $hash[0] = chr((ord($hash[0]) &amp; 0x0F) | 0x40);
+        }
+
+        return $hash;
+    }
+
+    /**
+     * Format a public key as appropriate
+     *
+     * @return array|false
+     */
+    private function formatSubjectPublicKey()
+    {
+        $format = $this-&gt;publicKey instanceof RSA &amp;&amp; ($this-&gt;publicKey-&gt;getPadding() &amp; RSA::SIGNATURE_PSS) ?
+            &#039;PSS&#039; :
+            &#039;PKCS8&#039;;
+
+        $publicKey = base64_decode(preg_replace(&#039;#-.+-|[\r\n]#&#039;, &#039;&#039;, $this-&gt;publicKey-&gt;toString($format)));
+
+        $decoded = ASN1::decodeBER($publicKey);
+        if (!$decoded) {
+            return false;
+        }
+        $mapped = ASN1::asn1map($decoded[0], Maps\SubjectPublicKeyInfo::MAP);
+        if (!is_array($mapped)) {
+            return false;
+        }
+
+        $mapped[&#039;subjectPublicKey&#039;] = $this-&gt;publicKey-&gt;toString($format);
+
+        return $mapped;
+    }
+
+    /**
+     * Set the domain name&#039;s which the cert is to be valid for
+     *
+     * @param mixed ...$domains
+     * @return void
+     */
+    public function setDomain(...$domains)
+    {
+        $this-&gt;domains = $domains;
+        $this-&gt;removeDNProp(&#039;id-at-commonName&#039;);
+        $this-&gt;setDNProp(&#039;id-at-commonName&#039;, $this-&gt;domains[0]);
+    }
+
+    /**
+     * Set the IP Addresses&#039;s which the cert is to be valid for
+     *
+     * @param mixed[] ...$ipAddresses
+     */
+    public function setIPAddress(...$ipAddresses)
+    {
+        $this-&gt;ipAddresses = $ipAddresses;
+        /*
+        if (!isset($this-&gt;domains)) {
+            $this-&gt;removeDNProp(&#039;id-at-commonName&#039;);
+            $this-&gt;setDNProp(&#039;id-at-commonName&#039;, $this-&gt;ipAddresses[0]);
+        }
+        */
+    }
+
+    /**
+     * Helper function to build domain array
+     *
+     * @param string $domain
+     * @return array
+     */
+    private static function dnsName($domain)
+    {
+        return [&#039;dNSName&#039; =&gt; $domain];
+    }
+
+    /**
+     * Helper function to build IP Address array
+     *
+     * (IPv6 is not currently supported)
+     *
+     * @param string $address
+     * @return array
+     */
+    private function iPAddress($address)
+    {
+        return [&#039;iPAddress&#039; =&gt; $address];
+    }
+
+    /**
+     * Get the index of a revoked certificate.
+     *
+     * @param array $rclist
+     * @param string $serial
+     * @param bool $create optional
+     * @return int|false
+     */
+    private function revokedCertificate(array &amp;$rclist, $serial, $create = false)
+    {
+        $serial = new BigInteger($serial);
+
+        foreach ($rclist as $i =&gt; $rc) {
+            if (!($serial-&gt;compare($rc[&#039;userCertificate&#039;]))) {
+                return $i;
+            }
+        }
+
+        if (!$create) {
+            return false;
+        }
+
+        $i = count($rclist);
+        $revocationDate = new \DateTimeImmutable(&#039;now&#039;, new \DateTimeZone(@date_default_timezone_get()));
+        $rclist[] = [&#039;userCertificate&#039; =&gt; $serial,
+                          &#039;revocationDate&#039;  =&gt; $this-&gt;timeField($revocationDate-&gt;format(&#039;D, d M Y H:i:s O&#039;))];
+        return $i;
+    }
+
+    /**
+     * Revoke a certificate.
+     *
+     * @param string $serial
+     * @param string $date optional
+     * @return bool
+     */
+    public function revoke($serial, $date = null)
+    {
+        if (isset($this-&gt;currentCert[&#039;tbsCertList&#039;])) {
+            if (is_array($rclist = &amp;$this-&gt;subArray($this-&gt;currentCert, &#039;tbsCertList/revokedCertificates&#039;, true))) {
+                if ($this-&gt;revokedCertificate($rclist, $serial) === false) { // If not yet revoked
+                    if (($i = $this-&gt;revokedCertificate($rclist, $serial, true)) !== false) {
+                        if (!empty($date)) {
+                            $rclist[$i][&#039;revocationDate&#039;] = $this-&gt;timeField($date);
+                        }
+
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Unrevoke a certificate.
+     *
+     * @param string $serial
+     * @return bool
+     */
+    public function unrevoke($serial)
+    {
+        if (is_array($rclist = &amp;$this-&gt;subArray($this-&gt;currentCert, &#039;tbsCertList/revokedCertificates&#039;))) {
+            if (($i = $this-&gt;revokedCertificate($rclist, $serial)) !== false) {
+                unset($rclist[$i]);
+                $rclist = array_values($rclist);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Get a revoked certificate.
+     *
+     * @param string $serial
+     * @return mixed
+     */
+    public function getRevoked($serial)
+    {
+        if (is_array($rclist = $this-&gt;subArray($this-&gt;currentCert, &#039;tbsCertList/revokedCertificates&#039;))) {
+            if (($i = $this-&gt;revokedCertificate($rclist, $serial)) !== false) {
+                return $rclist[$i];
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * List revoked certificates
+     *
+     * @param array $crl optional
+     * @return array|bool
+     */
+    public function listRevoked($crl = null)
+    {
+        if (!isset($crl)) {
+            $crl = $this-&gt;currentCert;
+        }
+
+        if (!isset($crl[&#039;tbsCertList&#039;])) {
+            return false;
+        }
+
+        $result = [];
+
+        if (is_array($rclist = $this-&gt;subArray($crl, &#039;tbsCertList/revokedCertificates&#039;))) {
+            foreach ($rclist as $rc) {
+                $result[] = $rc[&#039;userCertificate&#039;]-&gt;toString();
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Remove a Revoked Certificate Extension
+     *
+     * @param string $serial
+     * @param string $id
+     * @return bool
+     */
+    public function removeRevokedCertificateExtension($serial, $id)
+    {
+        if (is_array($rclist = &amp;$this-&gt;subArray($this-&gt;currentCert, &#039;tbsCertList/revokedCertificates&#039;))) {
+            if (($i = $this-&gt;revokedCertificate($rclist, $serial)) !== false) {
+                return $this-&gt;removeExtensionHelper($id, &quot;tbsCertList/revokedCertificates/$i/crlEntryExtensions&quot;);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Get a Revoked Certificate Extension
+     *
+     * Returns the extension if it exists and false if not
+     *
+     * @param string $serial
+     * @param string $id
+     * @param array $crl optional
+     * @return mixed
+     */
+    public function getRevokedCertificateExtension($serial, $id, $crl = null)
+    {
+        if (!isset($crl)) {
+            $crl = $this-&gt;currentCert;
+        }
+
+        if (is_array($rclist = $this-&gt;subArray($crl, &#039;tbsCertList/revokedCertificates&#039;))) {
+            if (($i = $this-&gt;revokedCertificate($rclist, $serial)) !== false) {
+                return $this-&gt;getExtension($id, $crl, &quot;tbsCertList/revokedCertificates/$i/crlEntryExtensions&quot;);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns a list of all extensions in use for a given revoked certificate
+     *
+     * @param string $serial
+     * @param array $crl optional
+     * @return array|bool
+     */
+    public function getRevokedCertificateExtensions($serial, $crl = null)
+    {
+        if (!isset($crl)) {
+            $crl = $this-&gt;currentCert;
+        }
+
+        if (is_array($rclist = $this-&gt;subArray($crl, &#039;tbsCertList/revokedCertificates&#039;))) {
+            if (($i = $this-&gt;revokedCertificate($rclist, $serial)) !== false) {
+                return $this-&gt;getExtensions($crl, &quot;tbsCertList/revokedCertificates/$i/crlEntryExtensions&quot;);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Set a Revoked Certificate Extension
+     *
+     * @param string $serial
+     * @param string $id
+     * @param mixed $value
+     * @param bool $critical optional
+     * @param bool $replace optional
+     * @return bool
+     */
+    public function setRevokedCertificateExtension($serial, $id, $value, $critical = false, $replace = true)
+    {
+        if (isset($this-&gt;currentCert[&#039;tbsCertList&#039;])) {
+            if (is_array($rclist = &amp;$this-&gt;subArray($this-&gt;currentCert, &#039;tbsCertList/revokedCertificates&#039;, true))) {
+                if (($i = $this-&gt;revokedCertificate($rclist, $serial, true)) !== false) {
+                    return $this-&gt;setExtensionHelper($id, $value, $critical, $replace, &quot;tbsCertList/revokedCertificates/$i/crlEntryExtensions&quot;);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Register the mapping for a custom/unsupported extension.
+     *
+     * @param string $id
+     * @param array $mapping
+     */
+    public static function registerExtension($id, array $mapping)
+    {
+        if (isset(self::$extensions[$id]) &amp;&amp; self::$extensions[$id] !== $mapping) {
+            throw new \RuntimeException(
+                &#039;Extension &#039; . $id . &#039; has already been defined with a different mapping.&#039;
+            );
+        }
+
+        self::$extensions[$id] = $mapping;
+    }
+
+    /**
+     * Register the mapping for a custom/unsupported extension.
+     *
+     * @param string $id
+     *
+     * @return array|null
+     */
+    public static function getRegisteredExtension($id)
+    {
+        return isset(self::$extensions[$id]) ? self::$extensions[$id] : null;
+    }
+
+    /**
+     * Register the mapping for a custom/unsupported extension.
+     *
+     * @param string $id
+     * @param mixed $value
+     * @param bool $critical
+     * @param bool $replace
+     */
+    public function setExtensionValue($id, $value, $critical = false, $replace = false)
+    {
+        $this-&gt;extensionValues[$id] = compact(&#039;critical&#039;, &#039;replace&#039;, &#039;value&#039;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Math/BigInteger.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/File/ASN1 -->
+
+</body>
+</html>

@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Client.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis;
+
+use ArrayIterator;
+use InvalidArgumentException;
+use IteratorAggregate;
+use Predis\Command\CommandInterface;
+use Predis\Command\RawCommand;
+use Predis\Command\Redis\Container\ContainerFactory;
+use Predis\Command\Redis\Container\ContainerInterface;
+use Predis\Command\ScriptCommand;
+use Predis\Configuration\Options;
+use Predis\Configuration\OptionsInterface;
+use Predis\Connection\ConnectionInterface;
+use Predis\Connection\Parameters;
+use Predis\Connection\ParametersInterface;
+use Predis\Connection\RelayConnection;
+use Predis\Monitor\Consumer as MonitorConsumer;
+use Predis\Pipeline\Atomic;
+use Predis\Pipeline\FireAndForget;
+use Predis\Pipeline\Pipeline;
+use Predis\Pipeline\RelayAtomic;
+use Predis\Pipeline\RelayPipeline;
+use Predis\PubSub\Consumer as PubSubConsumer;
+use Predis\PubSub\RelayConsumer as RelayPubSubConsumer;
+use Predis\Response\ErrorInterface as ErrorResponseInterface;
+use Predis\Response\ResponseInterface;
+use Predis\Response\ServerException;
+use Predis\Transaction\MultiExec as MultiExecTransaction;
+use ReturnTypeWillChange;
+use RuntimeException;
+use Traversable;
+
+/**
+ * Client class used for connecting and executing commands on Redis.
+ *
+ * This is the main high-level abstraction of Predis upon which various other
+ * abstractions are built. Internally it aggregates various other classes each
+ * one with its own responsibility and scope.
+ *
+ * @template-implements \IteratorAggregate&lt;string, static&gt;
+ */
+class Client implements ClientInterface, IteratorAggregate
+{
+    public const VERSION = &#039;2.4.1&#039;;
+
+    /** @var OptionsInterface */
+    private $options;
+
+    /** @var ConnectionInterface */
+    private $connection;
+
+    /** @var Command\FactoryInterface */
+    private $commands;
+
+    /**
+     * @param mixed $parameters Connection parameters for one or more servers.
+     * @param mixed $options    Options to configure some behaviours of the client.
+     */
+    public function __construct($parameters = null, $options = null)
+    {
+        $this-&gt;options = static::createOptions($options ?? new Options());
+        $this-&gt;connection = static::createConnection($this-&gt;options, $parameters ?? new Parameters());
+        $this-&gt;commands = $this-&gt;options-&gt;commands;
+    }
+
+    /**
+     * Creates a new set of client options for the client.
+     *
+     * @param array|OptionsInterface $options Set of client options
+     *
+     * @return OptionsInterface
+     * @throws InvalidArgumentException
+     */
+    protected static function createOptions($options)
+    {
+        if (is_array($options)) {
+            return new Options($options);
+        } elseif ($options instanceof OptionsInterface) {
+            return $options;
+        } else {
+            throw new InvalidArgumentException(&#039;Invalid type for client options&#039;);
+        }
+    }
+
+    /**
+     * Creates single or aggregate connections from supplied arguments.
+     *
+     * This method accepts the following types to create a connection instance:
+     *
+     *  - Array (dictionary: single connection, indexed: aggregate connections)
+     *  - String (URI for a single connection)
+     *  - Callable (connection initializer callback)
+     *  - Instance of Predis\Connection\ParametersInterface (used as-is)
+     *  - Instance of Predis\Connection\ConnectionInterface (returned as-is)
+     *
+     * When a callable is passed, it receives the original set of client options
+     * and must return an instance of Predis\Connection\ConnectionInterface.
+     *
+     * Connections are created using the connection factory (in case of single
+     * connections) or a specialized aggregate connection initializer (in case
+     * of cluster and replication) retrieved from the supplied client options.
+     *
+     * @param OptionsInterface $options    Client options container
+     * @param mixed            $parameters Connection parameters
+     *
+     * @return ConnectionInterface
+     * @throws InvalidArgumentException
+     */
+    protected static function createConnection(OptionsInterface $options, $parameters)
+    {
+        if ($parameters instanceof ConnectionInterface) {
+            return $parameters;
+        }
+
+        if ($parameters instanceof ParametersInterface || is_string($parameters)) {
+            return $options-&gt;connections-&gt;create($parameters);
+        }
+
+        if (is_array($parameters)) {
+            if (!isset($parameters[0])) {
+                return $options-&gt;connections-&gt;create($parameters);
+            } elseif ($options-&gt;defined(&#039;cluster&#039;) &amp;&amp; $initializer = $options-&gt;cluster) {
+                return $initializer($parameters, true);
+            } elseif ($options-&gt;defined(&#039;replication&#039;) &amp;&amp; $initializer = $options-&gt;replication) {
+                return $initializer($parameters, true);
+            } elseif ($options-&gt;defined(&#039;aggregate&#039;) &amp;&amp; $initializer = $options-&gt;aggregate) {
+                return $initializer($parameters, false);
+            } else {
+                throw new InvalidArgumentException(
+                    &#039;Array of connection parameters requires `cluster`, `replication` or `aggregate` client option&#039;
+                );
+            }
+        }
+
+        if (is_callable($parameters)) {
+            $connection = call_user_func($parameters, $options);
+
+            if (!$connection instanceof ConnectionInterface) {
+                throw new InvalidArgumentException(&#039;Callable parameters must return a valid connection&#039;);
+            }
+
+            return $connection;
+        }
+
+        throw new InvalidArgumentException(&#039;Invalid type for connection parameters&#039;);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getCommandFactory()
+    {
+        return $this-&gt;commands;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getOptions()
+    {
+        return $this-&gt;options;
+    }
+
+    /**
+     * Creates a new client using a specific underlying connection.
+     *
+     * This method allows to create a new client instance by picking a specific
+     * connection out of an aggregate one, with the same options of the original
+     * client instance.
+     *
+     * The specified selector defines which logic to use to look for a suitable
+     * connection by the specified value. Supported selectors are:
+     *
+     *   - `id`
+     *   - `key`
+     *   - `slot`
+     *   - `command`
+     *   - `alias`
+     *   - `role`
+     *
+     * Internally the client relies on duck-typing and follows this convention:
+     *
+     *   $selector string =&gt; getConnectionBy$selector($value) method
+     *
+     * This means that support for specific selectors may vary depending on the
+     * actual logic implemented by connection classes and there is no interface
+     * binding a connection class to implement any of these.
+     *
+     * @param string $selector Type of selector.
+     * @param mixed  $value    Value to be used by the selector.
+     *
+     * @return ClientInterface
+     */
+    public function getClientBy($selector, $value)
+    {
+        $selector = strtolower($selector);
+
+        if (!in_array($selector, [&#039;id&#039;, &#039;key&#039;, &#039;slot&#039;, &#039;role&#039;, &#039;alias&#039;, &#039;command&#039;])) {
+            throw new InvalidArgumentException(&quot;Invalid selector type: `$selector`&quot;);
+        }
+
+        if (!method_exists($this-&gt;connection, $method = &quot;getConnectionBy$selector&quot;)) {
+            $class = get_class($this-&gt;connection);
+            throw new InvalidArgumentException(&quot;Selecting connection by $selector is not supported by $class&quot;);
+        }
+
+        if (!$connection = $this-&gt;connection-&gt;$method($value)) {
+            throw new InvalidArgumentException(&quot;Cannot find a connection by $selector matching `$value`&quot;);
+        }
+
+        return new static($connection, $this-&gt;getOptions());
+    }
+
+    /**
+     * Opens the underlying connection and connects to the server.
+     */
+    public function connect()
+    {
+        $this-&gt;connection-&gt;connect();
+    }
+
+    /**
+     * Closes the underlying connection and disconnects from the server.
+     */
+    public function disconnect()
+    {
+        $this-&gt;connection-&gt;disconnect();
+    }
+
+    /**
+     * Closes the underlying connection and disconnects from the server.
+     *
+     * This is the same as `Client::disconnect()` as it does not actually send
+     * the `QUIT` command to Redis, but simply closes the connection.
+     */
+    public function quit()
+    {
+        $this-&gt;disconnect();
+    }
+
+    /**
+     * Returns the current state of the underlying connection.
+     *
+     * @return bool
+     */
+    public function isConnected()
+    {
+        return $this-&gt;connection-&gt;isConnected();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getConnection()
+    {
+        return $this-&gt;connection;
+    }
+
+    /**
+     * Applies the configured serializer and compression to given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    public function pack($value)
+    {
+        return $this-&gt;connection instanceof RelayConnection
+            ? $this-&gt;connection-&gt;pack($value)
+            : $value;
+    }
+
+    /**
+     * Deserializes and decompresses to given value.
+     *
+     * @param  mixed  $value
+     * @return string
+     */
+    public function unpack($value)
+    {
+        return $this-&gt;connection instanceof RelayConnection
+            ? $this-&gt;connection-&gt;unpack($value)
+            : $value;
+    }
+
+    /**
+     * Executes a command without filtering its arguments, parsing the response,
+     * applying any prefix to keys or throwing exceptions on Redis errors even
+     * regardless of client options.
+     *
+     * It is possible to identify Redis error responses from normal responses
+     * using the second optional argument which is populated by reference.
+     *
+     * @param array $arguments Command arguments as defined by the command signature.
+     * @param bool  $error     Set to TRUE when Redis returned an error response.
+     *
+     * @return mixed
+     */
+    public function executeRaw(array $arguments, &amp;$error = null)
+    {
+        $error = false;
+        $commandID = array_shift($arguments);
+
+        $response = $this-&gt;connection-&gt;executeCommand(
+            new RawCommand($commandID, $arguments)
+        );
+
+        if ($response instanceof ResponseInterface) {
+            if ($response instanceof ErrorResponseInterface) {
+                $error = true;
+            }
+
+            return (string) $response;
+        }
+
+        return $response;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function __call($commandID, $arguments)
+    {
+        return $this-&gt;executeCommand(
+            $this-&gt;createCommand($commandID, $arguments)
+        );
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function createCommand($commandID, $arguments = [])
+    {
+        return $this-&gt;commands-&gt;create($commandID, $arguments);
+    }
+
+    /**
+     * @param  string             $name
+     * @return ContainerInterface
+     */
+    public function __get(string $name)
+    {
+        return ContainerFactory::create($this, $name);
+    }
+
+    /**
+     * @param  string $name
+     * @param  mixed  $value
+     * @return mixed
+     */
+    public function __set(string $name, $value)
+    {
+        throw new RuntimeException(&#039;Not allowed&#039;);
+    }
+
+    /**
+     * @param  string $name
+     * @return mixed
+     */
+    public function __isset(string $name)
+    {
+        throw new RuntimeException(&#039;Not allowed&#039;);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function executeCommand(CommandInterface $command)
+    {
+        $response = $this-&gt;connection-&gt;executeCommand($command);
+
+        if ($response instanceof ResponseInterface) {
+            if ($response instanceof ErrorResponseInterface) {
+                $response = $this-&gt;onErrorResponse($command, $response);
+            }
+
+            return $response;
+        }
+
+        return $command-&gt;parseResponse($response);
+    }
+
+    /**
+     * Handles -ERR responses returned by Redis.
+     *
+     * @param CommandInterface       $command  Redis command that generated the error.
+     * @param ErrorResponseInterface $response Instance of the error response.
+     *
+     * @return mixed
+     * @throws ServerException
+     */
+    protected function onErrorResponse(CommandInterface $command, ErrorResponseInterface $response)
+    {
+        if ($command instanceof ScriptCommand &amp;&amp; $response-&gt;getErrorType() === &#039;NOSCRIPT&#039;) {
+            $response = $this-&gt;executeCommand($command-&gt;getEvalCommand());
+
+            if (!$response instanceof ResponseInterface) {
+                $response = $command-&gt;parseResponse($response);
+            }
+
+            return $response;
+        }
+
+        if ($this-&gt;options-&gt;exceptions) {
+            throw new ServerException($response-&gt;getMessage());
+        }
+
+        return $response;
+    }
+
+    /**
+     * Executes the specified initializer method on `$this` by adjusting the
+     * actual invocation depending on the arity (0, 1 or 2 arguments). This is
+     * simply an utility method to create Redis contexts instances since they
+     * follow a common initialization path.
+     *
+     * @param string $initializer Method name.
+     * @param array  $argv        Arguments for the method.
+     *
+     * @return mixed
+     */
+    private function sharedContextFactory($initializer, $argv = null)
+    {
+        switch (count($argv)) {
+            case 0:
+                return $this-&gt;$initializer();
+
+            case 1:
+                return is_array($argv[0])
+                    ? $this-&gt;$initializer($argv[0])
+                    : $this-&gt;$initializer(null, $argv[0]);
+
+            case 2:
+                [$arg0, $arg1] = $argv;
+
+                return $this-&gt;$initializer($arg0, $arg1);
+
+            default:
+                return $this-&gt;$initializer($this, $argv);
+        }
+    }
+
+    /**
+     * Creates a new pipeline context and returns it, or returns the results of
+     * a pipeline executed inside the optionally provided callable object.
+     *
+     * @param mixed ...$arguments Array of options, a callable for execution, or both.
+     *
+     * @return Pipeline|array
+     */
+    public function pipeline(...$arguments)
+    {
+        return $this-&gt;sharedContextFactory(&#039;createPipeline&#039;, func_get_args());
+    }
+
+    /**
+     * Actual pipeline context initializer method.
+     *
+     * @param array|null $options  Options for the context.
+     * @param mixed      $callable Optional callable used to execute the context.
+     *
+     * @return Pipeline|array
+     */
+    protected function createPipeline(?array $options = null, $callable = null)
+    {
+        if (isset($options[&#039;atomic&#039;]) &amp;&amp; $options[&#039;atomic&#039;]) {
+            $class = Atomic::class;
+        } elseif (isset($options[&#039;fire-and-forget&#039;]) &amp;&amp; $options[&#039;fire-and-forget&#039;]) {
+            $class = FireAndForget::class;
+        } else {
+            $class = Pipeline::class;
+        }
+
+        if ($this-&gt;connection instanceof RelayConnection) {
+            if (isset($options[&#039;atomic&#039;]) &amp;&amp; $options[&#039;atomic&#039;]) {
+                $class = RelayAtomic::class;
+            } elseif (isset($options[&#039;fire-and-forget&#039;]) &amp;&amp; $options[&#039;fire-and-forget&#039;]) {
+                throw new NotSupportedException(&#039;The &quot;relay&quot; extension does not support fire-and-forget pipelines.&#039;);
+            } else {
+                $class = RelayPipeline::class;
+            }
+        }
+
+        /*
+         * @var ClientContextInterface
+         */
+        $pipeline = new $class($this);
+
+        if (isset($callable)) {
+            return $pipeline-&gt;execute($callable);
+        }
+
+        return $pipeline;
+    }
+
+    /**
+     * Creates a new transaction context and returns it, or returns the results
+     * of a transaction executed inside the optionally provided callable object.
+     *
+     * @param mixed ...$arguments Array of options, a callable for execution, or both.
+     *
+     * @return MultiExecTransaction|array
+     */
+    public function transaction(...$arguments)
+    {
+        return $this-&gt;sharedContextFactory(&#039;createTransaction&#039;, func_get_args());
+    }
+
+    /**
+     * Actual transaction context initializer method.
+     *
+     * @param array|null $options  Options for the context.
+     * @param mixed      $callable Optional callable used to execute the context.
+     *
+     * @return MultiExecTransaction|array
+     */
+    protected function createTransaction(?array $options = null, $callable = null)
+    {
+        $transaction = new MultiExecTransaction($this, $options);
+
+        if (isset($callable)) {
+            return $transaction-&gt;execute($callable);
+        }
+
+        return $transaction;
+    }
+
+    /**
+     * Creates a new publish/subscribe context and returns it, or starts its loop
+     * inside the optionally provided callable object.
+     *
+     * @param mixed ...$arguments Array of options, a callable for execution, or both.
+     *
+     * @return PubSubConsumer|null
+     */
+    public function pubSubLoop(...$arguments)
+    {
+        return $this-&gt;sharedContextFactory(&#039;createPubSub&#039;, func_get_args());
+    }
+
+    /**
+     * Actual publish/subscribe context initializer method.
+     *
+     * @param array|null $options  Options for the context.
+     * @param mixed      $callable Optional callable used to execute the context.
+     *
+     * @return PubSubConsumer|null
+     */
+    protected function createPubSub(?array $options = null, $callable = null)
+    {
+        if ($this-&gt;connection instanceof RelayConnection) {
+            $pubsub = new RelayPubSubConsumer($this, $options);
+        } else {
+            $pubsub = new PubSubConsumer($this, $options);
+        }
+
+        if (!isset($callable)) {
+            return $pubsub;
+        }
+
+        foreach ($pubsub as $message) {
+            if (call_user_func($callable, $pubsub, $message) === false) {
+                $pubsub-&gt;stop();
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Creates a new monitor consumer and returns it.
+     *
+     * @return MonitorConsumer
+     */
+    public function monitor()
+    {
+        return new MonitorConsumer($this);
+    }
+
+    /**
+     * @return Traversable&lt;string, static&gt;
+     */
+    #[ReturnTypeWillChange]
+    public function getIterator()
+    {
+        $clients = [];
+        $connection = $this-&gt;getConnection();
+
+        if (!$connection instanceof Traversable) {
+            return new ArrayIterator([
+                (string) $connection =&gt; new static($connection, $this-&gt;getOptions()),
+            ]);
+        }
+
+        foreach ($connection as $node) {
+            $clients[(string) $node] = new static($node, $this-&gt;getOptions());
+        }
+
+        return new ArrayIterator($clients);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/ClientConfiguration.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Cluster -->
+
+</body>
+</html>

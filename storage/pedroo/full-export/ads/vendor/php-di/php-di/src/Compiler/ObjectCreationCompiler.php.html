@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-di/php-di/src/Compiler/ObjectCreationCompiler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace DI\Compiler;
+
+use DI\Definition\Exception\InvalidDefinition;
+use DI\Definition\ObjectDefinition;
+use DI\Definition\ObjectDefinition\MethodInjection;
+use ReflectionClass;
+use ReflectionMethod;
+use ReflectionParameter;
+use ReflectionProperty;
+
+/**
+ * Compiles an object definition into native PHP code that, when executed, creates the object.
+ *
+ * @author Matthieu Napoli &lt;matthieu@mnapoli.fr&gt;
+ */
+class ObjectCreationCompiler
+{
+    public function __construct(
+        private Compiler $compiler,
+    ) {
+    }
+
+    public function compile(ObjectDefinition $definition) : string
+    {
+        $this-&gt;assertClassIsNotAnonymous($definition);
+        $this-&gt;assertClassIsInstantiable($definition);
+        /** @var class-string $className At this point we have checked the class is valid */
+        $className = $definition-&gt;getClassName();
+
+        // Lazy?
+        if ($definition-&gt;isLazy()) {
+            return $this-&gt;compileLazyDefinition($definition);
+        }
+
+        try {
+            $classReflection = new ReflectionClass($className);
+            $constructorArguments = $this-&gt;resolveParameters($definition-&gt;getConstructorInjection(), $classReflection-&gt;getConstructor());
+            $dumpedConstructorArguments = array_map(function ($value) {
+                return $this-&gt;compiler-&gt;compileValue($value);
+            }, $constructorArguments);
+
+            $code = [];
+            $code[] = sprintf(
+                &#039;$object = new %s(%s);&#039;,
+                $className,
+                implode(&#039;, &#039;, $dumpedConstructorArguments)
+            );
+
+            // Property injections
+            foreach ($definition-&gt;getPropertyInjections() as $propertyInjection) {
+                $value = $propertyInjection-&gt;getValue();
+                $value = $this-&gt;compiler-&gt;compileValue($value);
+
+                $propertyClassName = $propertyInjection-&gt;getClassName() ?: $className;
+                $property = new ReflectionProperty($propertyClassName, $propertyInjection-&gt;getPropertyName());
+                if ($property-&gt;isPublic() &amp;&amp; !(\PHP_VERSION_ID &gt;= 80100 &amp;&amp; $property-&gt;isReadOnly())) {
+                    $code[] = sprintf(&#039;$object-&gt;%s = %s;&#039;, $propertyInjection-&gt;getPropertyName(), $value);
+                } else {
+                    // Private/protected/readonly property
+                    $code[] = sprintf(
+                        &#039;\DI\Definition\Resolver\ObjectCreator::setPrivatePropertyValue(%s, $object, \&#039;%s\&#039;, %s);&#039;,
+                        var_export($propertyInjection-&gt;getClassName(), true),
+                        $propertyInjection-&gt;getPropertyName(),
+                        $value
+                    );
+                }
+            }
+
+            // Method injections
+            foreach ($definition-&gt;getMethodInjections() as $methodInjection) {
+                $methodReflection = new ReflectionMethod($className, $methodInjection-&gt;getMethodName());
+                $parameters = $this-&gt;resolveParameters($methodInjection, $methodReflection);
+
+                $dumpedParameters = array_map(function ($value) {
+                    return $this-&gt;compiler-&gt;compileValue($value);
+                }, $parameters);
+
+                $code[] = sprintf(
+                    &#039;$object-&gt;%s(%s);&#039;,
+                    $methodInjection-&gt;getMethodName(),
+                    implode(&#039;, &#039;, $dumpedParameters)
+                );
+            }
+        } catch (InvalidDefinition $e) {
+            throw InvalidDefinition::create($definition, sprintf(
+                &#039;Entry &quot;%s&quot; cannot be compiled: %s&#039;,
+                $definition-&gt;getName(),
+                $e-&gt;getMessage()
+            ));
+        }
+
+        return implode(&quot;\n        &quot;, $code);
+    }
+
+    public function resolveParameters(?MethodInjection $definition, ?ReflectionMethod $method) : array
+    {
+        $args = [];
+
+        if (! $method) {
+            return $args;
+        }
+
+        $definitionParameters = $definition ? $definition-&gt;getParameters() : [];
+
+        foreach ($method-&gt;getParameters() as $index =&gt; $parameter) {
+            if (array_key_exists($index, $definitionParameters)) {
+                // Look in the definition
+                $value = &amp;$definitionParameters[$index];
+            } elseif ($parameter-&gt;isOptional()) {
+                // If the parameter is optional and wasn&#039;t specified, we take its default value
+                $args[] = $this-&gt;getParameterDefaultValue($parameter, $method);
+                continue;
+            } else {
+                throw new InvalidDefinition(sprintf(
+                    &#039;Parameter $%s of %s has no value defined or guessable&#039;,
+                    $parameter-&gt;getName(),
+                    $this-&gt;getFunctionName($method)
+                ));
+            }
+
+            $args[] = &amp;$value;
+        }
+
+        return $args;
+    }
+
+    private function compileLazyDefinition(ObjectDefinition $definition) : string
+    {
+        $subDefinition = clone $definition;
+        $subDefinition-&gt;setLazy(false);
+        $subDefinition = $this-&gt;compiler-&gt;compileValue($subDefinition);
+
+        /** @var class-string $className At this point we have checked the class is valid */
+        $className = $definition-&gt;getClassName();
+
+        $this-&gt;compiler-&gt;getProxyFactory()-&gt;generateProxyClass($className);
+
+        return &lt;&lt;&lt;STR
+                    \$object = \$this-&gt;proxyFactory-&gt;createProxy(
+                        &#039;{$definition-&gt;getClassName()}&#039;,
+                        function () {
+                            return $subDefinition;
+                        }
+                    );
+            STR;
+    }
+
+    /**
+     * Returns the default value of a function parameter.
+     *
+     * @throws InvalidDefinition Can&#039;t get default values from PHP internal classes and functions
+     */
+    private function getParameterDefaultValue(ReflectionParameter $parameter, ReflectionMethod $function) : mixed
+    {
+        try {
+            return $parameter-&gt;getDefaultValue();
+        } catch (\ReflectionException) {
+            throw new InvalidDefinition(sprintf(
+                &#039;The parameter &quot;%s&quot; of %s has no type defined or guessable. It has a default value, &#039;
+                . &#039;but the default value can\&#039;t be read through Reflection because it is a PHP internal class.&#039;,
+                $parameter-&gt;getName(),
+                $this-&gt;getFunctionName($function)
+            ));
+        }
+    }
+
+    private function getFunctionName(ReflectionMethod $method) : string
+    {
+        return $method-&gt;getName() . &#039;()&#039;;
+    }
+
+    private function assertClassIsNotAnonymous(ObjectDefinition $definition) : void
+    {
+        if (str_contains($definition-&gt;getClassName(), &#039;@&#039;)) {
+            throw InvalidDefinition::create($definition, sprintf(
+                &#039;Entry &quot;%s&quot; cannot be compiled: anonymous classes cannot be compiled&#039;,
+                $definition-&gt;getName()
+            ));
+        }
+    }
+
+    private function assertClassIsInstantiable(ObjectDefinition $definition) : void
+    {
+        if ($definition-&gt;isInstantiable()) {
+            return;
+        }
+
+        $message = ! $definition-&gt;classExists()
+            ? &#039;Entry &quot;%s&quot; cannot be compiled: the class doesn\&#039;t exist&#039;
+            : &#039;Entry &quot;%s&quot; cannot be compiled: the class is not instantiable&#039;;
+
+        throw InvalidDefinition::create($definition, sprintf($message, $definition-&gt;getName()));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-di/php-di/src/Compiler/RequestedEntryHolder.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-di/php-di/src/Definition -->
+
+</body>
+</html>

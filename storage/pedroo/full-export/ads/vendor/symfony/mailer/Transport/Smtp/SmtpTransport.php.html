@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/mailer/Transport/Smtp/SmtpTransport.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Mailer\Transport\Smtp;
+
+use Psr\EventDispatcher\EventDispatcherInterface;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\Mailer\Envelope;
+use Symfony\Component\Mailer\Exception\InvalidArgumentException;
+use Symfony\Component\Mailer\Exception\LogicException;
+use Symfony\Component\Mailer\Exception\TransportException;
+use Symfony\Component\Mailer\Exception\TransportExceptionInterface;
+use Symfony\Component\Mailer\Exception\UnexpectedResponseException;
+use Symfony\Component\Mailer\SentMessage;
+use Symfony\Component\Mailer\Transport\AbstractTransport;
+use Symfony\Component\Mailer\Transport\Smtp\Stream\AbstractStream;
+use Symfony\Component\Mailer\Transport\Smtp\Stream\SocketStream;
+use Symfony\Component\Mime\RawMessage;
+
+/**
+ * Sends emails over SMTP.
+ *
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ * @author Chris Corbyn
+ */
+class SmtpTransport extends AbstractTransport
+{
+    private bool $started = false;
+    private int $restartThreshold = 100;
+    private int $restartThresholdSleep = 0;
+    private int $restartCounter = 0;
+    private int $pingThreshold = 100;
+    private float $lastMessageTime = 0;
+    private AbstractStream $stream;
+    private string $domain = &#039;[127.0.0.1]&#039;;
+
+    public function __construct(?AbstractStream $stream = null, ?EventDispatcherInterface $dispatcher = null, ?LoggerInterface $logger = null)
+    {
+        parent::__construct($dispatcher, $logger);
+
+        $this-&gt;stream = $stream ?? new SocketStream();
+    }
+
+    public function getStream(): AbstractStream
+    {
+        return $this-&gt;stream;
+    }
+
+    /**
+     * Sets the maximum number of messages to send before re-starting the transport.
+     *
+     * By default, the threshold is set to 100 (and no sleep at restart).
+     *
+     * @param int $threshold The maximum number of messages (0 to disable)
+     * @param int $sleep     The number of seconds to sleep between stopping and re-starting the transport
+     *
+     * @return $this
+     */
+    public function setRestartThreshold(int $threshold, int $sleep = 0): static
+    {
+        $this-&gt;restartThreshold = $threshold;
+        $this-&gt;restartThresholdSleep = $sleep;
+
+        return $this;
+    }
+
+    /**
+     * Sets the minimum number of seconds required between two messages, before the server is pinged.
+     * If the transport wants to send a message and the time since the last message exceeds the specified threshold,
+     * the transport will ping the server first (NOOP command) to check if the connection is still alive.
+     * Otherwise the message will be sent without pinging the server first.
+     *
+     * Do not set the threshold too low, as the SMTP server may drop the connection if there are too many
+     * non-mail commands (like pinging the server with NOOP).
+     *
+     * By default, the threshold is set to 100 seconds.
+     *
+     * @param int $seconds The minimum number of seconds between two messages required to ping the server
+     *
+     * @return $this
+     */
+    public function setPingThreshold(int $seconds): static
+    {
+        $this-&gt;pingThreshold = $seconds;
+
+        return $this;
+    }
+
+    /**
+     * Sets the name of the local domain that will be used in HELO.
+     *
+     * This should be a fully-qualified domain name and should be truly the domain
+     * you&#039;re using.
+     *
+     * If your server does not have a domain name, use the IP address. This will
+     * automatically be wrapped in square brackets as described in RFC 5321,
+     * section 4.1.3.
+     *
+     * @return $this
+     */
+    public function setLocalDomain(string $domain): static
+    {
+        if (&#039;&#039; !== $domain &amp;&amp; &#039;[&#039; !== $domain[0]) {
+            if (filter_var($domain, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV4)) {
+                $domain = &#039;[&#039;.$domain.&#039;]&#039;;
+            } elseif (filter_var($domain, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV6)) {
+                $domain = &#039;[IPv6:&#039;.$domain.&#039;]&#039;;
+            }
+        }
+
+        $this-&gt;domain = $domain;
+
+        return $this;
+    }
+
+    /**
+     * Gets the name of the domain that will be used in HELO.
+     *
+     * If an IP address was specified, this will be returned wrapped in square
+     * brackets as described in RFC 5321, section 4.1.3.
+     */
+    public function getLocalDomain(): string
+    {
+        return $this-&gt;domain;
+    }
+
+    public function send(RawMessage $message, ?Envelope $envelope = null): ?SentMessage
+    {
+        try {
+            $message = parent::send($message, $envelope);
+        } catch (TransportExceptionInterface $e) {
+            if ($this-&gt;started) {
+                try {
+                    $this-&gt;executeCommand(&quot;RSET\r\n&quot;, [250]);
+                } catch (TransportExceptionInterface) {
+                    // ignore this exception as it probably means that the server error was final
+                }
+            }
+
+            throw $e;
+        }
+
+        $this-&gt;checkRestartThreshold();
+
+        return $message;
+    }
+
+    protected function parseMessageId(string $mtaResult): string
+    {
+        return preg_match(&#039;/^250 (?:\S+ )?Ok:?+ (?:queued as |id=)?+(?P&lt;id&gt;[A-Z0-9._-]++)/im&#039;, $mtaResult, $matches) ? $matches[&#039;id&#039;] : &#039;&#039;;
+    }
+
+    public function __toString(): string
+    {
+        if ($this-&gt;stream instanceof SocketStream) {
+            $name = \sprintf(&#039;smtp%s://%s&#039;, ($tls = $this-&gt;stream-&gt;isTLS()) ? &#039;s&#039; : &#039;&#039;, $this-&gt;stream-&gt;getHost());
+            $port = $this-&gt;stream-&gt;getPort();
+            if (!(25 === $port || ($tls &amp;&amp; 465 === $port))) {
+                $name .= &#039;:&#039;.$port;
+            }
+
+            return $name;
+        }
+
+        return &#039;smtp://sendmail&#039;;
+    }
+
+    /**
+     * Runs a command against the stream, expecting the given response codes.
+     *
+     * @param int[] $codes
+     *
+     * @throws TransportException when an invalid response if received
+     */
+    public function executeCommand(string $command, array $codes): string
+    {
+        $this-&gt;stream-&gt;write($command);
+        $response = $this-&gt;getFullResponse();
+        $this-&gt;assertResponseCode($response, $codes);
+
+        return $response;
+    }
+
+    protected function doSend(SentMessage $message): void
+    {
+        if (microtime(true) - $this-&gt;lastMessageTime &gt; $this-&gt;pingThreshold) {
+            $this-&gt;ping();
+        }
+
+        try {
+            if (!$this-&gt;started) {
+                $this-&gt;start();
+            }
+
+            $envelope = $message-&gt;getEnvelope();
+            $this-&gt;doMailFromCommand($envelope-&gt;getSender()-&gt;getEncodedAddress(), $envelope-&gt;anyAddressHasUnicodeLocalpart());
+            foreach ($envelope-&gt;getRecipients() as $recipient) {
+                $this-&gt;doRcptToCommand($recipient-&gt;getEncodedAddress());
+            }
+
+            $this-&gt;executeCommand(&quot;DATA\r\n&quot;, [354]);
+            try {
+                foreach (AbstractStream::replace(&quot;\r\n.&quot;, &quot;\r\n..&quot;, $message-&gt;toIterable()) as $chunk) {
+                    $this-&gt;stream-&gt;write($chunk, false);
+                }
+                $this-&gt;stream-&gt;flush();
+            } catch (TransportExceptionInterface $e) {
+                throw $e;
+            } catch (\Exception $e) {
+                $this-&gt;stream-&gt;terminate();
+                $this-&gt;started = false;
+                $this-&gt;getLogger()-&gt;debug(\sprintf(&#039;Email transport &quot;%s&quot; stopped&#039;, __CLASS__));
+                throw $e;
+            }
+            $mtaResult = $this-&gt;executeCommand(&quot;\r\n.\r\n&quot;, [250]);
+            $message-&gt;appendDebug($this-&gt;stream-&gt;getDebug());
+            $this-&gt;lastMessageTime = microtime(true);
+
+            if ($mtaResult &amp;&amp; $messageId = $this-&gt;parseMessageId($mtaResult)) {
+                $message-&gt;setMessageId($messageId);
+            }
+        } catch (TransportExceptionInterface $e) {
+            $e-&gt;appendDebug($this-&gt;stream-&gt;getDebug());
+            $this-&gt;lastMessageTime = 0;
+            throw $e;
+        }
+    }
+
+    protected function serverSupportsSmtpUtf8(): bool
+    {
+        return false;
+    }
+
+    private function doHeloCommand(): void
+    {
+        $this-&gt;executeCommand(\sprintf(&quot;HELO %s\r\n&quot;, $this-&gt;domain), [250]);
+    }
+
+    private function doMailFromCommand(string $address, bool $smtputf8): void
+    {
+        if ($smtputf8 &amp;&amp; !$this-&gt;serverSupportsSmtpUtf8()) {
+            throw new InvalidArgumentException(&#039;Invalid addresses: non-ASCII characters not supported in local-part of email.&#039;);
+        }
+        $this-&gt;executeCommand(\sprintf(&quot;MAIL FROM:&lt;%s&gt;%s\r\n&quot;, $address, $smtputf8 ? &#039; SMTPUTF8&#039; : &#039;&#039;), [250]);
+    }
+
+    private function doRcptToCommand(string $address): void
+    {
+        $this-&gt;executeCommand(\sprintf(&quot;RCPT TO:&lt;%s&gt;\r\n&quot;, $address), [250, 251, 252]);
+    }
+
+    public function start(): void
+    {
+        if ($this-&gt;started) {
+            return;
+        }
+
+        $this-&gt;getLogger()-&gt;debug(\sprintf(&#039;Email transport &quot;%s&quot; starting&#039;, __CLASS__));
+
+        $this-&gt;stream-&gt;initialize();
+        $this-&gt;assertResponseCode($this-&gt;getFullResponse(), [220]);
+        $this-&gt;doHeloCommand();
+        $this-&gt;started = true;
+        $this-&gt;lastMessageTime = 0;
+
+        $this-&gt;getLogger()-&gt;debug(\sprintf(&#039;Email transport &quot;%s&quot; started&#039;, __CLASS__));
+    }
+
+    /**
+     * Manually disconnect from the SMTP server.
+     *
+     * In most cases this is not necessary since the disconnect happens automatically on termination.
+     * In cases of long-running scripts, this might however make sense to avoid keeping an open
+     * connection to the SMTP server in between sending emails.
+     */
+    public function stop(): void
+    {
+        if (!$this-&gt;started) {
+            return;
+        }
+
+        $this-&gt;getLogger()-&gt;debug(\sprintf(&#039;Email transport &quot;%s&quot; stopping&#039;, __CLASS__));
+
+        try {
+            $this-&gt;executeCommand(&quot;QUIT\r\n&quot;, [221]);
+        } catch (TransportExceptionInterface) {
+        } finally {
+            $this-&gt;stream-&gt;terminate();
+            $this-&gt;started = false;
+            $this-&gt;getLogger()-&gt;debug(\sprintf(&#039;Email transport &quot;%s&quot; stopped&#039;, __CLASS__));
+        }
+    }
+
+    private function ping(): void
+    {
+        if (!$this-&gt;started) {
+            return;
+        }
+
+        try {
+            $this-&gt;executeCommand(&quot;NOOP\r\n&quot;, [250]);
+        } catch (TransportExceptionInterface) {
+            $this-&gt;stop();
+        }
+    }
+
+    /**
+     * @throws TransportException if a response code is incorrect
+     */
+    private function assertResponseCode(string $response, array $codes): void
+    {
+        if (!$codes) {
+            throw new LogicException(&#039;You must set the expected response code.&#039;);
+        }
+
+        [$code] = sscanf($response, &#039;%3d&#039;);
+        $valid = \in_array($code, $codes);
+
+        if (!$valid || !$response) {
+            $codeStr = $code ? \sprintf(&#039;code &quot;%s&quot;&#039;, $code) : &#039;empty code&#039;;
+            $responseStr = $response ? \sprintf(&#039;, with message &quot;%s&quot;&#039;, trim($response)) : &#039;&#039;;
+
+            throw new UnexpectedResponseException(\sprintf(&#039;Expected response code &quot;%s&quot; but got &#039;, implode(&#039;/&#039;, $codes)).$codeStr.$responseStr.&#039;.&#039;, $code ?: 0);
+        }
+    }
+
+    private function getFullResponse(): string
+    {
+        $response = &#039;&#039;;
+        do {
+            $line = $this-&gt;stream-&gt;readLine();
+            $response .= $line;
+        } while ($line &amp;&amp; isset($line[3]) &amp;&amp; &#039; &#039; !== $line[3]);
+
+        return $response;
+    }
+
+    private function checkRestartThreshold(): void
+    {
+        // when using sendmail via non-interactive mode, the transport is never &quot;started&quot;
+        if (!$this-&gt;started) {
+            return;
+        }
+
+        ++$this-&gt;restartCounter;
+        if ($this-&gt;restartCounter &lt; $this-&gt;restartThreshold) {
+            return;
+        }
+
+        $this-&gt;stop();
+        if (0 &lt; $sleep = $this-&gt;restartThresholdSleep) {
+            $this-&gt;getLogger()-&gt;debug(\sprintf(&#039;Email transport &quot;%s&quot; sleeps for %d seconds after stopping&#039;, __CLASS__, $sleep));
+
+            sleep($sleep);
+        }
+        $this-&gt;start();
+        $this-&gt;restartCounter = 0;
+    }
+
+    public function __serialize(): array
+    {
+        throw new \BadMethodCallException(&#039;Cannot serialize &#039;.__CLASS__);
+    }
+
+    public function __unserialize(array $data): void
+    {
+        throw new \BadMethodCallException(&#039;Cannot unserialize &#039;.__CLASS__);
+    }
+
+    public function __destruct()
+    {
+        $this-&gt;stop();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/mailer/Transport/Smtp/Stream/AbstractStream.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/mailer/Transport/Smtp/Auth -->
+
+</body>
+</html>

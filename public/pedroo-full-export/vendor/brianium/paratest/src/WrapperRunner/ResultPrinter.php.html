@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/brianium/paratest/src/WrapperRunner/ResultPrinter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace ParaTest\WrapperRunner;
+
+use ParaTest\Options;
+use PHPUnit\Logging\TestDox\TestResultCollection as TestDoxTestResultCollection;
+use PHPUnit\Runner\TestSuiteSorter;
+use PHPUnit\TestRunner\TestResult\TestResult;
+use PHPUnit\TextUI\Output\Default\ResultPrinter as DefaultResultPrinter;
+use PHPUnit\TextUI\Output\Printer;
+use PHPUnit\TextUI\Output\SummaryPrinter;
+use PHPUnit\TextUI\Output\TestDox\ResultPrinter as TestDoxResultPrinter;
+use PHPUnit\Util\Color;
+use SebastianBergmann\CodeCoverage\Driver\Selector;
+use SebastianBergmann\CodeCoverage\Filter;
+use SebastianBergmann\Timer\ResourceUsageFormatter;
+use SplFileInfo;
+use Symfony\Component\Console\Formatter\OutputFormatter;
+use Symfony\Component\Console\Output\OutputInterface;
+
+use function assert;
+use function fclose;
+use function feof;
+use function floor;
+use function fopen;
+use function fread;
+use function fseek;
+use function ftell;
+use function fwrite;
+use function sprintf;
+use function str_repeat;
+use function strlen;
+
+use const DIRECTORY_SEPARATOR;
+use const PHP_EOL;
+use const PHP_VERSION;
+
+/** @internal */
+final class ResultPrinter
+{
+    public readonly Printer $printer;
+
+    private int $numTestsWidth  = 0;
+    private int $maxColumn      = 0;
+    private int $totalCases     = 0;
+    private int $column         = 0;
+    private int $casesProcessed = 0;
+    private int $numberOfColumns;
+    /** @var resource|null */
+    private $teamcityLogFileHandle;
+    /** @var array&lt;non-empty-string, int&gt; */
+    private array $tailPositions;
+
+    public function __construct(
+        private readonly OutputInterface $output,
+        private readonly Options $options
+    ) {
+        $this-&gt;printer = new class ($this-&gt;output) implements Printer {
+            public function __construct(
+                private readonly OutputInterface $output,
+            ) {
+            }
+
+            public function print(string $buffer): void
+            {
+                $this-&gt;output-&gt;write(OutputFormatter::escape($buffer));
+            }
+
+            public function flush(): void
+            {
+            }
+        };
+
+        $this-&gt;numberOfColumns = $this-&gt;options-&gt;configuration-&gt;columns();
+
+        if (! $this-&gt;options-&gt;configuration-&gt;hasLogfileTeamcity()) {
+            return;
+        }
+
+        $teamcityLogFileHandle = fopen($this-&gt;options-&gt;configuration-&gt;logfileTeamcity(), &#039;ab+&#039;);
+        assert($teamcityLogFileHandle !== false);
+        $this-&gt;teamcityLogFileHandle = $teamcityLogFileHandle;
+    }
+
+    public function setTestCount(int $testCount): void
+    {
+        $this-&gt;totalCases = $testCount;
+    }
+
+    public function start(): void
+    {
+        $this-&gt;numTestsWidth = strlen((string) $this-&gt;totalCases);
+        $this-&gt;maxColumn     = $this-&gt;numberOfColumns
+                         + (DIRECTORY_SEPARATOR === &#039;\\&#039; ? -1 : 0) // fix windows blank lines
+                         - strlen($this-&gt;getProgress());
+
+        // @see \PHPUnit\TextUI\TestRunner::writeMessage()
+        $output = $this-&gt;output;
+        $write  = static function (string $type, string $message) use ($output): void {
+            $output-&gt;write(sprintf(&quot;%-15s%s\n&quot;, $type . &#039;:&#039;, $message));
+        };
+
+        // @see \PHPUnit\TextUI\Application::writeRuntimeInformation()
+        $write(&#039;Processes&#039;, (string) $this-&gt;options-&gt;processes);
+
+        if ($this-&gt;options-&gt;hasShard()) {
+            $write(&#039;Shard&#039;, $this-&gt;options-&gt;currentShard . &#039;/&#039; . $this-&gt;options-&gt;totalShards);
+        }
+
+        $runtime = &#039;PHP &#039; . PHP_VERSION;
+
+        if ($this-&gt;options-&gt;configuration-&gt;hasCoverageReport()) {
+            $filter = new Filter();
+            if ($this-&gt;options-&gt;configuration-&gt;pathCoverage()) {
+                $codeCoverageDriver = (new Selector())-&gt;forLineAndPathCoverage($filter); // @codeCoverageIgnore
+            } else {
+                $codeCoverageDriver = (new Selector())-&gt;forLineCoverage($filter);
+            }
+
+            $runtime .= &#039; with &#039; . $codeCoverageDriver-&gt;nameAndVersion();
+        }
+
+        $write(&#039;Runtime&#039;, $runtime);
+
+        if ($this-&gt;options-&gt;configuration-&gt;hasConfigurationFile()) {
+            $write(&#039;Configuration&#039;, $this-&gt;options-&gt;configuration-&gt;configurationFile());
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;executionOrder() === TestSuiteSorter::ORDER_RANDOMIZED) {
+            $write(&#039;Random Seed&#039;, (string) $this-&gt;options-&gt;configuration-&gt;randomOrderSeed());
+        }
+
+        $output-&gt;write(&quot;\n&quot;);
+    }
+
+    public function printFeedback(
+        SplFileInfo $progressFile,
+        SplFileInfo $outputFile,
+        SplFileInfo|null $teamcityFile
+    ): void {
+        if ($this-&gt;options-&gt;needsTeamcity &amp;&amp; $teamcityFile !== null) {
+            $teamcityProgress = $this-&gt;tailMultiple([$teamcityFile]);
+
+            if ($this-&gt;teamcityLogFileHandle !== null) {
+                fwrite($this-&gt;teamcityLogFileHandle, $teamcityProgress);
+            }
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;outputIsTeamCity()) {
+            assert(isset($teamcityProgress));
+            $this-&gt;output-&gt;write($teamcityProgress);
+
+            return;
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;noProgress()) {
+            return;
+        }
+
+        $unexpectedOutput = $this-&gt;tail($outputFile);
+        if ($unexpectedOutput !== &#039;&#039;) {
+            $this-&gt;output-&gt;write($unexpectedOutput);
+        }
+
+        $feedbackItems = $this-&gt;tail($progressFile);
+        if ($feedbackItems === &#039;&#039;) {
+            return;
+        }
+
+        $actualTestCount = strlen($feedbackItems);
+        for ($index = 0; $index &lt; $actualTestCount; ++$index) {
+            $this-&gt;printFeedbackItem($feedbackItems[$index]);
+        }
+    }
+
+    /**
+     * @param list&lt;SplFileInfo&gt;                         $teamcityFiles
+     * @param array&lt;string,TestDoxTestResultCollection&gt; $testdoxResults
+     */
+    public function printResults(TestResult $testResult, array $teamcityFiles, array $testdoxResults): void
+    {
+        if ($this-&gt;options-&gt;needsTeamcity) {
+            $teamcityProgress = $this-&gt;tailMultiple($teamcityFiles);
+
+            if ($this-&gt;teamcityLogFileHandle !== null) {
+                fwrite($this-&gt;teamcityLogFileHandle, $teamcityProgress);
+                $resource                    = $this-&gt;teamcityLogFileHandle;
+                $this-&gt;teamcityLogFileHandle = null;
+                fclose($resource);
+            }
+        }
+
+        if ($this-&gt;options-&gt;configuration-&gt;outputIsTeamCity()) {
+            assert(isset($teamcityProgress));
+            $this-&gt;output-&gt;write($teamcityProgress);
+
+            return;
+        }
+
+        $this-&gt;printer-&gt;print(PHP_EOL . (new ResourceUsageFormatter())-&gt;resourceUsageSinceStartOfRequest() . PHP_EOL . PHP_EOL);
+
+        $defaultResultPrinter = new DefaultResultPrinter(
+            $this-&gt;printer,
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnPhpunitDeprecations() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            true,
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnPhpunitNotices() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            true,
+            true,
+            true,
+            true,
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnIncompleteTests() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnSkippedTests() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerDeprecations() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerErrors() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerNotices() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerWarnings() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+            $this-&gt;options-&gt;configuration-&gt;reverseDefectList(),
+        );
+
+        if ($this-&gt;options-&gt;configuration-&gt;outputIsTestDox()) {
+            (new TestDoxResultPrinter(
+                $this-&gt;printer,
+                $this-&gt;options-&gt;configuration-&gt;colors(),
+                $this-&gt;options-&gt;configuration-&gt;columns(),
+                $this-&gt;options-&gt;configuration-&gt;testDoxOutputWithSummary(),
+            ))-&gt;print($testResult, $testdoxResults);
+
+            $defaultResultPrinter = new DefaultResultPrinter(
+                $this-&gt;printer,
+                $this-&gt;options-&gt;configuration-&gt;displayDetailsOnPhpunitDeprecations() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+                true,
+                $this-&gt;options-&gt;configuration-&gt;displayDetailsOnPhpunitNotices() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerDeprecations() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+                $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerErrors() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+                $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerNotices() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+                $this-&gt;options-&gt;configuration-&gt;displayDetailsOnTestsThatTriggerWarnings() || $this-&gt;options-&gt;configuration-&gt;displayDetailsOnAllIssues(),
+                $this-&gt;options-&gt;configuration-&gt;reverseDefectList(),
+            );
+        }
+
+        $defaultResultPrinter-&gt;print($testResult);
+
+        (new SummaryPrinter(
+            $this-&gt;printer,
+            $this-&gt;options-&gt;configuration-&gt;colors(),
+        ))-&gt;print($testResult);
+    }
+
+    private function printFeedbackItem(string $item): void
+    {
+        $this-&gt;printFeedbackItemColor($item);
+        ++$this-&gt;column;
+        ++$this-&gt;casesProcessed;
+        if ($this-&gt;column !== $this-&gt;maxColumn &amp;&amp; $this-&gt;casesProcessed &lt; $this-&gt;totalCases) {
+            return;
+        }
+
+        if (
+            $this-&gt;casesProcessed &gt; 0
+            &amp;&amp; $this-&gt;casesProcessed === $this-&gt;totalCases
+            &amp;&amp; ($pad = $this-&gt;maxColumn - $this-&gt;column) &gt; 0
+        ) {
+            $this-&gt;output-&gt;write(str_repeat(&#039; &#039;, $pad));
+        }
+
+        $this-&gt;output-&gt;write($this-&gt;getProgress() . &quot;\n&quot;);
+        $this-&gt;column = 0;
+    }
+
+    private function printFeedbackItemColor(string $item): void
+    {
+        $buffer = match ($item) {
+            &#039;E&#039; =&gt; $this-&gt;colorizeTextBox(&#039;fg-red, bold&#039;, $item),
+            &#039;F&#039; =&gt; $this-&gt;colorizeTextBox(&#039;bg-red, fg-white&#039;, $item),
+            &#039;I&#039;, &#039;N&#039;, &#039;D&#039;, &#039;R&#039;, &#039;W&#039; =&gt; $this-&gt;colorizeTextBox(&#039;fg-yellow, bold&#039;, $item),
+            &#039;S&#039; =&gt; $this-&gt;colorizeTextBox(&#039;fg-cyan, bold&#039;, $item),
+            &#039;.&#039; =&gt; $item,
+        };
+        $this-&gt;output-&gt;write($buffer);
+    }
+
+    private function getProgress(): string
+    {
+        return sprintf(
+            &#039; %&#039; . $this-&gt;numTestsWidth . &#039;d / %&#039; . $this-&gt;numTestsWidth . &#039;d (%3s%%)&#039;,
+            $this-&gt;casesProcessed,
+            $this-&gt;totalCases,
+            floor(($this-&gt;totalCases &gt; 0 ? $this-&gt;casesProcessed / $this-&gt;totalCases : 0) * 100),
+        );
+    }
+
+    private function colorizeTextBox(string $color, string $buffer): string
+    {
+        if (! $this-&gt;options-&gt;configuration-&gt;colors()) {
+            return $buffer;
+        }
+
+        return Color::colorizeTextBox($color, $buffer);
+    }
+
+    /** @param list&lt;SplFileInfo&gt; $files */
+    private function tailMultiple(array $files): string
+    {
+        $content = &#039;&#039;;
+        foreach ($files as $file) {
+            if (! $file-&gt;isFile()) {
+                continue;
+            }
+
+            $content .= $this-&gt;tail($file);
+        }
+
+        return $content;
+    }
+
+    private function tail(SplFileInfo $file): string
+    {
+        $path = $file-&gt;getPathname();
+        assert($path !== &#039;&#039;);
+        $handle = fopen($path, &#039;r&#039;);
+        assert($handle !== false);
+        $fseek = fseek($handle, $this-&gt;tailPositions[$path] ?? 0);
+        assert($fseek === 0);
+
+        $contents = &#039;&#039;;
+        while (! feof($handle)) {
+            $fread = fread($handle, 8192);
+            assert($fread !== false);
+            $contents .= $fread;
+        }
+
+        $ftell = ftell($handle);
+        assert($ftell !== false);
+        $this-&gt;tailPositions[$path] = $ftell;
+        fclose($handle);
+
+        return $contents;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/brianium/paratest/src/WrapperRunner/SuiteLoader.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/brick -->
+
+</body>
+</html>

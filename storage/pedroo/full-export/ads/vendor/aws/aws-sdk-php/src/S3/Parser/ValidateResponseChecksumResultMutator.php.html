@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/Parser/ValidateResponseChecksumResultMutator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Aws\S3\Parser;
+
+use Aws\Api\Service;
+use Aws\CommandInterface;
+use Aws\ResultInterface;
+use Aws\S3\CalculatesChecksumTrait;
+use Aws\S3\Exception\S3Exception;
+use Psr\Http\Message\ResponseInterface;
+
+/**
+ * A custom s3 result mutator that validates the response checksums.
+ *
+ * @internal
+ */
+final class ValidateResponseChecksumResultMutator implements S3ResultMutator
+{
+    use CalculatesChecksumTrait;
+
+    public const DEFAULT_VALIDATION_MODE = &#039;when_supported&#039;;
+
+    /** @var Service $api */
+    private $api;
+
+    /** @var array $api */
+    private $config;
+
+    /**
+     * @param Service $api
+     * @param array $config
+     */
+    public function __construct(Service $api, array $config = [])
+    {
+        $this-&gt;api = $api;
+        $this-&gt;config = $config;
+    }
+
+    /**
+     * @param ResultInterface $result
+     * @param CommandInterface|null $command
+     * @param ResponseInterface|null $response
+     *
+     * @return ResultInterface
+     */
+    public function __invoke(
+        ResultInterface $result,
+        ?CommandInterface $command = null,
+        ?ResponseInterface $response = null
+    ): ResultInterface
+    {
+        $operation = $this-&gt;api-&gt;getOperation($command-&gt;getName());
+
+        // Skip this middleware if the operation doesn&#039;t have an httpChecksum
+        $checksumInfo = $operation[&#039;httpChecksum&#039;] ?? null;
+        if (is_null($checksumInfo)) {
+            return $result;
+        }
+
+        $mode = $this-&gt;config[&#039;response_checksum_validation&#039;] ?? self::DEFAULT_VALIDATION_MODE;
+        $checksumModeEnabledMember = $checksumInfo[&#039;requestValidationModeMember&#039;] ?? &quot;&quot;;
+        $checksumModeEnabled = strtolower($command[$checksumModeEnabledMember] ?? &quot;&quot;);
+        $responseAlgorithms = $checksumInfo[&#039;responseAlgorithms&#039;] ?? [];
+        $shouldSkipValidation = $this-&gt;shouldSkipValidation(
+            $mode,
+            $checksumModeEnabled,
+            $responseAlgorithms
+        );
+
+        if ($shouldSkipValidation) {
+            return $result;
+        }
+
+        $checksumPriority = $this-&gt;getChecksumPriority();
+        $checksumsToCheck = array_intersect($responseAlgorithms, array_map(
+            &#039;strtoupper&#039;,
+            array_keys($checksumPriority))
+        );
+        $checksumValidationInfo = $this-&gt;validateChecksum($checksumsToCheck, $response);
+
+        if ($checksumValidationInfo[&#039;status&#039;] === &quot;SUCCEEDED&quot;) {
+            $result[&#039;ChecksumValidated&#039;] = $checksumValidationInfo[&#039;checksum&#039;];
+        } elseif ($checksumValidationInfo[&#039;status&#039;] === &quot;FAILED&quot;) {
+            if ($this-&gt;isMultipartGetObject($command, $checksumValidationInfo)) {
+                return $result;
+            }
+            throw new S3Exception(
+                &quot;Calculated response checksum did not match the expected value&quot;,
+                $command
+            );
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param $checksumPriority
+     * @param ResponseInterface $response
+     *
+     * @return array
+     */
+    private function validateChecksum(
+        $checksumPriority,
+        ResponseInterface $response
+    ): array
+    {
+        $checksumToValidate = $this-&gt;chooseChecksumHeaderToValidate(
+            $checksumPriority,
+            $response
+        );
+        $validationStatus = &quot;SKIPPED&quot;;
+        $checksumHeaderValue = null;
+        if (!empty($checksumToValidate)) {
+            $checksumHeaderValue = $response-&gt;getHeaderLine(
+                &#039;x-amz-checksum-&#039; . $checksumToValidate
+            );
+            if (!empty($checksumHeaderValue)) {
+                $calculatedChecksumValue = $this-&gt;getEncodedValue(
+                    $checksumToValidate,
+                    $response-&gt;getBody()
+                );
+                $validationStatus = $checksumHeaderValue == $calculatedChecksumValue
+                    ? &quot;SUCCEEDED&quot;
+                    : &quot;FAILED&quot;;
+            }
+        }
+        return [
+            &quot;status&quot; =&gt; $validationStatus,
+            &quot;checksum&quot; =&gt; $checksumToValidate,
+            &quot;checksumHeaderValue&quot; =&gt; $checksumHeaderValue,
+        ];
+    }
+
+    /**
+     * @param $checksumPriority
+     * @param ResponseInterface $response
+     *
+     * @return string
+     */
+    private function chooseChecksumHeaderToValidate(
+        $checksumPriority,
+        ResponseInterface $response
+    ):? string
+    {
+        foreach ($checksumPriority as $checksum) {
+            $checksumHeader = &#039;x-amz-checksum-&#039; . $checksum;
+            if ($response-&gt;hasHeader($checksumHeader)) {
+                return $checksum;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param string $mode
+     * @param string $checksumModeEnabled
+     * @param array $responseAlgorithms
+     *
+     * @return bool
+     */
+    private function shouldSkipValidation(
+        string $mode,
+        string $checksumModeEnabled,
+        array $responseAlgorithms
+    ): bool
+    {
+        return empty($responseAlgorithms)
+            || ($mode === &#039;when_required&#039; &amp;&amp; $checksumModeEnabled !== &#039;enabled&#039;);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function getChecksumPriority(): array
+    {
+        return extension_loaded(&#039;awscrt&#039;)
+            ? self::$supportedAlgorithms
+            : array_slice(self::$supportedAlgorithms, 1);
+    }
+
+    /**
+     * @param CommandInterface $command
+     * @param array $checksumValidationInfo
+     *
+     * @return bool
+     */
+    private function isMultipartGetObject(
+        CommandInterface $command,
+        array $checksumValidationInfo
+    ): bool
+    {
+        if ($command-&gt;getName() !== &quot;GetObject&quot;
+            || empty($checksumValidationInfo[&#039;checksumHeaderValue&#039;])
+        ) {
+            return false;
+        }
+
+        $headerValue = $checksumValidationInfo[&#039;checksumHeaderValue&#039;];
+        $lastDashPos = strrpos($headerValue, &#039;-&#039;);
+        $endOfChecksum = substr($headerValue, $lastDashPos + 1);
+
+        return is_numeric($endOfChecksum)
+            &amp;&amp; (int) $endOfChecksum &gt; 1
+            &amp;&amp; (int) $endOfChecksum &lt; 10000;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/PermanentRedirectMiddleware.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/RegionalEndpoint -->
+
+</body>
+</html>

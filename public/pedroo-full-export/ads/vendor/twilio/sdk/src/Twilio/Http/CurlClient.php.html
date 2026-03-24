@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/twilio/sdk/src/Twilio/Http/CurlClient.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+
+namespace Twilio\Http;
+
+
+use Twilio\AuthStrategy\AuthStrategy;
+use Twilio\Exceptions\ConfigurationException;
+use Twilio\Exceptions\EnvironmentException;
+
+class CurlClient implements Client {
+    public const DEFAULT_TIMEOUT = 60;
+    protected $curlOptions = [];
+
+    public $lastRequest;
+    public $lastResponse;
+
+    public function __construct(array $options = []) {
+        $this-&gt;curlOptions = $options;
+    }
+
+    public function request(string $method, string $url,
+                            array $params = [], array $data = [], array $headers = [],
+                            ?string $user = null, ?string $password = null,
+                            ?int $timeout = null, ?AuthStrategy $authStrategy = null): Response {
+        $options = $this-&gt;options($method, $url, $params, $data, $headers,
+                                  $user, $password, $timeout, $authStrategy);
+
+        $this-&gt;lastRequest = $options;
+        $this-&gt;lastResponse = null;
+
+        try {
+            if (!$curl = \curl_init()) {
+                throw new EnvironmentException(&#039;Unable to initialize cURL&#039;);
+            }
+
+            if (!\curl_setopt_array($curl, $options)) {
+                throw new EnvironmentException(\curl_error($curl));
+            }
+
+            if (!$response = \curl_exec($curl)) {
+                throw new EnvironmentException(\curl_error($curl));
+            }
+
+            $parts = \explode(&quot;\r\n\r\n&quot;, $response, 3);
+
+            list($head, $body) = (
+                \preg_match(&#039;/\AHTTP\/1.\d 100 Continue\Z/&#039;, $parts[0])
+                || \preg_match(&#039;/\AHTTP\/1.\d 200 Connection established\Z/&#039;, $parts[0])
+                || \preg_match(&#039;/\AHTTP\/1.\d 200 Tunnel established\Z/&#039;, $parts[0])
+            )
+                ? array($parts[1], $parts[2])
+                : array($parts[0], $parts[1]);
+
+            $statusCode = \curl_getinfo($curl, CURLINFO_HTTP_CODE);
+
+            $responseHeaders = [];
+            $headerLines = \explode(&quot;\r\n&quot;, $head);
+            \array_shift($headerLines);
+            foreach ($headerLines as $line) {
+                list($key, $value) = \explode(&#039;:&#039;, $line, 2);
+                $responseHeaders[$key] = $value;
+            }
+
+            if (PHP_MAJOR_VERSION &lt; 8) {
+                \curl_close($curl);
+            }
+
+            if (isset($options[CURLOPT_INFILE]) &amp;&amp; \is_resource($options[CURLOPT_INFILE])) {
+                \fclose($options[CURLOPT_INFILE]);
+            }
+
+            $this-&gt;lastResponse = new Response($statusCode, $body, $responseHeaders);
+
+            return $this-&gt;lastResponse;
+        } catch (\ErrorException $e) {
+            if (PHP_MAJOR_VERSION &lt; 8 &amp;&amp; isset($curl) &amp;&amp; \is_resource($curl)) {
+                \curl_close($curl);
+            }
+
+            if (isset($options[CURLOPT_INFILE]) &amp;&amp; \is_resource($options[CURLOPT_INFILE])) {
+                \fclose($options[CURLOPT_INFILE]);
+            }
+
+            throw $e;
+        }
+    }
+
+    public function options(string $method, string $url,
+                            array $params = [], array $data = [], array $headers = [],
+                            ?string $user = null, ?string $password = null,
+                            ?int $timeout = null, ?AuthStrategy $authStrategy = null): array {
+        $timeout = $timeout ?? self::DEFAULT_TIMEOUT;
+        $options = $this-&gt;curlOptions + [
+            CURLOPT_URL =&gt; $url,
+            CURLOPT_HEADER =&gt; true,
+            CURLOPT_RETURNTRANSFER =&gt; true,
+            CURLOPT_INFILESIZE =&gt; Null,
+            CURLOPT_HTTPHEADER =&gt; [],
+            CURLOPT_TIMEOUT =&gt; $timeout,
+            CURLOPT_PROTOCOLS =&gt; CURLPROTO_HTTPS | CURLPROTO_HTTP
+        ];
+
+        foreach ($headers as $key =&gt; $value) {
+            $options[CURLOPT_HTTPHEADER][] = &quot;$key: $value&quot;;
+        }
+
+        if ($user &amp;&amp; $password) {
+            $options[CURLOPT_HTTPHEADER][] = &#039;Authorization: Basic &#039; . \base64_encode(&quot;$user:$password&quot;);
+        }
+        elseif ($authStrategy) {
+            $options[CURLOPT_HTTPHEADER][] = &#039;Authorization: &#039; . $authStrategy-&gt;getAuthString();
+        }
+
+        $query = $this-&gt;buildQuery($params);
+        if ($query) {
+            $options[CURLOPT_URL] .= &#039;?&#039; . $query;
+        }
+
+        $methodName = \strtolower(\trim($method));
+
+        // Configure HTTP method-specific options
+        if ($methodName === &#039;get&#039;) {
+            $options[CURLOPT_HTTPGET] = true;
+        } elseif ($methodName === &#039;head&#039;) {
+            $options[CURLOPT_NOBODY] = true;
+        } elseif (\in_array($methodName, [&#039;post&#039;, &#039;put&#039;, &#039;patch&#039;])) {
+            // Handle methods that send data in the request body
+            $this-&gt;configureMethodWithData($options, $methodName, $method, $data, $headers);
+        } else {
+            // Handle other HTTP methods (DELETE, etc.)
+            $options[CURLOPT_CUSTOMREQUEST] = \strtoupper($method);
+        }
+
+        return $options;
+    }
+
+    /**
+     * Configure cURL options for HTTP methods that send data in the request body
+     * (POST, PUT, PATCH)
+     */
+    private function configureMethodWithData(array &amp;$options, string $methodName, string $method, array $data, array $headers): void
+    {
+        // Set the appropriate cURL option for the HTTP method
+        if ($methodName === &#039;post&#039;) {
+            $options[CURLOPT_POST] = true;
+        } else {
+            $options[CURLOPT_CUSTOMREQUEST] = \strtoupper($method);
+        }
+
+        // Configure the request body based on data type
+        if ($this-&gt;hasFile($data)) {
+            // Handle multipart/form-data for file uploads
+            [$headers, $body] = $this-&gt;buildMultipartOptions($data);
+            $options[CURLOPT_POSTFIELDS] = $body;
+            $options[CURLOPT_HTTPHEADER] = \array_merge($options[CURLOPT_HTTPHEADER], $headers);
+        } elseif (isset($headers[&#039;Content-Type&#039;]) &amp;&amp; $headers[&#039;Content-Type&#039;] === &#039;application/json&#039;) {
+            // Handle JSON data
+            $options[CURLOPT_POSTFIELDS] = \json_encode($data);
+        } else {
+            // Handle URL-encoded form data
+            $options[CURLOPT_POSTFIELDS] = $this-&gt;buildQuery($data);
+        }
+    }
+
+    public function buildQuery(?array $params): string {
+        $parts = [];
+        $params = $params ?: [];
+
+        foreach ($params as $key =&gt; $value) {
+            if (\is_array($value)) {
+                foreach ($value as $item) {
+                    $parts[] = $this-&gt;encodeQueryComponent((string)$key) . &#039;=&#039; .
+                        $this-&gt;encodeQueryComponent((string)$item);
+                }
+            } else {
+                $parts[] = $this-&gt;encodeQueryComponent((string)$key) . &#039;=&#039; .
+                    $this-&gt;encodeQueryComponent((string)$value);
+            }
+        }
+
+        return \implode(&#039;&amp;&#039;, $parts);
+    }
+
+    /**
+     * Custom encoder for query string components that:
+     * 1. Encodes spaces as &#039;+&#039; (like urlencode)
+     * 2. Preserves unreserved characters including tilde (like rawurlencode)
+     */
+    private function encodeQueryComponent(string $string): string {
+        // Start with rawurlencode to encode as per RFC 3986
+        $encoded = \rawurlencode($string);
+
+        // Convert %20 back to + for query string compatibility
+        $encoded = \str_replace(&#039;%20&#039;, &#039;+&#039;, $encoded);
+
+        return $encoded;
+    }
+
+    private function hasFile(array $data): bool {
+        foreach ($data as $value) {
+            if ($value instanceof File) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function buildMultipartOptions(array $data): array {
+        $boundary = \uniqid(&#039;&#039;, true);
+        $delimiter = &quot;-------------{$boundary}&quot;;
+        $body = &#039;&#039;;
+
+        foreach ($data as $key =&gt; $value) {
+            if ($value instanceof File) {
+                $contents = $value-&gt;getContents();
+                if ($contents === null) {
+                    $chunk = \file_get_contents($value-&gt;getFileName());
+                    $filename = \basename($value-&gt;getFileName());
+                } elseif (\is_resource($contents)) {
+                    $chunk = &#039;&#039;;
+                    while (!\feof($contents)) {
+                        $chunk .= \fread($contents, 8096);
+                    }
+
+                    $filename = $value-&gt;getFileName();
+                } elseif (\is_string($contents)) {
+                    $chunk = $contents;
+                    $filename = $value-&gt;getFileName();
+                } else {
+                    throw new \InvalidArgumentException(&#039;Unsupported content type&#039;);
+                }
+
+                $headers = &#039;&#039;;
+                $contentType = $value-&gt;getContentType();
+                if ($contentType !== null) {
+                    $headers .= &quot;Content-Type: {$contentType}\r\n&quot;;
+                }
+
+                $body .= \vsprintf(&quot;--%s\r\nContent-Disposition: form-data; name=\&quot;%s\&quot;; filename=\&quot;%s\&quot;\r\n%s\r\n%s\r\n&quot;, [
+                    $delimiter,
+                    $key,
+                    $filename,
+                    $headers,
+                    $chunk,
+                ]);
+            } else {
+                $body .= \vsprintf(&quot;--%s\r\nContent-Disposition: form-data; name=\&quot;%s\&quot;\r\n\r\n%s\r\n&quot;, [
+                    $delimiter,
+                    $key,
+                    $value,
+                ]);
+            }
+        }
+
+        $body .= &quot;--{$delimiter}--\r\n&quot;;
+
+        return [
+            [
+                &quot;Content-Type: multipart/form-data; boundary={$delimiter}&quot;,
+                &#039;Content-Length: &#039; . \strlen($body),
+            ],
+            $body,
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/twilio/sdk/src/Twilio/Http/File.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/twilio/sdk/src/Twilio/Http/BearerToken -->
+
+</body>
+</html>

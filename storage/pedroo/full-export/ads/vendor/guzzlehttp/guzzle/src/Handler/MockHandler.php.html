@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/guzzlehttp/guzzle/src/Handler/MockHandler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace GuzzleHttp\Handler;
+
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Promise as P;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\TransferStats;
+use GuzzleHttp\Utils;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Handler that returns responses or throw exceptions from a queue.
+ *
+ * @final
+ */
+class MockHandler implements \Countable
+{
+    /**
+     * @var array
+     */
+    private $queue = [];
+
+    /**
+     * @var RequestInterface|null
+     */
+    private $lastRequest;
+
+    /**
+     * @var array
+     */
+    private $lastOptions = [];
+
+    /**
+     * @var callable|null
+     */
+    private $onFulfilled;
+
+    /**
+     * @var callable|null
+     */
+    private $onRejected;
+
+    /**
+     * Creates a new MockHandler that uses the default handler stack list of
+     * middlewares.
+     *
+     * @param array|null    $queue       Array of responses, callables, or exceptions.
+     * @param callable|null $onFulfilled Callback to invoke when the return value is fulfilled.
+     * @param callable|null $onRejected  Callback to invoke when the return value is rejected.
+     */
+    public static function createWithMiddleware(?array $queue = null, ?callable $onFulfilled = null, ?callable $onRejected = null): HandlerStack
+    {
+        return HandlerStack::create(new self($queue, $onFulfilled, $onRejected));
+    }
+
+    /**
+     * The passed in value must be an array of
+     * {@see ResponseInterface} objects, Exceptions,
+     * callables, or Promises.
+     *
+     * @param array&lt;int, mixed&gt;|null $queue       The parameters to be passed to the append function, as an indexed array.
+     * @param callable|null          $onFulfilled Callback to invoke when the return value is fulfilled.
+     * @param callable|null          $onRejected  Callback to invoke when the return value is rejected.
+     */
+    public function __construct(?array $queue = null, ?callable $onFulfilled = null, ?callable $onRejected = null)
+    {
+        $this-&gt;onFulfilled = $onFulfilled;
+        $this-&gt;onRejected = $onRejected;
+
+        if ($queue) {
+            // array_values included for BC
+            $this-&gt;append(...array_values($queue));
+        }
+    }
+
+    public function __invoke(RequestInterface $request, array $options): PromiseInterface
+    {
+        if (!$this-&gt;queue) {
+            throw new \OutOfBoundsException(&#039;Mock queue is empty&#039;);
+        }
+
+        if (isset($options[&#039;delay&#039;]) &amp;&amp; \is_numeric($options[&#039;delay&#039;])) {
+            \usleep((int) $options[&#039;delay&#039;] * 1000);
+        }
+
+        $this-&gt;lastRequest = $request;
+        $this-&gt;lastOptions = $options;
+        $response = \array_shift($this-&gt;queue);
+
+        if (isset($options[&#039;on_headers&#039;])) {
+            if (!\is_callable($options[&#039;on_headers&#039;])) {
+                throw new \InvalidArgumentException(&#039;on_headers must be callable&#039;);
+            }
+            try {
+                $options[&#039;on_headers&#039;]($response);
+            } catch (\Exception $e) {
+                $msg = &#039;An error was encountered during the on_headers event&#039;;
+                $response = new RequestException($msg, $request, $response, $e);
+            }
+        }
+
+        if (\is_callable($response)) {
+            $response = $response($request, $options);
+        }
+
+        $response = $response instanceof \Throwable
+            ? P\Create::rejectionFor($response)
+            : P\Create::promiseFor($response);
+
+        return $response-&gt;then(
+            function (?ResponseInterface $value) use ($request, $options) {
+                $this-&gt;invokeStats($request, $options, $value);
+                if ($this-&gt;onFulfilled) {
+                    ($this-&gt;onFulfilled)($value);
+                }
+
+                if ($value !== null &amp;&amp; isset($options[&#039;sink&#039;])) {
+                    $contents = (string) $value-&gt;getBody();
+                    $sink = $options[&#039;sink&#039;];
+
+                    if (\is_resource($sink)) {
+                        \fwrite($sink, $contents);
+                    } elseif (\is_string($sink)) {
+                        \file_put_contents($sink, $contents);
+                    } elseif ($sink instanceof StreamInterface) {
+                        $sink-&gt;write($contents);
+                    }
+                }
+
+                return $value;
+            },
+            function ($reason) use ($request, $options) {
+                $this-&gt;invokeStats($request, $options, null, $reason);
+                if ($this-&gt;onRejected) {
+                    ($this-&gt;onRejected)($reason);
+                }
+
+                return P\Create::rejectionFor($reason);
+            }
+        );
+    }
+
+    /**
+     * Adds one or more variadic requests, exceptions, callables, or promises
+     * to the queue.
+     *
+     * @param mixed ...$values
+     */
+    public function append(...$values): void
+    {
+        foreach ($values as $value) {
+            if ($value instanceof ResponseInterface
+                || $value instanceof \Throwable
+                || $value instanceof PromiseInterface
+                || \is_callable($value)
+            ) {
+                $this-&gt;queue[] = $value;
+            } else {
+                throw new \TypeError(&#039;Expected a Response, Promise, Throwable or callable. Found &#039;.Utils::describeType($value));
+            }
+        }
+    }
+
+    /**
+     * Get the last received request.
+     */
+    public function getLastRequest(): ?RequestInterface
+    {
+        return $this-&gt;lastRequest;
+    }
+
+    /**
+     * Get the last received request options.
+     */
+    public function getLastOptions(): array
+    {
+        return $this-&gt;lastOptions;
+    }
+
+    /**
+     * Returns the number of remaining items in the queue.
+     */
+    public function count(): int
+    {
+        return \count($this-&gt;queue);
+    }
+
+    public function reset(): void
+    {
+        $this-&gt;queue = [];
+    }
+
+    /**
+     * @param mixed $reason Promise or reason.
+     */
+    private function invokeStats(
+        RequestInterface $request,
+        array $options,
+        ?ResponseInterface $response = null,
+        $reason = null
+    ): void {
+        if (isset($options[&#039;on_stats&#039;])) {
+            $transferTime = $options[&#039;transfer_time&#039;] ?? 0;
+            $stats = new TransferStats($request, $response, $transferTime, $reason);
+            ($options[&#039;on_stats&#039;])($stats);
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/guzzlehttp/guzzle/src/Handler/Proxy.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/guzzlehttp/promises -->
+
+</body>
+</html>

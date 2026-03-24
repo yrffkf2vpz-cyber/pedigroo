@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/lab404/laravel-impersonate/src/Services/ImpersonateManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Lab404\Impersonate\Services;
+
+use Exception;
+use Illuminate\Contracts\Auth\Guard;
+use Illuminate\Contracts\Auth\UserProvider;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Foundation\Application;
+use Lab404\Impersonate\Events\LeaveImpersonation;
+use Lab404\Impersonate\Events\TakeImpersonation;
+use Lab404\Impersonate\Exceptions\InvalidUserProvider;
+use Lab404\Impersonate\Exceptions\MissingUserProvider;
+
+class ImpersonateManager
+{
+    const REMEMBER_PREFIX = &#039;remember_web&#039;;
+
+    /** @var Application $app */
+    private $app;
+
+    public function __construct(Application $app)
+    {
+        $this-&gt;app = $app;
+    }
+
+    /**
+     * @param int $id
+     * @return \Illuminate\Contracts\Auth\Authenticatable
+     * @throws MissingUserProvider
+     * @throws InvalidUserProvider
+     * @throws ModelNotFoundException
+     */
+    public function findUserById($id, $guardName = null)
+    {
+        if (empty($guardName)) {
+            $guardName = $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;auth.default.guard&#039;, &#039;web&#039;);
+        }
+
+        $providerName = $this-&gt;app[&#039;config&#039;]-&gt;get(&quot;auth.guards.$guardName.provider&quot;);
+
+        if (empty($providerName)) {
+            throw new MissingUserProvider($guardName);
+        }
+
+        try {
+            /** @var UserProvider $userProvider */
+            $userProvider = $this-&gt;app[&#039;auth&#039;]-&gt;createUserProvider($providerName);
+        } catch (\InvalidArgumentException $e) {
+            throw new InvalidUserProvider($guardName);
+        }
+
+        if (!($modelInstance = $userProvider-&gt;retrieveById($id))) {
+            $model = $this-&gt;app[&#039;config&#039;]-&gt;get(&quot;auth.providers.$providerName.model&quot;);
+
+            throw (new ModelNotFoundException())-&gt;setModel(
+                $model,
+                $id
+            );
+        }
+
+        return $modelInstance;
+    }
+
+    public function isImpersonating(): bool
+    {
+        return session()-&gt;has($this-&gt;getSessionKey());
+    }
+
+    /**
+     * @return  int|null
+     */
+    public function getImpersonatorId()
+    {
+        return session($this-&gt;getSessionKey(), null);
+    }
+
+    /**
+     * @return \Illuminate\Contracts\Auth\Authenticatable
+     */
+    public function getImpersonator()
+    {
+        $id = session($this-&gt;getSessionKey(), null);
+
+        return is_null($id) ? null : $this-&gt;findUserById($id, $this-&gt;getImpersonatorGuardName());
+    }
+
+    /**
+     * @return string|null
+     */
+    public function getImpersonatorGuardName()
+    {
+        return session($this-&gt;getSessionGuard(), null);
+    }
+
+    /**
+     * @return string|null
+     */
+    public function getImpersonatorGuardUsingName()
+    {
+        return session($this-&gt;getSessionGuardUsing(), null);
+    }
+
+    /**
+     * @param \Illuminate\Contracts\Auth\Authenticatable $from
+     * @param \Illuminate\Contracts\Auth\Authenticatable $to
+     * @param string|null                         $guardName
+     * @return bool
+     */
+    public function take($from, $to, $guardName = null)
+    {
+        $this-&gt;saveAuthCookieInSession();
+
+        try {
+            $currentGuard = $this-&gt;getCurrentAuthGuardName();
+            session()-&gt;put($this-&gt;getSessionKey(), $from-&gt;getAuthIdentifier());
+            session()-&gt;put($this-&gt;getSessionGuard(), $currentGuard);
+            session()-&gt;put($this-&gt;getSessionGuardUsing(), $guardName);
+
+            $this-&gt;app[&#039;auth&#039;]-&gt;guard($currentGuard)-&gt;quietLogout();
+            $this-&gt;app[&#039;auth&#039;]-&gt;guard($guardName)-&gt;quietLogin($to);
+
+        } catch (\Exception $e) {
+            unset($e);
+            return false;
+        }
+
+        $this-&gt;app[&#039;events&#039;]-&gt;dispatch(new TakeImpersonation($from, $to));
+
+        return true;
+    }
+
+    public function leave(): bool
+    {
+        try {
+            $impersonated = $this-&gt;app[&#039;auth&#039;]-&gt;guard($this-&gt;getImpersonatorGuardUsingName())-&gt;user();
+            $impersonator = $this-&gt;findUserById($this-&gt;getImpersonatorId(), $this-&gt;getImpersonatorGuardName());
+
+            $this-&gt;app[&#039;auth&#039;]-&gt;guard($this-&gt;getCurrentAuthGuardName())-&gt;quietLogout();
+            $this-&gt;app[&#039;auth&#039;]-&gt;guard($this-&gt;getImpersonatorGuardName())-&gt;quietLogin($impersonator);
+
+            $this-&gt;extractAuthCookieFromSession();
+
+            $this-&gt;clear();
+
+        } catch (\Exception $e) {
+            unset($e);
+            return false;
+        }
+
+        $this-&gt;app[&#039;events&#039;]-&gt;dispatch(new LeaveImpersonation($impersonator, $impersonated));
+
+        return true;
+    }
+
+    public function clear()
+    {
+        session()-&gt;forget($this-&gt;getSessionKey());
+        session()-&gt;forget($this-&gt;getSessionGuard());
+        session()-&gt;forget($this-&gt;getSessionGuardUsing());
+    }
+
+    public function getSessionKey(): string
+    {
+        return config(&#039;laravel-impersonate.session_key&#039;);
+    }
+
+    public function getSessionGuard(): string
+    {
+        return config(&#039;laravel-impersonate.session_guard&#039;);
+    }
+
+    public function getSessionGuardUsing(): string
+    {
+        return config(&#039;laravel-impersonate.session_guard_using&#039;);
+    }
+
+    public function getDefaultSessionGuard(): string
+    {
+        return config(&#039;laravel-impersonate.default_impersonator_guard&#039;);
+    }
+
+    public function getTakeRedirectTo(): string
+    {
+        try {
+            $uri = route(config(&#039;laravel-impersonate.take_redirect_to&#039;));
+        } catch (\InvalidArgumentException $e) {
+            $uri = config(&#039;laravel-impersonate.take_redirect_to&#039;);
+        }
+
+        return $uri;
+    }
+
+    public function getLeaveRedirectTo(): string
+    {
+        $routeName = config(&#039;laravel-impersonate.leave_redirect_to&#039;);
+
+        if (session()-&gt;has(&#039;laravel-impersonate:leave_redirect_to&#039;)) {
+            $routeName = session(&#039;laravel-impersonate:leave_redirect_to&#039;);
+            session()-&gt;forget(&#039;laravel-impersonate:leave_redirect_to&#039;);
+        }
+
+        try {
+            $uri = route($routeName);
+        } catch (\InvalidArgumentException $e) {
+            $uri = $routeName;
+        }
+
+        return $uri;
+    }
+
+    /**
+     * @return array|null
+     */
+    public function getCurrentAuthGuardName()
+    {
+        $guards = array_keys(config(&#039;auth.guards&#039;));
+
+        foreach ($guards as $guard) {
+            if ($this-&gt;app[&#039;auth&#039;]-&gt;guard($guard)-&gt;check()) {
+                return $guard;
+            }
+        }
+
+        return null;
+    }
+
+    protected function saveAuthCookieInSession(): void
+    {
+        $cookie = $this-&gt;findByKeyInArray($this-&gt;app[&#039;request&#039;]-&gt;cookies-&gt;all(), static::REMEMBER_PREFIX);
+        $key = $cookie-&gt;keys()-&gt;first();
+        $val = $cookie-&gt;values()-&gt;first();
+
+        if (!$key || !$val) {
+            return;
+        }
+
+        session()-&gt;put(static::REMEMBER_PREFIX, [
+            $key,
+            $val,
+        ]);
+    }
+
+    protected function extractAuthCookieFromSession(): void
+    {
+        if (!$session = $this-&gt;findByKeyInArray(session()-&gt;all(), static::REMEMBER_PREFIX)-&gt;first()) {
+            return;
+        }
+
+        $this-&gt;app[&#039;cookie&#039;]-&gt;queue($session[0], $session[1]);
+        session()-&gt;forget($session);
+    }
+
+    /**
+     * @param array  $values
+     * @param string $search
+     * @return \Illuminate\Support\Collection
+     */
+    protected function findByKeyInArray(array $values, string $search)
+    {
+        return collect($values ?? session()-&gt;all())
+            -&gt;filter(function ($val, $key) use ($search) {
+                return strpos($key, $search) !== false;
+            });
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/lab404/laravel-impersonate/src/helpers.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laminas -->
+
+</body>
+</html>

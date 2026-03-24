@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-debugbar/php-debugbar/src/DebugBar/DebugBar.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * This file is part of the DebugBar package.
+ *
+ * (c) 2013 Maxime Bouroumeau-Fuseau
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace DebugBar;
+
+use ArrayAccess;
+use DebugBar\DataCollector\DataCollectorInterface;
+use DebugBar\Storage\StorageInterface;
+
+/**
+ * Main DebugBar object
+ *
+ * Manages data collectors. DebugBar provides an array-like access
+ * to collectors by name.
+ *
+ * &lt;code&gt;
+ *     $debugbar = new DebugBar();
+ *     $debugbar-&gt;addCollector(new DataCollector\MessagesCollector());
+ *     $debugbar[&#039;messages&#039;]-&gt;addMessage(&quot;foobar&quot;);
+ * &lt;/code&gt;
+ */
+class DebugBar implements ArrayAccess
+{
+    public static $useOpenHandlerWhenSendingDataHeaders = false;
+
+    protected $collectors = array();
+
+    protected $data;
+
+    protected $jsRenderer;
+
+    protected $requestIdGenerator;
+
+    protected $requestId;
+
+    protected $storage;
+
+    protected $httpDriver;
+
+    protected $stackSessionNamespace = &#039;PHPDEBUGBAR_STACK_DATA&#039;;
+
+    protected $stackAlwaysUseSessionStorage = false;
+
+    /**
+     * Adds a data collector
+     *
+     * @param DataCollectorInterface $collector
+     *
+     * @throws DebugBarException
+     * @return $this
+     */
+    public function addCollector(DataCollectorInterface $collector)
+    {
+        if ($collector-&gt;getName() === &#039;__meta&#039;) {
+            throw new DebugBarException(&quot;&#039;__meta&#039; is a reserved name and cannot be used as a collector name&quot;);
+        }
+        if (isset($this-&gt;collectors[$collector-&gt;getName()])) {
+            throw new DebugBarException(&quot;&#039;{$collector-&gt;getName()}&#039; is already a registered collector&quot;);
+        }
+        $this-&gt;collectors[$collector-&gt;getName()] = $collector;
+        return $this;
+    }
+
+    /**
+     * Checks if a data collector has been added
+     *
+     * @param string $name
+     * @return boolean
+     */
+    public function hasCollector($name)
+    {
+        return isset($this-&gt;collectors[$name]);
+    }
+
+    /**
+     * Returns a data collector
+     *
+     * @param string $name
+     * @return DataCollectorInterface
+     * @throws DebugBarException
+     */
+    public function getCollector($name)
+    {
+        if (!isset($this-&gt;collectors[$name])) {
+            throw new DebugBarException(&quot;&#039;$name&#039; is not a registered collector&quot;);
+        }
+        return $this-&gt;collectors[$name];
+    }
+
+    /**
+     * Returns an array of all data collectors
+     *
+     * @return array[DataCollectorInterface]
+     */
+    public function getCollectors()
+    {
+        return $this-&gt;collectors;
+    }
+
+    /**
+     * Sets the request id generator
+     *
+     * @param RequestIdGeneratorInterface $generator
+     * @return $this
+     */
+    public function setRequestIdGenerator(RequestIdGeneratorInterface $generator)
+    {
+        $this-&gt;requestIdGenerator = $generator;
+        return $this;
+    }
+
+    /**
+     * @return RequestIdGeneratorInterface
+     */
+    public function getRequestIdGenerator()
+    {
+        if ($this-&gt;requestIdGenerator === null) {
+            $this-&gt;requestIdGenerator = new RequestIdGenerator();
+        }
+        return $this-&gt;requestIdGenerator;
+    }
+
+    /**
+     * Returns the id of the current request
+     *
+     * @return string
+     */
+    public function getCurrentRequestId()
+    {
+        if ($this-&gt;requestId === null) {
+            $this-&gt;requestId = $this-&gt;getRequestIdGenerator()-&gt;generate();
+        }
+        return $this-&gt;requestId;
+    }
+
+    /**
+     * Sets the storage backend to use to store the collected data
+     *
+     * @param StorageInterface $storage
+     * @return $this
+     */
+    public function setStorage(?StorageInterface $storage = null)
+    {
+        $this-&gt;storage = $storage;
+        return $this;
+    }
+
+    /**
+     * @return StorageInterface
+     */
+    public function getStorage()
+    {
+        return $this-&gt;storage;
+    }
+
+    /**
+     * Checks if the data will be persisted
+     *
+     * @return boolean
+     */
+    public function isDataPersisted()
+    {
+        return $this-&gt;storage !== null;
+    }
+
+    /**
+     * Sets the HTTP driver
+     *
+     * @param HttpDriverInterface $driver
+     * @return $this
+     */
+    public function setHttpDriver(HttpDriverInterface $driver)
+    {
+        $this-&gt;httpDriver = $driver;
+        return $this;
+    }
+
+    /**
+     * Returns the HTTP driver
+     *
+     * If no http driver where defined, a PhpHttpDriver is automatically created
+     *
+     * @return HttpDriverInterface
+     */
+    public function getHttpDriver()
+    {
+        if ($this-&gt;httpDriver === null) {
+            $this-&gt;httpDriver = new PhpHttpDriver();
+        }
+        return $this-&gt;httpDriver;
+    }
+
+    /**
+     * Collects the data from the collectors
+     *
+     * @return array
+     */
+    public function collect()
+    {
+        if (php_sapi_name() === &#039;cli&#039;) {
+            $ip = gethostname();
+            if ($ip) {
+                $ip = gethostbyname($ip);
+            } else {
+                $ip = &#039;127.0.0.1&#039;;
+            }
+            $request_variables = array(
+                &#039;method&#039; =&gt; &#039;CLI&#039;,
+                &#039;uri&#039; =&gt; isset($_SERVER[&#039;SCRIPT_FILENAME&#039;]) ? realpath($_SERVER[&#039;SCRIPT_FILENAME&#039;]) : null,
+                &#039;ip&#039; =&gt; $ip
+            );
+        } else {
+            $request_variables = array(
+                &#039;method&#039; =&gt; isset($_SERVER[&#039;REQUEST_METHOD&#039;]) ? $_SERVER[&#039;REQUEST_METHOD&#039;] : null,
+                &#039;uri&#039; =&gt; isset($_SERVER[&#039;REQUEST_URI&#039;]) ? $_SERVER[&#039;REQUEST_URI&#039;] : null,
+                &#039;ip&#039; =&gt; isset($_SERVER[&#039;REMOTE_ADDR&#039;]) ? $_SERVER[&#039;REMOTE_ADDR&#039;] : null
+            );
+        }
+        $this-&gt;data = array(
+            &#039;__meta&#039; =&gt; array_merge(
+                array(
+                    &#039;id&#039; =&gt; $this-&gt;getCurrentRequestId(),
+                    &#039;datetime&#039; =&gt; date(&#039;Y-m-d H:i:s&#039;),
+                    &#039;utime&#039; =&gt; microtime(true)
+                ),
+                $request_variables
+            )
+        );
+
+        foreach ($this-&gt;collectors as $name =&gt; $collector) {
+            $this-&gt;data[$name] = $collector-&gt;collect();
+        }
+
+        // Remove all invalid (non UTF-8) characters
+        array_walk_recursive($this-&gt;data, function (&amp;$item) {
+                if (is_string($item) &amp;&amp; !mb_check_encoding($item, &#039;UTF-8&#039;)) {
+                    $item = mb_convert_encoding($item, &#039;UTF-8&#039;, &#039;UTF-8&#039;);
+                }
+            });
+
+        if ($this-&gt;storage !== null) {
+            $this-&gt;storage-&gt;save($this-&gt;getCurrentRequestId(), $this-&gt;data);
+        }
+
+        return $this-&gt;data;
+    }
+
+    /**
+     * Returns collected data
+     *
+     * Will collect the data if none have been collected yet
+     *
+     * @return array
+     */
+    public function getData()
+    {
+        if ($this-&gt;data === null) {
+            $this-&gt;collect();
+        }
+        return $this-&gt;data;
+    }
+
+    /**
+     * Returns an array of HTTP headers containing the data
+     *
+     * @param string $headerName
+     * @param integer $maxHeaderLength
+     * @return array
+     */
+    public function getDataAsHeaders($headerName = &#039;phpdebugbar&#039;, $maxHeaderLength = 4096, $maxTotalHeaderLength = 250000)
+    {
+        $data = rawurlencode(json_encode(array(
+            &#039;id&#039; =&gt; $this-&gt;getCurrentRequestId(),
+            &#039;data&#039; =&gt; $this-&gt;getData()
+        )));
+
+        if (strlen($data) &gt; $maxTotalHeaderLength) {
+            $data = rawurlencode(json_encode(array(
+                &#039;error&#039; =&gt; &#039;Maximum header size exceeded&#039;
+            )));
+        }
+
+        $chunks = array();
+
+        while (strlen($data) &gt; $maxHeaderLength) {
+            $chunks[] = substr($data, 0, $maxHeaderLength);
+            $data = substr($data, $maxHeaderLength);
+        }
+        $chunks[] = $data;
+
+        $headers = array();
+        for ($i = 0, $c = count($chunks); $i &lt; $c; $i++) {
+            $name = $headerName . ($i &gt; 0 ? &quot;-$i&quot; : &#039;&#039;);
+            $headers[$name] = $chunks[$i];
+        }
+
+        return $headers;
+    }
+
+    /**
+     * Sends the data through the HTTP headers
+     *
+     * @param bool $useOpenHandler
+     * @param string $headerName
+     * @param integer $maxHeaderLength
+     * @return $this
+     */
+    public function sendDataInHeaders($useOpenHandler = null, $headerName = &#039;phpdebugbar&#039;, $maxHeaderLength = 4096)
+    {
+        if ($useOpenHandler === null) {
+            $useOpenHandler = self::$useOpenHandlerWhenSendingDataHeaders;
+        }
+        if ($useOpenHandler &amp;&amp; $this-&gt;storage !== null) {
+            $this-&gt;getData();
+            $headerName .= &#039;-id&#039;;
+            $headers = array($headerName =&gt; $this-&gt;getCurrentRequestId());
+        } else {
+            $headers = $this-&gt;getDataAsHeaders($headerName, $maxHeaderLength);
+        }
+        $this-&gt;getHttpDriver()-&gt;setHeaders($headers);
+        return $this;
+    }
+
+    /**
+     * Stacks the data in the session for later rendering
+     */
+    public function stackData()
+    {
+        $http = $this-&gt;initStackSession();
+
+        $data = null;
+        if (!$this-&gt;isDataPersisted() || $this-&gt;stackAlwaysUseSessionStorage) {
+            $data = $this-&gt;getData();
+        } elseif ($this-&gt;data === null) {
+            $this-&gt;collect();
+        }
+
+        $stack = $http-&gt;getSessionValue($this-&gt;stackSessionNamespace);
+        $stack[$this-&gt;getCurrentRequestId()] = $data;
+        $http-&gt;setSessionValue($this-&gt;stackSessionNamespace, $stack);
+        return $this;
+    }
+
+    /**
+     * Checks if there is stacked data in the session
+     *
+     * @return boolean
+     */
+    public function hasStackedData()
+    {
+        try {
+            $http = $this-&gt;initStackSession();
+        } catch (DebugBarException $e) {
+            return false;
+        }
+        return count($http-&gt;getSessionValue($this-&gt;stackSessionNamespace)) &gt; 0;
+    }
+
+    /**
+     * Returns the data stacked in the session
+     *
+     * @param boolean $delete Whether to delete the data in the session
+     * @return array
+     */
+    public function getStackedData($delete = true)
+    {
+        $http = $this-&gt;initStackSession();
+        $stackedData = $http-&gt;getSessionValue($this-&gt;stackSessionNamespace);
+        if ($delete) {
+            $http-&gt;deleteSessionValue($this-&gt;stackSessionNamespace);
+        }
+
+        $datasets = array();
+        if ($this-&gt;isDataPersisted() &amp;&amp; !$this-&gt;stackAlwaysUseSessionStorage) {
+            foreach ($stackedData as $id =&gt; $data) {
+                $datasets[$id] = $this-&gt;getStorage()-&gt;get($id);
+            }
+        } else {
+            $datasets = $stackedData;
+        }
+
+        return array_filter($datasets);
+    }
+
+    /**
+     * Sets the key to use in the $_SESSION array
+     *
+     * @param string $ns
+     * @return $this
+     */
+    public function setStackDataSessionNamespace($ns)
+    {
+        $this-&gt;stackSessionNamespace = $ns;
+        return $this;
+    }
+
+    /**
+     * Returns the key used in the $_SESSION array
+     *
+     * @return string
+     */
+    public function getStackDataSessionNamespace()
+    {
+        return $this-&gt;stackSessionNamespace;
+    }
+
+    /**
+     * Sets whether to only use the session to store stacked data even
+     * if a storage is enabled
+     *
+     * @param boolean $enabled
+     * @return $this
+     */
+    public function setStackAlwaysUseSessionStorage($enabled = true)
+    {
+        $this-&gt;stackAlwaysUseSessionStorage = $enabled;
+        return $this;
+    }
+
+    /**
+     * Checks if the session is always used to store stacked data
+     * even if a storage is enabled
+     *
+     * @return boolean
+     */
+    public function isStackAlwaysUseSessionStorage()
+    {
+        return $this-&gt;stackAlwaysUseSessionStorage;
+    }
+
+    /**
+     * Initializes the session for stacked data
+     * @return HttpDriverInterface
+     * @throws DebugBarException
+     */
+    protected function initStackSession()
+    {
+        $http = $this-&gt;getHttpDriver();
+        if (!$http-&gt;isSessionStarted()) {
+            throw new DebugBarException(&quot;Session must be started before using stack data in the debug bar&quot;);
+        }
+
+        if (!$http-&gt;hasSessionValue($this-&gt;stackSessionNamespace)) {
+            $http-&gt;setSessionValue($this-&gt;stackSessionNamespace, array());
+        }
+
+        return $http;
+    }
+
+    /**
+     * Returns a JavascriptRenderer for this instance
+     * @param string $baseUrl
+     * @param string $basePath
+     * @return JavascriptRenderer
+     */
+    public function getJavascriptRenderer($baseUrl = null, $basePath = null)
+    {
+        if ($this-&gt;jsRenderer === null) {
+            $this-&gt;jsRenderer = new JavascriptRenderer($this, $baseUrl, $basePath);
+        }
+        return $this-&gt;jsRenderer;
+    }
+
+    // --------------------------------------------
+    // ArrayAccess implementation
+
+    #[\ReturnTypeWillChange]
+    public function offsetSet($key, $value)
+    {
+        throw new DebugBarException(&quot;DebugBar[] is read-only&quot;);
+    }
+
+    #[\ReturnTypeWillChange]
+    public function offsetGet($key)
+    {
+        return $this-&gt;getCollector($key);
+    }
+
+    #[\ReturnTypeWillChange]
+    public function offsetExists($key)
+    {
+        return $this-&gt;hasCollector($key);
+    }
+
+    #[\ReturnTypeWillChange]
+    public function offsetUnset($key)
+    {
+        throw new DebugBarException(&quot;DebugBar[] is read-only&quot;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-debugbar/php-debugbar/src/DebugBar/DebugBarException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-debugbar/php-debugbar/src/DebugBar/Bridge -->
+
+</body>
+</html>

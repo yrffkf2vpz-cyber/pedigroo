@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Foundation/Testing/DatabaseTruncation.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Foundation\Testing;
+
+use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Database\ConnectionInterface;
+use Illuminate\Foundation\Testing\Traits\CanConfigureMigrationCommands;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+
+trait DatabaseTruncation
+{
+    use CanConfigureMigrationCommands;
+
+    /**
+     * The cached names of the database tables for each connection.
+     *
+     * @var array
+     */
+    protected static array $allTables;
+
+    /**
+     * Truncate the database tables for all configured connections.
+     *
+     * @return void
+     */
+    protected function truncateDatabaseTables(): void
+    {
+        $this-&gt;beforeTruncatingDatabase();
+
+        // Migrate and seed the database on first run...
+        if (! RefreshDatabaseState::$migrated) {
+            $this-&gt;artisan(&#039;migrate:fresh&#039;, $this-&gt;migrateFreshUsing());
+
+            $this-&gt;app[Kernel::class]-&gt;setArtisan(null);
+
+            RefreshDatabaseState::$migrated = true;
+
+            return;
+        }
+
+        // Always clear any test data on subsequent runs...
+        $this-&gt;truncateTablesForAllConnections();
+
+        if ($seeder = $this-&gt;seeder()) {
+            // Use a specific seeder class...
+            $this-&gt;artisan(&#039;db:seed&#039;, [&#039;--class&#039; =&gt; $seeder]);
+        } elseif ($this-&gt;shouldSeed()) {
+            // Use the default seeder class...
+            $this-&gt;artisan(&#039;db:seed&#039;);
+        }
+
+        $this-&gt;afterTruncatingDatabase();
+    }
+
+    /**
+     * Truncate the database tables for all configured connections.
+     *
+     * @return void
+     */
+    protected function truncateTablesForAllConnections(): void
+    {
+        $database = $this-&gt;app-&gt;make(&#039;db&#039;);
+
+        (new Collection($this-&gt;connectionsToTruncate()))
+            -&gt;each(function ($name) use ($database) {
+                $connection = $database-&gt;connection($name);
+
+                $connection-&gt;getSchemaBuilder()-&gt;withoutForeignKeyConstraints(
+                    fn () =&gt; $this-&gt;truncateTablesForConnection($connection, $name)
+                );
+            });
+    }
+
+    /**
+     * Truncate the database tables for the given database connection.
+     *
+     * @param  \Illuminate\Database\ConnectionInterface  $connection
+     * @param  string|null  $name
+     * @return void
+     */
+    protected function truncateTablesForConnection(ConnectionInterface $connection, ?string $name): void
+    {
+        $dispatcher = $connection-&gt;getEventDispatcher();
+
+        $connection-&gt;unsetEventDispatcher();
+
+        (new Collection($this-&gt;getAllTablesForConnection($connection, $name)))
+            -&gt;when(
+                $this-&gt;tablesToTruncate($connection, $name),
+                function (Collection $tables, array $tablesToTruncate) {
+                    return $tables-&gt;filter(fn (array $table) =&gt; $this-&gt;tableExistsIn($table, $tablesToTruncate));
+                },
+                function (Collection $tables) use ($connection, $name) {
+                    $exceptTables = $this-&gt;exceptTables($connection, $name);
+
+                    return $tables-&gt;reject(fn (array $table) =&gt; $this-&gt;tableExistsIn($table, $exceptTables));
+                }
+            )
+            -&gt;each(function (array $table) use ($connection) {
+                $connection-&gt;withoutTablePrefix(function ($connection) use ($table) {
+                    $table = $connection-&gt;table($table[&#039;schema_qualified_name&#039;]);
+
+                    if ($table-&gt;exists()) {
+                        $table-&gt;truncate();
+                    }
+                });
+            });
+
+        $connection-&gt;setEventDispatcher($dispatcher);
+    }
+
+    /**
+     * Get all the tables that belong to the connection.
+     */
+    protected function getAllTablesForConnection(ConnectionInterface $connection, ?string $name): array
+    {
+        if (isset(static::$allTables[$name])) {
+            return static::$allTables[$name];
+        }
+
+        $schema = $connection-&gt;getSchemaBuilder();
+
+        return static::$allTables[$name] = Arr::from($schema-&gt;getTables($schema-&gt;getCurrentSchemaListing()));
+    }
+
+    /**
+     * Determine if a table exists in the given list, with or without its schema.
+     */
+    protected function tableExistsIn(array $table, array $tables): bool
+    {
+        return $table[&#039;schema&#039;]
+            ? ! empty(array_intersect([$table[&#039;name&#039;], $table[&#039;schema_qualified_name&#039;]], $tables))
+            : in_array($table[&#039;name&#039;], $tables);
+    }
+
+    /**
+     * The database connections that should have their tables truncated.
+     *
+     * @return array
+     */
+    protected function connectionsToTruncate(): array
+    {
+        return property_exists($this, &#039;connectionsToTruncate&#039;)
+            ? $this-&gt;connectionsToTruncate
+            : [null];
+    }
+
+    /**
+     * Get the tables that should be truncated.
+     */
+    protected function tablesToTruncate(ConnectionInterface $connection, ?string $connectionName): ?array
+    {
+        return property_exists($this, &#039;tablesToTruncate&#039;) &amp;&amp; is_array($this-&gt;tablesToTruncate)
+            ? $this-&gt;tablesToTruncate[$connectionName] ?? $this-&gt;tablesToTruncate
+            : null;
+    }
+
+    /**
+     * Get the tables that should not be truncated.
+     */
+    protected function exceptTables(ConnectionInterface $connection, ?string $connectionName): array
+    {
+        $migrations = $this-&gt;app[&#039;config&#039;]-&gt;get(&#039;database.migrations&#039;);
+
+        $migrationsTable = is_array($migrations) ? ($migrations[&#039;table&#039;] ?? &#039;migrations&#039;) : $migrations;
+        $migrationsTable = $connection-&gt;getTablePrefix().$migrationsTable;
+
+        return property_exists($this, &#039;exceptTables&#039;) &amp;&amp; is_array($this-&gt;exceptTables)
+            ? array_merge(
+                $this-&gt;exceptTables[$connectionName] ?? $this-&gt;exceptTables,
+                [$migrationsTable],
+            )
+            : [$migrationsTable];
+    }
+
+    /**
+     * Perform any work that should take place before the database has started truncating.
+     *
+     * @return void
+     */
+    protected function beforeTruncatingDatabase(): void
+    {
+        //
+    }
+
+    /**
+     * Perform any work that should take place once the database has finished truncating.
+     *
+     * @return void
+     */
+    protected function afterTruncatingDatabase(): void
+    {
+        //
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Foundation/Testing/LazilyRefreshDatabase.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Foundation/Testing/Concerns -->
+
+</body>
+</html>

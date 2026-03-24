@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Connection/StreamConnection.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Connection;
+
+use InvalidArgumentException;
+use Predis\Command\CommandInterface;
+use Predis\Response\Error as ErrorResponse;
+use Predis\Response\ErrorInterface as ErrorResponseInterface;
+use Predis\Response\Status as StatusResponse;
+
+/**
+ * Standard connection to Redis servers implemented on top of PHP&#039;s streams.
+ * The connection parameters supported by this class are:.
+ *
+ *  - scheme: it can be either &#039;redis&#039;, &#039;tcp&#039;, &#039;rediss&#039;, &#039;tls&#039; or &#039;unix&#039;.
+ *  - host: hostname or IP address of the server.
+ *  - port: TCP port of the server.
+ *  - path: path of a UNIX domain socket when scheme is &#039;unix&#039;.
+ *  - timeout: timeout to perform the connection (default is 5 seconds).
+ *  - read_write_timeout: timeout of read / write operations.
+ *  - async_connect: performs the connection asynchronously.
+ *  - tcp_nodelay: enables or disables Nagle&#039;s algorithm for coalescing.
+ *  - persistent: the connection is left intact after a GC collection.
+ *  - ssl: context options array (see http://php.net/manual/en/context.ssl.php)
+ */
+class StreamConnection extends AbstractConnection
+{
+    /**
+     * @param ParametersInterface $parameters
+     */
+    public function __construct(ParametersInterface $parameters)
+    {
+        parent::__construct($parameters);
+    }
+
+    /**
+     * Disconnects from the server and destroys the underlying resource when the
+     * garbage collector kicks in only if the connection has not been marked as
+     * persistent.
+     */
+    public function __destruct()
+    {
+        if (isset($this-&gt;parameters-&gt;persistent) &amp;&amp; $this-&gt;parameters-&gt;persistent) {
+            return;
+        }
+
+        $this-&gt;disconnect();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function assertParameters(ParametersInterface $parameters)
+    {
+        switch ($parameters-&gt;scheme) {
+            case &#039;tcp&#039;:
+            case &#039;redis&#039;:
+            case &#039;unix&#039;:
+            case &#039;tls&#039;:
+            case &#039;rediss&#039;:
+                break;
+
+            default:
+                throw new InvalidArgumentException(&quot;Invalid scheme: &#039;$parameters-&gt;scheme&#039;.&quot;);
+        }
+
+        return $parameters;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function createResource()
+    {
+        switch ($this-&gt;parameters-&gt;scheme) {
+            case &#039;tcp&#039;:
+            case &#039;redis&#039;:
+                return $this-&gt;tcpStreamInitializer($this-&gt;parameters);
+
+            case &#039;unix&#039;:
+                return $this-&gt;unixStreamInitializer($this-&gt;parameters);
+
+            case &#039;tls&#039;:
+            case &#039;rediss&#039;:
+                return $this-&gt;tlsStreamInitializer($this-&gt;parameters);
+
+            default:
+                throw new InvalidArgumentException(&quot;Invalid scheme: &#039;{$this-&gt;parameters-&gt;scheme}&#039;.&quot;);
+        }
+    }
+
+    /**
+     * Creates a connected stream socket resource.
+     *
+     * @param ParametersInterface $parameters Connection parameters.
+     * @param string              $address    Address for stream_socket_client().
+     * @param int                 $flags      Flags for stream_socket_client().
+     *
+     * @return resource
+     */
+    protected function createStreamSocket(ParametersInterface $parameters, $address, $flags)
+    {
+        $timeout = (isset($parameters-&gt;timeout) ? (float) $parameters-&gt;timeout : 5.0);
+        $context = stream_context_create([&#039;socket&#039; =&gt; [&#039;tcp_nodelay&#039; =&gt; (bool) $parameters-&gt;tcp_nodelay]]);
+
+        if (
+            (isset($parameters-&gt;persistent) &amp;&amp; $parameters-&gt;persistent)
+            &amp;&amp; (isset($parameters-&gt;conn_uid) &amp;&amp; $parameters-&gt;conn_uid)
+        ) {
+            $conn_uid = &#039;/&#039; . $parameters-&gt;conn_uid;
+        } else {
+            $conn_uid = &#039;&#039;;
+        }
+
+        // Needs to create multiple persistent connections to the same resource
+        $address = $address . $conn_uid;
+
+        if (!$resource = @stream_socket_client($address, $errno, $errstr, $timeout, $flags, $context)) {
+            $this-&gt;onConnectionError(trim($errstr), $errno);
+        }
+
+        if (isset($parameters-&gt;read_write_timeout)) {
+            $rwtimeout = (float) $parameters-&gt;read_write_timeout;
+            $rwtimeout = $rwtimeout &gt; 0 ? $rwtimeout : -1;
+            $timeoutSeconds = floor($rwtimeout);
+            $timeoutUSeconds = ($rwtimeout - $timeoutSeconds) * 1000000;
+            stream_set_timeout($resource, $timeoutSeconds, $timeoutUSeconds);
+        }
+
+        return $resource;
+    }
+
+    /**
+     * Initializes a TCP stream resource.
+     *
+     * @param ParametersInterface $parameters Initialization parameters for the connection.
+     *
+     * @return resource
+     */
+    protected function tcpStreamInitializer(ParametersInterface $parameters)
+    {
+        if (!filter_var($parameters-&gt;host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            $address = &quot;tcp://$parameters-&gt;host:$parameters-&gt;port&quot;;
+        } else {
+            $address = &quot;tcp://[$parameters-&gt;host]:$parameters-&gt;port&quot;;
+        }
+
+        $flags = STREAM_CLIENT_CONNECT;
+
+        if (isset($parameters-&gt;async_connect) &amp;&amp; $parameters-&gt;async_connect) {
+            $flags |= STREAM_CLIENT_ASYNC_CONNECT;
+        }
+
+        if (isset($parameters-&gt;persistent)) {
+            if (false !== $persistent = filter_var($parameters-&gt;persistent, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE)) {
+                $flags |= STREAM_CLIENT_PERSISTENT;
+
+                if ($persistent === null) {
+                    $address = &quot;{$address}/{$parameters-&gt;persistent}&quot;;
+                }
+            }
+        }
+
+        return $this-&gt;createStreamSocket($parameters, $address, $flags);
+    }
+
+    /**
+     * Initializes a UNIX stream resource.
+     *
+     * @param ParametersInterface $parameters Initialization parameters for the connection.
+     *
+     * @return resource
+     */
+    protected function unixStreamInitializer(ParametersInterface $parameters)
+    {
+        if (!isset($parameters-&gt;path)) {
+            throw new InvalidArgumentException(&#039;Missing UNIX domain socket path.&#039;);
+        }
+
+        $flags = STREAM_CLIENT_CONNECT;
+
+        if (isset($parameters-&gt;persistent)) {
+            if (false !== $persistent = filter_var($parameters-&gt;persistent, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE)) {
+                $flags |= STREAM_CLIENT_PERSISTENT;
+
+                if ($persistent === null) {
+                    throw new InvalidArgumentException(
+                        &#039;Persistent connection IDs are not supported when using UNIX domain sockets.&#039;
+                    );
+                }
+            }
+        }
+
+        return $this-&gt;createStreamSocket($parameters, &quot;unix://{$parameters-&gt;path}&quot;, $flags);
+    }
+
+    /**
+     * Initializes a SSL-encrypted TCP stream resource.
+     *
+     * @param ParametersInterface $parameters Initialization parameters for the connection.
+     *
+     * @return resource
+     */
+    protected function tlsStreamInitializer(ParametersInterface $parameters)
+    {
+        $resource = $this-&gt;tcpStreamInitializer($parameters);
+        $metadata = stream_get_meta_data($resource);
+
+        // Detect if crypto mode is already enabled for this stream (PHP &gt;= 7.0.0).
+        if (isset($metadata[&#039;crypto&#039;])) {
+            return $resource;
+        }
+
+        if (isset($parameters-&gt;ssl) &amp;&amp; is_array($parameters-&gt;ssl)) {
+            $options = $parameters-&gt;ssl;
+        } else {
+            $options = [];
+        }
+
+        if (!isset($options[&#039;crypto_type&#039;])) {
+            $options[&#039;crypto_type&#039;] = STREAM_CRYPTO_METHOD_TLS_CLIENT;
+        }
+
+        $context_options = function_exists(&#039;stream_context_set_options&#039;)
+            ? stream_context_set_options($resource, [&#039;ssl&#039; =&gt; $options])
+            : stream_context_set_option($resource, [&#039;ssl&#039; =&gt; $options]);
+
+        if (!$context_options) {
+            $this-&gt;onConnectionError(&#039;Error while setting SSL context options&#039;);
+        }
+
+        if (!stream_socket_enable_crypto($resource, true, $options[&#039;crypto_type&#039;])) {
+            $this-&gt;onConnectionError(&#039;Error while switching to encrypted communication&#039;);
+        }
+
+        return $resource;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function connect()
+    {
+        if (parent::connect() &amp;&amp; $this-&gt;initCommands) {
+            foreach ($this-&gt;initCommands as $command) {
+                $response = $this-&gt;executeCommand($command);
+
+                if ($response instanceof ErrorResponseInterface &amp;&amp; $command-&gt;getId() === &#039;CLIENT&#039;) {
+                    // Do nothing on CLIENT SETINFO command failure
+                } elseif ($response instanceof ErrorResponseInterface) {
+                    $this-&gt;onConnectionError(&quot;`{$command-&gt;getId()}` failed: {$response-&gt;getMessage()}&quot;, 0);
+                }
+            }
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function disconnect()
+    {
+        if ($this-&gt;isConnected()) {
+            $resource = $this-&gt;getResource();
+            if (is_resource($resource)) {
+                fclose($resource);
+            }
+            parent::disconnect();
+        }
+    }
+
+    /**
+     * Performs a write operation over the stream of the buffer containing a
+     * command serialized with the Redis wire protocol.
+     *
+     * @param string $buffer Representation of a command in the Redis wire protocol.
+     */
+    protected function write($buffer)
+    {
+        $socket = $this-&gt;getResource();
+
+        while (($length = strlen($buffer)) &gt; 0) {
+            $written = is_resource($socket) ? @fwrite($socket, $buffer) : false;
+
+            if ($length === $written) {
+                return;
+            }
+
+            if ($written === false || $written === 0) {
+                $this-&gt;onConnectionError(&#039;Error while writing bytes to the server.&#039;);
+            }
+
+            $buffer = substr($buffer, $written);
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function read()
+    {
+        $socket = $this-&gt;getResource();
+        $chunk = fgets($socket);
+
+        if ($chunk === false || $chunk === &#039;&#039;) {
+            $this-&gt;onConnectionError(&#039;Error while reading line from the server.&#039;);
+        }
+
+        $prefix = $chunk[0];
+        $payload = substr($chunk, 1, -2);
+
+        switch ($prefix) {
+            case &#039;+&#039;:
+                return StatusResponse::get($payload);
+
+            case &#039;$&#039;:
+                $size = (int) $payload;
+
+                if ($size === -1) {
+                    return;
+                }
+
+                $bulkData = &#039;&#039;;
+                $bytesLeft = ($size += 2);
+
+                do {
+                    $chunk = is_resource($socket) ? fread($socket, min($bytesLeft, 4096)) : false;
+
+                    if ($chunk === false || $chunk === &#039;&#039;) {
+                        $this-&gt;onConnectionError(&#039;Error while reading bytes from the server.&#039;);
+                    }
+
+                    $bulkData .= $chunk;
+                    $bytesLeft = $size - strlen($bulkData);
+                } while ($bytesLeft &gt; 0);
+
+                return substr($bulkData, 0, -2);
+
+            case &#039;*&#039;:
+                $count = (int) $payload;
+
+                if ($count === -1) {
+                    return;
+                }
+
+                $multibulk = [];
+
+                for ($i = 0; $i &lt; $count; ++$i) {
+                    $multibulk[$i] = $this-&gt;read();
+                }
+
+                return $multibulk;
+
+            case &#039;:&#039;:
+                $integer = (int) $payload;
+
+                return $integer == $payload ? $integer : $payload;
+
+            case &#039;-&#039;:
+                return new ErrorResponse($payload);
+
+            default:
+                $this-&gt;onProtocolError(&quot;Unknown response prefix: &#039;$prefix&#039;.&quot;);
+
+                return;
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function writeRequest(CommandInterface $command)
+    {
+        $commandID = $command-&gt;getId();
+        $arguments = $command-&gt;getArguments();
+
+        $cmdlen = strlen($commandID);
+        $reqlen = count($arguments) + 1;
+
+        $buffer = &quot;*{$reqlen}\r\n\${$cmdlen}\r\n{$commandID}\r\n&quot;;
+
+        foreach ($arguments as $argument) {
+            $arglen = strlen(strval($argument));
+            $buffer .= &quot;\${$arglen}\r\n{$argument}\r\n&quot;;
+        }
+
+        $this-&gt;write($buffer);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Connection/WebdisConnection.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Connection/Cluster -->
+
+</body>
+</html>

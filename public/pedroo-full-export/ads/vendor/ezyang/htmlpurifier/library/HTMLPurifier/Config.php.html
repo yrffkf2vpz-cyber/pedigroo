@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/ezyang/htmlpurifier/library/HTMLPurifier/Config.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Configuration object that triggers customizable behavior.
+ *
+ * @warning This class is strongly defined: that means that the class
+ *          will fail if an undefined directive is retrieved or set.
+ *
+ * @note Many classes that could (although many times don&#039;t) use the
+ *       configuration object make it a mandatory parameter.  This is
+ *       because a configuration object should always be forwarded,
+ *       otherwise, you run the risk of missing a parameter and then
+ *       being stumped when a configuration directive doesn&#039;t work.
+ *
+ * @todo Reconsider some of the public member variables
+ */
+class HTMLPurifier_Config
+{
+
+    /**
+     * HTML Purifier&#039;s version
+     * @type string
+     */
+    public $version = &#039;4.19.0&#039;;
+
+    /**
+     * Whether or not to automatically finalize
+     * the object if a read operation is done.
+     * @type bool
+     */
+    public $autoFinalize = true;
+
+    // protected member variables
+
+    /**
+     * Namespace indexed array of serials for specific namespaces.
+     * @see getSerial() for more info.
+     * @type string[]
+     */
+    protected $serials = array();
+
+    /**
+     * Serial for entire configuration object.
+     * @type string
+     */
+    protected $serial;
+
+    /**
+     * Parser for variables.
+     * @type HTMLPurifier_VarParser_Flexible
+     */
+    protected $parser = null;
+
+    /**
+     * Reference HTMLPurifier_ConfigSchema for value checking.
+     * @type HTMLPurifier_ConfigSchema
+     * @note This is public for introspective purposes. Please don&#039;t
+     *       abuse!
+     */
+    public $def;
+
+    /**
+     * Indexed array of definitions.
+     * @type HTMLPurifier_Definition[]
+     */
+    protected $definitions;
+
+    /**
+     * Whether or not config is finalized.
+     * @type bool
+     */
+    protected $finalized = false;
+
+    /**
+     * Property list containing configuration directives.
+     * @type array
+     */
+    protected $plist;
+
+    /**
+     * Whether or not a set is taking place due to an alias lookup.
+     * @type bool
+     */
+    private $aliasMode;
+
+    /**
+     * Set to false if you do not want line and file numbers in errors.
+     * (useful when unit testing).  This will also compress some errors
+     * and exceptions.
+     * @type bool
+     */
+    public $chatty = true;
+
+    /**
+     * Current lock; only gets to this namespace are allowed.
+     * @type string
+     */
+    private $lock;
+
+    /**
+     * Constructor
+     * @param HTMLPurifier_ConfigSchema $definition ConfigSchema that defines
+     * what directives are allowed.
+     * @param HTMLPurifier_PropertyList $parent
+     */
+    public function __construct($definition, $parent = null)
+    {
+        $parent = $parent ? $parent : $definition-&gt;defaultPlist;
+        $this-&gt;plist = new HTMLPurifier_PropertyList($parent);
+        $this-&gt;def = $definition; // keep a copy around for checking
+        $this-&gt;parser = new HTMLPurifier_VarParser_Flexible();
+    }
+
+    /**
+     * Convenience constructor that creates a config object based on a mixed var
+     * @param mixed $config Variable that defines the state of the config
+     *                      object. Can be: a HTMLPurifier_Config() object,
+     *                      an array of directives based on loadArray(),
+     *                      or a string filename of an ini file.
+     * @param HTMLPurifier_ConfigSchema $schema Schema object
+     * @return HTMLPurifier_Config Configured object
+     */
+    public static function create($config, $schema = null)
+    {
+        if ($config instanceof HTMLPurifier_Config) {
+            // pass-through
+            return $config;
+        }
+        if (!$schema) {
+            $ret = HTMLPurifier_Config::createDefault();
+        } else {
+            $ret = new HTMLPurifier_Config($schema);
+        }
+        if (is_string($config)) {
+            $ret-&gt;loadIni($config);
+        } elseif (is_array($config)) $ret-&gt;loadArray($config);
+        return $ret;
+    }
+
+    /**
+     * Creates a new config object that inherits from a previous one.
+     * @param HTMLPurifier_Config $config Configuration object to inherit from.
+     * @return HTMLPurifier_Config object with $config as its parent.
+     */
+    public static function inherit(HTMLPurifier_Config $config)
+    {
+        return new HTMLPurifier_Config($config-&gt;def, $config-&gt;plist);
+    }
+
+    /**
+     * Convenience constructor that creates a default configuration object.
+     * @return HTMLPurifier_Config default object.
+     */
+    public static function createDefault()
+    {
+        $definition = HTMLPurifier_ConfigSchema::instance();
+        $config = new HTMLPurifier_Config($definition);
+        return $config;
+    }
+
+    /**
+     * Retrieves a value from the configuration.
+     *
+     * @param string $key String key
+     * @param mixed $a
+     *
+     * @return mixed
+     */
+    public function get($key, $a = null)
+    {
+        if ($a !== null) {
+            $this-&gt;triggerError(
+                &quot;Using deprecated API: use \$config-&gt;get(&#039;$key.$a&#039;) instead&quot;,
+                E_USER_WARNING
+            );
+            $key = &quot;$key.$a&quot;;
+        }
+        if (!$this-&gt;finalized) {
+            $this-&gt;autoFinalize();
+        }
+        if (!isset($this-&gt;def-&gt;info[$key])) {
+            // can&#039;t add % due to SimpleTest bug
+            $this-&gt;triggerError(
+                &#039;Cannot retrieve value of undefined directive &#039; . htmlspecialchars($key),
+                E_USER_WARNING
+            );
+            return;
+        }
+        if (isset($this-&gt;def-&gt;info[$key]-&gt;isAlias)) {
+            $d = $this-&gt;def-&gt;info[$key];
+            $this-&gt;triggerError(
+                &#039;Cannot get value from aliased directive, use real name &#039; . $d-&gt;key,
+                E_USER_ERROR
+            );
+            return;
+        }
+        if ($this-&gt;lock) {
+            list($ns) = explode(&#039;.&#039;, $key);
+            if ($ns !== $this-&gt;lock) {
+                $this-&gt;triggerError(
+                    &#039;Cannot get value of namespace &#039; . $ns . &#039; when lock for &#039; .
+                    $this-&gt;lock .
+                    &#039; is active, this probably indicates a Definition setup method &#039; .
+                    &#039;is accessing directives that are not within its namespace&#039;,
+                    E_USER_ERROR
+                );
+                return;
+            }
+        }
+        return $this-&gt;plist-&gt;get($key);
+    }
+
+    /**
+     * Retrieves an array of directives to values from a given namespace
+     *
+     * @param string $namespace String namespace
+     *
+     * @return array
+     */
+    public function getBatch($namespace)
+    {
+        if (!$this-&gt;finalized) {
+            $this-&gt;autoFinalize();
+        }
+        $full = $this-&gt;getAll();
+        if (!isset($full[$namespace])) {
+            $this-&gt;triggerError(
+                &#039;Cannot retrieve undefined namespace &#039; .
+                htmlspecialchars($namespace),
+                E_USER_WARNING
+            );
+            return;
+        }
+        return $full[$namespace];
+    }
+
+    /**
+     * Returns a SHA-1 signature of a segment of the configuration object
+     * that uniquely identifies that particular configuration
+     *
+     * @param string $namespace Namespace to get serial for
+     *
+     * @return string
+     * @note Revision is handled specially and is removed from the batch
+     *       before processing!
+     */
+    public function getBatchSerial($namespace)
+    {
+        if (empty($this-&gt;serials[$namespace])) {
+            $batch = $this-&gt;getBatch($namespace);
+            unset($batch[&#039;DefinitionRev&#039;]);
+            $this-&gt;serials[$namespace] = sha1(serialize($batch));
+        }
+        return $this-&gt;serials[$namespace];
+    }
+
+    /**
+     * Returns a SHA-1 signature for the entire configuration object
+     * that uniquely identifies that particular configuration
+     *
+     * @return string
+     */
+    public function getSerial()
+    {
+        if (empty($this-&gt;serial)) {
+            $this-&gt;serial = sha1(serialize($this-&gt;getAll()));
+        }
+        return $this-&gt;serial;
+    }
+
+    /**
+     * Retrieves all directives, organized by namespace
+     *
+     * @warning This is a pretty inefficient function, avoid if you can
+     */
+    public function getAll()
+    {
+        if (!$this-&gt;finalized) {
+            $this-&gt;autoFinalize();
+        }
+        $ret = array();
+        foreach ($this-&gt;plist-&gt;squash() as $name =&gt; $value) {
+            list($ns, $key) = explode(&#039;.&#039;, $name, 2);
+            $ret[$ns][$key] = $value;
+        }
+        return $ret;
+    }
+
+    /**
+     * Sets a value to configuration.
+     *
+     * @param string $key key
+     * @param mixed $value value
+     * @param mixed $a
+     */
+    public function set($key, $value, $a = null)
+    {
+        if (strpos($key, &#039;.&#039;) === false) {
+            $namespace = $key;
+            $directive = $value;
+            $value = $a;
+            $key = &quot;$key.$directive&quot;;
+            $this-&gt;triggerError(&quot;Using deprecated API: use \$config-&gt;set(&#039;$key&#039;, ...) instead&quot;, E_USER_NOTICE);
+        } else {
+            list($namespace) = explode(&#039;.&#039;, $key);
+        }
+        if ($this-&gt;isFinalized(&#039;Cannot set directive after finalization&#039;)) {
+            return;
+        }
+        if (!isset($this-&gt;def-&gt;info[$key])) {
+            $this-&gt;triggerError(
+                &#039;Cannot set undefined directive &#039; . htmlspecialchars($key) . &#039; to value&#039;,
+                E_USER_WARNING
+            );
+            return;
+        }
+        $def = $this-&gt;def-&gt;info[$key];
+
+        if (isset($def-&gt;isAlias)) {
+            if ($this-&gt;aliasMode) {
+                $this-&gt;triggerError(
+                    &#039;Double-aliases not allowed, please fix &#039;.
+                    &#039;ConfigSchema bug with&#039; . $key,
+                    E_USER_ERROR
+                );
+                return;
+            }
+            $this-&gt;aliasMode = true;
+            $this-&gt;set($def-&gt;key, $value);
+            $this-&gt;aliasMode = false;
+            $this-&gt;triggerError(&quot;$key is an alias, preferred directive name is {$def-&gt;key}&quot;, E_USER_NOTICE);
+            return;
+        }
+
+        // Raw type might be negative when using the fully optimized form
+        // of stdClass, which indicates allow_null == true
+        $rtype = is_int($def) ? $def : $def-&gt;type;
+        if ($rtype &lt; 0) {
+            $type = -$rtype;
+            $allow_null = true;
+        } else {
+            $type = $rtype;
+            $allow_null = isset($def-&gt;allow_null);
+        }
+
+        try {
+            $value = $this-&gt;parser-&gt;parse($value, $type, $allow_null);
+        } catch (HTMLPurifier_VarParserException $e) {
+            $this-&gt;triggerError(
+                &#039;Value for &#039; . $key . &#039; is of invalid type, should be &#039; .
+                HTMLPurifier_VarParser::getTypeName($type),
+                E_USER_WARNING
+            );
+            return;
+        }
+        if (is_string($value) &amp;&amp; is_object($def)) {
+            // resolve value alias if defined
+            if (isset($def-&gt;aliases[$value])) {
+                $value = $def-&gt;aliases[$value];
+            }
+            // check to see if the value is allowed
+            if (isset($def-&gt;allowed) &amp;&amp; !isset($def-&gt;allowed[$value])) {
+                $this-&gt;triggerError(
+                    &#039;Value not supported, valid values are: &#039; .
+                    $this-&gt;_listify($def-&gt;allowed),
+                    E_USER_WARNING
+                );
+                return;
+            }
+        }
+        $this-&gt;plist-&gt;set($key, $value);
+
+        // reset definitions if the directives they depend on changed
+        // this is a very costly process, so it&#039;s discouraged
+        // with finalization
+        if ($namespace == &#039;HTML&#039; || $namespace == &#039;CSS&#039; || $namespace == &#039;URI&#039;) {
+            $this-&gt;definitions[$namespace] = null;
+        }
+
+        $this-&gt;serials[$namespace] = false;
+    }
+
+    /**
+     * Convenience function for error reporting
+     *
+     * @param array $lookup
+     *
+     * @return string
+     */
+    private function _listify($lookup)
+    {
+        $list = array();
+        foreach ($lookup as $name =&gt; $b) {
+            $list[] = $name;
+        }
+        return implode(&#039;, &#039;, $list);
+    }
+
+    /**
+     * Retrieves object reference to the HTML definition.
+     *
+     * @param bool $raw Return a copy that has not been setup yet. Must be
+     *             called before it&#039;s been setup, otherwise won&#039;t work.
+     * @param bool $optimized If true, this method may return null, to
+     *             indicate that a cached version of the modified
+     *             definition object is available and no further edits
+     *             are necessary.  Consider using
+     *             maybeGetRawHTMLDefinition, which is more explicitly
+     *             named, instead.
+     *
+     * @return HTMLPurifier_HTMLDefinition|null
+     */
+    public function getHTMLDefinition($raw = false, $optimized = false)
+    {
+        return $this-&gt;getDefinition(&#039;HTML&#039;, $raw, $optimized);
+    }
+
+    /**
+     * Retrieves object reference to the CSS definition
+     *
+     * @param bool $raw Return a copy that has not been setup yet. Must be
+     *             called before it&#039;s been setup, otherwise won&#039;t work.
+     * @param bool $optimized If true, this method may return null, to
+     *             indicate that a cached version of the modified
+     *             definition object is available and no further edits
+     *             are necessary.  Consider using
+     *             maybeGetRawCSSDefinition, which is more explicitly
+     *             named, instead.
+     *
+     * @return HTMLPurifier_CSSDefinition|null
+     */
+    public function getCSSDefinition($raw = false, $optimized = false)
+    {
+        return $this-&gt;getDefinition(&#039;CSS&#039;, $raw, $optimized);
+    }
+
+    /**
+     * Retrieves object reference to the URI definition
+     *
+     * @param bool $raw Return a copy that has not been setup yet. Must be
+     *             called before it&#039;s been setup, otherwise won&#039;t work.
+     * @param bool $optimized If true, this method may return null, to
+     *             indicate that a cached version of the modified
+     *             definition object is available and no further edits
+     *             are necessary.  Consider using
+     *             maybeGetRawURIDefinition, which is more explicitly
+     *             named, instead.
+     *
+     * @return HTMLPurifier_URIDefinition|null
+     */
+    public function getURIDefinition($raw = false, $optimized = false)
+    {
+        return $this-&gt;getDefinition(&#039;URI&#039;, $raw, $optimized);
+    }
+
+    /**
+     * Retrieves a definition
+     *
+     * @param string $type Type of definition: HTML, CSS, etc
+     * @param bool $raw Whether or not definition should be returned raw
+     * @param bool $optimized Only has an effect when $raw is true.  Whether
+     *        or not to return null if the result is already present in
+     *        the cache.  This is off by default for backwards
+     *        compatibility reasons, but you need to do things this
+     *        way in order to ensure that caching is done properly.
+     *        Check out enduser-customize.html for more details.
+     *        We probably won&#039;t ever change this default, as much as the
+     *        maybe semantics is the &quot;right thing to do.&quot;
+     *
+     * @throws HTMLPurifier_Exception
+     * @return HTMLPurifier_Definition|null
+     */
+    public function getDefinition($type, $raw = false, $optimized = false)
+    {
+        if ($optimized &amp;&amp; !$raw) {
+            throw new HTMLPurifier_Exception(&quot;Cannot set optimized = true when raw = false&quot;);
+        }
+        if (!$this-&gt;finalized) {
+            $this-&gt;autoFinalize();
+        }
+        // temporarily suspend locks, so we can handle recursive definition calls
+        $lock = $this-&gt;lock;
+        $this-&gt;lock = null;
+        $factory = HTMLPurifier_DefinitionCacheFactory::instance();
+        $cache = $factory-&gt;create($type, $this);
+        $this-&gt;lock = $lock;
+        if (!$raw) {
+            // full definition
+            // ---------------
+            // check if definition is in memory
+            if (!empty($this-&gt;definitions[$type])) {
+                $def = $this-&gt;definitions[$type];
+                // check if the definition is setup
+                if ($def-&gt;setup) {
+                    return $def;
+                } else {
+                    $def-&gt;setup($this);
+                    if ($def-&gt;optimized) {
+                        $cache-&gt;add($def, $this);
+                    }
+                    return $def;
+                }
+            }
+            // check if definition is in cache
+            $def = $cache-&gt;get($this);
+            if ($def) {
+                // definition in cache, save to memory and return it
+                $this-&gt;definitions[$type] = $def;
+                return $def;
+            }
+            // initialize it
+            $def = $this-&gt;initDefinition($type);
+            // set it up
+            $this-&gt;lock = $type;
+            $def-&gt;setup($this);
+            $this-&gt;lock = null;
+            // save in cache
+            $cache-&gt;add($def, $this);
+            // return it
+            return $def;
+        } else {
+            // raw definition
+            // --------------
+            // check preconditions
+            $def = null;
+            if ($optimized) {
+                if (is_null($this-&gt;get($type . &#039;.DefinitionID&#039;))) {
+                    // fatally error out if definition ID not set
+                    throw new HTMLPurifier_Exception(
+                        &quot;Cannot retrieve raw version without specifying %$type.DefinitionID&quot;
+                    );
+                }
+            }
+            if (!empty($this-&gt;definitions[$type])) {
+                $def = $this-&gt;definitions[$type];
+                if ($def-&gt;setup &amp;&amp; !$optimized) {
+                    $extra = $this-&gt;chatty ?
+                        &quot; (try moving this code block earlier in your initialization)&quot; :
+                        &quot;&quot;;
+                    throw new HTMLPurifier_Exception(
+                        &quot;Cannot retrieve raw definition after it has already been setup&quot; .
+                        $extra
+                    );
+                }
+                if ($def-&gt;optimized === null) {
+                    $extra = $this-&gt;chatty ? &quot; (try flushing your cache)&quot; : &quot;&quot;;
+                    throw new HTMLPurifier_Exception(
+                        &quot;Optimization status of definition is unknown&quot; . $extra
+                    );
+                }
+                if ($def-&gt;optimized !== $optimized) {
+                    $msg = $optimized ? &quot;optimized&quot; : &quot;unoptimized&quot;;
+                    $extra = $this-&gt;chatty ?
+                        &quot; (this backtrace is for the first inconsistent call, which was for a $msg raw definition)&quot;
+                        : &quot;&quot;;
+                    throw new HTMLPurifier_Exception(
+                        &quot;Inconsistent use of optimized and unoptimized raw definition retrievals&quot; . $extra
+                    );
+                }
+            }
+            // check if definition was in memory
+            if ($def) {
+                if ($def-&gt;setup) {
+                    // invariant: $optimized === true (checked above)
+                    return null;
+                } else {
+                    return $def;
+                }
+            }
+            // if optimized, check if definition was in cache
+            // (because we do the memory check first, this formulation
+            // is prone to cache slamming, but I think
+            // guaranteeing that either /all/ of the raw
+            // setup code or /none/ of it is run is more important.)
+            if ($optimized) {
+                // This code path only gets run once; once we put
+                // something in $definitions (which is guaranteed by the
+                // trailing code), we always short-circuit above.
+                $def = $cache-&gt;get($this);
+                if ($def) {
+                    // save the full definition for later, but don&#039;t
+                    // return it yet
+                    $this-&gt;definitions[$type] = $def;
+                    return null;
+                }
+            }
+            // check invariants for creation
+            if (!$optimized) {
+                if (!is_null($this-&gt;get($type . &#039;.DefinitionID&#039;))) {
+                    if ($this-&gt;chatty) {
+                        $this-&gt;triggerError(
+                            &#039;Due to a documentation error in previous version of HTML Purifier, your &#039; .
+                            &#039;definitions are not being cached.  If this is OK, you can remove the &#039; .
+                            &#039;%$type.DefinitionRev and %$type.DefinitionID declaration.  Otherwise, &#039; .
+                            &#039;modify your code to use maybeGetRawDefinition, and test if the returned &#039; .
+                            &#039;value is null before making any edits (if it is null, that means that a &#039; .
+                            &#039;cached version is available, and no raw operations are necessary).  See &#039; .
+                            &#039;&lt;a href=&quot;http://htmlpurifier.org/docs/enduser-customize.html#optimized&quot;&gt;&#039; .
+                            &#039;Customize&lt;/a&gt; for more details&#039;,
+                            E_USER_WARNING
+                        );
+                    } else {
+                        $this-&gt;triggerError(
+                            &quot;Useless DefinitionID declaration&quot;,
+                            E_USER_WARNING
+                        );
+                    }
+                }
+            }
+            // initialize it
+            $def = $this-&gt;initDefinition($type);
+            $def-&gt;optimized = $optimized;
+            return $def;
+        }
+        throw new HTMLPurifier_Exception(&quot;The impossible happened!&quot;);
+    }
+
+    /**
+     * Initialise definition
+     *
+     * @param string $type What type of definition to create
+     *
+     * @return HTMLPurifier_CSSDefinition|HTMLPurifier_HTMLDefinition|HTMLPurifier_URIDefinition
+     * @throws HTMLPurifier_Exception
+     */
+    private function initDefinition($type)
+    {
+        // quick checks failed, let&#039;s create the object
+        if ($type == &#039;HTML&#039;) {
+            $def = new HTMLPurifier_HTMLDefinition();
+        } elseif ($type == &#039;CSS&#039;) {
+            $def = new HTMLPurifier_CSSDefinition();
+        } elseif ($type == &#039;URI&#039;) {
+            $def = new HTMLPurifier_URIDefinition();
+        } else {
+            throw new HTMLPurifier_Exception(
+                &quot;Definition of $type type not supported&quot;
+            );
+        }
+        $this-&gt;definitions[$type] = $def;
+        return $def;
+    }
+
+    public function maybeGetRawDefinition($name)
+    {
+        return $this-&gt;getDefinition($name, true, true);
+    }
+
+    /**
+     * @return HTMLPurifier_HTMLDefinition|null
+     */
+    public function maybeGetRawHTMLDefinition()
+    {
+        return $this-&gt;getDefinition(&#039;HTML&#039;, true, true);
+    }
+    
+    /**
+     * @return HTMLPurifier_CSSDefinition|null
+     */
+    public function maybeGetRawCSSDefinition()
+    {
+        return $this-&gt;getDefinition(&#039;CSS&#039;, true, true);
+    }
+    
+    /**
+     * @return HTMLPurifier_URIDefinition|null
+     */
+    public function maybeGetRawURIDefinition()
+    {
+        return $this-&gt;getDefinition(&#039;URI&#039;, true, true);
+    }
+
+    /**
+     * Loads configuration values from an array with the following structure:
+     * Namespace.Directive =&gt; Value
+     *
+     * @param array $config_array Configuration associative array
+     */
+    public function loadArray($config_array)
+    {
+        if ($this-&gt;isFinalized(&#039;Cannot load directives after finalization&#039;)) {
+            return;
+        }
+        foreach ($config_array as $key =&gt; $value) {
+            $key = str_replace(&#039;_&#039;, &#039;.&#039;, $key);
+            if (strpos($key, &#039;.&#039;) !== false) {
+                $this-&gt;set($key, $value);
+            } else {
+                $namespace = $key;
+                $namespace_values = $value;
+                foreach ($namespace_values as $directive =&gt; $value2) {
+                    $this-&gt;set($namespace .&#039;.&#039;. $directive, $value2);
+                }
+            }
+        }
+    }
+
+    /**
+     * Returns a list of array(namespace, directive) for all directives
+     * that are allowed in a web-form context as per an allowed
+     * namespaces/directives list.
+     *
+     * @param array $allowed List of allowed namespaces/directives
+     * @param HTMLPurifier_ConfigSchema $schema Schema to use, if not global copy
+     *
+     * @return array
+     */
+    public static function getAllowedDirectivesForForm($allowed, $schema = null)
+    {
+        if (!$schema) {
+            $schema = HTMLPurifier_ConfigSchema::instance();
+        }
+        if ($allowed !== true) {
+            if (is_string($allowed)) {
+                $allowed = array($allowed);
+            }
+            $allowed_ns = array();
+            $allowed_directives = array();
+            $blacklisted_directives = array();
+            foreach ($allowed as $ns_or_directive) {
+                if (strpos($ns_or_directive, &#039;.&#039;) !== false) {
+                    // directive
+                    if ($ns_or_directive[0] == &#039;-&#039;) {
+                        $blacklisted_directives[substr($ns_or_directive, 1)] = true;
+                    } else {
+                        $allowed_directives[$ns_or_directive] = true;
+                    }
+                } else {
+                    // namespace
+                    $allowed_ns[$ns_or_directive] = true;
+                }
+            }
+        }
+        $ret = array();
+        foreach ($schema-&gt;info as $key =&gt; $def) {
+            list($ns, $directive) = explode(&#039;.&#039;, $key, 2);
+            if ($allowed !== true) {
+                if (isset($blacklisted_directives[&quot;$ns.$directive&quot;])) {
+                    continue;
+                }
+                if (!isset($allowed_directives[&quot;$ns.$directive&quot;]) &amp;&amp; !isset($allowed_ns[$ns])) {
+                    continue;
+                }
+            }
+            if (isset($def-&gt;isAlias)) {
+                continue;
+            }
+            if ($directive == &#039;DefinitionID&#039; || $directive == &#039;DefinitionRev&#039;) {
+                continue;
+            }
+            $ret[] = array($ns, $directive);
+        }
+        return $ret;
+    }
+
+    /**
+     * Loads configuration values from $_GET/$_POST that were posted
+     * via ConfigForm
+     *
+     * @param array $array $_GET or $_POST array to import
+     * @param string|bool $index Index/name that the config variables are in
+     * @param array|bool $allowed List of allowed namespaces/directives
+     * @param bool $mq_fix Boolean whether or not to enable magic quotes fix
+     * @param HTMLPurifier_ConfigSchema $schema Schema to use, if not global copy
+     *
+     * @return mixed
+     */
+    public static function loadArrayFromForm($array, $index = false, $allowed = true, $mq_fix = true, $schema = null)
+    {
+        $ret = HTMLPurifier_Config::prepareArrayFromForm($array, $index, $allowed, $mq_fix, $schema);
+        $config = HTMLPurifier_Config::create($ret, $schema);
+        return $config;
+    }
+
+    /**
+     * Merges in configuration values from $_GET/$_POST to object. NOT STATIC.
+     *
+     * @param array $array $_GET or $_POST array to import
+     * @param string|bool $index Index/name that the config variables are in
+     * @param array|bool $allowed List of allowed namespaces/directives
+     * @param bool $mq_fix Boolean whether or not to enable magic quotes fix
+     */
+    public function mergeArrayFromForm($array, $index = false, $allowed = true, $mq_fix = true)
+    {
+         $ret = HTMLPurifier_Config::prepareArrayFromForm($array, $index, $allowed, $mq_fix, $this-&gt;def);
+         $this-&gt;loadArray($ret);
+    }
+
+    /**
+     * Prepares an array from a form into something usable for the more
+     * strict parts of HTMLPurifier_Config
+     *
+     * @param array $array $_GET or $_POST array to import
+     * @param string|bool $index Index/name that the config variables are in
+     * @param array|bool $allowed List of allowed namespaces/directives
+     * @param bool $mq_fix Boolean whether or not to enable magic quotes fix
+     * @param HTMLPurifier_ConfigSchema $schema Schema to use, if not global copy
+     *
+     * @return array
+     */
+    public static function prepareArrayFromForm($array, $index = false, $allowed = true, $mq_fix = true, $schema = null)
+    {
+        if ($index !== false) {
+            $array = (isset($array[$index]) &amp;&amp; is_array($array[$index])) ? $array[$index] : array();
+        }
+        $mq = $mq_fix &amp;&amp; version_compare(PHP_VERSION, &#039;7.4.0&#039;, &#039;&lt;&#039;) &amp;&amp; function_exists(&#039;get_magic_quotes_gpc&#039;) &amp;&amp; get_magic_quotes_gpc();
+
+        $allowed = HTMLPurifier_Config::getAllowedDirectivesForForm($allowed, $schema);
+        $ret = array();
+        foreach ($allowed as $key) {
+            list($ns, $directive) = $key;
+            $skey = &quot;$ns.$directive&quot;;
+            if (!empty($array[&quot;Null_$skey&quot;])) {
+                $ret[$ns][$directive] = null;
+                continue;
+            }
+            if (!isset($array[$skey])) {
+                continue;
+            }
+            $value = $mq ? stripslashes($array[$skey]) : $array[$skey];
+            $ret[$ns][$directive] = $value;
+        }
+        return $ret;
+    }
+
+    /**
+     * Loads configuration values from an ini file
+     *
+     * @param string $filename Name of ini file
+     */
+    public function loadIni($filename)
+    {
+        if ($this-&gt;isFinalized(&#039;Cannot load directives after finalization&#039;)) {
+            return;
+        }
+        $array = parse_ini_file($filename, true);
+        $this-&gt;loadArray($array);
+    }
+
+    /**
+     * Checks whether or not the configuration object is finalized.
+     *
+     * @param string|bool $error String error message, or false for no error
+     *
+     * @return bool
+     */
+    public function isFinalized($error = false)
+    {
+        if ($this-&gt;finalized &amp;&amp; $error) {
+            $this-&gt;triggerError($error, E_USER_ERROR);
+        }
+        return $this-&gt;finalized;
+    }
+
+    /**
+     * Finalizes configuration only if auto finalize is on and not
+     * already finalized
+     */
+    public function autoFinalize()
+    {
+        if ($this-&gt;autoFinalize) {
+            $this-&gt;finalize();
+        } else {
+            $this-&gt;plist-&gt;squash(true);
+        }
+    }
+
+    /**
+     * Finalizes a configuration object, prohibiting further change
+     */
+    public function finalize()
+    {
+        $this-&gt;finalized = true;
+        $this-&gt;parser = null;
+    }
+
+    /**
+     * Produces a nicely formatted error message by supplying the
+     * stack frame information OUTSIDE of HTMLPurifier_Config.
+     *
+     * @param string $msg An error message
+     * @param int $no An error number
+     */
+    protected function triggerError($msg, $no)
+    {
+        // determine previous stack frame
+        $extra = &#039;&#039;;
+        if ($this-&gt;chatty) {
+            $trace = debug_backtrace();
+            // zip(tail(trace), trace) -- but PHP is not Haskell har har
+            for ($i = 0, $c = count($trace); $i &lt; $c - 1; $i++) {
+                // XXX this is not correct on some versions of HTML Purifier
+                if (isset($trace[$i + 1][&#039;class&#039;]) &amp;&amp; $trace[$i + 1][&#039;class&#039;] === &#039;HTMLPurifier_Config&#039;) {
+                    continue;
+                }
+                $frame = $trace[$i];
+                $extra = &quot; invoked on line {$frame[&#039;line&#039;]} in file {$frame[&#039;file&#039;]}&quot;;
+                break;
+            }
+        }
+        if ($no == E_USER_ERROR) {
+          throw new Exception($msg . $extra);
+        } else {
+          trigger_error($msg . $extra, $no);
+        }
+    }
+
+    /**
+     * Returns a serialized form of the configuration object that can
+     * be reconstituted.
+     *
+     * @return string
+     */
+    public function serialize()
+    {
+        $this-&gt;getDefinition(&#039;HTML&#039;);
+        $this-&gt;getDefinition(&#039;CSS&#039;);
+        $this-&gt;getDefinition(&#039;URI&#039;);
+        return serialize($this);
+    }
+
+}
+
+// vim: et sw=4 sts=4
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/ezyang/htmlpurifier/library/HTMLPurifier/ConfigSchema.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/ezyang/htmlpurifier/library/HTMLPurifier/AttrDef -->
+
+</body>
+</html>

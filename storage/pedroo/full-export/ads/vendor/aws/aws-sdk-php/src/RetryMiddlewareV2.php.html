@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/RetryMiddlewareV2.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws;
+
+use Aws\Exception\AwsException;
+use Aws\Retry\ConfigurationInterface;
+use Aws\Retry\QuotaManager;
+use Aws\Retry\RateLimiter;
+use Aws\Retry\RetryHelperTrait;
+use Exception;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Promise;
+use Psr\Http\Message\RequestInterface;
+
+/**
+ * Middleware that retries failures. V2 implementation that supports &#039;standard&#039;
+ * and &#039;adaptive&#039; modes.
+ *
+ * @internal
+ */
+class RetryMiddlewareV2
+{
+    use RetryHelperTrait;
+
+    private static $standardThrottlingErrors = [
+        &#039;Throttling&#039;                                =&gt; true,
+        &#039;ThrottlingException&#039;                       =&gt; true,
+        &#039;ThrottledException&#039;                        =&gt; true,
+        &#039;RequestThrottledException&#039;                 =&gt; true,
+        &#039;TooManyRequestsException&#039;                  =&gt; true,
+        &#039;ProvisionedThroughputExceededException&#039;    =&gt; true,
+        &#039;TransactionInProgressException&#039;            =&gt; true,
+        &#039;RequestLimitExceeded&#039;                      =&gt; true,
+        &#039;BandwidthLimitExceeded&#039;                    =&gt; true,
+        &#039;LimitExceededException&#039;                    =&gt; true,
+        &#039;RequestThrottled&#039;                          =&gt; true,
+        &#039;SlowDown&#039;                                  =&gt; true,
+        &#039;PriorRequestNotComplete&#039;                   =&gt; true,
+        &#039;EC2ThrottledException&#039;                     =&gt; true,
+    ];
+
+    private static $standardTransientErrors = [
+        &#039;RequestTimeout&#039;            =&gt; true,
+        &#039;RequestTimeoutException&#039;   =&gt; true,
+    ];
+
+    private static $standardTransientStatusCodes = [
+        500 =&gt; true,
+        502 =&gt; true,
+        503 =&gt; true,
+        504 =&gt; true,
+    ];
+
+    private $collectStats;
+    private $decider;
+    private $delayer;
+    private $maxAttempts;
+    private $maxBackoff;
+    private $mode;
+    private $nextHandler;
+    private $options;
+    private $quotaManager;
+    private $rateLimiter;
+
+    public static function wrap($config, $options)
+    {
+        return function (callable $handler) use (
+            $config,
+            $options
+        ) {
+            return new static(
+                $config,
+                $handler,
+                $options
+            );
+        };
+    }
+
+    public static function createDefaultDecider(
+        QuotaManager $quotaManager,
+        $maxAttempts = 3,
+        $options = []
+    ) {
+        $retryCurlErrors = [];
+        if (extension_loaded(&#039;curl&#039;)) {
+            $retryCurlErrors[CURLE_RECV_ERROR] = true;
+        }
+
+        return function(
+            $attempts,
+            CommandInterface $command,
+            $result
+        ) use ($options, $quotaManager, $retryCurlErrors, $maxAttempts) {
+
+            // Release retry tokens back to quota on a successful result
+            $quotaManager-&gt;releaseToQuota($result);
+
+            // Allow command-level option to override this value
+            // # of attempts = # of retries + 1
+            $maxAttempts = (null !== $command[&#039;@retries&#039;])
+                ? $command[&#039;@retries&#039;] + 1
+                : $maxAttempts;
+
+            $isRetryable = self::isRetryable(
+                $result,
+                $retryCurlErrors,
+                $options
+            );
+
+            if ($isRetryable) {
+
+                // Retrieve retry tokens and check if quota has been exceeded
+                if (!$quotaManager-&gt;hasRetryQuota($result)) {
+                    return false;
+                }
+
+                if ($attempts &gt;= $maxAttempts) {
+                    if (!empty($result) &amp;&amp; $result instanceof AwsException) {
+                        $result-&gt;setMaxRetriesExceeded();
+                    }
+                    return false;
+                }
+            }
+
+            return $isRetryable;
+        };
+    }
+
+    public function __construct(
+        ConfigurationInterface $config,
+        callable $handler,
+        $options = []
+    ) {
+        $this-&gt;options = $options;
+        $this-&gt;maxAttempts = $config-&gt;getMaxAttempts();
+        $this-&gt;mode = $config-&gt;getMode();
+        $this-&gt;nextHandler = $handler;
+        $this-&gt;quotaManager = new QuotaManager();
+
+        $this-&gt;maxBackoff = isset($options[&#039;max_backoff&#039;])
+            ? $options[&#039;max_backoff&#039;]
+            : 20000;
+
+        $this-&gt;collectStats = isset($options[&#039;collect_stats&#039;])
+            ? (bool) $options[&#039;collect_stats&#039;]
+            : false;
+
+        $this-&gt;decider = isset($options[&#039;decider&#039;])
+            ? $options[&#039;decider&#039;]
+            : self::createDefaultDecider(
+                $this-&gt;quotaManager,
+                $this-&gt;maxAttempts,
+                $options
+            );
+
+        $this-&gt;delayer = isset($options[&#039;delayer&#039;])
+            ? $options[&#039;delayer&#039;]
+            : function ($attempts) {
+                return $this-&gt;exponentialDelayWithJitter($attempts);
+            };
+
+        if ($this-&gt;mode === &#039;adaptive&#039;) {
+            $this-&gt;rateLimiter = isset($options[&#039;rate_limiter&#039;])
+                ? $options[&#039;rate_limiter&#039;]
+                : new RateLimiter();
+        }
+    }
+
+    public function __invoke(CommandInterface $cmd, RequestInterface $req)
+    {
+        $decider = $this-&gt;decider;
+        $delayer = $this-&gt;delayer;
+        $handler = $this-&gt;nextHandler;
+
+        $attempts = 1;
+        $monitoringEvents = [];
+        $requestStats = [];
+
+        $req = $this-&gt;addRetryHeader($req, 0, 0);
+
+        $callback = function ($value) use (
+            $handler,
+            $cmd,
+            $req,
+            $decider,
+            $delayer,
+            &amp;$attempts,
+            &amp;$requestStats,
+            &amp;$monitoringEvents,
+            &amp;$callback
+        ) {
+            if ($this-&gt;mode === &#039;adaptive&#039;) {
+                $this-&gt;rateLimiter-&gt;updateSendingRate($this-&gt;isThrottlingError($value));
+            }
+
+            $this-&gt;updateHttpStats($value, $requestStats);
+
+            if ($value instanceof MonitoringEventsInterface) {
+                $reversedEvents = array_reverse($monitoringEvents);
+                $monitoringEvents = array_merge($monitoringEvents, $value-&gt;getMonitoringEvents());
+                foreach ($reversedEvents as $event) {
+                    $value-&gt;prependMonitoringEvent($event);
+                }
+            }
+            if ($value instanceof Exception || $value instanceof \Throwable) {
+                if (!$decider($attempts, $cmd, $value)) {
+                    return Promise\Create::rejectionFor(
+                        $this-&gt;bindStatsToReturn($value, $requestStats)
+                    );
+                }
+            } elseif ($value instanceof ResultInterface
+                &amp;&amp; !$decider($attempts, $cmd, $value)
+            ) {
+                return $this-&gt;bindStatsToReturn($value, $requestStats);
+            }
+
+            $delayBy = $delayer($attempts++);
+            $cmd[&#039;@http&#039;][&#039;delay&#039;] = $delayBy;
+            if ($this-&gt;collectStats) {
+                $this-&gt;updateStats($attempts - 1, $delayBy, $requestStats);
+            }
+
+            // Update retry header with retry count and delayBy
+            $req = $this-&gt;addRetryHeader($req, $attempts - 1, $delayBy);
+
+            // Get token from rate limiter, which will sleep if necessary
+            if ($this-&gt;mode === &#039;adaptive&#039;) {
+                $this-&gt;rateLimiter-&gt;getSendToken();
+            }
+
+            return $handler($cmd, $req)-&gt;then($callback, $callback);
+        };
+
+        // Get token from rate limiter, which will sleep if necessary
+        if ($this-&gt;mode === &#039;adaptive&#039;) {
+            $this-&gt;rateLimiter-&gt;getSendToken();
+        }
+
+        return $handler($cmd, $req)-&gt;then($callback, $callback);
+    }
+
+    /**
+     * Amount of milliseconds to delay as a function of attempt number
+     *
+     * @param $attempts
+     * @return mixed
+     */
+    public function exponentialDelayWithJitter($attempts)
+    {
+        $max = mt_getrandmax();
+        try {
+            $rand = random_int(0, $max) / $max;
+        } catch (Exception $_) {
+            // fallback to prevent failing
+            $rand = mt_rand(0, $max) / $max;
+        }
+
+        return min(1000 * $rand * pow(2, $attempts) , $this-&gt;maxBackoff);
+    }
+
+    private static function isRetryable(
+        $result,
+        $retryCurlErrors,
+        $options = []
+    ) {
+        $errorCodes = self::$standardThrottlingErrors + self::$standardTransientErrors;
+        if (!empty($options[&#039;transient_error_codes&#039;])
+            &amp;&amp; is_array($options[&#039;transient_error_codes&#039;])
+        ) {
+            foreach($options[&#039;transient_error_codes&#039;] as $code) {
+                $errorCodes[$code] = true;
+            }
+        }
+        if (!empty($options[&#039;throttling_error_codes&#039;])
+            &amp;&amp; is_array($options[&#039;throttling_error_codes&#039;])
+        ) {
+            foreach($options[&#039;throttling_error_codes&#039;] as $code) {
+                $errorCodes[$code] = true;
+            }
+        }
+
+        $statusCodes = self::$standardTransientStatusCodes;
+        if (!empty($options[&#039;status_codes&#039;])
+            &amp;&amp; is_array($options[&#039;status_codes&#039;])
+        ) {
+            foreach($options[&#039;status_codes&#039;] as $code) {
+                $statusCodes[$code] = true;
+            }
+        }
+
+        if (!empty($options[&#039;curl_errors&#039;])
+            &amp;&amp; is_array($options[&#039;curl_errors&#039;])
+        ) {
+            foreach($options[&#039;curl_errors&#039;] as $code) {
+                $retryCurlErrors[$code] = true;
+            }
+        }
+
+        if ($result instanceof Exception || $result instanceof \Throwable) {
+            $isError = true;
+        } else {
+            $isError = false;
+        }
+
+        if (!$isError) {
+            if (!isset($result[&#039;@metadata&#039;][&#039;statusCode&#039;])) {
+                return false;
+            }
+            return isset($statusCodes[$result[&#039;@metadata&#039;][&#039;statusCode&#039;]]);
+        }
+
+        if (!($result instanceof AwsException)) {
+            return false;
+        }
+
+        if ($result-&gt;isConnectionError()) {
+            return true;
+        }
+
+        $awsCode = $result-&gt;getAwsErrorCode();
+        if (!is_null($awsCode) &amp;&amp; isset($errorCodes[$awsCode])) {
+            return true;
+        }
+
+        $status = $result-&gt;getStatusCode();
+        if (!is_null($status) &amp;&amp; isset($statusCodes[$status])) {
+            return true;
+        }
+
+        if (count($retryCurlErrors)
+            &amp;&amp; ($previous = $result-&gt;getPrevious())
+            &amp;&amp; $previous instanceof RequestException
+        ) {
+            if (method_exists($previous, &#039;getHandlerContext&#039;)) {
+                $context = $previous-&gt;getHandlerContext();
+                return !empty($context[&#039;errno&#039;])
+                    &amp;&amp; isset($retryCurlErrors[$context[&#039;errno&#039;]]);
+            }
+
+            $message = $previous-&gt;getMessage();
+            foreach (array_keys($retryCurlErrors) as $curlError) {
+                if (strpos($message, &#039;cURL error &#039; . $curlError . &#039;:&#039;) === 0) {
+                    return true;
+                }
+            }
+        }
+
+        // Check error shape for the retryable trait
+        if (!empty($errorShape = $result-&gt;getAwsErrorShape())) {
+            $definition = $errorShape-&gt;toArray();
+            if (!empty($definition[&#039;retryable&#039;])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isThrottlingError($result)
+    {
+        if ($result instanceof AwsException) {
+            // Check pre-defined throttling errors
+            $throttlingErrors = self::$standardThrottlingErrors;
+            if (!empty($this-&gt;options[&#039;throttling_error_codes&#039;])
+                &amp;&amp; is_array($this-&gt;options[&#039;throttling_error_codes&#039;])
+            ) {
+                foreach($this-&gt;options[&#039;throttling_error_codes&#039;] as $code) {
+                    $throttlingErrors[$code] = true;
+                }
+            }
+            if (!empty($result-&gt;getAwsErrorCode())
+                &amp;&amp; !empty($throttlingErrors[$result-&gt;getAwsErrorCode()])
+            ) {
+                return true;
+            }
+
+            // Check error shape for the throttling trait
+            if (!empty($errorShape = $result-&gt;getAwsErrorShape())) {
+                $definition = $errorShape-&gt;toArray();
+                if (!empty($definition[&#039;retryable&#039;][&#039;throttling&#039;])) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/RolesAnywhere/Exception/RolesAnywhereException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/ACMPCA -->
+
+</body>
+</html>

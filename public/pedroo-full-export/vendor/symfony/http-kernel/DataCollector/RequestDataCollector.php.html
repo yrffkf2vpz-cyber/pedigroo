@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/http-kernel/DataCollector/RequestDataCollector.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpKernel\DataCollector;
+
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\HttpFoundation\Cookie;
+use Symfony\Component\HttpFoundation\ParameterBag;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpFoundation\Session\SessionBagInterface;
+use Symfony\Component\HttpFoundation\Session\SessionInterface;
+use Symfony\Component\HttpKernel\Event\ControllerEvent;
+use Symfony\Component\HttpKernel\Event\ResponseEvent;
+use Symfony\Component\HttpKernel\KernelEvents;
+use Symfony\Component\VarDumper\Cloner\Data;
+
+/**
+ * @author Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * @final
+ */
+class RequestDataCollector extends DataCollector implements EventSubscriberInterface, LateDataCollectorInterface
+{
+    /**
+     * @var \SplObjectStorage&lt;Request, callable&gt;
+     */
+    private \SplObjectStorage $controllers;
+    private array $sessionUsages = [];
+
+    public function __construct(
+        private ?RequestStack $requestStack = null,
+    ) {
+        $this-&gt;controllers = new \SplObjectStorage();
+    }
+
+    public function collect(Request $request, Response $response, ?\Throwable $exception = null): void
+    {
+        // attributes are serialized and as they can be anything, they need to be converted to strings.
+        $attributes = [];
+        $route = &#039;&#039;;
+        foreach ($request-&gt;attributes-&gt;all() as $key =&gt; $value) {
+            if (&#039;_route&#039; === $key) {
+                $route = \is_object($value) ? $value-&gt;getPath() : $value;
+                $attributes[$key] = $route;
+            } else {
+                $attributes[$key] = $value;
+            }
+        }
+
+        $content = $request-&gt;getContent();
+
+        $sessionMetadata = [];
+        $sessionAttributes = [];
+        $flashes = [];
+        if (!$request-&gt;attributes-&gt;getBoolean(&#039;_stateless&#039;) &amp;&amp; $request-&gt;hasSession()) {
+            $session = $request-&gt;getSession();
+            if ($session-&gt;isStarted()) {
+                $sessionMetadata[&#039;Created&#039;] = date(\DATE_RFC822, $session-&gt;getMetadataBag()-&gt;getCreated());
+                $sessionMetadata[&#039;Last used&#039;] = date(\DATE_RFC822, $session-&gt;getMetadataBag()-&gt;getLastUsed());
+                $sessionMetadata[&#039;Lifetime&#039;] = $session-&gt;getMetadataBag()-&gt;getLifetime();
+                $sessionAttributes = $session-&gt;all();
+                $flashes = $session-&gt;getFlashBag()-&gt;peekAll();
+            }
+        }
+
+        $statusCode = $response-&gt;getStatusCode();
+
+        $responseCookies = [];
+        foreach ($response-&gt;headers-&gt;getCookies() as $cookie) {
+            $responseCookies[$cookie-&gt;getName()] = $cookie;
+        }
+
+        $dotenvVars = [];
+        foreach (explode(&#039;,&#039;, $_SERVER[&#039;SYMFONY_DOTENV_VARS&#039;] ?? $_ENV[&#039;SYMFONY_DOTENV_VARS&#039;] ?? &#039;&#039;) as $name) {
+            if (&#039;&#039; !== $name &amp;&amp; isset($_ENV[$name])) {
+                $dotenvVars[$name] = $_ENV[$name];
+            }
+        }
+
+        $this-&gt;data = [
+            &#039;method&#039; =&gt; $request-&gt;getMethod(),
+            &#039;format&#039; =&gt; $request-&gt;getRequestFormat(),
+            &#039;content_type&#039; =&gt; $response-&gt;headers-&gt;get(&#039;Content-Type&#039;, &#039;text/html&#039;),
+            &#039;status_text&#039; =&gt; Response::$statusTexts[$statusCode] ?? &#039;&#039;,
+            &#039;status_code&#039; =&gt; $statusCode,
+            &#039;request_query&#039; =&gt; $request-&gt;query-&gt;all(),
+            &#039;request_request&#039; =&gt; $request-&gt;request-&gt;all(),
+            &#039;request_files&#039; =&gt; $request-&gt;files-&gt;all(),
+            &#039;request_headers&#039; =&gt; $request-&gt;headers-&gt;all(),
+            &#039;request_server&#039; =&gt; $request-&gt;server-&gt;all(),
+            &#039;request_cookies&#039; =&gt; $request-&gt;cookies-&gt;all(),
+            &#039;request_attributes&#039; =&gt; $attributes,
+            &#039;route&#039; =&gt; $route,
+            &#039;response_headers&#039; =&gt; $response-&gt;headers-&gt;all(),
+            &#039;response_cookies&#039; =&gt; $responseCookies,
+            &#039;session_metadata&#039; =&gt; $sessionMetadata,
+            &#039;session_attributes&#039; =&gt; $sessionAttributes,
+            &#039;session_usages&#039; =&gt; array_values($this-&gt;sessionUsages),
+            &#039;stateless_check&#039; =&gt; $this-&gt;requestStack?-&gt;getMainRequest()?-&gt;attributes-&gt;get(&#039;_stateless&#039;) ?? false,
+            &#039;flashes&#039; =&gt; $flashes,
+            &#039;path_info&#039; =&gt; $request-&gt;getPathInfo(),
+            &#039;controller&#039; =&gt; &#039;n/a&#039;,
+            &#039;locale&#039; =&gt; $request-&gt;getLocale(),
+            &#039;dotenv_vars&#039; =&gt; $dotenvVars,
+        ];
+
+        if (isset($this-&gt;data[&#039;request_headers&#039;][&#039;php-auth-pw&#039;])) {
+            $this-&gt;data[&#039;request_headers&#039;][&#039;php-auth-pw&#039;] = &#039;******&#039;;
+        }
+
+        if (isset($this-&gt;data[&#039;request_server&#039;][&#039;PHP_AUTH_PW&#039;])) {
+            $this-&gt;data[&#039;request_server&#039;][&#039;PHP_AUTH_PW&#039;] = &#039;******&#039;;
+        }
+
+        if (isset($this-&gt;data[&#039;request_request&#039;][&#039;_password&#039;])) {
+            $encodedPassword = rawurlencode($this-&gt;data[&#039;request_request&#039;][&#039;_password&#039;]);
+            $content = str_replace(&#039;_password=&#039;.$encodedPassword, &#039;_password=******&#039;, $content);
+            $this-&gt;data[&#039;request_request&#039;][&#039;_password&#039;] = &#039;******&#039;;
+        }
+
+        $this-&gt;data[&#039;content&#039;] = $content;
+
+        foreach ($this-&gt;data as $key =&gt; $value) {
+            if (!\is_array($value)) {
+                continue;
+            }
+            if (&#039;request_headers&#039; === $key || &#039;response_headers&#039; === $key) {
+                $this-&gt;data[$key] = array_map(fn ($v) =&gt; isset($v[0]) &amp;&amp; !isset($v[1]) ? $v[0] : $v, $value);
+            }
+        }
+
+        if (isset($this-&gt;controllers[$request])) {
+            $this-&gt;data[&#039;controller&#039;] = $this-&gt;parseController($this-&gt;controllers[$request]);
+            unset($this-&gt;controllers[$request]);
+        }
+
+        if ($request-&gt;attributes-&gt;has(&#039;_redirected&#039;) &amp;&amp; $redirectCookie = $request-&gt;cookies-&gt;get(&#039;sf_redirect&#039;)) {
+            $this-&gt;data[&#039;redirect&#039;] = json_decode($redirectCookie, true);
+
+            $response-&gt;headers-&gt;clearCookie(&#039;sf_redirect&#039;);
+        }
+
+        if ($response-&gt;isRedirect()) {
+            $response-&gt;headers-&gt;setCookie(new Cookie(
+                &#039;sf_redirect&#039;,
+                json_encode([
+                    &#039;token&#039; =&gt; $response-&gt;headers-&gt;get(&#039;x-debug-token&#039;),
+                    &#039;route&#039; =&gt; $request-&gt;attributes-&gt;get(&#039;_route&#039;, &#039;n/a&#039;),
+                    &#039;method&#039; =&gt; $request-&gt;getMethod(),
+                    &#039;controller&#039; =&gt; $this-&gt;parseController($request-&gt;attributes-&gt;get(&#039;_controller&#039;)),
+                    &#039;status_code&#039; =&gt; $statusCode,
+                    &#039;status_text&#039; =&gt; Response::$statusTexts[$statusCode],
+                ]),
+                0, &#039;/&#039;, null, $request-&gt;isSecure(), true, false, &#039;lax&#039;
+            ));
+        }
+
+        $this-&gt;data[&#039;identifier&#039;] = $this-&gt;data[&#039;route&#039;] ?: (\is_array($this-&gt;data[&#039;controller&#039;]) ? $this-&gt;data[&#039;controller&#039;][&#039;class&#039;].&#039;::&#039;.$this-&gt;data[&#039;controller&#039;][&#039;method&#039;].&#039;()&#039; : $this-&gt;data[&#039;controller&#039;]);
+
+        if ($response-&gt;headers-&gt;has(&#039;x-previous-debug-token&#039;)) {
+            $this-&gt;data[&#039;forward_token&#039;] = $response-&gt;headers-&gt;get(&#039;x-previous-debug-token&#039;);
+        }
+    }
+
+    public function lateCollect(): void
+    {
+        $this-&gt;data = $this-&gt;cloneVar($this-&gt;data);
+    }
+
+    public function reset(): void
+    {
+        parent::reset();
+        $this-&gt;controllers = new \SplObjectStorage();
+        $this-&gt;sessionUsages = [];
+    }
+
+    public function getMethod(): string
+    {
+        return $this-&gt;data[&#039;method&#039;];
+    }
+
+    public function getPathInfo(): string
+    {
+        return $this-&gt;data[&#039;path_info&#039;];
+    }
+
+    public function getRequestRequest(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;request_request&#039;]-&gt;getValue());
+    }
+
+    public function getRequestQuery(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;request_query&#039;]-&gt;getValue());
+    }
+
+    public function getRequestFiles(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;request_files&#039;]-&gt;getValue());
+    }
+
+    public function getRequestHeaders(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;request_headers&#039;]-&gt;getValue());
+    }
+
+    public function getRequestServer(bool $raw = false): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;request_server&#039;]-&gt;getValue($raw));
+    }
+
+    public function getRequestCookies(bool $raw = false): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;request_cookies&#039;]-&gt;getValue($raw));
+    }
+
+    public function getRequestAttributes(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;request_attributes&#039;]-&gt;getValue());
+    }
+
+    public function getResponseHeaders(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;response_headers&#039;]-&gt;getValue());
+    }
+
+    public function getResponseCookies(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;response_cookies&#039;]-&gt;getValue());
+    }
+
+    public function getSessionMetadata(): array
+    {
+        return $this-&gt;data[&#039;session_metadata&#039;]-&gt;getValue();
+    }
+
+    public function getSessionAttributes(): array
+    {
+        return $this-&gt;data[&#039;session_attributes&#039;]-&gt;getValue();
+    }
+
+    public function getStatelessCheck(): bool
+    {
+        return $this-&gt;data[&#039;stateless_check&#039;];
+    }
+
+    public function getSessionUsages(): Data|array
+    {
+        return $this-&gt;data[&#039;session_usages&#039;];
+    }
+
+    public function getFlashes(): array
+    {
+        return $this-&gt;data[&#039;flashes&#039;]-&gt;getValue();
+    }
+
+    /**
+     * @return string|resource
+     */
+    public function getContent()
+    {
+        return $this-&gt;data[&#039;content&#039;];
+    }
+
+    public function isJsonRequest(): bool
+    {
+        return 1 === preg_match(&#039;{^application/(?:\w+\++)*json$}i&#039;, $this-&gt;data[&#039;request_headers&#039;][&#039;content-type&#039;]);
+    }
+
+    public function getPrettyJson(): ?string
+    {
+        $decoded = json_decode($this-&gt;getContent());
+
+        return \JSON_ERROR_NONE === json_last_error() ? json_encode($decoded, \JSON_PRETTY_PRINT) : null;
+    }
+
+    public function getContentType(): string
+    {
+        return $this-&gt;data[&#039;content_type&#039;];
+    }
+
+    public function getStatusText(): string
+    {
+        return $this-&gt;data[&#039;status_text&#039;];
+    }
+
+    public function getStatusCode(): int
+    {
+        return $this-&gt;data[&#039;status_code&#039;];
+    }
+
+    public function getFormat(): string
+    {
+        return $this-&gt;data[&#039;format&#039;];
+    }
+
+    public function getLocale(): string
+    {
+        return $this-&gt;data[&#039;locale&#039;];
+    }
+
+    public function getDotenvVars(): ParameterBag
+    {
+        return new ParameterBag($this-&gt;data[&#039;dotenv_vars&#039;]-&gt;getValue());
+    }
+
+    /**
+     * Gets the route name.
+     *
+     * The _route request attributes is automatically set by the Router Matcher.
+     */
+    public function getRoute(): string
+    {
+        return $this-&gt;data[&#039;route&#039;];
+    }
+
+    public function getIdentifier(): string
+    {
+        return $this-&gt;data[&#039;identifier&#039;];
+    }
+
+    /**
+     * Gets the route parameters.
+     *
+     * The _route_params request attributes is automatically set by the RouterListener.
+     */
+    public function getRouteParams(): array
+    {
+        return isset($this-&gt;data[&#039;request_attributes&#039;][&#039;_route_params&#039;]) ? $this-&gt;data[&#039;request_attributes&#039;][&#039;_route_params&#039;]-&gt;getValue() : [];
+    }
+
+    /**
+     * Gets the parsed controller.
+     *
+     * @return array|string|Data The controller as a string or array of data
+     *                           with keys &#039;class&#039;, &#039;method&#039;, &#039;file&#039; and &#039;line&#039;
+     */
+    public function getController(): array|string|Data
+    {
+        return $this-&gt;data[&#039;controller&#039;];
+    }
+
+    /**
+     * Gets the previous request attributes.
+     *
+     * @return array|Data|false A legacy array of data from the previous redirection response
+     *                          or false otherwise
+     */
+    public function getRedirect(): array|Data|false
+    {
+        return $this-&gt;data[&#039;redirect&#039;] ?? false;
+    }
+
+    public function getForwardToken(): ?string
+    {
+        return $this-&gt;data[&#039;forward_token&#039;] ?? null;
+    }
+
+    public function onKernelController(ControllerEvent $event): void
+    {
+        $this-&gt;controllers[$event-&gt;getRequest()] = $event-&gt;getController();
+    }
+
+    public function onKernelResponse(ResponseEvent $event): void
+    {
+        if (!$event-&gt;isMainRequest()) {
+            return;
+        }
+
+        if ($event-&gt;getRequest()-&gt;cookies-&gt;has(&#039;sf_redirect&#039;)) {
+            $event-&gt;getRequest()-&gt;attributes-&gt;set(&#039;_redirected&#039;, true);
+        }
+    }
+
+    public static function getSubscribedEvents(): array
+    {
+        return [
+            KernelEvents::CONTROLLER =&gt; &#039;onKernelController&#039;,
+            KernelEvents::RESPONSE =&gt; &#039;onKernelResponse&#039;,
+        ];
+    }
+
+    public function getName(): string
+    {
+        return &#039;request&#039;;
+    }
+
+    public function collectSessionUsage(): void
+    {
+        $trace = debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS);
+
+        $traceEndIndex = \count($trace) - 1;
+        for ($i = $traceEndIndex; $i &gt; 0; --$i) {
+            if (null !== ($class = $trace[$i][&#039;class&#039;] ?? null) &amp;&amp; (is_subclass_of($class, SessionInterface::class) || is_subclass_of($class, SessionBagInterface::class))) {
+                $traceEndIndex = $i;
+                break;
+            }
+        }
+
+        if ((\count($trace) - 1) === $traceEndIndex) {
+            return;
+        }
+
+        // Remove part of the backtrace that belongs to session only
+        array_splice($trace, 0, $traceEndIndex);
+
+        // Merge identical backtraces generated by internal call reports
+        $name = \sprintf(&#039;%s:%s&#039;, $trace[1][&#039;class&#039;] ?? $trace[0][&#039;file&#039;], $trace[0][&#039;line&#039;]);
+        if (!\array_key_exists($name, $this-&gt;sessionUsages)) {
+            $this-&gt;sessionUsages[$name] = [
+                &#039;name&#039; =&gt; $name,
+                &#039;file&#039; =&gt; $trace[0][&#039;file&#039;],
+                &#039;line&#039; =&gt; $trace[0][&#039;line&#039;],
+                &#039;trace&#039; =&gt; $trace,
+            ];
+        }
+    }
+
+    /**
+     * @return array|string An array of controller data or a simple string
+     */
+    private function parseController(array|object|string|null $controller): array|string
+    {
+        if (\is_string($controller) &amp;&amp; str_contains($controller, &#039;::&#039;)) {
+            $controller = explode(&#039;::&#039;, $controller);
+        }
+
+        if (\is_array($controller)) {
+            try {
+                $r = new \ReflectionMethod($controller[0], $controller[1]);
+
+                return [
+                    &#039;class&#039; =&gt; \is_object($controller[0]) ? get_debug_type($controller[0]) : $controller[0],
+                    &#039;method&#039; =&gt; $controller[1],
+                    &#039;file&#039; =&gt; $r-&gt;getFileName(),
+                    &#039;line&#039; =&gt; $r-&gt;getStartLine(),
+                ];
+            } catch (\ReflectionException) {
+                if (\is_callable($controller)) {
+                    // using __call or  __callStatic
+                    return [
+                        &#039;class&#039; =&gt; \is_object($controller[0]) ? get_debug_type($controller[0]) : $controller[0],
+                        &#039;method&#039; =&gt; $controller[1],
+                        &#039;file&#039; =&gt; &#039;n/a&#039;,
+                        &#039;line&#039; =&gt; &#039;n/a&#039;,
+                    ];
+                }
+            }
+        }
+
+        if ($controller instanceof \Closure) {
+            $r = new \ReflectionFunction($controller);
+
+            $controller = [
+                &#039;class&#039; =&gt; $r-&gt;getName(),
+                &#039;method&#039; =&gt; null,
+                &#039;file&#039; =&gt; $r-&gt;getFileName(),
+                &#039;line&#039; =&gt; $r-&gt;getStartLine(),
+            ];
+
+            if ($r-&gt;isAnonymous()) {
+                return $controller;
+            }
+            $controller[&#039;method&#039;] = $r-&gt;name;
+
+            if ($class = $r-&gt;getClosureCalledClass()) {
+                $controller[&#039;class&#039;] = $class-&gt;name;
+            } else {
+                return $r-&gt;name;
+            }
+
+            return $controller;
+        }
+
+        if (\is_object($controller)) {
+            $r = new \ReflectionClass($controller);
+
+            return [
+                &#039;class&#039; =&gt; $r-&gt;getName(),
+                &#039;method&#039; =&gt; null,
+                &#039;file&#039; =&gt; $r-&gt;getFileName(),
+                &#039;line&#039; =&gt; $r-&gt;getStartLine(),
+            ];
+        }
+
+        return \is_string($controller) ? $controller : &#039;n/a&#039;;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/http-kernel/DataCollector/RouterDataCollector.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/http-kernel/Debug -->
+
+</body>
+</html>

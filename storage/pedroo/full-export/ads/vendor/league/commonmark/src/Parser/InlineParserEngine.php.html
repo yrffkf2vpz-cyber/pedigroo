@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/commonmark/src/Parser/InlineParserEngine.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the league/commonmark package.
+ *
+ * (c) Colin O&#039;Dell &lt;colinodell@gmail.com&gt;
+ *
+ * Original code based on the CommonMark JS reference parser (https://bitly.com/commonmark-js)
+ *  - (c) John MacFarlane
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace League\CommonMark\Parser;
+
+use League\CommonMark\Environment\EnvironmentInterface;
+use League\CommonMark\Node\Block\AbstractBlock;
+use League\CommonMark\Node\Inline\AdjacentTextMerger;
+use League\CommonMark\Node\Inline\Text;
+use League\CommonMark\Parser\Inline\InlineParserInterface;
+use League\CommonMark\Reference\ReferenceMapInterface;
+
+/**
+ * @internal
+ */
+final class InlineParserEngine implements InlineParserEngineInterface
+{
+    /** @psalm-readonly */
+    private EnvironmentInterface $environment;
+
+    /** @psalm-readonly */
+    private ReferenceMapInterface $referenceMap;
+
+    /**
+     * @var array&lt;int, InlineParserInterface|string|bool&gt;
+     * @psalm-var list&lt;array{0: InlineParserInterface, 1: non-empty-string, 2: bool}&gt;
+     * @phpstan-var array&lt;int, array{0: InlineParserInterface, 1: non-empty-string, 2: bool}&gt;
+     */
+    private array $parsers = [];
+
+    public function __construct(EnvironmentInterface $environment, ReferenceMapInterface $referenceMap)
+    {
+        $this-&gt;environment  = $environment;
+        $this-&gt;referenceMap = $referenceMap;
+
+        foreach ($environment-&gt;getInlineParsers() as $parser) {
+            \assert($parser instanceof InlineParserInterface);
+            $regex = $parser-&gt;getMatchDefinition()-&gt;getRegex();
+
+            $this-&gt;parsers[] = [$parser, $regex, \strlen($regex) !== \mb_strlen($regex, &#039;UTF-8&#039;)];
+        }
+    }
+
+    public function parse(string $contents, AbstractBlock $block): void
+    {
+        $contents = \trim($contents);
+        $cursor   = new Cursor($contents);
+
+        $inlineParserContext = new InlineParserContext($cursor, $block, $this-&gt;referenceMap, $this-&gt;environment-&gt;getConfiguration()-&gt;get(&#039;max_delimiters_per_line&#039;));
+
+        // Have all parsers look at the line to determine what they might want to parse and what positions they exist at
+        foreach ($this-&gt;matchParsers($contents) as $matchPosition =&gt; $parsers) {
+            $currentPosition = $cursor-&gt;getPosition();
+            // We&#039;ve already gone past this point
+            if ($currentPosition &gt; $matchPosition) {
+                continue;
+            }
+
+            // We&#039;ve skipped over some uninteresting text that should be added as a plain text node
+            if ($currentPosition &lt; $matchPosition) {
+                $cursor-&gt;advanceBy($matchPosition - $currentPosition);
+                $this-&gt;addPlainText($cursor-&gt;getPreviousText(), $block);
+            }
+
+            // We&#039;re now at a potential start - see which of the current parsers can handle it
+            $parsed = false;
+            foreach ($parsers as [$parser, $matches]) {
+                \assert($parser instanceof InlineParserInterface);
+                if ($parser-&gt;parse($inlineParserContext-&gt;withMatches($matches))) {
+                    // A parser has successfully handled the text at the given position; don&#039;t consider any others at this position
+                    $parsed = true;
+                    break;
+                }
+            }
+
+            if ($parsed) {
+                continue;
+            }
+
+            // Despite potentially being interested, nothing actually parsed text here, so add the current character and continue onwards
+            $this-&gt;addPlainText((string) $cursor-&gt;getCurrentCharacter(), $block);
+            $cursor-&gt;advance();
+        }
+
+        // Add any remaining text that wasn&#039;t parsed
+        if (! $cursor-&gt;isAtEnd()) {
+            $this-&gt;addPlainText($cursor-&gt;getRemainder(), $block);
+        }
+
+        // Process any delimiters that were found
+        $delimiterStack = $inlineParserContext-&gt;getDelimiterStack();
+        $delimiterStack-&gt;processDelimiters(null, $this-&gt;environment-&gt;getDelimiterProcessors());
+        $delimiterStack-&gt;removeAll();
+
+        // Combine adjacent text notes into one
+        AdjacentTextMerger::mergeChildNodes($block);
+    }
+
+    private function addPlainText(string $text, AbstractBlock $container): void
+    {
+        $lastInline = $container-&gt;lastChild();
+        if ($lastInline instanceof Text &amp;&amp; ! $lastInline-&gt;data-&gt;has(&#039;delim&#039;)) {
+            $lastInline-&gt;append($text);
+        } else {
+            $container-&gt;appendChild(new Text($text));
+        }
+    }
+
+    /**
+     * Given the current line, ask all the parsers which parts of the text they would be interested in parsing.
+     *
+     * The resulting array provides a list of character positions, which parsers are interested in trying to parse
+     * the text at those points, and (for convenience/optimization) what the matching text happened to be.
+     *
+     * @return array&lt;array&lt;int, InlineParserInterface|string&gt;&gt;
+     *
+     * @psalm-return array&lt;int, list&lt;array{0: InlineParserInterface, 1: non-empty-array&lt;string&gt;}&gt;&gt;
+     *
+     * @phpstan-return array&lt;int, array&lt;int, array{0: InlineParserInterface, 1: non-empty-array&lt;string&gt;}&gt;&gt;
+     */
+    private function matchParsers(string $contents): array
+    {
+        $contents    = \trim($contents);
+        $isMultibyte = ! \mb_check_encoding($contents, &#039;ASCII&#039;);
+
+        $ret = [];
+
+        foreach ($this-&gt;parsers as [$parser, $regex, $isRegexMultibyte]) {
+            if ($isMultibyte || $isRegexMultibyte) {
+                $regex .= &#039;u&#039;;
+            }
+
+            // See if the parser&#039;s InlineParserMatch regex matched against any part of the string
+            if (! \preg_match_all($regex, $contents, $matches, \PREG_OFFSET_CAPTURE | \PREG_SET_ORDER)) {
+                continue;
+            }
+
+            // For each part that matched...
+            foreach ($matches as $match) {
+                if ($isMultibyte) {
+                    // PREG_OFFSET_CAPTURE always returns the byte offset, not the char offset, which is annoying
+                    $offset = \mb_strlen(\substr($contents, 0, $match[0][1]), &#039;UTF-8&#039;);
+                } else {
+                    $offset = \intval($match[0][1]);
+                }
+
+                // Remove the offsets, keeping only the matched text
+                $m = \array_column($match, 0);
+
+                if ($m === []) {
+                    continue;
+                }
+
+                // Add this match to the list of character positions to stop at
+                $ret[$offset][] = [$parser, $m];
+            }
+        }
+
+        // Sort matches by position so we visit them in order
+        \ksort($ret);
+
+        return $ret;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/commonmark/src/Parser/InlineParserEngineInterface.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/commonmark/src/Parser/Block -->
+
+</body>
+</html>

@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/sebastian/exporter/src/Exporter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of sebastian/exporter.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace SebastianBergmann\Exporter;
+
+use const COUNT_RECURSIVE;
+use function assert;
+use function bin2hex;
+use function count;
+use function get_resource_type;
+use function gettype;
+use function implode;
+use function ini_get;
+use function ini_set;
+use function is_array;
+use function is_bool;
+use function is_float;
+use function is_object;
+use function is_resource;
+use function is_string;
+use function mb_strlen;
+use function mb_substr;
+use function preg_match;
+use function spl_object_id;
+use function sprintf;
+use function str_repeat;
+use function str_replace;
+use function strtr;
+use function var_export;
+use BackedEnum;
+use Google\Protobuf\Internal\Message;
+use ReflectionClass;
+use ReflectionObject;
+use SebastianBergmann\RecursionContext\Context as RecursionContext;
+use SplObjectStorage;
+use stdClass;
+use UnitEnum;
+
+final readonly class Exporter
+{
+    /**
+     * @var non-negative-int
+     */
+    private int $shortenArraysLongerThan;
+
+    /**
+     * @var positive-int
+     */
+    private int $maxLengthForStrings;
+
+    /**
+     * @param non-negative-int $shortenArraysLongerThan
+     * @param positive-int     $maxLengthForStrings
+     */
+    public function __construct(int $shortenArraysLongerThan = 0, int $maxLengthForStrings = 40)
+    {
+        $this-&gt;shortenArraysLongerThan = $shortenArraysLongerThan;
+        $this-&gt;maxLengthForStrings     = $maxLengthForStrings;
+    }
+
+    /**
+     * Exports a value as a string.
+     *
+     * The output of this method is similar to the output of print_r(), but
+     * improved in various aspects:
+     *
+     *  - NULL is rendered as &quot;null&quot; (instead of &quot;&quot;)
+     *  - TRUE is rendered as &quot;true&quot; (instead of &quot;1&quot;)
+     *  - FALSE is rendered as &quot;false&quot; (instead of &quot;&quot;)
+     *  - Strings are always quoted with single quotes
+     *  - Carriage returns and newlines are normalized to \n
+     *  - Recursion and repeated rendering is treated properly
+     */
+    public function export(mixed $value, int $indentation = 0): string
+    {
+        return $this-&gt;recursiveExport($value, $indentation);
+    }
+
+    /**
+     * @param array&lt;mixed&gt; $data
+     * @param positive-int $maxLengthForStrings
+     */
+    public function shortenedRecursiveExport(array &amp;$data, int $maxLengthForStrings = 40, ?RecursionContext $processed = null): string
+    {
+        if ($maxLengthForStrings === 40) {
+            $maxLengthForStrings = $this-&gt;maxLengthForStrings;
+        }
+
+        if ($processed === null) {
+            $processed = new RecursionContext;
+        }
+
+        $overallCount = @count($data, COUNT_RECURSIVE);
+        $counter      = 0;
+
+        $export = $this-&gt;shortenedCountedRecursiveExport($data, $processed, $counter, $maxLengthForStrings);
+
+        if ($this-&gt;shortenArraysLongerThan &gt; 0 &amp;&amp;
+            $overallCount &gt; $this-&gt;shortenArraysLongerThan) {
+            $export .= sprintf(&#039;, ...%d more elements&#039;, $overallCount - $this-&gt;shortenArraysLongerThan);
+        }
+
+        return $export;
+    }
+
+    /**
+     * Exports a value into a single-line string.
+     *
+     * The output of this method is similar to the output of
+     * SebastianBergmann\Exporter\Exporter::export().
+     *
+     * Newlines are replaced by the visible string &#039;\n&#039;.
+     * Contents of arrays and objects (if any) are replaced by &#039;...&#039;.
+     *
+     * @param positive-int $maxLengthForStrings
+     */
+    public function shortenedExport(mixed $value, int $maxLengthForStrings = 40): string
+    {
+        if ($maxLengthForStrings === 40) {
+            $maxLengthForStrings = $this-&gt;maxLengthForStrings;
+        }
+
+        if (is_string($value)) {
+            $string = str_replace(&quot;\n&quot;, &#039;&#039;, $this-&gt;exportString($value));
+
+            if (mb_strlen($string) &gt; $maxLengthForStrings) {
+                return mb_substr($string, 0, $maxLengthForStrings - 10) . &#039;...&#039; . mb_substr($string, -7);
+            }
+
+            return $string;
+        }
+
+        if ($value instanceof BackedEnum) {
+            return sprintf(
+                &#039;%s Enum (%s, %s)&#039;,
+                $value::class,
+                $value-&gt;name,
+                $this-&gt;export($value-&gt;value),
+            );
+        }
+
+        if ($value instanceof UnitEnum) {
+            return sprintf(
+                &#039;%s Enum (%s)&#039;,
+                $value::class,
+                $value-&gt;name,
+            );
+        }
+
+        if (is_object($value)) {
+            return sprintf(
+                &#039;%s Object (%s)&#039;,
+                $value::class,
+                $this-&gt;countProperties($value) &gt; 0 ? &#039;...&#039; : &#039;&#039;,
+            );
+        }
+
+        if (is_array($value)) {
+            return sprintf(
+                &#039;[%s]&#039;,
+                count($value) &gt; 0 ? &#039;...&#039; : &#039;&#039;,
+            );
+        }
+
+        return $this-&gt;export($value);
+    }
+
+    /**
+     * Converts an object to an array containing all of its private, protected
+     * and public properties.
+     *
+     * @return array&lt;mixed&gt;
+     */
+    public function toArray(mixed $value): array
+    {
+        if (!is_object($value)) {
+            return (array) $value;
+        }
+
+        $array = [];
+
+        foreach ((array) $value as $key =&gt; $val) {
+            // Exception traces commonly reference hundreds to thousands of
+            // objects currently loaded in memory. Including them in the result
+            // has a severe negative performance impact.
+            if (&quot;\0Error\0trace&quot; === $key || &quot;\0Exception\0trace&quot; === $key) {
+                continue;
+            }
+
+            // properties are transformed to keys in the following way:
+            // private   $propertyName =&gt; &quot;\0ClassName\0propertyName&quot;
+            // protected $propertyName =&gt; &quot;\0*\0propertyName&quot;
+            // public    $propertyName =&gt; &quot;propertyName&quot;
+            if (preg_match(&#039;/\0.+\0(.+)/&#039;, (string) $key, $matches) === 1) {
+                $key = $matches[1];
+            }
+
+            // See https://github.com/php/php-src/commit/5721132
+            if ($key === &quot;\0gcdata&quot;) {
+                continue;
+            }
+
+            $array[$key] = $val;
+        }
+
+        // Some internal classes like SplObjectStorage do not work with the
+        // above (fast) mechanism nor with reflection in Zend.
+        // Format the output similarly to print_r() in this case
+        if ($value instanceof SplObjectStorage) {
+            foreach ($value as $_value) {
+                $array[&#039;Object #&#039; . spl_object_id($_value)] = [
+                    &#039;obj&#039; =&gt; $_value,
+                    &#039;inf&#039; =&gt; $value-&gt;getInfo(),
+                ];
+            }
+
+            $value-&gt;rewind();
+        }
+
+        return $array;
+    }
+
+    public function countProperties(object $value): int
+    {
+        if (!$this-&gt;canBeReflected($value)) {
+            // @codeCoverageIgnoreStart
+            return count($this-&gt;toArray($value));
+            // @codeCoverageIgnoreEnd
+        }
+
+        if (!$value instanceof stdClass) {
+            // using ReflectionClass prevents initialization of potential lazy objects
+            return count((new ReflectionClass($value))-&gt;getProperties());
+        }
+
+        return count((new ReflectionObject($value))-&gt;getProperties());
+    }
+
+    /**
+     * @param array&lt;mixed&gt; $data
+     * @param positive-int $maxLengthForStrings
+     */
+    private function shortenedCountedRecursiveExport(array &amp;$data, RecursionContext $processed, int &amp;$counter, int $maxLengthForStrings): string
+    {
+        $result = [];
+
+        $array = $data;
+
+        /* @noinspection UnusedFunctionResultInspection */
+        $processed-&gt;add($data);
+
+        foreach ($array as $key =&gt; $value) {
+            if ($this-&gt;shortenArraysLongerThan &gt; 0 &amp;&amp;
+                $counter &gt; $this-&gt;shortenArraysLongerThan) {
+                break;
+            }
+
+            if (is_array($value)) {
+                assert(isset($data[$key]) &amp;&amp; (is_array($data[$key]) || is_object($data[$key])));
+
+                if ($processed-&gt;contains($data[$key]) !== false) {
+                    $result[] = &#039;*RECURSION*&#039;;
+                } else {
+                    assert(is_array($data[$key]));
+
+                    $result[] = &#039;[&#039; . $this-&gt;shortenedCountedRecursiveExport($data[$key], $processed, $counter, $maxLengthForStrings) . &#039;]&#039;;
+                }
+            } else {
+                $result[] = $this-&gt;shortenedExport($value, $maxLengthForStrings);
+            }
+
+            $counter++;
+        }
+
+        return implode(&#039;, &#039;, $result);
+    }
+
+    private function recursiveExport(mixed &amp;$value, int $indentation = 0, ?RecursionContext $processed = null): string
+    {
+        if ($value === null) {
+            return &#039;null&#039;;
+        }
+
+        if (is_bool($value)) {
+            return $value ? &#039;true&#039; : &#039;false&#039;;
+        }
+
+        if (is_float($value)) {
+            return $this-&gt;exportFloat($value);
+        }
+
+        if (gettype($value) === &#039;resource (closed)&#039;) {
+            return &#039;resource (closed)&#039;;
+        }
+
+        if (is_resource($value)) {
+            return sprintf(
+                &#039;resource(%d) of type (%s)&#039;,
+                /** @phpstan-ignore cast.useless */
+                (int) $value,
+                get_resource_type($value),
+            );
+        }
+
+        if ($value instanceof BackedEnum) {
+            return sprintf(
+                &#039;%s Enum #%d (%s, %s)&#039;,
+                $value::class,
+                spl_object_id($value),
+                $value-&gt;name,
+                $this-&gt;export($value-&gt;value),
+            );
+        }
+
+        if ($value instanceof UnitEnum) {
+            return sprintf(
+                &#039;%s Enum #%d (%s)&#039;,
+                $value::class,
+                spl_object_id($value),
+                $value-&gt;name,
+            );
+        }
+
+        if (is_string($value)) {
+            return $this-&gt;exportString($value);
+        }
+
+        if ($processed === null) {
+            $processed = new RecursionContext;
+        }
+
+        if (is_array($value)) {
+            return $this-&gt;exportArray($value, $processed, $indentation);
+        }
+
+        if (is_object($value)) {
+            return $this-&gt;exportObject($value, $processed, $indentation);
+        }
+
+        return var_export($value, true);
+    }
+
+    private function exportFloat(float $value): string
+    {
+        $precisionBackup = ini_get(&#039;precision&#039;);
+
+        ini_set(&#039;precision&#039;, &#039;-1&#039;);
+
+        $valueAsString = @(string) $value;
+
+        ini_set(&#039;precision&#039;, $precisionBackup);
+
+        if ((string) @(int) $value === $valueAsString) {
+            return $valueAsString . &#039;.0&#039;;
+        }
+
+        return $valueAsString;
+    }
+
+    private function exportString(string $value): string
+    {
+        // Match for most non-printable chars somewhat taking multibyte chars into account
+        if (preg_match(&#039;/[^\x09-\x0d\x1b\x20-\xff]/&#039;, $value) === 1) {
+            return &#039;Binary String: 0x&#039; . bin2hex($value);
+        }
+
+        return &quot;&#039;&quot; .
+            strtr(
+                $value,
+                [
+                    &quot;\r\n&quot; =&gt; &#039;\r\n&#039; . &quot;\n&quot;,
+                    &quot;\n\r&quot; =&gt; &#039;\n\r&#039; . &quot;\n&quot;,
+                    &quot;\r&quot;   =&gt; &#039;\r&#039; . &quot;\n&quot;,
+                    &quot;\n&quot;   =&gt; &#039;\n&#039; . &quot;\n&quot;,
+                ],
+            ) .
+            &quot;&#039;&quot;;
+    }
+
+    /**
+     * @param array&lt;mixed&gt; $value
+     */
+    private function exportArray(array &amp;$value, RecursionContext $processed, int $indentation): string
+    {
+        if (($key = $processed-&gt;contains($value)) !== false) {
+            return &#039;Array &amp;&#039; . $key;
+        }
+
+        $array  = $value;
+        $key    = $processed-&gt;add($value);
+        $values = &#039;&#039;;
+
+        if (count($array) &gt; 0) {
+            $whitespace = str_repeat(&#039; &#039;, 4 * $indentation);
+
+            foreach ($array as $k =&gt; $v) {
+                $values .=
+                    $whitespace
+                    . &#039;    &#039; .
+                    $this-&gt;recursiveExport($k, $indentation)
+                    . &#039; =&gt; &#039; .
+                    /** @phpstan-ignore offsetAccess.invalidOffset */
+                    $this-&gt;recursiveExport($value[$k], $indentation + 1, $processed)
+                    . &quot;,\n&quot;;
+            }
+
+            $values = &quot;\n&quot; . $values . $whitespace;
+        }
+
+        return &#039;Array &amp;&#039; . (string) $key . &#039; [&#039; . $values . &#039;]&#039;;
+    }
+
+    private function exportObject(object $value, RecursionContext $processed, int $indentation): string
+    {
+        $class = $value::class;
+
+        if ($processed-&gt;contains($value) !== false) {
+            return $class . &#039; Object #&#039; . spl_object_id($value);
+        }
+
+        $processed-&gt;add($value);
+
+        $array  = $this-&gt;toArray($value);
+        $buffer = &#039;&#039;;
+
+        if (count($array) &gt; 0) {
+            $whitespace = str_repeat(&#039; &#039;, 4 * $indentation);
+
+            foreach ($array as $k =&gt; $v) {
+                $buffer .=
+                    $whitespace
+                    . &#039;    &#039; .
+                    $this-&gt;recursiveExport($k, $indentation)
+                    . &#039; =&gt; &#039; .
+                    $this-&gt;recursiveExport($v, $indentation + 1, $processed)
+                    . &quot;,\n&quot;;
+            }
+
+            $buffer = &quot;\n&quot; . $buffer . $whitespace;
+        }
+
+        return $class . &#039; Object #&#039; . spl_object_id($value) . &#039; (&#039; . $buffer . &#039;)&#039;;
+    }
+
+    private function canBeReflected(object $object): bool
+    {
+        /** @phpstan-ignore class.notFound */
+        if ($object instanceof Message) {
+            // @codeCoverageIgnoreStart
+            return false;
+            // @codeCoverageIgnoreEnd
+        }
+
+        return true;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/sebastian/global-state/ChangeLog.md -->
+<!-- PEDROO_NEXT_DIR: /vendor/sebastian/global-state -->
+
+</body>
+</html>

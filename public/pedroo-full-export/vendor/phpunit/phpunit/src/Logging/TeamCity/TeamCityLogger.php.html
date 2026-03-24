@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpunit/phpunit/src/Logging/TeamCity/TeamCityLogger.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of PHPUnit.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace PHPUnit\Logging\TeamCity;
+
+use function assert;
+use function getmypid;
+use function ini_get;
+use function is_a;
+use function round;
+use function sprintf;
+use function str_replace;
+use function stripos;
+use PHPUnit\Event\Code\TestMethod;
+use PHPUnit\Event\Code\Throwable;
+use PHPUnit\Event\Event;
+use PHPUnit\Event\Facade;
+use PHPUnit\Event\InvalidArgumentException;
+use PHPUnit\Event\Telemetry\HRTime;
+use PHPUnit\Event\Test\BeforeFirstTestMethodErrored;
+use PHPUnit\Event\Test\ConsideredRisky;
+use PHPUnit\Event\Test\Errored;
+use PHPUnit\Event\Test\Failed;
+use PHPUnit\Event\Test\Finished;
+use PHPUnit\Event\Test\MarkedIncomplete;
+use PHPUnit\Event\Test\Prepared;
+use PHPUnit\Event\Test\Skipped;
+use PHPUnit\Event\TestSuite\Finished as TestSuiteFinished;
+use PHPUnit\Event\TestSuite\Skipped as TestSuiteSkipped;
+use PHPUnit\Event\TestSuite\Started as TestSuiteStarted;
+use PHPUnit\Event\TestSuite\TestSuiteForTestClass;
+use PHPUnit\Event\TestSuite\TestSuiteForTestMethodWithDataProvider;
+use PHPUnit\Framework\Exception as FrameworkException;
+use PHPUnit\TextUI\Output\Printer;
+
+/**
+ * @no-named-arguments Parameter names are not covered by the backward compatibility promise for PHPUnit
+ *
+ * @internal This class is not covered by the backward compatibility promise for PHPUnit
+ */
+final class TeamCityLogger
+{
+    private readonly Printer $printer;
+    private bool $isSummaryTestCountPrinted = false;
+    private ?HRTime $time                   = null;
+    private ?int $flowId                    = null;
+
+    public function __construct(Printer $printer, Facade $facade)
+    {
+        $this-&gt;printer = $printer;
+
+        $this-&gt;registerSubscribers($facade);
+        $this-&gt;setFlowId();
+    }
+
+    public function testSuiteStarted(TestSuiteStarted $event): void
+    {
+        $testSuite = $event-&gt;testSuite();
+
+        if (!$this-&gt;isSummaryTestCountPrinted) {
+            $this-&gt;isSummaryTestCountPrinted = true;
+
+            $this-&gt;writeMessage(
+                &#039;testCount&#039;,
+                [&#039;count&#039; =&gt; $testSuite-&gt;count()],
+            );
+        }
+
+        $parameters = [&#039;name&#039; =&gt; $testSuite-&gt;name()];
+
+        if ($testSuite-&gt;isForTestClass()) {
+            assert($testSuite instanceof TestSuiteForTestClass);
+
+            $parameters[&#039;locationHint&#039;] = sprintf(
+                &#039;php_qn://%s::\\%s&#039;,
+                $testSuite-&gt;file(),
+                $testSuite-&gt;name(),
+            );
+        } elseif ($testSuite-&gt;isForTestMethodWithDataProvider()) {
+            assert($testSuite instanceof TestSuiteForTestMethodWithDataProvider);
+
+            $parameters[&#039;locationHint&#039;] = sprintf(
+                &#039;php_qn://%s::\\%s&#039;,
+                $testSuite-&gt;file(),
+                $testSuite-&gt;name(),
+            );
+
+            $parameters[&#039;name&#039;] = $testSuite-&gt;methodName();
+        }
+
+        $this-&gt;writeMessage(&#039;testSuiteStarted&#039;, $parameters);
+    }
+
+    public function testSuiteFinished(TestSuiteFinished $event): void
+    {
+        $testSuite = $event-&gt;testSuite();
+
+        $parameters = [&#039;name&#039; =&gt; $testSuite-&gt;name()];
+
+        if ($testSuite-&gt;isForTestMethodWithDataProvider()) {
+            assert($testSuite instanceof TestSuiteForTestMethodWithDataProvider);
+
+            $parameters[&#039;name&#039;] = $testSuite-&gt;methodName();
+        }
+
+        $this-&gt;writeMessage(&#039;testSuiteFinished&#039;, $parameters);
+    }
+
+    public function testPrepared(Prepared $event): void
+    {
+        $test = $event-&gt;test();
+
+        $parameters = [
+            &#039;name&#039; =&gt; $test-&gt;name(),
+        ];
+
+        if ($test-&gt;isTestMethod()) {
+            assert($test instanceof TestMethod);
+
+            $parameters[&#039;locationHint&#039;] = sprintf(
+                &#039;php_qn://%s::\\%s::%s&#039;,
+                $test-&gt;file(),
+                $test-&gt;className(),
+                $test-&gt;name(),
+            );
+        }
+
+        $this-&gt;writeMessage(&#039;testStarted&#039;, $parameters);
+
+        $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testMarkedIncomplete(MarkedIncomplete $event): void
+    {
+        if ($this-&gt;time === null) {
+            // @codeCoverageIgnoreStart
+            $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+            // @codeCoverageIgnoreEnd
+        }
+
+        $this-&gt;writeMessage(
+            &#039;testIgnored&#039;,
+            [
+                &#039;name&#039;     =&gt; $event-&gt;test()-&gt;name(),
+                &#039;message&#039;  =&gt; $event-&gt;throwable()-&gt;message(),
+                &#039;details&#039;  =&gt; $this-&gt;details($event-&gt;throwable()),
+                &#039;duration&#039; =&gt; $this-&gt;duration($event),
+            ],
+        );
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testSkipped(Skipped $event): void
+    {
+        if ($this-&gt;time === null) {
+            $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+        }
+
+        $parameters = [
+            &#039;name&#039;    =&gt; $event-&gt;test()-&gt;name(),
+            &#039;message&#039; =&gt; $event-&gt;message(),
+        ];
+
+        $parameters[&#039;duration&#039;] = $this-&gt;duration($event);
+
+        $this-&gt;writeMessage(&#039;testIgnored&#039;, $parameters);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testSuiteSkipped(TestSuiteSkipped $event): void
+    {
+        if ($this-&gt;time === null) {
+            $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+        }
+
+        $parameters = [
+            &#039;name&#039;    =&gt; $event-&gt;testSuite()-&gt;name(),
+            &#039;message&#039; =&gt; $event-&gt;message(),
+        ];
+
+        $parameters[&#039;duration&#039;] = $this-&gt;duration($event);
+
+        $this-&gt;writeMessage(&#039;testIgnored&#039;, $parameters);
+        $this-&gt;writeMessage(&#039;testSuiteFinished&#039;, $parameters);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function beforeFirstTestMethodErrored(BeforeFirstTestMethodErrored $event): void
+    {
+        if ($this-&gt;time === null) {
+            $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+        }
+
+        $parameters = [
+            &#039;name&#039;     =&gt; $event-&gt;testClassName(),
+            &#039;message&#039;  =&gt; $this-&gt;message($event-&gt;throwable()),
+            &#039;details&#039;  =&gt; $this-&gt;details($event-&gt;throwable()),
+            &#039;duration&#039; =&gt; $this-&gt;duration($event),
+        ];
+
+        $this-&gt;writeMessage(&#039;testFailed&#039;, $parameters);
+        $this-&gt;writeMessage(&#039;testSuiteFinished&#039;, $parameters);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testErrored(Errored $event): void
+    {
+        if ($this-&gt;time === null) {
+            $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+        }
+
+        $this-&gt;writeMessage(
+            &#039;testFailed&#039;,
+            [
+                &#039;name&#039;     =&gt; $event-&gt;test()-&gt;name(),
+                &#039;message&#039;  =&gt; $this-&gt;message($event-&gt;throwable()),
+                &#039;details&#039;  =&gt; $this-&gt;details($event-&gt;throwable()),
+                &#039;duration&#039; =&gt; $this-&gt;duration($event),
+            ],
+        );
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testFailed(Failed $event): void
+    {
+        if ($this-&gt;time === null) {
+            // @codeCoverageIgnoreStart
+            $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+            // @codeCoverageIgnoreEnd
+        }
+
+        $parameters = [
+            &#039;name&#039;     =&gt; $event-&gt;test()-&gt;name(),
+            &#039;message&#039;  =&gt; $this-&gt;message($event-&gt;throwable()),
+            &#039;details&#039;  =&gt; $this-&gt;details($event-&gt;throwable()),
+            &#039;duration&#039; =&gt; $this-&gt;duration($event),
+        ];
+
+        if ($event-&gt;hasComparisonFailure()) {
+            $parameters[&#039;type&#039;]     = &#039;comparisonFailure&#039;;
+            $parameters[&#039;actual&#039;]   = $event-&gt;comparisonFailure()-&gt;actual();
+            $parameters[&#039;expected&#039;] = $event-&gt;comparisonFailure()-&gt;expected();
+        }
+
+        $this-&gt;writeMessage(&#039;testFailed&#039;, $parameters);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testConsideredRisky(ConsideredRisky $event): void
+    {
+        if ($this-&gt;time === null) {
+            // @codeCoverageIgnoreStart
+            $this-&gt;time = $event-&gt;telemetryInfo()-&gt;time();
+            // @codeCoverageIgnoreEnd
+        }
+
+        $this-&gt;writeMessage(
+            &#039;testFailed&#039;,
+            [
+                &#039;name&#039;     =&gt; $event-&gt;test()-&gt;name(),
+                &#039;message&#039;  =&gt; $event-&gt;message(),
+                &#039;details&#039;  =&gt; &#039;&#039;,
+                &#039;duration&#039; =&gt; $this-&gt;duration($event),
+            ],
+        );
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    public function testFinished(Finished $event): void
+    {
+        $this-&gt;writeMessage(
+            &#039;testFinished&#039;,
+            [
+                &#039;name&#039;     =&gt; $event-&gt;test()-&gt;name(),
+                &#039;duration&#039; =&gt; $this-&gt;duration($event),
+            ],
+        );
+
+        $this-&gt;time = null;
+    }
+
+    public function flush(): void
+    {
+        $this-&gt;printer-&gt;flush();
+    }
+
+    private function registerSubscribers(Facade $facade): void
+    {
+        $facade-&gt;registerSubscribers(
+            new TestSuiteStartedSubscriber($this),
+            new TestSuiteFinishedSubscriber($this),
+            new TestPreparedSubscriber($this),
+            new TestFinishedSubscriber($this),
+            new TestErroredSubscriber($this),
+            new TestFailedSubscriber($this),
+            new TestMarkedIncompleteSubscriber($this),
+            new TestSkippedSubscriber($this),
+            new TestSuiteSkippedSubscriber($this),
+            new TestConsideredRiskySubscriber($this),
+            new TestRunnerExecutionFinishedSubscriber($this),
+            new TestSuiteBeforeFirstTestMethodErroredSubscriber($this),
+        );
+    }
+
+    private function setFlowId(): void
+    {
+        if (stripos(ini_get(&#039;disable_functions&#039;), &#039;getmypid&#039;) === false) {
+            $this-&gt;flowId = getmypid();
+        }
+    }
+
+    /**
+     * @param array&lt;non-empty-string, int|string&gt; $parameters
+     */
+    private function writeMessage(string $eventName, array $parameters = []): void
+    {
+        $this-&gt;printer-&gt;print(
+            sprintf(
+                &#039;##teamcity[%s&#039;,
+                $eventName,
+            ),
+        );
+
+        if ($this-&gt;flowId !== null) {
+            $parameters[&#039;flowId&#039;] = $this-&gt;flowId;
+        }
+
+        foreach ($parameters as $key =&gt; $value) {
+            $this-&gt;printer-&gt;print(
+                sprintf(
+                    &quot; %s=&#039;%s&#039;&quot;,
+                    $key,
+                    $this-&gt;escape((string) $value),
+                ),
+            );
+        }
+
+        $this-&gt;printer-&gt;print(&quot;]\n&quot;);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function duration(Event $event): int
+    {
+        if ($this-&gt;time === null) {
+            // @codeCoverageIgnoreStart
+            return 0;
+            // @codeCoverageIgnoreEnd
+        }
+
+        return (int) round($event-&gt;telemetryInfo()-&gt;time()-&gt;duration($this-&gt;time)-&gt;asFloat() * 1000);
+    }
+
+    private function escape(string $string): string
+    {
+        return str_replace(
+            [&#039;|&#039;, &quot;&#039;&quot;, &quot;\n&quot;, &quot;\r&quot;, &#039;]&#039;, &#039;[&#039;],
+            [&#039;||&#039;, &quot;|&#039;&quot;, &#039;|n&#039;, &#039;|r&#039;, &#039;|]&#039;, &#039;|[&#039;],
+            $string,
+        );
+    }
+
+    private function message(Throwable $throwable): string
+    {
+        if (is_a($throwable-&gt;className(), FrameworkException::class, true)) {
+            return $throwable-&gt;message();
+        }
+
+        $buffer = $throwable-&gt;className();
+
+        if ($throwable-&gt;message() !== &#039;&#039;) {
+            $buffer .= &#039;: &#039; . $throwable-&gt;message();
+        }
+
+        return $buffer;
+    }
+
+    private function details(Throwable $throwable): string
+    {
+        $buffer = $throwable-&gt;stackTrace();
+
+        while ($throwable-&gt;hasPrevious()) {
+            $throwable = $throwable-&gt;previous();
+
+            $buffer .= sprintf(
+                &quot;\nCaused by\n%s\n%s&quot;,
+                $throwable-&gt;description(),
+                $throwable-&gt;stackTrace(),
+            );
+        }
+
+        return $buffer;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpunit/phpunit/src/Logging/TestDox/HtmlRenderer.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpunit/phpunit/src/Logging/TeamCity/Subscriber -->
+
+</body>
+</html>

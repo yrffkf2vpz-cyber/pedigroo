@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/spatie/laravel-ignition/src/Views/ViewExceptionMapper.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Spatie\LaravelIgnition\Views;
+
+use Illuminate\Contracts\View\Engine;
+use Illuminate\Foundation\Application;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\View\Engines\PhpEngine;
+use Illuminate\View\ViewException;
+use ReflectionClass;
+use ReflectionProperty;
+use Spatie\ErrorSolutions\Contracts\ProvidesSolution;
+use Spatie\LaravelIgnition\Exceptions\ViewException as IgnitionViewException;
+use Spatie\LaravelIgnition\Exceptions\ViewExceptionWithSolution;
+use Throwable;
+
+class ViewExceptionMapper
+{
+    protected Engine $compilerEngine;
+
+    protected BladeSourceMapCompiler $bladeSourceMapCompiler;
+
+    protected array $knownPaths;
+
+    public function __construct(BladeSourceMapCompiler $bladeSourceMapCompiler)
+    {
+        $resolver = app(&#039;view.engine.resolver&#039;);
+
+        $this-&gt;compilerEngine = $resolver-&gt;resolve(&#039;blade&#039;);
+
+        $this-&gt;bladeSourceMapCompiler = $bladeSourceMapCompiler;
+    }
+
+    public function map(ViewException $viewException): IgnitionViewException
+    {
+        $baseException = $this-&gt;getRealException($viewException);
+
+        if ($baseException instanceof IgnitionViewException) {
+            return $baseException;
+        }
+
+        preg_match(&#039;/\(View: (?P&lt;path&gt;.*?)\)/&#039;, $viewException-&gt;getMessage(), $matches);
+
+        $compiledViewPath = $matches[&#039;path&#039;];
+
+        $exception = $this-&gt;createException($baseException);
+
+        if ($baseException instanceof ProvidesSolution) {
+            /** @var ViewExceptionWithSolution $exception */
+            $exception-&gt;setSolution($baseException-&gt;getSolution());
+        }
+
+        $this-&gt;modifyViewsInTrace($exception);
+
+        $exception-&gt;setView($compiledViewPath);
+        $exception-&gt;setViewData($this-&gt;getViewData($exception));
+
+        return $exception;
+    }
+
+    protected function createException(Throwable $baseException): IgnitionViewException
+    {
+        $viewExceptionClass = $baseException instanceof ProvidesSolution
+            ? ViewExceptionWithSolution::class
+            : IgnitionViewException::class;
+
+        $viewFile = $this-&gt;findCompiledView($baseException-&gt;getFile());
+        $file = $viewFile ?? $baseException-&gt;getFile();
+        $line = $viewFile ? $this-&gt;getBladeLineNumber($file, $baseException-&gt;getLine()) : $baseException-&gt;getLine();
+
+        return new $viewExceptionClass(
+            $baseException-&gt;getMessage(),
+            0,
+            1,
+            $file,
+            $line,
+            $baseException
+        );
+    }
+
+    protected function modifyViewsInTrace(IgnitionViewException $exception): void
+    {
+        $viewIndex = null;
+
+        $trace = Collection::make($exception-&gt;getPrevious()-&gt;getTrace())
+            -&gt;map(function ($trace, $index) use (&amp;$viewIndex) {
+                if ($originalPath = $this-&gt;findCompiledView(Arr::get($trace, &#039;file&#039;, &#039;&#039;))) {
+
+                    $trace[&#039;file&#039;] = $originalPath;
+                    $trace[&#039;line&#039;] = $this-&gt;getBladeLineNumber($trace[&#039;file&#039;], $trace[&#039;line&#039;]);
+
+                    if ($viewIndex === null) {
+                        $viewIndex = $index;
+                    }
+                }
+
+                return $trace;
+            })
+            -&gt;when(
+                $viewIndex !== null &amp;&amp; str_ends_with($exception-&gt;getFile(), &#039;.blade.php&#039;),
+                fn (Collection $trace) =&gt; $trace-&gt;slice($viewIndex + 1)  // Remove all traces before the view
+            )
+            -&gt;toArray();
+
+        $traceProperty = new ReflectionProperty(&#039;Exception&#039;, &#039;trace&#039;);
+        $traceProperty-&gt;setValue($exception, $trace);
+    }
+
+    /**
+     * Look at the previous exceptions to find the original exception.
+     * This is usually the first Exception that is not a ViewException.
+     */
+    protected function getRealException(Throwable $exception): Throwable
+    {
+        $rootException = $exception-&gt;getPrevious() ?? $exception;
+
+        while ($rootException instanceof ViewException &amp;&amp; $rootException-&gt;getPrevious()) {
+            $rootException = $rootException-&gt;getPrevious();
+        }
+
+        return $rootException;
+    }
+
+    protected function findCompiledView(string $compiledPath): ?string
+    {
+        $this-&gt;knownPaths ??= $this-&gt;getKnownPaths();
+
+        return $this-&gt;knownPaths[$compiledPath] ?? null;
+    }
+
+    protected function getKnownPaths(): array
+    {
+        $compilerEngineReflection = new ReflectionClass($this-&gt;compilerEngine);
+
+        if (! $compilerEngineReflection-&gt;hasProperty(&#039;lastCompiled&#039;) &amp;&amp; $compilerEngineReflection-&gt;hasProperty(&#039;engine&#039;)) {
+            $compilerEngine = $compilerEngineReflection-&gt;getProperty(&#039;engine&#039;);
+            $compilerEngine = $compilerEngine-&gt;getValue($this-&gt;compilerEngine);
+            $lastCompiled = new ReflectionProperty($compilerEngine, &#039;lastCompiled&#039;);
+            $lastCompiled = $lastCompiled-&gt;getValue($compilerEngine);
+        } else {
+            $lastCompiled = $compilerEngineReflection-&gt;getProperty(&#039;lastCompiled&#039;);
+            $lastCompiled = $lastCompiled-&gt;getValue($this-&gt;compilerEngine);
+        }
+
+        $knownPaths = [];
+        foreach ($lastCompiled as $lastCompiledPath) {
+            $compiledPath = $this-&gt;compilerEngine-&gt;getCompiler()-&gt;getCompiledPath($lastCompiledPath);
+
+            $knownPaths[realpath($compiledPath ?? $lastCompiledPath)] = realpath($lastCompiledPath);
+        }
+
+        return $knownPaths;
+    }
+
+    protected function getBladeLineNumber(string $view, int $compiledLineNumber): int
+    {
+        return $this-&gt;bladeSourceMapCompiler-&gt;detectLineNumber($view, $compiledLineNumber);
+    }
+
+    protected function getViewData(Throwable $exception): array
+    {
+        foreach ($exception-&gt;getTrace() as $frame) {
+            if (Arr::get($frame, &#039;class&#039;) === PhpEngine::class) {
+                $data = Arr::get($frame, &#039;args.1&#039;, []);
+
+                return $this-&gt;filterViewData($data);
+            }
+        }
+
+        return [];
+    }
+
+    protected function filterViewData(array $data): array
+    {
+        // By default, Laravel views get two data keys:
+        // __env and app. We try to filter them out.
+        return array_filter($data, function ($value, $key) {
+            if ($key === &#039;app&#039;) {
+                return ! $value instanceof Application;
+            }
+
+            return $key !== &#039;__env&#039;;
+        }, ARRAY_FILTER_USE_BOTH);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/spatie/laravel-ignition/src/helpers.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/spatie/laravel-package-tools -->
+
+</body>
+</html>

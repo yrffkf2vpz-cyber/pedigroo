@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpstan/phpdoc-parser/src/Ast/NodeTraverser.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types = 1);
+
+namespace PHPStan\PhpDocParser\Ast;
+
+use LogicException;
+use PHPStan\PhpDocParser\Ast\ConstExpr\ConstExprNode;
+use PHPStan\PhpDocParser\Ast\PhpDoc\PhpDocChildNode;
+use PHPStan\PhpDocParser\Ast\PhpDoc\PhpDocTagValueNode;
+use PHPStan\PhpDocParser\Ast\Type\TypeNode;
+use function array_keys;
+use function array_pop;
+use function array_splice;
+use function count;
+use function get_class;
+use function get_object_vars;
+use function gettype;
+use function is_array;
+use function sprintf;
+
+/**
+ * Inspired by https://github.com/nikic/PHP-Parser/tree/36a6dcd04e7b0285e8f0868f44bd4927802f7df1
+ *
+ * Copyright (c) 2011, Nikita Popov
+ * All rights reserved.
+ */
+final class NodeTraverser
+{
+
+	/**
+	 * If NodeVisitor::enterNode() returns DONT_TRAVERSE_CHILDREN, child nodes
+	 * of the current node will not be traversed for any visitors.
+	 *
+	 * For subsequent visitors enterNode() will still be called on the current
+	 * node and leaveNode() will also be invoked for the current node.
+	 */
+	public const DONT_TRAVERSE_CHILDREN = 1;
+
+	/**
+	 * If NodeVisitor::enterNode() or NodeVisitor::leaveNode() returns
+	 * STOP_TRAVERSAL, traversal is aborted.
+	 *
+	 * The afterTraverse() method will still be invoked.
+	 */
+	public const STOP_TRAVERSAL = 2;
+
+	/**
+	 * If NodeVisitor::leaveNode() returns REMOVE_NODE for a node that occurs
+	 * in an array, it will be removed from the array.
+	 *
+	 * For subsequent visitors leaveNode() will still be invoked for the
+	 * removed node.
+	 */
+	public const REMOVE_NODE = 3;
+
+	/**
+	 * If NodeVisitor::enterNode() returns DONT_TRAVERSE_CURRENT_AND_CHILDREN, child nodes
+	 * of the current node will not be traversed for any visitors.
+	 *
+	 * For subsequent visitors enterNode() will not be called as well.
+	 * leaveNode() will be invoked for visitors that has enterNode() method invoked.
+	 */
+	public const DONT_TRAVERSE_CURRENT_AND_CHILDREN = 4;
+
+	/** @var list&lt;NodeVisitor&gt; Visitors */
+	private array $visitors = [];
+
+	/** @var bool Whether traversal should be stopped */
+	private bool $stopTraversal;
+
+	/**
+	 * @param list&lt;NodeVisitor&gt; $visitors
+	 */
+	public function __construct(array $visitors)
+	{
+		$this-&gt;visitors = $visitors;
+	}
+
+	/**
+	 * Traverses an array of nodes using the registered visitors.
+	 *
+	 * @param Node[] $nodes Array of nodes
+	 *
+	 * @return Node[] Traversed array of nodes
+	 */
+	public function traverse(array $nodes): array
+	{
+		$this-&gt;stopTraversal = false;
+
+		foreach ($this-&gt;visitors as $visitor) {
+			$return = $visitor-&gt;beforeTraverse($nodes);
+			if ($return === null) {
+				continue;
+			}
+
+			$nodes = $return;
+		}
+
+		$nodes = $this-&gt;traverseArray($nodes);
+
+		foreach ($this-&gt;visitors as $visitor) {
+			$return = $visitor-&gt;afterTraverse($nodes);
+			if ($return === null) {
+				continue;
+			}
+
+			$nodes = $return;
+		}
+
+		return $nodes;
+	}
+
+	/**
+	 * Recursively traverse a node.
+	 *
+	 * @param Node $node Node to traverse.
+	 *
+	 * @return Node Result of traversal (may be original node or new one)
+	 */
+	private function traverseNode(Node $node): Node
+	{
+		$subNodeNames = array_keys(get_object_vars($node));
+		foreach ($subNodeNames as $name) {
+			$subNode =&amp; $node-&gt;$name;
+
+			if (is_array($subNode)) {
+				$subNode = $this-&gt;traverseArray($subNode);
+				if ($this-&gt;stopTraversal) {
+					break;
+				}
+			} elseif ($subNode instanceof Node) {
+				$traverseChildren = true;
+				$breakVisitorIndex = null;
+
+				foreach ($this-&gt;visitors as $visitorIndex =&gt; $visitor) {
+					$return = $visitor-&gt;enterNode($subNode);
+					if ($return === null) {
+						continue;
+					}
+
+					if ($return instanceof Node) {
+						$this-&gt;ensureReplacementReasonable($subNode, $return);
+						$subNode = $return;
+					} elseif ($return === self::DONT_TRAVERSE_CHILDREN) {
+						$traverseChildren = false;
+					} elseif ($return === self::DONT_TRAVERSE_CURRENT_AND_CHILDREN) {
+						$traverseChildren = false;
+						$breakVisitorIndex = $visitorIndex;
+						break;
+					} elseif ($return === self::STOP_TRAVERSAL) {
+						$this-&gt;stopTraversal = true;
+						break 2;
+					} else {
+						throw new LogicException(
+							&#039;enterNode() returned invalid value of type &#039; . gettype($return),
+						);
+					}
+				}
+
+				if ($traverseChildren) {
+					$subNode = $this-&gt;traverseNode($subNode);
+					if ($this-&gt;stopTraversal) {
+						break;
+					}
+				}
+
+				foreach ($this-&gt;visitors as $visitorIndex =&gt; $visitor) {
+					$return = $visitor-&gt;leaveNode($subNode);
+
+					if ($return !== null) {
+						if ($return instanceof Node) {
+							$this-&gt;ensureReplacementReasonable($subNode, $return);
+							$subNode = $return;
+						} elseif ($return === self::STOP_TRAVERSAL) {
+							$this-&gt;stopTraversal = true;
+							break 2;
+						} elseif (is_array($return)) {
+							throw new LogicException(
+								&#039;leaveNode() may only return an array &#039; .
+								&#039;if the parent structure is an array&#039;,
+							);
+						} else {
+							throw new LogicException(
+								&#039;leaveNode() returned invalid value of type &#039; . gettype($return),
+							);
+						}
+					}
+
+					if ($breakVisitorIndex === $visitorIndex) {
+						break;
+					}
+				}
+			}
+		}
+
+		return $node;
+	}
+
+	/**
+	 * Recursively traverse array (usually of nodes).
+	 *
+	 * @param mixed[] $nodes Array to traverse
+	 *
+	 * @return mixed[] Result of traversal (may be original array or changed one)
+	 */
+	private function traverseArray(array $nodes): array
+	{
+		$doNodes = [];
+
+		foreach ($nodes as $i =&gt; &amp;$node) {
+			if ($node instanceof Node) {
+				$traverseChildren = true;
+				$breakVisitorIndex = null;
+
+				foreach ($this-&gt;visitors as $visitorIndex =&gt; $visitor) {
+					$return = $visitor-&gt;enterNode($node);
+					if ($return === null) {
+						continue;
+					}
+
+					if ($return instanceof Node) {
+						$this-&gt;ensureReplacementReasonable($node, $return);
+						$node = $return;
+					} elseif (is_array($return)) {
+						$doNodes[] = [$i, $return];
+						continue 2;
+					} elseif ($return === self::REMOVE_NODE) {
+						$doNodes[] = [$i, []];
+						continue 2;
+					} elseif ($return === self::DONT_TRAVERSE_CHILDREN) {
+						$traverseChildren = false;
+					} elseif ($return === self::DONT_TRAVERSE_CURRENT_AND_CHILDREN) {
+						$traverseChildren = false;
+						$breakVisitorIndex = $visitorIndex;
+						break;
+					} elseif ($return === self::STOP_TRAVERSAL) {
+						$this-&gt;stopTraversal = true;
+						break 2;
+					} else {
+						throw new LogicException(
+							&#039;enterNode() returned invalid value of type &#039; . gettype($return),
+						);
+					}
+				}
+
+				if ($traverseChildren) {
+					$node = $this-&gt;traverseNode($node);
+					if ($this-&gt;stopTraversal) {
+						break;
+					}
+				}
+
+				foreach ($this-&gt;visitors as $visitorIndex =&gt; $visitor) {
+					$return = $visitor-&gt;leaveNode($node);
+
+					if ($return !== null) {
+						if ($return instanceof Node) {
+							$this-&gt;ensureReplacementReasonable($node, $return);
+							$node = $return;
+						} elseif (is_array($return)) {
+							$doNodes[] = [$i, $return];
+							break;
+						} elseif ($return === self::REMOVE_NODE) {
+							$doNodes[] = [$i, []];
+							break;
+						} elseif ($return === self::STOP_TRAVERSAL) {
+							$this-&gt;stopTraversal = true;
+							break 2;
+						} else {
+							throw new LogicException(
+								&#039;leaveNode() returned invalid value of type &#039; . gettype($return),
+							);
+						}
+					}
+
+					if ($breakVisitorIndex === $visitorIndex) {
+						break;
+					}
+				}
+			} elseif (is_array($node)) {
+				throw new LogicException(&#039;Invalid node structure: Contains nested arrays&#039;);
+			}
+		}
+
+		if (count($doNodes) &gt; 0) {
+			while ([$i, $replace] = array_pop($doNodes)) {
+				array_splice($nodes, $i, 1, $replace);
+			}
+		}
+
+		return $nodes;
+	}
+
+	private function ensureReplacementReasonable(Node $old, Node $new): void
+	{
+		if ($old instanceof TypeNode &amp;&amp; !$new instanceof TypeNode) {
+			throw new LogicException(sprintf(&#039;Trying to replace TypeNode with %s&#039;, get_class($new)));
+		}
+
+		if ($old instanceof ConstExprNode &amp;&amp; !$new instanceof ConstExprNode) {
+			throw new LogicException(sprintf(&#039;Trying to replace ConstExprNode with %s&#039;, get_class($new)));
+		}
+
+		if ($old instanceof PhpDocChildNode &amp;&amp; !$new instanceof PhpDocChildNode) {
+			throw new LogicException(sprintf(&#039;Trying to replace PhpDocChildNode with %s&#039;, get_class($new)));
+		}
+
+		if ($old instanceof PhpDocTagValueNode &amp;&amp; !$new instanceof PhpDocTagValueNode) {
+			throw new LogicException(sprintf(&#039;Trying to replace PhpDocTagValueNode with %s&#039;, get_class($new)));
+		}
+	}
+
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpstan/phpdoc-parser/src/Ast/NodeVisitor.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpstan/phpdoc-parser/src/Ast/ConstExpr -->
+
+</body>
+</html>

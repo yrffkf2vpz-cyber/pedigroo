@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest-plugin-arch/src/Repositories/ObjectsRepository.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Arch\Repositories;
+
+use Pest\Arch\Factories\ObjectDescriptionFactory;
+use Pest\Arch\Objects\FunctionDescription;
+use Pest\Arch\Support\Composer;
+use Pest\Arch\Support\PhpCoreExpressions;
+use Pest\Arch\Support\UserDefinedFunctions;
+use PHPUnit\Architecture\Elements\ObjectDescription;
+use ReflectionFunction;
+use SplFileInfo;
+use Symfony\Component\Finder\Finder;
+
+/**
+ * @internal
+ */
+final class ObjectsRepository
+{
+    /**
+     * Creates a new Objects Repository singleton instance, if any.
+     */
+    private static ?self $instance = null;
+
+    /**
+     * Holds the Objects Descriptions of the previous resolved prefixes.
+     *
+     * @var array&lt;string, array{0?: array&lt;int, ObjectDescription|FunctionDescription&gt;, 1?: array&lt;int, ObjectDescription|FunctionDescription&gt;}&gt;
+     */
+    private array $cachedObjectsPerPrefix = [];
+
+    /**
+     * Creates a new Objects Repository.
+     *
+     * @param  array&lt;string, array&lt;int, string&gt;&gt;  $prefixes
+     */
+    public function __construct(private readonly array $prefixes)
+    {
+        // ...
+    }
+
+    /**
+     * Creates a new Composer Namespace Repositories instance from the &quot;global&quot; autoloader.
+     */
+    public static function getInstance(): self
+    {
+        if (self::$instance instanceof \Pest\Arch\Repositories\ObjectsRepository) {
+            return self::$instance;
+        }
+
+        $loader = Composer::loader();
+
+        $namespaces = [];
+
+        foreach ((fn (): array =&gt; $loader-&gt;getPrefixesPsr4())-&gt;call($loader) as $namespacePrefix =&gt; $directories) {
+            $namespace = rtrim($namespacePrefix, &#039;\\&#039;);
+
+            $namespaces[$namespace] = $directories;
+        }
+
+        return self::$instance = new self($namespaces);
+    }
+
+    /**
+     * Gets the objects of the given namespace.
+     *
+     * @return array&lt;int, ObjectDescription|FunctionDescription&gt;
+     */
+    public function allByNamespace(string $namespace, bool $onlyUserDefinedUses = true): array
+    {
+        if (PhpCoreExpressions::getClass($namespace) !== null) {
+            return [
+                FunctionDescription::make($namespace),
+            ];
+        }
+
+        if (function_exists($namespace) &amp;&amp; (new ReflectionFunction($namespace))-&gt;getName() === $namespace) {
+            return [
+                FunctionDescription::make($namespace),
+            ];
+        }
+
+        $directoriesByNamespace = $this-&gt;directoriesByNamespace($namespace);
+
+        if ($directoriesByNamespace === []) {
+            return [];
+        }
+
+        $objects = [];
+
+        foreach ($directoriesByNamespace as $prefix =&gt; $directories) {
+            if (array_key_exists($prefix, $this-&gt;cachedObjectsPerPrefix)) {
+                if (array_key_exists((int) $onlyUserDefinedUses, $this-&gt;cachedObjectsPerPrefix[$prefix])) {
+                    $objects = [...$objects, ...$this-&gt;cachedObjectsPerPrefix[$prefix][(int) $onlyUserDefinedUses]];
+
+                    continue;
+                }
+            } else {
+                $this-&gt;cachedObjectsPerPrefix[$prefix] = [];
+            }
+
+            $objectsPerPrefix = array_values(array_filter(array_reduce($directories, fn (array $files, string $fileOrDirectory): array =&gt; array_merge($files, array_values(array_map(
+                static fn (SplFileInfo $file): ?ObjectDescription =&gt; ObjectDescriptionFactory::make($file-&gt;getPathname(), $onlyUserDefinedUses),
+                is_dir($fileOrDirectory) || str_contains($fileOrDirectory, &#039;*&#039;) ? iterator_to_array(Finder::create()-&gt;files()-&gt;in($fileOrDirectory)-&gt;name(&#039;*.php&#039;)) : [new SplFileInfo($fileOrDirectory)],
+            ))), [])));
+
+            // @phpstan-ignore-next-line
+            $objects = [...$objects, ...$this-&gt;cachedObjectsPerPrefix[$prefix][(int) $onlyUserDefinedUses] = $objectsPerPrefix];
+        }
+
+        // @phpstan-ignore-next-line
+        return [...$objects, ...array_map(
+            static fn (string $function): FunctionDescription =&gt; FunctionDescription::make($function),
+            $this-&gt;functionsByNamespace($namespace),
+        )];
+    }
+
+    /**
+     * Gets all the functions for the given namespace.
+     *
+     * @return array&lt;int, string&gt;
+     */
+    private function functionsByNamespace(string $name): array
+    {
+        return array_map(
+            static function (string $functionName): string {
+                $reflection = new ReflectionFunction($functionName);
+
+                return $reflection-&gt;getName();
+            },
+            array_values(array_filter(UserDefinedFunctions::get(), fn (string $function): bool =&gt; str_starts_with(
+                mb_strtolower($function), mb_strtolower($name)
+            )))
+        );
+    }
+
+    /**
+     * Gets all the directories for the given namespace.
+     *
+     * @return array&lt;string, array&lt;int, string&gt;&gt;
+     */
+    private function directoriesByNamespace(string $name): array
+    {
+        $directoriesByNamespace = [];
+
+        foreach ($this-&gt;prefixes as $prefix =&gt; $directories) {
+            if (str_starts_with($name, $prefix)) {
+                $directories = array_values(array_filter($directories, static fn (string $directory): bool =&gt; is_dir($directory)));
+
+                // Remove the first occurrence of the prefix, if any.
+                // This is needed to avoid having a prefix like &quot;App&quot; and a namespace like &quot;App\Application\...&quot;
+                // This would result in a directory like &quot;\lication\...&quot;
+                $posFirstPrefix = strpos($name, $prefix);
+                $nameWithoutPrefix = $posFirstPrefix !== false ? substr($name, $posFirstPrefix + strlen($prefix)) : $name;
+
+                $prefix = str_replace(&#039;\\&#039;, DIRECTORY_SEPARATOR, ltrim($nameWithoutPrefix, &#039;\\&#039;));
+
+                $directoriesByNamespace[$name] = [...$directoriesByNamespace[$name] ?? [], ...array_values(array_filter(array_map(static function (string $directory) use ($prefix): string {
+                    $fileOrDirectory = $directory.DIRECTORY_SEPARATOR.$prefix;
+                    if (is_dir($fileOrDirectory)) {
+                        return $fileOrDirectory;
+                    }
+                    if (str_contains($fileOrDirectory, &#039;*&#039;)) {
+                        return $fileOrDirectory;
+                    }
+
+                    return $fileOrDirectory.&#039;.php&#039;;
+                }, $directories), static fn (string $fileOrDirectory): bool =&gt; is_dir($fileOrDirectory) || str_contains($fileOrDirectory, &#039;*&#039;) || file_exists($fileOrDirectory)))];
+            }
+        }
+
+        return $directoriesByNamespace;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest-plugin-arch/src/SingleArchExpectation.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest-plugin-arch/src/Support -->
+
+</body>
+</html>

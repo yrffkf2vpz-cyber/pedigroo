@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Api/Parser/DecodingEventStreamIterator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Aws\Api\Parser;
+
+use \Iterator;
+use Aws\Api\DateTimeResult;
+use GuzzleHttp\Psr7;
+use Psr\Http\Message\StreamInterface;
+use Aws\Api\Parser\Exception\ParserException;
+
+/**
+ * @internal Implements a decoder for a binary encoded event stream that will
+ * decode, validate, and provide individual events from the stream.
+ */
+class DecodingEventStreamIterator implements Iterator
+{
+    const HEADERS = &#039;headers&#039;;
+    const PAYLOAD = &#039;payload&#039;;
+
+    const LENGTH_TOTAL = &#039;total_length&#039;;
+    const LENGTH_HEADERS = &#039;headers_length&#039;;
+
+    const CRC_PRELUDE = &#039;prelude_crc&#039;;
+
+    const BYTES_PRELUDE = 12;
+    const BYTES_TRAILING = 4;
+
+    private static $preludeFormat = [
+        self::LENGTH_TOTAL =&gt; &#039;decodeUint32&#039;,
+        self::LENGTH_HEADERS =&gt; &#039;decodeUint32&#039;,
+        self::CRC_PRELUDE =&gt; &#039;decodeUint32&#039;,
+    ];
+
+    private static $lengthFormatMap = [
+        1 =&gt; &#039;decodeUint8&#039;,
+        2 =&gt; &#039;decodeUint16&#039;,
+        4 =&gt; &#039;decodeUint32&#039;,
+        8 =&gt; &#039;decodeUint64&#039;,
+    ];
+
+    private static $headerTypeMap = [
+        0 =&gt; &#039;decodeBooleanTrue&#039;,
+        1 =&gt; &#039;decodeBooleanFalse&#039;,
+        2 =&gt; &#039;decodeInt8&#039;,
+        3 =&gt; &#039;decodeInt16&#039;,
+        4 =&gt; &#039;decodeInt32&#039;,
+        5 =&gt; &#039;decodeInt64&#039;,
+        6 =&gt; &#039;decodeBytes&#039;,
+        7 =&gt; &#039;decodeString&#039;,
+        8 =&gt; &#039;decodeTimestamp&#039;,
+        9 =&gt; &#039;decodeUuid&#039;,
+    ];
+
+    /** @var StreamInterface Stream of eventstream shape to parse. */
+    protected $stream;
+
+    /** @var array Currently parsed event. */
+    protected $currentEvent;
+
+    /** @var int Current in-order event key. */
+    protected $key;
+
+    /** @var resource|\HashContext CRC32 hash context for event validation */
+    protected $hashContext;
+
+    /** @var int $currentPosition */
+    protected $currentPosition;
+
+    /**
+     * DecodingEventStreamIterator constructor.
+     *
+     * @param StreamInterface $stream
+     */
+    public function __construct(StreamInterface $stream)
+    {
+        $this-&gt;stream = $stream;
+        $this-&gt;rewind();
+    }
+
+    protected function parseHeaders($headerBytes)
+    {
+        $headers = [];
+        $bytesRead = 0;
+
+        while ($bytesRead &lt; $headerBytes) {
+            list($key, $numBytes) = $this-&gt;decodeString(1);
+            $bytesRead += $numBytes;
+
+            list($type, $numBytes) = $this-&gt;decodeUint8();
+            $bytesRead += $numBytes;
+
+            $f = self::$headerTypeMap[$type];
+            list($value, $numBytes) = $this-&gt;{$f}();
+            $bytesRead += $numBytes;
+
+            if (isset($headers[$key])) {
+                throw new ParserException(&#039;Duplicate key in event headers.&#039;);
+            }
+            $headers[$key] = $value;
+        }
+
+        return [$headers, $bytesRead];
+    }
+
+    protected function parsePrelude()
+    {
+        $prelude = [];
+        $bytesRead = 0;
+
+        $calculatedCrc = null;
+        foreach (self::$preludeFormat as $key =&gt; $decodeFunction) {
+            if ($key === self::CRC_PRELUDE) {
+                $hashCopy = hash_copy($this-&gt;hashContext);
+                $calculatedCrc = hash_final($this-&gt;hashContext, true);
+                $this-&gt;hashContext = $hashCopy;
+            }
+            list($value, $numBytes) = $this-&gt;{$decodeFunction}();
+            $bytesRead += $numBytes;
+
+            $prelude[$key] = $value;
+        }
+
+        if (unpack(&#039;N&#039;, $calculatedCrc)[1] !== $prelude[self::CRC_PRELUDE]) {
+            throw new ParserException(&#039;Prelude checksum mismatch.&#039;);
+        }
+
+        return [$prelude, $bytesRead];
+    }
+
+    /**
+     * This method decodes an event from the stream.
+     *
+     * @return array
+     */
+    protected function parseEvent()
+    {
+        $event = [];
+
+        if ($this-&gt;stream-&gt;tell() &lt; $this-&gt;stream-&gt;getSize()) {
+            $this-&gt;hashContext = hash_init(&#039;crc32b&#039;);
+
+            $bytesLeft = $this-&gt;stream-&gt;getSize() - $this-&gt;stream-&gt;tell();
+            list($prelude, $numBytes) = $this-&gt;parsePrelude();
+            if ($prelude[self::LENGTH_TOTAL] &gt; $bytesLeft) {
+                throw new ParserException(&#039;Message length too long.&#039;);
+            }
+            $bytesLeft -= $numBytes;
+
+            if ($prelude[self::LENGTH_HEADERS] &gt; $bytesLeft) {
+                throw new ParserException(&#039;Headers length too long.&#039;);
+            }
+
+            list(
+                $event[self::HEADERS],
+                $numBytes
+            ) = $this-&gt;parseHeaders($prelude[self::LENGTH_HEADERS]);
+
+            $event[self::PAYLOAD] = Psr7\Utils::streamFor(
+                $this-&gt;readAndHashBytes(
+                    $prelude[self::LENGTH_TOTAL] - self::BYTES_PRELUDE
+                    - $numBytes - self::BYTES_TRAILING
+                )
+            );
+
+            $calculatedCrc = hash_final($this-&gt;hashContext, true);
+            $messageCrc = $this-&gt;stream-&gt;read(4);
+            if ($calculatedCrc !== $messageCrc) {
+                throw new ParserException(&#039;Message checksum mismatch.&#039;);
+            }
+        }
+
+        return $event;
+    }
+
+    // Iterator Functionality
+
+    /**
+     * @return array
+     */
+    #[\ReturnTypeWillChange]
+    public function current()
+    {
+        return $this-&gt;currentEvent;
+    }
+
+    /**
+     * @return int
+     */
+    #[\ReturnTypeWillChange]
+    public function key()
+    {
+        return $this-&gt;key;
+    }
+
+    /**
+     * @return void
+     */
+    #[\ReturnTypeWillChange]
+    public function next()
+    {
+        $this-&gt;currentPosition = $this-&gt;stream-&gt;tell();
+        if ($this-&gt;valid()) {
+            $this-&gt;key++;
+            $this-&gt;currentEvent = $this-&gt;parseEvent();
+        }
+    }
+
+    /**
+     * @return void
+     */
+    #[\ReturnTypeWillChange]
+    public function rewind()
+    {
+        $this-&gt;stream-&gt;rewind();
+        $this-&gt;key = 0;
+        $this-&gt;currentPosition = 0;
+        $this-&gt;currentEvent = $this-&gt;parseEvent();
+    }
+
+    /**
+     * @return bool
+     */
+    #[\ReturnTypeWillChange]
+    public function valid()
+    {
+        return $this-&gt;currentPosition &lt; $this-&gt;stream-&gt;getSize();
+    }
+
+    // Decoding Utilities
+
+    protected function readAndHashBytes($num)
+    {
+        $bytes = $this-&gt;stream-&gt;read($num);
+        hash_update($this-&gt;hashContext, $bytes);
+        return $bytes;
+    }
+
+    private function decodeBooleanTrue()
+    {
+        return [true, 0];
+    }
+
+    private function decodeBooleanFalse()
+    {
+        return [false, 0];
+    }
+
+    private function uintToInt($val, $size)
+    {
+        $signedCap = pow(2, $size - 1);
+        if ($val &gt; $signedCap) {
+            $val -= (2 * $signedCap);
+        }
+        return $val;
+    }
+
+    private function decodeInt8()
+    {
+        $val = (int)unpack(&#039;C&#039;, $this-&gt;readAndHashBytes(1))[1];
+        return [$this-&gt;uintToInt($val, 8), 1];
+    }
+
+    private function decodeUint8()
+    {
+        return [unpack(&#039;C&#039;, $this-&gt;readAndHashBytes(1))[1], 1];
+    }
+
+    private function decodeInt16()
+    {
+        $val = (int)unpack(&#039;n&#039;, $this-&gt;readAndHashBytes(2))[1];
+        return [$this-&gt;uintToInt($val, 16), 2];
+    }
+
+    private function decodeUint16()
+    {
+        return [unpack(&#039;n&#039;, $this-&gt;readAndHashBytes(2))[1], 2];
+    }
+
+    private function decodeInt32()
+    {
+        $val = (int)unpack(&#039;N&#039;, $this-&gt;readAndHashBytes(4))[1];
+        return [$this-&gt;uintToInt($val, 32), 4];
+    }
+
+    private function decodeUint32()
+    {
+        return [unpack(&#039;N&#039;, $this-&gt;readAndHashBytes(4))[1], 4];
+    }
+
+    private function decodeInt64()
+    {
+        $val = $this-&gt;unpackInt64($this-&gt;readAndHashBytes(8))[1];
+        return [$this-&gt;uintToInt($val, 64), 8];
+    }
+
+    private function decodeUint64()
+    {
+        return [$this-&gt;unpackInt64($this-&gt;readAndHashBytes(8))[1], 8];
+    }
+
+    private function unpackInt64($bytes)
+    {
+        return unpack(&#039;J&#039;, $bytes);
+    }
+
+    private function decodeBytes($lengthBytes=2)
+    {
+        if (!isset(self::$lengthFormatMap[$lengthBytes])) {
+            throw new ParserException(&#039;Undefined variable length format.&#039;);
+        }
+        $f = self::$lengthFormatMap[$lengthBytes];
+        list($len, $bytes) = $this-&gt;{$f}();
+        return [$this-&gt;readAndHashBytes($len), $len + $bytes];
+    }
+
+    private function decodeString($lengthBytes=2)
+    {
+        if (!isset(self::$lengthFormatMap[$lengthBytes])) {
+            throw new ParserException(&#039;Undefined variable length format.&#039;);
+        }
+        $f = self::$lengthFormatMap[$lengthBytes];
+        list($len, $bytes) = $this-&gt;{$f}();
+        return [$this-&gt;readAndHashBytes($len), $len + $bytes];
+    }
+
+    private function decodeTimestamp()
+    {
+        list($val, $bytes) = $this-&gt;decodeInt64();
+        return [
+            DateTimeResult::createFromFormat(&#039;U.u&#039;, $val / 1000),
+            $bytes
+        ];
+    }
+
+    private function decodeUuid()
+    {
+        $val = unpack(&#039;H32&#039;, $this-&gt;readAndHashBytes(16))[1];
+        return [
+            substr($val, 0, 8) . &#039;-&#039;
+            . substr($val, 8, 4) . &#039;-&#039;
+            . substr($val, 12, 4) . &#039;-&#039;
+            . substr($val, 16, 4) . &#039;-&#039;
+            . substr($val, 20, 12),
+            16
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Api/Parser/EventParsingIterator.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Api/Parser/Exception -->
+
+</body>
+</html>

@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/S3Transfer/MultipartUploader.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\S3\S3Transfer;
+
+use Aws\HashingStream;
+use Aws\PhpHash;
+use Aws\ResultInterface;
+use Aws\S3\S3ClientInterface;
+use Aws\S3\S3Transfer\Exception\S3TransferException;
+use Aws\S3\S3Transfer\Models\S3TransferManagerConfig;
+use Aws\S3\S3Transfer\Models\UploadResult;
+use Aws\S3\S3Transfer\Progress\TransferListenerNotifier;
+use Aws\S3\S3Transfer\Progress\TransferProgressSnapshot;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\Each;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Psr7\LazyOpenStream;
+use GuzzleHttp\Psr7\LimitStream;
+use GuzzleHttp\Psr7\Utils;
+use Psr\Http\Message\StreamInterface;
+use Throwable;
+
+/**
+ * Multipart uploader implementation.
+ */
+final class MultipartUploader extends AbstractMultipartUploader
+{
+    static array $supportedAlgorithms = [
+        &#039;ChecksumCRC32&#039;,
+        &#039;ChecksumCRC32C&#039;,
+        &#039;ChecksumCRC64NVME&#039;,
+        &#039;ChecksumSHA1&#039;,
+        &#039;ChecksumSHA256&#039;,
+    ];
+
+    private const STREAM_WRAPPER_TYPE_PLAIN_FILE = &#039;plainfile&#039;;
+    public const DEFAULT_CHECKSUM_CALCULATION_ALGORITHM = &#039;crc32&#039;;
+    private const CHECKSUM_TYPE_FULL_OBJECT = &#039;FULL_OBJECT&#039;;
+
+    /** @var int */
+    protected int $calculatedObjectSize;
+
+    /** @var StreamInterface */
+    private StreamInterface $body;
+
+    /**
+     * For custom or default checksum.
+     *
+     * @var string|null
+     */
+    protected ?string $requestChecksum;
+
+    /**
+     * This will be used for custom or default checksum.
+     *
+     * @var string|null
+     */
+    protected ?string $requestChecksumAlgorithm;
+
+    /** @var bool */
+    private bool $isFullObjectChecksum;
+
+    /**
+     * @param S3ClientInterface $s3Client
+     * @param array $requestArgs
+     * @param string|StreamInterface $source
+     * @param array $config
+     *  - target_part_size_bytes: (int, optional)
+     *  - request_checksum_calculation: (string, optional)
+     *  - concurrency: (int, optional)
+     * @param string|null $uploadId
+     * @param array $parts
+     * @param TransferProgressSnapshot|null $currentSnapshot
+     * @param TransferListenerNotifier|null $listenerNotifier
+     */
+    public function __construct(
+        S3ClientInterface $s3Client,
+        array $requestArgs,
+        string|StreamInterface $source,
+        array $config = [],
+        ?string $uploadId = null,
+        array $parts = [],
+        ?TransferProgressSnapshot $currentSnapshot = null,
+        ?TransferListenerNotifier $listenerNotifier = null,
+    ) {
+        if (!isset($config[&#039;request_checksum_calculation&#039;])) {
+            $config[&#039;request_checksum_calculation&#039;] = S3TransferManagerConfig::DEFAULT_REQUEST_CHECKSUM_CALCULATION;
+        }
+        parent::__construct(
+            $s3Client,
+            $requestArgs,
+            $config,
+            $uploadId,
+            $parts,
+            $currentSnapshot,
+            $listenerNotifier
+        );
+        $this-&gt;body = $this-&gt;parseBody($source);
+        $this-&gt;calculatedObjectSize = 0;
+        $this-&gt;isFullObjectChecksum = false;
+        $this-&gt;evaluateCustomChecksum();
+    }
+
+    /**
+     * @inheritDoc
+     *
+     * @return PromiseInterface
+     */
+    protected function createMultipartOperation(): PromiseInterface
+    {
+        $createMultipartUploadArgs = $this-&gt;requestArgs;
+        if ($this-&gt;requestChecksum !== null) {
+            $createMultipartUploadArgs[&#039;ChecksumType&#039;] = self::CHECKSUM_TYPE_FULL_OBJECT;
+            $createMultipartUploadArgs[&#039;ChecksumAlgorithm&#039;] = $this-&gt;requestChecksumAlgorithm;
+            $this-&gt;isFullObjectChecksum = true;
+        } elseif ($this-&gt;config[&#039;request_checksum_calculation&#039;] === &#039;when_supported&#039;) {
+            $this-&gt;requestChecksumAlgorithm = $createMultipartUploadArgs[&#039;ChecksumAlgorithm&#039;]
+                ?? self::DEFAULT_CHECKSUM_CALCULATION_ALGORITHM;
+            $createMultipartUploadArgs[&#039;ChecksumAlgorithm&#039;] = $this-&gt;requestChecksumAlgorithm;
+        }
+
+        // Make sure algorithm with full object is a supported one
+        if (($createMultipartUploadArgs[&#039;ChecksumType&#039;] ?? &#039;&#039;) === self::CHECKSUM_TYPE_FULL_OBJECT) {
+            if (stripos($this-&gt;requestChecksumAlgorithm, &#039;crc&#039;) !== 0) {
+                return Create::rejectionFor(
+                    new S3TransferException(
+                        &quot;Full object checksum algorithm must be `CRC` family base.&quot;
+                    )
+                );
+            }
+        }
+
+        $this-&gt;operationInitiated($createMultipartUploadArgs);
+        $command = $this-&gt;s3Client-&gt;getCommand(
+            &#039;CreateMultipartUpload&#039;,
+            $createMultipartUploadArgs
+        );
+
+        return $this-&gt;s3Client-&gt;executeAsync($command)
+            -&gt;then(function (ResultInterface $result) {
+                $this-&gt;uploadId = $result[&#039;UploadId&#039;];
+                return $result;
+            });
+    }
+
+    /**
+     * @inheritDoc
+     *
+     * @return PromiseInterface
+     */
+    protected function completeMultipartOperation(): PromiseInterface
+    {
+        $this-&gt;sortParts();
+        $completeMultipartUploadArgs = $this-&gt;requestArgs;
+        $completeMultipartUploadArgs[&#039;UploadId&#039;] = $this-&gt;uploadId;
+        $completeMultipartUploadArgs[&#039;MultipartUpload&#039;] = [
+            &#039;Parts&#039; =&gt; $this-&gt;parts
+        ];
+        $completeMultipartUploadArgs[&#039;MpuObjectSize&#039;] = $this-&gt;getTotalSize();
+
+        if ($this-&gt;isFullObjectChecksum &amp;&amp; $this-&gt;requestChecksum !== null) {
+            $completeMultipartUploadArgs[&#039;ChecksumType&#039;] = self::CHECKSUM_TYPE_FULL_OBJECT;
+            $completeMultipartUploadArgs[
+            &#039;Checksum&#039; . strtoupper($this-&gt;requestChecksumAlgorithm)
+            ] = $this-&gt;requestChecksum;
+        }
+
+        $command = $this-&gt;s3Client-&gt;getCommand(
+            &#039;CompleteMultipartUpload&#039;,
+            $completeMultipartUploadArgs
+        );
+
+        return $this-&gt;s3Client-&gt;executeAsync($command)
+            -&gt;then(function (ResultInterface $result) {
+                $this-&gt;operationCompleted($result);
+                return $result;
+            });
+    }
+
+    /**
+     * Sync upload method.
+     *
+     * @return UploadResult
+     */
+    public function upload(): UploadResult
+    {
+        return $this-&gt;promise()-&gt;wait();
+    }
+
+    /**
+     * Parses the source into an instance of
+     * StreamInterface to be read.
+     *
+     * @param string|StreamInterface $source
+     *
+     * @return StreamInterface
+     */
+    private function parseBody(
+        string|StreamInterface $source
+    ): StreamInterface
+    {
+        if (is_string($source)) {
+            // Make sure the files exists
+            if (!is_readable($source)) {
+                throw new \InvalidArgumentException(
+                    &quot;The source for this upload must be either a&quot;
+                    . &quot; readable file path or a valid stream.&quot;
+                );
+            }
+            $body = new LazyOpenStream($source, &#039;r&#039;);
+            // To make sure the resource is closed.
+            $this-&gt;onCompletionCallbacks[] = function () use ($body) {
+                $body-&gt;close();
+            };
+        } elseif ($source instanceof StreamInterface) {
+            $body = $source;
+        } else {
+            throw new \InvalidArgumentException(
+                &quot;The source must be a valid string file path or a StreamInterface.&quot;
+            );
+        }
+
+        return $body;
+    }
+
+    /**
+     * Evaluates if custom checksum has been provided,
+     * and if so then, the values are placed in the
+     * respective properties.
+     *
+     * @return void
+     */
+    private function evaluateCustomChecksum(): void
+    {
+        // Evaluation for custom provided checksums
+        $checksumName = self::filterChecksum($this-&gt;requestArgs);
+        if ($checksumName !== null) {
+            $this-&gt;requestChecksum = $this-&gt;requestArgs[$checksumName];
+            $this-&gt;requestChecksumAlgorithm = str_replace(
+                &#039;Checksum&#039;,
+                &#039;&#039;,
+                $checksumName
+            );
+            $this-&gt;requestChecksumAlgorithm = strtolower(
+                $this-&gt;requestChecksumAlgorithm
+            );
+        } else {
+            $this-&gt;requestChecksum = null;
+            $this-&gt;requestChecksumAlgorithm = null;
+        }
+    }
+
+    /**
+     * Process a multipart upload operation.
+     *
+     * @return PromiseInterface
+     */
+    protected function processMultipartOperation(): PromiseInterface
+    {
+        $uploadPartCommandArgs = $this-&gt;requestArgs;
+        $this-&gt;calculatedObjectSize = 0;
+        $partSize = $this-&gt;calculatePartSize();
+        $partsCount = ceil($this-&gt;getTotalSize() / $partSize);
+        $uploadPartCommandArgs[&#039;UploadId&#039;] = $this-&gt;uploadId;
+        // Customer provided checksum
+        if ($this-&gt;requestChecksum !== null) {
+            // To avoid default calculation for individual parts
+            $uploadPartCommandArgs[&#039;@context&#039;][&#039;request_checksum_calculation&#039;] = &#039;when_required&#039;;
+            unset($uploadPartCommandArgs[&#039;Checksum&#039;. strtoupper($this-&gt;requestChecksumAlgorithm)]);
+        } elseif ($this-&gt;requestChecksumAlgorithm !== null) {
+            $uploadPartCommandArgs[&#039;ChecksumAlgorithm&#039;] = $this-&gt;requestChecksumAlgorithm;
+        }
+
+        $promises = $this-&gt;createUploadPartPromises(
+            $uploadPartCommandArgs,
+            $partSize,
+            $partsCount,
+        );
+
+        return Each::ofLimitAll($promises, $this-&gt;config[&#039;concurrency&#039;]);
+    }
+
+    /**
+     * @param array $uploadPartCommandArgs
+     * @param int $partSize
+     * @param int $partsCount
+     *
+     * @return \Generator
+     */
+    private function createUploadPartPromises(
+        array $uploadPartCommandArgs,
+        int $partSize,
+        int $partsCount
+    ): \Generator
+    {
+        $partNo = count($this-&gt;parts);
+        $bytesRead = 0;
+        $isSeekable = $this-&gt;body-&gt;isSeekable()
+            &amp;&amp; $this-&gt;body-&gt;getMetadata(&#039;wrapper_type&#039;)
+            === self::STREAM_WRAPPER_TYPE_PLAIN_FILE;
+        while (!$this-&gt;body-&gt;eof()) {
+            if ($isSeekable) {
+                $partBody = new LimitStream(
+                    new LazyOpenStream(
+                        $this-&gt;body-&gt;getMetadata(&#039;uri&#039;),
+                        &#039;r&#039;
+                    ),
+                    $partSize,
+                    $bytesRead,
+                );
+            } else {
+                $body = new LimitStream(
+                    $this-&gt;body,
+                    $partSize,
+                    $bytesRead,
+                );
+                $body = $this-&gt;decorateWithHashes($body, $uploadPartCommandArgs);
+                $partBody = Utils::streamFor();
+                Utils::copyToStream($body, $partBody);
+            }
+
+            $bodyLength = $partBody-&gt;getSize();
+            if ($bodyLength === 0) {
+                $partBody-&gt;close();
+                break;
+            }
+
+            $partNo++;
+            $bytesRead += $bodyLength;
+
+            $uploadPartCommandArgs[&#039;PartNumber&#039;] = $partNo;
+            $uploadPartCommandArgs[&#039;ContentLength&#039;] = $bodyLength;
+            // Attach body
+            if ($isSeekable) {
+                $partBody-&gt;rewind();
+            }
+            $uploadPartCommandArgs[&#039;Body&#039;] = $partBody;
+
+            $this-&gt;calculatedObjectSize += $bodyLength;
+            if ($partNo &gt; self::PART_MAX_NUM) {
+                return Create::rejectionFor(
+                    &quot;The max number of parts has been exceeded. &quot; .
+                    &quot;Max = &quot; . self::PART_MAX_NUM
+                );
+            }
+
+            if ($isSeekable &amp;&amp; $partNo &gt; $partsCount) {
+                return Create::rejectionFor(
+                    &quot;The current part `$partNo` is over &quot;
+                    . &quot;the expected number of parts `$partsCount`&quot;
+                );
+            }
+
+            $command = $this-&gt;s3Client-&gt;getCommand(
+                &#039;UploadPart&#039;,
+                $uploadPartCommandArgs
+            );
+
+            // Advance if behind
+            if ($bytesRead &lt; $this-&gt;body-&gt;tell()) {
+                $this-&gt;body-&gt;seek($bytesRead);
+            }
+
+            yield $this-&gt;s3Client-&gt;executeAsync($command)
+                -&gt;then(function (ResultInterface $result)
+                    use ($command, $partBody) {
+                    $partBody-&gt;close();
+                    // To make sure we don&#039;t continue when a failure occurred
+                    if ($this-&gt;currentSnapshot-&gt;getReason() !== null) {
+                        throw $this-&gt;currentSnapshot-&gt;getReason();
+                    }
+
+                    $this-&gt;collectPart(
+                        $result,
+                        $command
+                    );
+                    // Part Upload Completed Event
+                    $this-&gt;partCompleted(
+                        $command[&#039;ContentLength&#039;],
+                        $command-&gt;toArray()
+                    );
+                })-&gt;otherwise(function (Throwable $e) use ($partBody) {
+                    $partBody-&gt;close();
+                    $this-&gt;partFailed($e);
+
+                    throw $e;
+                });
+        }
+    }
+
+    /**
+     * @return int
+     */
+    protected function getTotalSize(): int
+    {
+        if ($this-&gt;calculatedObjectSize &gt; 0) {
+            return $this-&gt;calculatedObjectSize;
+        }
+
+        return $this-&gt;body-&gt;getSize();
+    }
+
+    /**
+     * @param ResultInterface $result
+     *
+     * @return UploadResult
+     */
+    protected function createResponse(ResultInterface $result): UploadResult
+    {
+        return new UploadResult(
+            $result-&gt;toArray()
+        );
+    }
+
+    /**
+     * @param StreamInterface $stream
+     * @param array $data
+     *
+     * @return StreamInterface
+     */
+    private function decorateWithHashes(
+        StreamInterface $stream,
+        array &amp;$data
+    ): StreamInterface
+    {
+        // Decorate source with a hashing stream
+        $hash = new PhpHash(&#039;sha256&#039;);
+        return new HashingStream($stream, $hash, function ($result) use (&amp;$data) {
+            $data[&#039;ContentSHA256&#039;] = bin2hex($result);
+        });
+    }
+
+    /**
+     * Filters a provided checksum if one was provided.
+     *
+     * @param array $requestArgs
+     *
+     * @return string|null
+     */
+    private static function filterChecksum(array $requestArgs):? string
+    {
+        foreach (self::$supportedAlgorithms as $algorithm) {
+            if (isset($requestArgs[$algorithm])) {
+                return $algorithm;
+            }
+        }
+
+        return null;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/S3Transfer/PartGetMultipartDownloader.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/S3Transfer/Exception -->
+
+</body>
+</html>

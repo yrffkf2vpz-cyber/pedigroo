@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/league/uri-interfaces/HostRecord.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * League.Uri (https://uri.thephpleague.com)
+ *
+ * (c) Ignace Nyamagana Butera &lt;nyamsprod@gmail.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+declare(strict_types=1);
+
+namespace League\Uri;
+
+use BackedEnum;
+use Exception;
+use JsonSerializable;
+use League\Uri\Contracts\UriComponentInterface;
+use League\Uri\Exceptions\SyntaxError;
+use League\Uri\Idna\Converter as IdnConverter;
+use Stringable;
+use Throwable;
+
+use function array_key_first;
+use function count;
+use function explode;
+use function filter_var;
+use function get_object_vars;
+use function in_array;
+use function inet_pton;
+use function is_object;
+use function preg_match;
+use function rawurldecode;
+use function strpos;
+use function strtolower;
+use function substr;
+
+use const FILTER_FLAG_IPV4;
+use const FILTER_FLAG_IPV6;
+use const FILTER_VALIDATE_IP;
+
+/**
+ * @phpstan-type HostRecordSerializedShape array{0: array{host: ?string}, 1: array{}}
+ */
+final class HostRecord implements JsonSerializable
+{
+    /**
+     * Maximum number of host cached.
+     *
+     * @var int
+     */
+    private const MAXIMUM_HOST_CACHED = 100;
+
+    private const REGEXP_NON_ASCII_PATTERN = &#039;/[^\x20-\x7f]/&#039;;
+
+    /**
+     * @see https://tools.ietf.org/html/rfc3986#section-3.2.2
+     *
+     * invalid characters in host regular expression
+     */
+    private const REGEXP_INVALID_HOST_CHARS = &#039;/
+        [:\/?#\[\]@ ]  # gen-delims characters as well as the space character
+    /ix&#039;;
+
+    /**
+     * General registered name regular expression.
+     *
+     * @see https://tools.ietf.org/html/rfc3986#section-3.2.2
+     * @see https://regex101.com/r/fptU8V/1
+     */
+    private const REGEXP_REGISTERED_NAME = &#039;/
+    (?(DEFINE)
+        (?&lt;unreserved&gt;[a-z0-9_~\-])   # . is missing as it is used to separate labels
+        (?&lt;sub_delims&gt;[!$&amp;\&#039;()*+,;=])
+        (?&lt;encoded&gt;%[A-F0-9]{2})
+        (?&lt;reg_name&gt;(?:(?&amp;unreserved)|(?&amp;sub_delims)|(?&amp;encoded))*)
+    )
+        ^(?:(?&amp;reg_name)\.)*(?&amp;reg_name)\.?$
+    /ix&#039;;
+
+    /**
+     * Domain name regular expression.
+     *
+     * Everything but the domain name length is validated
+     *
+     * @see https://tools.ietf.org/html/rfc1034#section-3.5
+     * @see https://tools.ietf.org/html/rfc1123#section-2.1
+     * @see https://regex101.com/r/71j6rt/1
+     */
+    private const REGEXP_DOMAIN_NAME = &#039;/
+    (?(DEFINE)
+        (?&lt;let_dig&gt; [a-z0-9])                         # alpha digit
+        (?&lt;let_dig_hyp&gt; [a-z0-9-])                    # alpha digit and hyphen
+        (?&lt;ldh_str&gt; (?&amp;let_dig_hyp){0,61}(?&amp;let_dig)) # domain label end
+        (?&lt;label&gt; (?&amp;let_dig)((?&amp;ldh_str))?)          # domain label
+        (?&lt;domain&gt; (?&amp;label)(\.(?&amp;label)){0,126}\.?)  # domain name
+    )
+        ^(?&amp;domain)$
+    /ix&#039;;
+
+    /**
+     * @see https://tools.ietf.org/html/rfc3986#section-3.2.2
+     *
+     * IPvFuture regular expression
+     */
+    private const REGEXP_IP_FUTURE = &#039;/^
+        v(?&lt;version&gt;[A-F\d])+\.
+        (?:
+            (?&lt;unreserved&gt;[a-z\d_~\-\.])|
+            (?&lt;sub_delims&gt;[!$&amp;\&#039;()*+,;=:])  # also include the : character
+        )+
+    $/ix&#039;;
+    private const REGEXP_GEN_DELIMS = &#039;/[:\/?#\[\]@ ]/&#039;;
+    private const ADDRESS_BLOCK = &quot;\xfe\x80&quot;;
+
+    private ?bool $isDomainName = null;
+    private ?bool $hasZoneIdentifier = null;
+    private bool $asciiIsLoaded = false;
+    private ?string $hostAsAscii = null;
+    private bool $unicodeIsLoaded = false;
+    private ?string $hostAsUnicode = null;
+    private bool $isIpVersionLoaded = false;
+    private ?string $ipVersion = null;
+    private bool $isIpValueLoaded = false;
+    private ?string $ipValue = null;
+
+    private function __construct(
+        public readonly ?string $value,
+        public readonly HostType $type,
+        public readonly HostFormat $format
+    ) {
+    }
+
+    public function hasZoneIdentifier(): bool
+    {
+        return $this-&gt;hasZoneIdentifier ??= HostType::Ipv6 === $this-&gt;type &amp;&amp; str_contains((string) $this-&gt;value, &#039;%&#039;);
+    }
+
+    public function toAscii(): ?string
+    {
+        if (!$this-&gt;asciiIsLoaded) {
+            $this-&gt;asciiIsLoaded = true;
+            $this-&gt;hostAsAscii = (function (): ?string {
+                if (HostType::RegisteredName !== $this-&gt;type || null === $this-&gt;value) {
+                    return $this-&gt;value;
+                }
+
+                $formattedHost = rawurldecode($this-&gt;value);
+                if ($formattedHost === $this-&gt;value) {
+                    return $this-&gt;isDomainType() ? IdnConverter::toAscii($this-&gt;value)-&gt;domain() : strtolower($formattedHost);
+                }
+
+                return Encoder::normalizeHost($this-&gt;value);
+            })();
+        }
+
+        return $this-&gt;hostAsAscii;
+    }
+
+    public function toUnicode(): ?string
+    {
+        if (!$this-&gt;unicodeIsLoaded) {
+            $this-&gt;unicodeIsLoaded = true;
+            $this-&gt;hostAsUnicode = $this-&gt;isDomainType() &amp;&amp; null !== $this-&gt;value ? IdnConverter::toUnicode($this-&gt;value)-&gt;domain() : $this-&gt;value;
+        }
+
+        return $this-&gt;hostAsUnicode;
+    }
+
+    public function isDomainType(): bool
+    {
+        return $this-&gt;isDomainName ??= match (true) {
+            HostType::RegisteredName !== $this-&gt;type, &#039;&#039; === $this-&gt;value =&gt; false,
+            null === $this-&gt;value =&gt; true,
+            default =&gt; is_object($result = IdnConverter::toAscii($this-&gt;value))
+                &amp;&amp; !$result-&gt;hasErrors()
+                &amp;&amp; self::isValidDomain($result-&gt;domain()),
+        };
+    }
+
+    public function ipVersion(): ?string
+    {
+        if (!$this-&gt;isIpVersionLoaded) {
+            $this-&gt;isIpVersionLoaded = true;
+            $this-&gt;ipVersion = match (true) {
+                HostType::Ipv4 === $this-&gt;type =&gt; &#039;4&#039;,
+                HostType::Ipv6 === $this-&gt;type =&gt; &#039;6&#039;,
+                1 === preg_match(self::REGEXP_IP_FUTURE, substr((string) $this-&gt;value, 1, -1), $matches) =&gt; $matches[&#039;version&#039;],
+                default =&gt; null,
+            };
+        }
+
+        return $this-&gt;ipVersion;
+    }
+
+    public function ipValue(): ?string
+    {
+        if (!$this-&gt;isIpValueLoaded) {
+            $this-&gt;isIpValueLoaded = true;
+            $this-&gt;ipValue = (function (): ?string {
+                if (HostType::RegisteredName === $this-&gt;type) {
+                    return null;
+                }
+
+                if (HostType::Ipv4 === $this-&gt;type) {
+                    return $this-&gt;value;
+                }
+
+                $ip = substr((string) $this-&gt;value, 1, -1);
+                if (HostType::Ipv6 !== $this-&gt;type) {
+                    return substr($ip, (int) strpos($ip, &#039;.&#039;) + 1);
+                }
+
+                $pos = strpos($ip, &#039;%&#039;);
+                if (false === $pos) {
+                    return $ip;
+                }
+
+                return substr($ip, 0, $pos).&#039;%&#039;.rawurldecode(substr($ip, $pos + 3));
+            })();
+        }
+
+        return $this-&gt;ipValue;
+    }
+
+    public static function isValid(BackedEnum|Stringable|string|null $host): bool
+    {
+        try {
+            HostRecord::from($host);
+
+            return true;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    public static function isIpv4(Stringable|string|null $host): bool
+    {
+        try {
+            return HostType::Ipv4 === HostRecord::from($host)-&gt;type;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    public static function isIpv6(Stringable|string|null $host): bool
+    {
+        try {
+            return HostType::Ipv6 === HostRecord::from($host)-&gt;type;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    public static function isIpvFuture(Stringable|string|null $host): bool
+    {
+        try {
+            return HostType::IpvFuture === HostRecord::from($host)-&gt;type;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    public static function isIp(Stringable|string|null $host): bool
+    {
+        return !self::isRegisteredName($host);
+    }
+
+    public static function isRegisteredName(Stringable|string|null $host): bool
+    {
+        try {
+            return HostType::RegisteredName === HostRecord::from($host)-&gt;type;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    public static function isDomain(Stringable|string|null $host): bool
+    {
+        try {
+            return HostRecord::from($host)-&gt;isDomainType();
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * @throws SyntaxError
+     */
+    public static function from(BackedEnum|Stringable|string|null $host): self
+    {
+        if ($host instanceof BackedEnum) {
+            $host = $host-&gt;value;
+        }
+
+        if ($host instanceof UriComponentInterface) {
+            $host = $host-&gt;value();
+        }
+
+        if (null === $host) {
+            return new self(
+                value: null,
+                type: HostType::RegisteredName,
+                format: HostFormat::Ascii,
+            );
+        }
+
+        $host = (string) $host;
+        if (&#039;&#039; === $host) {
+            return new self(
+                value: &#039;&#039;,
+                type: HostType::RegisteredName,
+                format: HostFormat::Ascii,
+            );
+        }
+
+        static $inMemoryCache = [];
+        if (isset($inMemoryCache[$host])) {
+            return $inMemoryCache[$host];
+        }
+
+        if (self::MAXIMUM_HOST_CACHED &lt; count($inMemoryCache)) {
+            unset($inMemoryCache[array_key_first($inMemoryCache)]);
+        }
+
+        if ($host === filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return $inMemoryCache[$host] = new self(
+                value: $host,
+                type: HostType::Ipv4,
+                format: HostFormat::Ascii,
+            );
+        }
+
+        if (str_starts_with($host, &#039;[&#039;)) {
+            str_ends_with($host, &#039;]&#039;) || throw new SyntaxError(&#039;The host &#039;.$host.&#039; is not a valid IPv6 host.&#039;);
+
+            $ipHost = substr($host, 1, -1);
+            if (1 === preg_match(self::REGEXP_IP_FUTURE, $ipHost, $matches)) {
+                return !in_array($matches[&#039;version&#039;], [&#039;4&#039;, &#039;6&#039;], true) ? ($inMemoryCache[$host] = new self(
+                    value: $host,
+                    type: HostType::IpvFuture,
+                    format: HostFormat::Ascii,
+                )) : throw new SyntaxError(&#039;The host &#039;.$host.&#039; is not a valid IPvFuture host.&#039;);
+            }
+
+            if (self::isValidIpv6Hostname($ipHost)) {
+                return $inMemoryCache[$host] = new self(
+                    value: $host,
+                    type: HostType::Ipv6,
+                    format: HostFormat::Ascii,
+                );
+            }
+
+            throw new SyntaxError(&#039;The host &#039;.$host.&#039; is not a valid IPv6 host.&#039;);
+        }
+
+        $domainName = rawurldecode($host);
+        $format = HostFormat::Unicode;
+        if (1 !== preg_match(self::REGEXP_NON_ASCII_PATTERN, $domainName)) {
+            $domainName = strtolower($domainName);
+            $format = HostFormat::Ascii;
+        }
+
+        if (1 === preg_match(self::REGEXP_REGISTERED_NAME, $domainName)) {
+            return $inMemoryCache[$host] = new self(
+                value: $host,
+                type: HostType::RegisteredName,
+                format: $format,
+            );
+        }
+
+        (HostFormat::Ascii !== $format &amp;&amp; 1 !== preg_match(self::REGEXP_INVALID_HOST_CHARS, $domainName)) || throw new SyntaxError(&#039;`&#039;.$host.&#039;` is an invalid domain name : the host contains invalid characters.&#039;);
+        IdnConverter::toAsciiOrFail($domainName);
+
+        return $inMemoryCache[$host] = new self(
+            value: $host,
+            type: HostType::RegisteredName,
+            format: $format,
+        );
+    }
+
+    /**
+     * Tells whether the registered name is a valid domain name according to RFC1123.
+     *
+     * @see http://man7.org/linux/man-pages/man7/hostname.7.html
+     * @see https://tools.ietf.org/html/rfc1123#section-2.1
+     */
+    private static function isValidDomain(string $hostname): bool
+    {
+        $domainMaxLength = str_ends_with($hostname, &#039;.&#039;) ? 254 : 253;
+
+        return !isset($hostname[$domainMaxLength])
+            &amp;&amp; 1 === preg_match(self::REGEXP_DOMAIN_NAME, $hostname);
+    }
+
+    /**
+     * Validates an Ipv6 as Host.
+     *
+     * @see http://tools.ietf.org/html/rfc6874#section-2
+     * @see http://tools.ietf.org/html/rfc6874#section-4
+     */
+    private static function isValidIpv6Hostname(string $host): bool
+    {
+        [$ipv6, $scope] = explode(&#039;%&#039;, $host, 2) + [1 =&gt; null];
+        if (null === $scope) {
+            return (bool) filter_var($ipv6, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6);
+        }
+
+        $scope = rawurldecode(&#039;%&#039;.$scope);
+
+        return 1 !== preg_match(self::REGEXP_NON_ASCII_PATTERN, $scope)
+            &amp;&amp; 1 !== preg_match(self::REGEXP_GEN_DELIMS, $scope)
+            &amp;&amp; false !== filter_var($ipv6, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)
+            &amp;&amp; str_starts_with((string)inet_pton((string)$ipv6), self::ADDRESS_BLOCK);
+    }
+
+    public function jsonSerialize(): ?string
+    {
+        return $this-&gt;value;
+    }
+
+    /**
+     * @return HostRecordSerializedShape
+     */
+    public function __serialize(): array
+    {
+        return [[&#039;host&#039; =&gt; $this-&gt;value], []];
+    }
+
+    /**
+     * @param HostRecordSerializedShape $data
+     *
+     * @throws Exception|SyntaxError
+     */
+    public function __unserialize(array $data): void
+    {
+        [$properties] = $data;
+        $record = self::from($properties[&#039;host&#039;] ?? throw new Exception(&#039;The `host` property is missing from the serialized object.&#039;));
+        //if the Host computed value are already cache this avoid recomputing them
+        foreach (get_object_vars($record) as $prop =&gt; $value) {
+            /* @phpstan-ignore-next-line */
+            $this-&gt;{$prop} = $value;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/league/uri-interfaces/HostType.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/league/uri-interfaces/Contracts -->
+
+</body>
+</html>

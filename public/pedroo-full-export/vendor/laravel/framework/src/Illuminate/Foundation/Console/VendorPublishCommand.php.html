@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Foundation/Console/VendorPublishCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Foundation\Console;
+
+use Illuminate\Console\Command;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\Foundation\Events\VendorTagPublished;
+use Illuminate\Support\Arr;
+use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Str;
+use League\Flysystem\Filesystem as Flysystem;
+use League\Flysystem\Local\LocalFilesystemAdapter as LocalAdapter;
+use League\Flysystem\MountManager;
+use League\Flysystem\UnixVisibility\PortableVisibilityConverter;
+use League\Flysystem\Visibility;
+use Symfony\Component\Console\Attribute\AsCommand;
+
+use function Laravel\Prompts\search;
+use function Laravel\Prompts\select;
+
+#[AsCommand(name: &#039;vendor:publish&#039;)]
+class VendorPublishCommand extends Command
+{
+    /**
+     * The filesystem instance.
+     *
+     * @var \Illuminate\Filesystem\Filesystem
+     */
+    protected $files;
+
+    /**
+     * The provider to publish.
+     *
+     * @var string|null
+     */
+    protected $provider = null;
+
+    /**
+     * The tags to publish.
+     *
+     * @var array
+     */
+    protected $tags = [];
+
+    /**
+     * The time the command started.
+     *
+     * @var \Illuminate\Support\Carbon|null
+     */
+    protected $publishedAt;
+
+    /**
+     * The console command signature.
+     *
+     * @var string
+     */
+    protected $signature = &#039;vendor:publish
+                    {--existing : Publish and overwrite only the files that have already been published}
+                    {--force : Overwrite any existing files}
+                    {--all : Publish assets for all service providers without prompt}
+                    {--provider= : The service provider that has assets you want to publish}
+                    {--tag=* : One or many tags that have assets you want to publish}&#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;Publish any publishable assets from vendor packages&#039;;
+
+    /**
+     * Indicates if migration dates should be updated while publishing.
+     *
+     * @var bool
+     */
+    protected static $updateMigrationDates = true;
+
+    /**
+     * Create a new command instance.
+     *
+     * @param  \Illuminate\Filesystem\Filesystem  $files
+     */
+    public function __construct(Filesystem $files)
+    {
+        parent::__construct();
+
+        $this-&gt;files = $files;
+    }
+
+    /**
+     * Execute the console command.
+     *
+     * @return void
+     */
+    public function handle()
+    {
+        $this-&gt;publishedAt = now();
+
+        $this-&gt;determineWhatShouldBePublished();
+
+        foreach ($this-&gt;tags ?: [null] as $tag) {
+            $this-&gt;publishTag($tag);
+        }
+    }
+
+    /**
+     * Determine the provider or tag(s) to publish.
+     *
+     * @return void
+     */
+    protected function determineWhatShouldBePublished()
+    {
+        if ($this-&gt;option(&#039;all&#039;)) {
+            return;
+        }
+
+        [$this-&gt;provider, $this-&gt;tags] = [
+            $this-&gt;option(&#039;provider&#039;), (array) $this-&gt;option(&#039;tag&#039;),
+        ];
+
+        if (! $this-&gt;provider &amp;&amp; ! $this-&gt;tags) {
+            $this-&gt;promptForProviderOrTag();
+        }
+    }
+
+    /**
+     * Prompt for which provider or tag to publish.
+     *
+     * @return void
+     */
+    protected function promptForProviderOrTag()
+    {
+        $choices = $this-&gt;publishableChoices();
+
+        $choice = windows_os()
+            ? select(
+                &quot;Which provider or tag&#039;s files would you like to publish?&quot;,
+                $choices,
+                scroll: 15,
+            )
+            : search(
+                label: &quot;Which provider or tag&#039;s files would you like to publish?&quot;,
+                placeholder: &#039;Search...&#039;,
+                options: fn ($search) =&gt; array_values(array_filter(
+                    $choices,
+                    fn ($choice) =&gt; str_contains(strtolower($choice), strtolower($search))
+                )),
+                scroll: 15,
+            );
+
+        if ($choice == $choices[0] || is_null($choice)) {
+            return;
+        }
+
+        $this-&gt;parseChoice($choice);
+    }
+
+    /**
+     * The choices available via the prompt.
+     *
+     * @return array
+     */
+    protected function publishableChoices()
+    {
+        return array_merge(
+            [&#039;All providers and tags&#039;],
+            preg_filter(&#039;/^/&#039;, &#039;&lt;fg=gray&gt;Provider:&lt;/&gt; &#039;, Arr::sort(ServiceProvider::publishableProviders())),
+            preg_filter(&#039;/^/&#039;, &#039;&lt;fg=gray&gt;Tag:&lt;/&gt; &#039;, Arr::sort(ServiceProvider::publishableGroups()))
+        );
+    }
+
+    /**
+     * Parse the answer that was given via the prompt.
+     *
+     * @param  string  $choice
+     * @return void
+     */
+    protected function parseChoice($choice)
+    {
+        [$type, $value] = explode(&#039;: &#039;, strip_tags($choice));
+
+        if ($type === &#039;Provider&#039;) {
+            $this-&gt;provider = $value;
+        } elseif ($type === &#039;Tag&#039;) {
+            $this-&gt;tags = [$value];
+        }
+    }
+
+    /**
+     * Publishes the assets for a tag.
+     *
+     * @param  string  $tag
+     * @return void
+     */
+    protected function publishTag($tag)
+    {
+        $pathsToPublish = $this-&gt;pathsToPublish($tag);
+
+        if ($publishing = count($pathsToPublish) &gt; 0) {
+            $this-&gt;components-&gt;info(sprintf(
+                &#039;Publishing %sassets&#039;,
+                $tag ? &quot;[$tag] &quot; : &#039;&#039;,
+            ));
+        }
+
+        foreach ($pathsToPublish as $from =&gt; $to) {
+            $this-&gt;publishItem($from, $to);
+        }
+
+        if ($publishing === false) {
+            $this-&gt;components-&gt;info(&#039;No publishable resources for tag [&#039;.$tag.&#039;].&#039;);
+        } else {
+            $this-&gt;laravel[&#039;events&#039;]-&gt;dispatch(new VendorTagPublished($tag, $pathsToPublish));
+
+            $this-&gt;newLine();
+        }
+    }
+
+    /**
+     * Get all of the paths to publish.
+     *
+     * @param  string  $tag
+     * @return array
+     */
+    protected function pathsToPublish($tag)
+    {
+        return ServiceProvider::pathsToPublish(
+            $this-&gt;provider, $tag
+        );
+    }
+
+    /**
+     * Publish the given item from and to the given location.
+     *
+     * @param  string  $from
+     * @param  string  $to
+     * @return void
+     */
+    protected function publishItem($from, $to)
+    {
+        if ($this-&gt;files-&gt;isFile($from)) {
+            return $this-&gt;publishFile($from, $to);
+        } elseif ($this-&gt;files-&gt;isDirectory($from)) {
+            return $this-&gt;publishDirectory($from, $to);
+        }
+
+        $this-&gt;components-&gt;error(&quot;Can&#039;t locate path: &lt;{$from}&gt;&quot;);
+    }
+
+    /**
+     * Publish the file to the given path.
+     *
+     * @param  string  $from
+     * @param  string  $to
+     * @return void
+     */
+    protected function publishFile($from, $to)
+    {
+        if ((! $this-&gt;option(&#039;existing&#039;) &amp;&amp; (! $this-&gt;files-&gt;exists($to) || $this-&gt;option(&#039;force&#039;)))
+            || ($this-&gt;option(&#039;existing&#039;) &amp;&amp; $this-&gt;files-&gt;exists($to))) {
+            $to = $this-&gt;ensureMigrationNameIsUpToDate($from, $to);
+
+            $this-&gt;createParentDirectory(dirname($to));
+
+            $this-&gt;files-&gt;copy($from, $to);
+
+            $this-&gt;status($from, $to, &#039;file&#039;);
+        } else {
+            if ($this-&gt;option(&#039;existing&#039;)) {
+                $this-&gt;components-&gt;twoColumnDetail(sprintf(
+                    &#039;File [%s] does not exist&#039;,
+                    str_replace(base_path().&#039;/&#039;, &#039;&#039;, $to),
+                ), &#039;&lt;fg=yellow;options=bold&gt;SKIPPED&lt;/&gt;&#039;);
+            } else {
+                $this-&gt;components-&gt;twoColumnDetail(sprintf(
+                    &#039;File [%s] already exists&#039;,
+                    str_replace(base_path().&#039;/&#039;, &#039;&#039;, realpath($to)),
+                ), &#039;&lt;fg=yellow;options=bold&gt;SKIPPED&lt;/&gt;&#039;);
+            }
+        }
+    }
+
+    /**
+     * Publish the directory to the given directory.
+     *
+     * @param  string  $from
+     * @param  string  $to
+     * @return void
+     */
+    protected function publishDirectory($from, $to)
+    {
+        $visibility = PortableVisibilityConverter::fromArray([], Visibility::PUBLIC);
+
+        $this-&gt;moveManagedFiles($from, new MountManager([
+            &#039;from&#039; =&gt; new Flysystem(new LocalAdapter($from)),
+            &#039;to&#039; =&gt; new Flysystem(new LocalAdapter($to, $visibility)),
+        ]));
+
+        $this-&gt;status($from, $to, &#039;directory&#039;);
+    }
+
+    /**
+     * Move all the files in the given MountManager.
+     *
+     * @param  string  $from
+     * @param  \League\Flysystem\MountManager  $manager
+     * @return void
+     */
+    protected function moveManagedFiles($from, $manager)
+    {
+        foreach ($manager-&gt;listContents(&#039;from://&#039;, true)-&gt;sortByPath() as $file) {
+            $path = Str::after($file[&#039;path&#039;], &#039;from://&#039;);
+
+            if (
+                $file[&#039;type&#039;] === &#039;file&#039;
+                &amp;&amp; (
+                    (! $this-&gt;option(&#039;existing&#039;) &amp;&amp; (! $manager-&gt;fileExists(&#039;to://&#039;.$path) || $this-&gt;option(&#039;force&#039;)))
+                    || ($this-&gt;option(&#039;existing&#039;) &amp;&amp; $manager-&gt;fileExists(&#039;to://&#039;.$path))
+                )
+            ) {
+                $path = $this-&gt;ensureMigrationNameIsUpToDate($from, $path);
+
+                $manager-&gt;write(&#039;to://&#039;.$path, $manager-&gt;read($file[&#039;path&#039;]));
+            }
+        }
+    }
+
+    /**
+     * Create the directory to house the published files if needed.
+     *
+     * @param  string  $directory
+     * @return void
+     */
+    protected function createParentDirectory($directory)
+    {
+        if (! $this-&gt;files-&gt;isDirectory($directory)) {
+            $this-&gt;files-&gt;makeDirectory($directory, 0755, true);
+        }
+    }
+
+    /**
+     * Ensure the given migration name is up-to-date.
+     *
+     * @param  string  $from
+     * @param  string  $to
+     * @return string
+     */
+    protected function ensureMigrationNameIsUpToDate($from, $to)
+    {
+        if (static::$updateMigrationDates === false) {
+            return $to;
+        }
+
+        $from = realpath($from);
+
+        foreach (ServiceProvider::publishableMigrationPaths() as $path) {
+            $path = realpath($path);
+
+            if ($from === $path &amp;&amp; preg_match(&#039;/\d{4}_(\d{2})_(\d{2})_(\d{6})_/&#039;, $to)) {
+                $this-&gt;publishedAt = $this-&gt;publishedAt-&gt;addSecond();
+
+                return preg_replace(
+                    &#039;/\d{4}_(\d{2})_(\d{2})_(\d{6})_/&#039;,
+                    $this-&gt;publishedAt-&gt;format(&#039;Y_m_d_His&#039;).&#039;_&#039;,
+                    $to,
+                );
+            }
+        }
+
+        return $to;
+    }
+
+    /**
+     * Write a status message to the console.
+     *
+     * @param  string  $from
+     * @param  string  $to
+     * @param  string  $type
+     * @return void
+     */
+    protected function status($from, $to, $type)
+    {
+        $from = str_replace(base_path().&#039;/&#039;, &#039;&#039;, realpath($from));
+
+        $to = str_replace(base_path().&#039;/&#039;, &#039;&#039;, realpath($to));
+
+        $this-&gt;components-&gt;task(sprintf(
+            &#039;Copying %s [%s] to [%s]&#039;,
+            $type,
+            $from,
+            $to,
+        ));
+    }
+
+    /**
+     * Instruct the command to not update the dates on migrations when publishing.
+     *
+     * @return void
+     */
+    public static function dontUpdateMigrationDates()
+    {
+        static::$updateMigrationDates = false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Foundation/Console/ViewCacheCommand.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Foundation/Console/stubs -->
+
+</body>
+</html>

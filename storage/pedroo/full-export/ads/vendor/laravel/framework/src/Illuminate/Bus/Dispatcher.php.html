@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Bus/Dispatcher.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Bus;
+
+use Closure;
+use Illuminate\Contracts\Bus\QueueingDispatcher;
+use Illuminate\Contracts\Container\Container;
+use Illuminate\Contracts\Queue\Queue;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\PendingChain;
+use Illuminate\Pipeline\Pipeline;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Jobs\SyncJob;
+use Illuminate\Support\Collection;
+use RuntimeException;
+
+class Dispatcher implements QueueingDispatcher
+{
+    /**
+     * The container implementation.
+     *
+     * @var \Illuminate\Contracts\Container\Container
+     */
+    protected $container;
+
+    /**
+     * The pipeline instance for the bus.
+     *
+     * @var \Illuminate\Pipeline\Pipeline
+     */
+    protected $pipeline;
+
+    /**
+     * The pipes to send commands through before dispatching.
+     *
+     * @var array
+     */
+    protected $pipes = [];
+
+    /**
+     * The command to handler mapping for non-self-handling events.
+     *
+     * @var array
+     */
+    protected $handlers = [];
+
+    /**
+     * The queue resolver callback.
+     *
+     * @var \Closure|null
+     */
+    protected $queueResolver;
+
+    /**
+     * Indicates if dispatching after response is disabled.
+     *
+     * @var bool
+     */
+    protected $allowsDispatchingAfterResponses = true;
+
+    /**
+     * Create a new command dispatcher instance.
+     */
+    public function __construct(Container $container, ?Closure $queueResolver = null)
+    {
+        $this-&gt;container = $container;
+        $this-&gt;queueResolver = $queueResolver;
+        $this-&gt;pipeline = new Pipeline($container);
+    }
+
+    /**
+     * Dispatch a command to its appropriate handler.
+     *
+     * @param  mixed  $command
+     * @return mixed
+     */
+    public function dispatch($command)
+    {
+        return $this-&gt;queueResolver &amp;&amp; $this-&gt;commandShouldBeQueued($command)
+            ? $this-&gt;dispatchToQueue($command)
+            : $this-&gt;dispatchNow($command);
+    }
+
+    /**
+     * Dispatch a command to its appropriate handler in the current process.
+     *
+     * Queueable jobs will be dispatched to the &quot;sync&quot; queue.
+     *
+     * @param  mixed  $command
+     * @param  mixed  $handler
+     * @return mixed
+     */
+    public function dispatchSync($command, $handler = null)
+    {
+        if ($this-&gt;queueResolver &amp;&amp;
+            $this-&gt;commandShouldBeQueued($command) &amp;&amp;
+            method_exists($command, &#039;onConnection&#039;)) {
+            return $this-&gt;dispatchToQueue($command-&gt;onConnection(&#039;sync&#039;));
+        }
+
+        return $this-&gt;dispatchNow($command, $handler);
+    }
+
+    /**
+     * Dispatch a command to its appropriate handler in the current process without using the synchronous queue.
+     *
+     * @param  mixed  $command
+     * @param  mixed  $handler
+     * @return mixed
+     */
+    public function dispatchNow($command, $handler = null)
+    {
+        $uses = class_uses_recursive($command);
+
+        if (isset($uses[InteractsWithQueue::class], $uses[Queueable::class]) &amp;&amp; ! $command-&gt;job) {
+            $command-&gt;setJob(new SyncJob($this-&gt;container, json_encode([]), &#039;sync&#039;, &#039;sync&#039;));
+        }
+
+        if ($handler || $handler = $this-&gt;getCommandHandler($command)) {
+            $callback = function ($command) use ($handler) {
+                $method = method_exists($handler, &#039;handle&#039;) ? &#039;handle&#039; : &#039;__invoke&#039;;
+
+                return $handler-&gt;{$method}($command);
+            };
+        } else {
+            $callback = function ($command) {
+                $method = method_exists($command, &#039;handle&#039;) ? &#039;handle&#039; : &#039;__invoke&#039;;
+
+                return $this-&gt;container-&gt;call([$command, $method]);
+            };
+        }
+
+        return $this-&gt;pipeline-&gt;send($command)-&gt;through($this-&gt;pipes)-&gt;then($callback);
+    }
+
+    /**
+     * Attempt to find the batch with the given ID.
+     *
+     * @return \Illuminate\Bus\Batch|null
+     */
+    public function findBatch(string $batchId)
+    {
+        return $this-&gt;container-&gt;make(BatchRepository::class)-&gt;find($batchId);
+    }
+
+    /**
+     * Create a new batch of queueable jobs.
+     *
+     * @param  \Illuminate\Support\Collection|mixed  $jobs
+     * @return \Illuminate\Bus\PendingBatch
+     */
+    public function batch($jobs)
+    {
+        return new PendingBatch($this-&gt;container, Collection::wrap($jobs));
+    }
+
+    /**
+     * Create a new chain of queueable jobs.
+     *
+     * @param  \Illuminate\Support\Collection|array|null  $jobs
+     * @return \Illuminate\Foundation\Bus\PendingChain
+     */
+    public function chain($jobs = null)
+    {
+        $jobs = Collection::wrap($jobs);
+        $jobs = ChainedBatch::prepareNestedBatches($jobs);
+
+        return new PendingChain($jobs-&gt;shift(), $jobs-&gt;toArray());
+    }
+
+    /**
+     * Determine if the given command has a handler.
+     *
+     * @param  mixed  $command
+     * @return bool
+     */
+    public function hasCommandHandler($command)
+    {
+        return array_key_exists(get_class($command), $this-&gt;handlers);
+    }
+
+    /**
+     * Retrieve the handler for a command.
+     *
+     * @param  mixed  $command
+     * @return mixed
+     */
+    public function getCommandHandler($command)
+    {
+        if ($this-&gt;hasCommandHandler($command)) {
+            return $this-&gt;container-&gt;make($this-&gt;handlers[get_class($command)]);
+        }
+
+        return false;
+    }
+
+    /**
+     * Determine if the given command should be queued.
+     *
+     * @param  mixed  $command
+     * @return bool
+     */
+    protected function commandShouldBeQueued($command)
+    {
+        return $command instanceof ShouldQueue;
+    }
+
+    /**
+     * Dispatch a command to its appropriate handler behind a queue.
+     *
+     * @param  mixed  $command
+     * @return mixed
+     *
+     * @throws \RuntimeException
+     */
+    public function dispatchToQueue($command)
+    {
+        $connection = $command-&gt;connection ?? null;
+
+        $queue = ($this-&gt;queueResolver)($connection);
+
+        if (! $queue instanceof Queue) {
+            throw new RuntimeException(&#039;Queue resolver did not return a Queue implementation.&#039;);
+        }
+
+        if (method_exists($command, &#039;queue&#039;)) {
+            return $command-&gt;queue($queue, $command);
+        }
+
+        return $this-&gt;pushCommandToQueue($queue, $command);
+    }
+
+    /**
+     * Push the command onto the given queue instance.
+     *
+     * @param  \Illuminate\Contracts\Queue\Queue  $queue
+     * @param  mixed  $command
+     * @return mixed
+     */
+    protected function pushCommandToQueue($queue, $command)
+    {
+        if (isset($command-&gt;delay)) {
+            return $queue-&gt;later($command-&gt;delay, $command, queue: $command-&gt;queue ?? null);
+        }
+
+        return $queue-&gt;push($command, queue: $command-&gt;queue ?? null);
+    }
+
+    /**
+     * Dispatch a command to its appropriate handler after the current process.
+     *
+     * @param  mixed  $command
+     * @param  mixed  $handler
+     * @return void
+     */
+    public function dispatchAfterResponse($command, $handler = null)
+    {
+        if (! $this-&gt;allowsDispatchingAfterResponses) {
+            $this-&gt;dispatchSync($command);
+
+            return;
+        }
+
+        $this-&gt;container-&gt;terminating(function () use ($command, $handler) {
+            $this-&gt;dispatchSync($command, $handler);
+        });
+    }
+
+    /**
+     * Set the pipes through which commands should be piped before dispatching.
+     *
+     * @return $this
+     */
+    public function pipeThrough(array $pipes)
+    {
+        $this-&gt;pipes = $pipes;
+
+        return $this;
+    }
+
+    /**
+     * Map a command to a handler.
+     *
+     * @return $this
+     */
+    public function map(array $map)
+    {
+        $this-&gt;handlers = array_merge($this-&gt;handlers, $map);
+
+        return $this;
+    }
+
+    /**
+     * Allow dispatching after responses.
+     *
+     * @return $this
+     */
+    public function withDispatchingAfterResponses()
+    {
+        $this-&gt;allowsDispatchingAfterResponses = true;
+
+        return $this;
+    }
+
+    /**
+     * Disable dispatching after responses.
+     *
+     * @return $this
+     */
+    public function withoutDispatchingAfterResponses()
+    {
+        $this-&gt;allowsDispatchingAfterResponses = false;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Bus/DynamoBatchRepository.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Bus/Events -->
+
+</body>
+</html>

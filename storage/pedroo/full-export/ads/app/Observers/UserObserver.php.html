@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Observers/UserObserver.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Observers;
+
+use App\Exceptions\Custom\CustomException;
+use App\Exceptions\Custom\ModelOperationCancelledException;
+use App\Helpers\Common\Arr;
+use App\Models\Payment;
+use App\Models\Permission;
+use App\Models\Post;
+use App\Models\SavedPost;
+use App\Models\SavedSearch;
+use App\Models\Scopes\ReviewedScope;
+use App\Models\Scopes\StrictActiveScope;
+use App\Models\Scopes\ValidPeriodScope;
+use App\Models\Scopes\VerifiedScope;
+use App\Models\ThreadMessage;
+use App\Models\ThreadParticipant;
+use App\Models\User;
+use App\Observers\Traits\HasImageWithThumbs;
+use App\Services\Auth\App\Notifications\AccountActivated;
+use App\Services\Auth\App\Notifications\AccountSuspended;
+use App\Services\Auth\App\Notifications\NewUserRegistered;
+use App\Services\Auth\App\Notifications\TwoFactorSetup;
+use App\Services\Auth\Traits\Custom\Verification\Metadata;
+use extras\addons\reviews\app\Models\Review;
+use Illuminate\Support\Facades\Notification;
+use Throwable;
+
+class UserObserver extends BaseObserver
+{
+	use Metadata, HasImageWithThumbs;
+	
+	/**
+	 * Listen to the Entry created event.
+	 *
+	 * @param User $user
+	 * @return void
+	 */
+	public function created(User $user)
+	{
+		// Send Admin Notification Email
+		if (config(&#039;settings.mail.admin_notification&#039;) == &#039;1&#039;) {
+			try {
+				// Get all admin users
+				$admins = User::permission(Permission::getStaffPermissions())-&gt;get();
+				if ($admins-&gt;count() &gt; 0) {
+					Notification::send($admins, new NewUserRegistered($user));
+				}
+			} catch (Throwable $t) {
+			}
+		}
+	}
+	
+	/**
+	 * Listen to the Entry updating event.
+	 *
+	 * @param User $user
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function updating(User $user)
+	{
+		// Delete the user&#039;s old photo/avatar if new file is filled
+		if ($user-&gt;isDirty(&#039;photo_path&#039;)) {
+			// Get the original object values
+			$original = $user-&gt;getOriginal();
+			$oldFilePath = $original[&#039;photo_path&#039;] ?? null;
+			
+			if (!empty($oldFilePath)) {
+				$defaultPicture = config(&#039;larapen.media.avatar&#039;);
+				$this-&gt;removePictureWithItsThumbs($oldFilePath, $defaultPicture);
+			}
+		}
+		
+		// Send Two-Factor Authentication notification
+		if (Arr::keyExists(&#039;two_factor_enabled&#039;, $user)) {
+			if ($user-&gt;isDirty(&#039;two_factor_enabled&#039;)) {
+				$isTwoFactorEnabled = ($user-&gt;two_factor_enabled == 1);
+				try {
+					$user-&gt;notify(new TwoFactorSetup($user, enable: $isTwoFactorEnabled));
+				} catch (Throwable $e) {
+					// Disable the 2FA option for the user and Clear any existing OTP,
+					// when the Mail or the SMS sending option is not properly configured to allow the OTP sending to the user
+					if ($isTwoFactorEnabled) {
+						$user-&gt;two_factor_enabled = 0;
+						$user-&gt;resetTwoFactorCode();
+					}
+					
+					throw new CustomException($e-&gt;getMessage());
+				}
+				
+				// Clear any existing OTP, when user disable the 2FA option
+				if (!$isTwoFactorEnabled) {
+					$user-&gt;resetTwoFactorCode();
+				}
+			}
+		}
+		
+		// Send user suspension notification
+		if (Arr::keyExists(&#039;suspended_at&#039;, $user)) {
+			if ($user-&gt;isDirty(&#039;suspended_at&#039;)) {
+				$isSuspended = !empty($user-&gt;suspended_at);
+				if ($isSuspended) {
+					$sendNotificationOnUserSuspension = config(&#039;settings.auth.send_notification_on_user_suspension&#039;);
+					$sendNotificationOnUserSuspension = castToString($sendNotificationOnUserSuspension, &#039;none&#039;);
+					if (in_array($sendNotificationOnUserSuspension, [&#039;send&#039;, &#039;forceToSend&#039;])) {
+						try {
+							$user-&gt;notify(new AccountSuspended($user));
+						} catch (\Throwable $e) {
+							if ($sendNotificationOnUserSuspension == &#039;forceToSend&#039;) {
+								throw new CustomException($e-&gt;getMessage());
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	/**
+	 * Listen to the Entry deleting event.
+	 *
+	 * @param User $user
+	 * @return void
+	 * @throws \App\Exceptions\Custom\ModelOperationCancelledException
+	 */
+	public function deleting(User $user)
+	{
+		// Prevent admin user to delete his account himself
+		if (isAdminPanelRoute()) {
+			$message = null;
+			$authUser = auth()-&gt;user();
+			if (!empty($authUser)) {
+				if (doesUserHaveStaffPermission($authUser)) {
+					if ($authUser-&gt;getAuthIdentifier() == $user-&gt;id) {
+						$message = trans(&#039;admin.your_account_cannot_be_deleted_by_yourself&#039;);
+					}
+				} else {
+					$message = trans(&#039;admin.forbidden&#039;);
+				}
+			} else {
+				$message = trans(&#039;admin.unauthorized&#039;);
+			}
+			if (isDemoDomain()) {
+				if (in_array($user-&gt;email, getDemoEmailAddresses())) {
+					$message = trans(&#039;global.demo_mode_message&#039;);
+				}
+			}
+			if (!empty($message)) {
+				// Use Exceptions to propagate error message in the Controller
+				// Or use &quot;return false;&quot; to cancel operation without message.
+				throw new ModelOperationCancelledException($message);
+			}
+		}
+		
+		// Revoke all the user&#039;s tokens
+		try {
+			$user-&gt;tokens()-&gt;delete();
+		} catch (Throwable $e) {
+		}
+		
+		// Revoke all the user&#039;s social logins
+		try {
+			$user-&gt;socialLogins()-&gt;delete();
+		} catch (Throwable $e) {
+		}
+		
+		// Delete the user&#039;s photo
+		if (!empty($user-&gt;photo_path)) {
+			$defaultPicture = config(&#039;larapen.media.avatar&#039;);
+			$this-&gt;removePictureWithItsThumbs($user-&gt;photo_path, $defaultPicture);
+		}
+		
+		// Delete all user&#039;s Posts
+		$posts = Post::query()
+			-&gt;withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+			-&gt;where(&#039;user_id&#039;, $user-&gt;id);
+		if ($posts-&gt;count() &gt; 0) {
+			foreach ($posts-&gt;cursor() as $post) {
+				$post-&gt;delete();
+			}
+		}
+		
+		// Delete all user&#039;s Messages
+		$messages = ThreadMessage::where(&#039;user_id&#039;, $user-&gt;id);
+		if ($messages-&gt;count() &gt; 0) {
+			foreach ($messages-&gt;cursor() as $message) {
+				$message-&gt;forceDelete();
+			}
+		}
+		
+		// Delete all user as Participant
+		$participants = ThreadParticipant::where(&#039;user_id&#039;, $user-&gt;id);
+		if ($participants-&gt;count() &gt; 0) {
+			foreach ($participants-&gt;cursor() as $participant) {
+				$participant-&gt;forceDelete();
+			}
+		}
+		
+		// Delete all user&#039;s Saved Posts
+		$savedPosts = SavedPost::where(&#039;user_id&#039;, $user-&gt;id);
+		if ($savedPosts-&gt;count() &gt; 0) {
+			foreach ($savedPosts-&gt;cursor() as $savedPost) {
+				$savedPost-&gt;delete();
+			}
+		}
+		
+		// Delete all user&#039;s Saved Searches
+		$savedSearches = SavedSearch::where(&#039;user_id&#039;, $user-&gt;id);
+		if ($savedSearches-&gt;count() &gt; 0) {
+			foreach ($savedSearches-&gt;cursor() as $savedSearch) {
+				$savedSearch-&gt;delete();
+			}
+		}
+		
+		// Delete the Payment(s) of this User
+		$payments = Payment::query()
+			-&gt;withoutGlobalScopes([ValidPeriodScope::class, StrictActiveScope::class])
+			-&gt;whereMorphedTo(&#039;payable&#039;, $user)
+			-&gt;get();
+		if ($payments-&gt;count() &gt; 0) {
+			foreach ($payments as $payment) {
+				$payment-&gt;delete();
+			}
+		}
+		
+		// Check the Reviews addon
+		if (config(&#039;addons.reviews.installed&#039;)) {
+			try {
+				// Delete the reviews of this User
+				$reviews = Review::where(&#039;user_id&#039;, $user-&gt;id);
+				if ($reviews-&gt;count() &gt; 0) {
+					foreach ($reviews-&gt;cursor() as $review) {
+						$review-&gt;delete();
+					}
+				}
+			} catch (Throwable $e) {
+			}
+		}
+	}
+	
+	/**
+	 * Listen to the Entry saved event.
+	 *
+	 * @param User $user
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function saved(User $user)
+	{
+		$this-&gt;sendNotification($user);
+		
+		// Create a new email token if the user&#039;s email is marked as unverified
+		if (empty($user-&gt;email_verified_at)) {
+			if (empty($user-&gt;email_token)) {
+				$user-&gt;email_token = generateToken(hashed: true);
+				$user-&gt;saveQuietly();
+			}
+		}
+		
+		// Create a new phone token if the user&#039;s phone number is marked as unverified
+		if (empty($user-&gt;phone_verified_at)) {
+			if (empty($user-&gt;phone_token)) {
+				$user-&gt;phone_token = generateOtp(defaultOtpLength());
+				$user-&gt;saveQuietly();
+			}
+		}
+	}
+	
+	/**
+	 * Send Notification,
+	 *
+	 * - If the user&#039;s email address or phone number was not verified and has just been verified
+	 *   (including when the user was recently created)
+	 *
+	 * @param User $user
+	 * @return void
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	private function sendNotification(User $user): void
+	{
+		try {
+			if ($user-&gt;wasRecentlyCreated) {
+				$userWasNotVerified = true;
+			} else {
+				$original = $user-&gt;getOriginal();
+				$userEmailWasNotVerified = ($user-&gt;wasChanged(&#039;email_verified_at&#039;) &amp;&amp; empty(data_get($original, &#039;email_verified_at&#039;)));
+				$userPhoneWasNotVerified = ($user-&gt;wasChanged(&#039;phone_verified_at&#039;) &amp;&amp; empty(data_get($original, &#039;phone_verified_at&#039;)));
+				$userWasNotVerified = ($userEmailWasNotVerified || $userPhoneWasNotVerified);
+			}
+			$userIsVerified = (!empty($user-&gt;email_verified_at) &amp;&amp; !empty($user-&gt;phone_verified_at));
+			$userHasJustBeenVerified = ($userIsVerified &amp;&amp; $userWasNotVerified);
+			
+			if ($userHasJustBeenVerified) {
+				$user-&gt;notify(new AccountActivated($user));
+			}
+		} catch (Throwable $e) {
+			throw new CustomException($e-&gt;getMessage());
+		}
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Observers/UserSocialLoginObserver.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Observers/Traits -->
+
+</body>
+</html>

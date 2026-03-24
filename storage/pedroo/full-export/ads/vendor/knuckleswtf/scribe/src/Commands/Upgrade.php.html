@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Commands/Upgrade.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Commands;
+
+use Illuminate\Console\Command;
+use Knuckles\Camel\Camel;
+use Knuckles\Scribe\GroupedEndpoints\GroupedEndpointsFactory;
+use Knuckles\Scribe\Scribe;
+use Knuckles\Scribe\Tools\PathConfig;
+use Shalvah\Upgrader\Upgrader;
+use Symfony\Component\VarExporter\VarExporter;
+
+class Upgrade extends Command
+{
+    protected $signature = &quot;scribe:upgrade {--dry-run : Print the changes that will be made, without actually making them}
+                            {--config=scribe : choose which config file to use}
+                            &quot;;
+
+    protected $description = &#039;&#039;;
+    protected bool $applyChanges;
+    protected string $configName;
+
+    public function handle(): void
+    {
+        $this-&gt;applyChanges = !$this-&gt;option(&#039;dry-run&#039;);
+
+        $this-&gt;configName = $this-&gt;option(&#039;config&#039;);
+        if (!($oldConfig = config($this-&gt;configName))) {
+            $this-&gt;error(&quot;The specified config (config/{$this-&gt;configName}.php) doesn&#039;t exist.&quot;);
+            return;
+        }
+
+        if (array_key_exists(&quot;interactive&quot;, $oldConfig)) {
+            $this-&gt;error(&quot;This upgrade tool is for upgrading from Scribe v3 to v4, but it looks like you&#039;re coming from v2.&quot;);
+            $this-&gt;error(&quot;Please install v3 and follow its upgrade guide first.&quot;);
+            return;
+        }
+
+        $isMajorUpgrade = array_key_exists(&quot;default_group&quot;, $oldConfig) || array_key_exists(&quot;faker_seed&quot;, $oldConfig);
+
+        if ($isMajorUpgrade) $this-&gt;info(&quot;Welcome to the Scribe v3 to v4 upgrader.&quot;);
+        $this-&gt;line(&quot;Checking for config file changes...&quot;);
+
+        $upgrader = Upgrader::ofConfigFile(&quot;config/$this-&gt;configName.php&quot;, __DIR__ . &#039;/../../config/scribe.php&#039;)
+            -&gt;dontTouch(&#039;routes&#039;, &#039;laravel.middleware&#039;, &#039;postman.overrides&#039;, &#039;openapi.overrides&#039;,
+                &#039;example_languages&#039;, &#039;database_connections_to_transact&#039;, &#039;strategies&#039;, &#039;examples.models_source&#039;, &#039;external.html_attributes&#039;)
+            -&gt;move(&#039;default_group&#039;, &#039;groups.default&#039;)
+            -&gt;move(&#039;faker_seed&#039;, &#039;examples.faker_seed&#039;);
+
+        if (!$isMajorUpgrade)
+            $upgrader-&gt;dontTouch(&#039;groups&#039;);
+
+        $changes = $upgrader-&gt;dryRun();
+        if (empty($changes)) {
+            $this-&gt;info(&quot;✔ No config file changes needed.&quot;);
+        } else {
+            $this-&gt;info(&#039;The following changes will be made to your config file:&#039;);
+            $this-&gt;newLine();
+            foreach ($changes as $change) {
+                $this-&gt;line($change[&quot;description&quot;]);
+            }
+
+            if ($this-&gt;applyChanges) {
+                $upgrader-&gt;upgrade();
+                $this-&gt;info(&quot;✔ Upgraded your config file. Your old config is backed up at config/$this-&gt;configName.php.bak.&quot;);
+            }
+        }
+        $this-&gt;newLine();
+
+        if (!$isMajorUpgrade) {
+            $this-&gt;info(&quot;✔ Done.&quot;);
+            $this-&gt;info(sprintf(&quot;See the full changelog at https://github.com/knuckleswtf/scribe/blob/%s/CHANGELOG.md&quot;, Scribe::VERSION));
+            return;
+        }
+
+        $this-&gt;finishV4Upgrade();
+    }
+
+    protected function finishV4Upgrade(): void
+    {
+        $this-&gt;migrateToConfigFileSort();
+
+        if ($this-&gt;applyChanges) {
+            if ($this-&gt;confirm(&quot;Do you have any custom strategies?&quot;)) {
+                $this-&gt;line(&#039;1. Add a new property &lt;info&gt;public ?ExtractedEndpointData $endpointData;&lt;/info&gt;.&#039;);
+                $this-&gt;line(&#039;2. Replace the &lt;info&gt;array $routeRules&lt;/info&gt; parameter in __invoke() with &lt;info&gt;array $routeRules = []&lt;/info&gt; .&#039;);
+            }
+            $this-&gt;newLine();
+            $this-&gt;info(&quot;✔ Done.&quot;);
+        }
+
+        $this-&gt;line(&quot;See the release announcement at &lt;href=https://scribe.knuckles.wtf/blog/laravel-v4&gt;http://scribe.knuckles.wtf/blog/laravel-v4&lt;/&gt; for the full upgrade guide!&quot;);
+    }
+
+    /**
+     * In v3, you sorted endpoints by reordering them in the group file, and groups by renaming the group files alphabetically
+     * (or by using `beforeGroup`/`afterGroup` for custom endpoints).
+     * v4 replaces them with the config item `groups.order`.
+     */
+    protected function migrateToConfigFileSort()
+    {
+        $this-&gt;info(&quot;In v3, you sorted endpoints/groups by editing/renaming the generated YAML files (or `beforeGroup`/`afterGroup` for custom endpoints).&quot;);
+        $this-&gt;info(&quot;We&#039;ll automatically import your current sorting into the config item `groups.order`.&quot;);
+
+        $defaultGroup = config($this-&gt;configName.&quot;.default_group&quot;);
+        $pathConfig = new PathConfig($this-&gt;configName);
+        $extractedEndpoints = GroupedEndpointsFactory::fromCamelDir($pathConfig)-&gt;get();
+
+        $order = array_map(function (array $group) {
+            return array_map(function (array $endpoint) {
+                return $endpoint[&#039;metadata&#039;][&#039;title&#039;] ?: ($endpoint[&#039;httpMethods&#039;][0] . &#039; /&#039;. $endpoint[&#039;uri&#039;]);
+            }, $group[&#039;endpoints&#039;]);
+        }, $extractedEndpoints);
+        $groupsOrder = array_keys($order);
+        $keyIndices = array_flip($groupsOrder);
+
+        $userDefinedEndpoints = Camel::loadUserDefinedEndpoints(Camel::camelDir($pathConfig));
+
+        if ($userDefinedEndpoints) {
+            foreach ($userDefinedEndpoints as $endpoint) {
+                $groupName = $endpoint[&#039;metadata&#039;][&#039;groupName&#039;] ?? $defaultGroup;
+                $endpointTitle = $endpoint[&#039;metadata&#039;][&#039;title&#039;] ?? ($endpoint[&#039;httpMethods&#039;][0] . &#039; /&#039; . $endpoint[&#039;uri&#039;]);
+
+                if (!isset($order[$groupName])) {
+                    // This is a new group; place it at the right spot.
+                    if (($nextGroup = $endpoint[&#039;metadata&#039;][&#039;beforeGroup&#039;] ?? null)) {
+                        $index = $keyIndices[$nextGroup];
+                        array_splice($groupsOrder, $index, 0, [$groupName]);
+                    } else if (($previousGroup = $endpoint[&#039;metadata&#039;][&#039;afterGroup&#039;] ?? null)) {
+                        $index = $keyIndices[$previousGroup];
+                        array_splice($groupsOrder, $index + 1, 0, [$groupName]);
+                    } else {
+                        $groupsOrder[] = $groupName;
+                    }
+                    $order[$groupName] = [$endpointTitle];
+                } else {
+                    // Existing group, add endpoint
+                    $order[$groupName] = [...$order[$groupName], $endpointTitle];
+                }
+            }
+        }
+
+        // Re-add them, so it&#039;s sorted in the right order
+        $newOrder = [];
+        foreach ($groupsOrder as $groupName) {
+            $newOrder[$groupName] = $order[$groupName];
+        }
+
+        $output = VarExporter::export($newOrder);
+        if ($this-&gt;applyChanges) {
+            $configFile = &quot;config/{$this-&gt;configName}.php&quot;;
+            $output = str_replace(&quot;\n&quot;, &quot;\n        &quot;, $output);
+            $newContents = str_replace(
+                &quot;&#039;order&#039; =&gt; [],&quot;,
+                &quot;&#039;order&#039; =&gt; $output,&quot;,
+                file_get_contents($configFile)
+            );
+            file_put_contents($configFile, $newContents);
+            $this-&gt;info(&quot;✔ Updated `groups.order`.&quot;);
+        } else {
+            $this-&gt;line(&quot;- `groups.order` will be set to:&quot;);
+            $this-&gt;info($output);
+        }
+    }
+
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Commands/stubs/strategy.stub -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Commands/stubs -->
+
+</body>
+</html>

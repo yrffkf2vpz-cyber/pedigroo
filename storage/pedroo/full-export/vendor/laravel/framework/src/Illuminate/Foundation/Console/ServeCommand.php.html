@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Foundation/Console/ServeCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Foundation\Console;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Env;
+use Illuminate\Support\InteractsWithTime;
+use Illuminate\Support\Stringable;
+use Symfony\Component\Console\Attribute\AsCommand;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Process\Process;
+
+use function Illuminate\Support\php_binary;
+use function Termwind\terminal;
+
+#[AsCommand(name: &#039;serve&#039;)]
+class ServeCommand extends Command
+{
+    use InteractsWithTime;
+
+    /**
+     * The console command name.
+     *
+     * @var string
+     */
+    protected $name = &#039;serve&#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;Serve the application on the PHP development server&#039;;
+
+    /**
+     * The number of PHP CLI server workers.
+     *
+     * @var int&lt;2, max&gt;|false
+     */
+    protected $phpServerWorkers = 1;
+
+    /**
+     * The current port offset.
+     *
+     * @var int
+     */
+    protected $portOffset = 0;
+
+    /**
+     * The list of lines that are pending to be output.
+     *
+     * @var string
+     */
+    protected $outputBuffer = &#039;&#039;;
+
+    /**
+     * The list of requests being handled and their start time.
+     *
+     * @var array&lt;int, \Illuminate\Support\Carbon&gt;
+     */
+    protected $requestsPool;
+
+    /**
+     * Indicates if the &quot;Server running on...&quot; output message has been displayed.
+     *
+     * @var bool
+     */
+    protected $serverRunningHasBeenDisplayed = false;
+
+    /**
+     * The environment variables that should be passed from host machine to the PHP server process.
+     *
+     * @var string[]
+     */
+    public static $passthroughVariables = [
+        &#039;APP_ENV&#039;,
+        &#039;HERD_PHP_81_INI_SCAN_DIR&#039;,
+        &#039;HERD_PHP_82_INI_SCAN_DIR&#039;,
+        &#039;HERD_PHP_83_INI_SCAN_DIR&#039;,
+        &#039;HERD_PHP_84_INI_SCAN_DIR&#039;,
+        &#039;HERD_PHP_85_INI_SCAN_DIR&#039;,
+        &#039;IGNITION_LOCAL_SITES_PATH&#039;,
+        &#039;LARAVEL_SAIL&#039;,
+        &#039;PATH&#039;,
+        &#039;PHP_IDE_CONFIG&#039;,
+        &#039;SYSTEMROOT&#039;,
+        &#039;XDEBUG_CONFIG&#039;,
+        &#039;XDEBUG_MODE&#039;,
+        &#039;XDEBUG_SESSION&#039;,
+    ];
+
+    /** {@inheritdoc} */
+    #[\Override]
+    protected function initialize(InputInterface $input, OutputInterface $output)
+    {
+        $this-&gt;phpServerWorkers = transform((int) env(&#039;PHP_CLI_SERVER_WORKERS&#039;, 1), function (int $workers) {
+            if ($workers &lt; 2) {
+                return false;
+            }
+
+            if ($workers &gt; 1 &amp;&amp;
+                ! $this-&gt;option(&#039;no-reload&#039;) &amp;&amp;
+                ! (int) env(&#039;LARAVEL_SAIL&#039;, 0)) {
+                $this-&gt;components-&gt;warn(&#039;Unable to respect the `PHP_CLI_SERVER_WORKERS` environment variable without the `--no-reload` flag. Only creating a single server.&#039;);
+
+                return false;
+            }
+
+            return $workers;
+        });
+
+        parent::initialize($input, $output);
+    }
+
+    /**
+     * Execute the console command.
+     *
+     * @return int
+     *
+     * @throws \Exception
+     */
+    public function handle()
+    {
+        $environmentFile = $this-&gt;option(&#039;env&#039;)
+            ? base_path(&#039;.env&#039;).&#039;.&#039;.$this-&gt;option(&#039;env&#039;)
+            : base_path(&#039;.env&#039;);
+
+        $hasEnvironment = file_exists($environmentFile);
+
+        $environmentLastModified = $hasEnvironment
+            ? filemtime($environmentFile)
+            : now()-&gt;addDays(30)-&gt;getTimestamp();
+
+        $process = $this-&gt;startProcess($hasEnvironment);
+
+        while ($process-&gt;isRunning()) {
+            if ($hasEnvironment) {
+                clearstatcache(false, $environmentFile);
+            }
+
+            if (! $this-&gt;option(&#039;no-reload&#039;) &amp;&amp;
+                $hasEnvironment &amp;&amp;
+                filemtime($environmentFile) &gt; $environmentLastModified) {
+                $environmentLastModified = filemtime($environmentFile);
+
+                $this-&gt;newLine();
+
+                $this-&gt;components-&gt;info(&#039;Environment modified. Restarting server...&#039;);
+
+                $process-&gt;stop(5);
+
+                $this-&gt;serverRunningHasBeenDisplayed = false;
+
+                $process = $this-&gt;startProcess($hasEnvironment);
+            }
+
+            usleep(500 * 1000);
+        }
+
+        $status = $process-&gt;getExitCode();
+
+        if ($status &amp;&amp; $this-&gt;canTryAnotherPort()) {
+            $this-&gt;portOffset += 1;
+
+            return $this-&gt;handle();
+        }
+
+        return $status;
+    }
+
+    /**
+     * Start a new server process.
+     *
+     * @param  bool  $hasEnvironment
+     * @return \Symfony\Component\Process\Process
+     */
+    protected function startProcess($hasEnvironment)
+    {
+        $process = new Process($this-&gt;serverCommand(), public_path(), (new Collection($_ENV))-&gt;mapWithKeys(function ($value, $key) use ($hasEnvironment) {
+            if ($this-&gt;option(&#039;no-reload&#039;) || ! $hasEnvironment) {
+                return [$key =&gt; $value];
+            }
+
+            return in_array($key, static::$passthroughVariables) ? [$key =&gt; $value] : [$key =&gt; false];
+        })-&gt;merge([&#039;PHP_CLI_SERVER_WORKERS&#039; =&gt; $this-&gt;phpServerWorkers])-&gt;all());
+
+        $this-&gt;trap(fn () =&gt; [SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2, SIGQUIT], function ($signal) use ($process) {
+            if ($process-&gt;isRunning()) {
+                $process-&gt;stop(10, $signal);
+            }
+
+            exit;
+        });
+
+        $process-&gt;start($this-&gt;handleProcessOutput());
+
+        return $process;
+    }
+
+    /**
+     * Get the full server command.
+     *
+     * @return array
+     */
+    protected function serverCommand()
+    {
+        $server = file_exists(base_path(&#039;server.php&#039;))
+            ? base_path(&#039;server.php&#039;)
+            : __DIR__.&#039;/../resources/server.php&#039;;
+
+        return [
+            php_binary(),
+            &#039;-S&#039;,
+            $this-&gt;host().&#039;:&#039;.$this-&gt;port(),
+            $server,
+        ];
+    }
+
+    /**
+     * Get the host for the command.
+     *
+     * @return string
+     */
+    protected function host()
+    {
+        [$host] = $this-&gt;getHostAndPort();
+
+        return $host;
+    }
+
+    /**
+     * Get the port for the command.
+     *
+     * @return string
+     */
+    protected function port()
+    {
+        $port = $this-&gt;input-&gt;getOption(&#039;port&#039;);
+
+        if (is_null($port)) {
+            [, $port] = $this-&gt;getHostAndPort();
+        }
+
+        $port = $port ?: 8000;
+
+        return $port + $this-&gt;portOffset;
+    }
+
+    /**
+     * Get the host and port from the host option string.
+     *
+     * @return array
+     */
+    protected function getHostAndPort()
+    {
+        if (preg_match(&#039;/(\[.*\]):?([0-9]+)?/&#039;, $this-&gt;input-&gt;getOption(&#039;host&#039;), $matches) !== false) {
+            return [
+                $matches[1] ?? $this-&gt;input-&gt;getOption(&#039;host&#039;),
+                $matches[2] ?? null,
+            ];
+        }
+
+        $hostParts = explode(&#039;:&#039;, $this-&gt;input-&gt;getOption(&#039;host&#039;));
+
+        return [
+            $hostParts[0],
+            $hostParts[1] ?? null,
+        ];
+    }
+
+    /**
+     * Check if the command has reached its maximum number of port tries.
+     *
+     * @return bool
+     */
+    protected function canTryAnotherPort()
+    {
+        return is_null($this-&gt;input-&gt;getOption(&#039;port&#039;)) &amp;&amp;
+            ($this-&gt;input-&gt;getOption(&#039;tries&#039;) &gt; $this-&gt;portOffset);
+    }
+
+    /**
+     * Returns a &quot;callable&quot; to handle the process output.
+     *
+     * @return callable(string, string): void
+     */
+    protected function handleProcessOutput()
+    {
+        return function ($type, $buffer) {
+            $this-&gt;outputBuffer .= $buffer;
+
+            $this-&gt;flushOutputBuffer();
+        };
+    }
+
+    /**
+     * Flush the output buffer.
+     *
+     * @return void
+     */
+    protected function flushOutputBuffer()
+    {
+        $lines = (new Stringable($this-&gt;outputBuffer))-&gt;explode(&quot;\n&quot;);
+
+        $this-&gt;outputBuffer = (string) $lines-&gt;pop();
+
+        $lines
+            -&gt;map(fn ($line) =&gt; trim($line))
+            -&gt;filter()
+            -&gt;each(function ($line) {
+                if ((new Stringable($line))-&gt;contains(&#039;Development Server (http&#039;)) {
+                    if ($this-&gt;serverRunningHasBeenDisplayed === false) {
+                        $this-&gt;serverRunningHasBeenDisplayed = true;
+
+                        $this-&gt;components-&gt;info(&quot;Server running on [http://{$this-&gt;host()}:{$this-&gt;port()}].&quot;);
+                        $this-&gt;comment(&#039;  &lt;fg=yellow;options=bold&gt;Press Ctrl+C to stop the server&lt;/&gt;&#039;);
+
+                        $this-&gt;newLine();
+                    }
+
+                    return;
+                }
+
+                if ((new Stringable($line))-&gt;contains(&#039; Accepted&#039;)) {
+                    $requestPort = static::getRequestPortFromLine($line);
+
+                    $this-&gt;requestsPool[$requestPort] = [
+                        $this-&gt;getDateFromLine($line),
+                        $this-&gt;requestsPool[$requestPort][1] ?? false,
+                        microtime(true),
+                    ];
+                } elseif ((new Stringable($line))-&gt;contains([&#039; [200]: GET &#039;])) {
+                    $requestPort = static::getRequestPortFromLine($line);
+
+                    $this-&gt;requestsPool[$requestPort][1] = trim(explode(&#039;[200]: GET&#039;, $line)[1]);
+                } elseif ((new Stringable($line))-&gt;contains(&#039;URI:&#039;)) {
+                    $requestPort = static::getRequestPortFromLine($line);
+
+                    $this-&gt;requestsPool[$requestPort][1] = trim(explode(&#039;URI: &#039;, $line)[1]);
+                } elseif ((new Stringable($line))-&gt;contains(&#039; Closing&#039;)) {
+                    $requestPort = static::getRequestPortFromLine($line);
+
+                    if (empty($this-&gt;requestsPool[$requestPort]) || count($this-&gt;requestsPool[$requestPort] ?? []) !== 3) {
+                        $this-&gt;requestsPool[$requestPort] = [
+                            $this-&gt;getDateFromLine($line),
+                            false,
+                            microtime(true),
+                        ];
+                    }
+
+                    [$startDate, $file, $startMicrotime] = $this-&gt;requestsPool[$requestPort];
+
+                    $formattedStartedAt = $startDate-&gt;format(&#039;Y-m-d H:i:s&#039;);
+
+                    unset($this-&gt;requestsPool[$requestPort]);
+
+                    [$date, $time] = explode(&#039; &#039;, $formattedStartedAt);
+
+                    $this-&gt;output-&gt;write(&quot;  &lt;fg=gray&gt;$date&lt;/&gt; $time&quot;);
+
+                    $runTime = $this-&gt;runTimeForHumans($startMicrotime);
+
+                    if ($file) {
+                        $this-&gt;output-&gt;write($file = &quot; $file&quot;);
+                    }
+
+                    $dots = max(terminal()-&gt;width() - mb_strlen($formattedStartedAt) - mb_strlen($file) - mb_strlen($runTime) - 9, 0);
+
+                    $this-&gt;output-&gt;write(&#039; &#039;.str_repeat(&#039;&lt;fg=gray&gt;.&lt;/&gt;&#039;, $dots));
+                    $this-&gt;output-&gt;writeln(&quot; &lt;fg=gray&gt;~ {$runTime}&lt;/&gt;&quot;);
+                } elseif ((new Stringable($line))-&gt;contains([&#039;Closed without sending a request&#039;, &#039;Failed to poll event&#039;])) {
+                    // ...
+                } elseif (! empty($line)) {
+                    if ((new Stringable($line))-&gt;startsWith(&#039;[&#039;)) {
+                        $line = (new Stringable($line))-&gt;after(&#039;] &#039;);
+                    }
+
+                    $this-&gt;output-&gt;writeln(&quot;  &lt;fg=gray&gt;$line&lt;/&gt;&quot;);
+                }
+            });
+    }
+
+    /**
+     * Get the date from the given PHP server output.
+     *
+     * @param  string  $line
+     * @return \Illuminate\Support\Carbon
+     */
+    protected function getDateFromLine($line)
+    {
+        $regex = ! windows_os() &amp;&amp; is_int($this-&gt;phpServerWorkers)
+            ? &#039;/^\[\d+]\s\[([a-zA-Z0-9: ]+)\]/&#039;
+            : &#039;/^\[([^\]]+)\]/&#039;;
+
+        $line = str_replace(&#039;  &#039;, &#039; &#039;, $line);
+
+        preg_match($regex, $line, $matches);
+
+        return Carbon::createFromFormat(&#039;D M d H:i:s Y&#039;, $matches[1]);
+    }
+
+    /**
+     * Get the request port from the given PHP server output.
+     *
+     * @param  string  $line
+     * @return int
+     */
+    public static function getRequestPortFromLine($line)
+    {
+        preg_match(&#039;/(\[\w+\s\w+\s\d+\s[\d:]+\s\d{4}\]\s)?:(\d+)\s(?:(?:\w+$)|(?:\[.*))/&#039;, $line, $matches);
+
+        if (! isset($matches[2])) {
+            throw new \InvalidArgumentException(&quot;Failed to extract the request port. Ensure the log line contains a valid port: {$line}&quot;);
+        }
+
+        return (int) $matches[2];
+    }
+
+    /**
+     * Get the console command options.
+     *
+     * @return array
+     */
+    protected function getOptions()
+    {
+        return [
+            [&#039;host&#039;, null, InputOption::VALUE_OPTIONAL, &#039;The host address to serve the application on&#039;, Env::get(&#039;SERVER_HOST&#039;, &#039;127.0.0.1&#039;)],
+            [&#039;port&#039;, null, InputOption::VALUE_OPTIONAL, &#039;The port to serve the application on&#039;, Env::get(&#039;SERVER_PORT&#039;)],
+            [&#039;tries&#039;, null, InputOption::VALUE_OPTIONAL, &#039;The max number of ports to attempt to serve from&#039;, 10],
+            [&#039;no-reload&#039;, null, InputOption::VALUE_NONE, &#039;Do not reload the development server on .env file changes&#039;],
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Foundation/Console/StorageLinkCommand.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Foundation/Console/stubs -->
+
+</body>
+</html>

@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laminas/laminas-diactoros/src/ServerRequestFilter/FilterUsingXForwardedHeaders.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Laminas\Diactoros\ServerRequestFilter;
+
+use Laminas\Diactoros\Exception\InvalidForwardedHeaderNameException;
+use Laminas\Diactoros\Exception\InvalidProxyAddressException;
+use Laminas\Diactoros\UriFactory;
+use Override;
+use Psr\Http\Message\ServerRequestInterface;
+
+use function array_values;
+use function assert;
+use function count;
+use function explode;
+use function filter_var;
+use function in_array;
+use function is_string;
+use function str_contains;
+use function strtolower;
+
+use const FILTER_FLAG_IPV4;
+use const FILTER_FLAG_IPV6;
+use const FILTER_VALIDATE_IP;
+
+/**
+ * Modify the URI to reflect the X-Forwarded-* headers.
+ *
+ * If the request comes from a trusted proxy, this filter will analyze the
+ * various X-Forwarded-* headers, if any, and if they are marked as trusted,
+ * in order to return a new request that composes a URI instance that reflects
+ * those headers.
+ */
+final class FilterUsingXForwardedHeaders implements FilterServerRequestInterface
+{
+    public const HEADER_HOST  = &#039;X-FORWARDED-HOST&#039;;
+    public const HEADER_PORT  = &#039;X-FORWARDED-PORT&#039;;
+    public const HEADER_PROTO = &#039;X-FORWARDED-PROTO&#039;;
+
+    private const X_FORWARDED_HEADERS = [
+        self::HEADER_HOST,
+        self::HEADER_PORT,
+        self::HEADER_PROTO,
+    ];
+
+    /**
+     * Only allow construction via named constructors
+     *
+     * @param list&lt;non-empty-string&gt; $trustedProxies
+     * @param list&lt;FilterUsingXForwardedHeaders::HEADER_*&gt; $trustedHeaders
+     */
+    private function __construct(
+        private readonly array $trustedProxies = [],
+        private readonly array $trustedHeaders = []
+    ) {
+    }
+
+    #[Override]
+    public function __invoke(ServerRequestInterface $request): ServerRequestInterface
+    {
+        $remoteAddress = $request-&gt;getServerParams()[&#039;REMOTE_ADDR&#039;] ?? &#039;&#039;;
+
+        if (&#039;&#039; === $remoteAddress || ! is_string($remoteAddress)) {
+            // Should we trigger a warning here?
+            return $request;
+        }
+
+        if (! $this-&gt;isFromTrustedProxy($remoteAddress)) {
+            // Do nothing
+            return $request;
+        }
+
+        // Update the URI based on the trusted headers
+        $uri = $originalUri = $request-&gt;getUri();
+        foreach ($this-&gt;trustedHeaders as $headerName) {
+            $header = $request-&gt;getHeaderLine($headerName);
+            if (&#039;&#039; === $header || str_contains($header, &#039;,&#039;)) {
+                // Reject empty headers and/or headers with multiple values
+                continue;
+            }
+
+            switch ($headerName) {
+                case self::HEADER_HOST:
+                    [$host, $port] = UriFactory::marshalHostAndPortFromHeader($header);
+                    $uri           = $uri
+                        -&gt;withHost($host);
+                    if ($port !== null) {
+                        $uri = $uri-&gt;withPort($port);
+                    }
+                    break;
+                case self::HEADER_PORT:
+                    $uri = $uri-&gt;withPort((int) $header);
+                    break;
+                case self::HEADER_PROTO:
+                    $scheme = strtolower($header) === &#039;https&#039; ? &#039;https&#039; : &#039;http&#039;;
+                    $uri    = $uri-&gt;withScheme($scheme);
+                    break;
+            }
+        }
+
+        if ($uri !== $originalUri) {
+            return $request-&gt;withUri($uri);
+        }
+
+        return $request;
+    }
+
+    /**
+     * Indicate which proxies and which X-Forwarded headers to trust.
+     *
+     * @param list&lt;non-empty-string&gt; $proxyCIDRList Each element may
+     *     be an IP address or a subnet specified using CIDR notation; both IPv4
+     *     and IPv6 are supported. The special string &quot;*&quot; will be translated to
+     *     two entries, &quot;0.0.0.0/0&quot; and &quot;::/0&quot;. An empty list indicates no
+     *     proxies are trusted.
+     * @param list&lt;FilterUsingXForwardedHeaders::HEADER_*&gt; $trustedHeaders If
+     *     the list is empty, all X-Forwarded headers are trusted.
+     * @throws InvalidProxyAddressException
+     * @throws InvalidForwardedHeaderNameException
+     */
+    public static function trustProxies(
+        array $proxyCIDRList,
+        array $trustedHeaders = self::X_FORWARDED_HEADERS
+    ): self {
+        $proxyCIDRList = self::normalizeProxiesList($proxyCIDRList);
+        self::validateTrustedHeaders($trustedHeaders);
+
+        return new self($proxyCIDRList, $trustedHeaders);
+    }
+
+    /**
+     * Trust any X-FORWARDED-* headers from any address.
+     *
+     * This is functionally equivalent to calling `trustProxies([&#039;*&#039;])`.
+     *
+     * WARNING: Only do this if you know for certain that your application
+     * sits behind a trusted proxy that cannot be spoofed. This should only
+     * be the case if your server is not publicly addressable, and all requests
+     * are routed via a reverse proxy (e.g., a load balancer, a server such as
+     * Caddy, when using Traefik, etc.).
+     */
+    public static function trustAny(): self
+    {
+        return self::trustProxies([&#039;*&#039;]);
+    }
+
+    /**
+     * Trust X-Forwarded headers from reserved subnetworks.
+     *
+     * This is functionally equivalent to calling `trustProxies()` where the
+     * `$proxcyCIDRList` argument is a list with the following:
+     *
+     * - 10.0.0.0/8
+     * - 127.0.0.0/8
+     * - 172.16.0.0/12
+     * - 192.168.0.0/16
+     * - ::1/128 (IPv6 localhost)
+     * - fc00::/7 (IPv6 private networks)
+     * - fe80::/10 (IPv6 local-link addresses)
+     *
+     * @param list&lt;FilterUsingXForwardedHeaders::HEADER_*&gt; $trustedHeaders If
+     *     the list is empty, all X-Forwarded headers are trusted.
+     * @throws InvalidForwardedHeaderNameException
+     */
+    public static function trustReservedSubnets(array $trustedHeaders = self::X_FORWARDED_HEADERS): self
+    {
+        return self::trustProxies([
+            &#039;10.0.0.0/8&#039;,
+            &#039;127.0.0.0/8&#039;,
+            &#039;172.16.0.0/12&#039;,
+            &#039;192.168.0.0/16&#039;,
+            &#039;::1/128&#039;, // ipv6 localhost
+            &#039;fc00::/7&#039;, // ipv6 private networks
+            &#039;fe80::/10&#039;, // ipv6 local-link addresses
+        ], $trustedHeaders);
+    }
+
+    private function isFromTrustedProxy(string $remoteAddress): bool
+    {
+        foreach ($this-&gt;trustedProxies as $proxy) {
+            if (IPRange::matches($remoteAddress, $proxy)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** @throws InvalidForwardedHeaderNameException */
+    private static function validateTrustedHeaders(array $headers): void
+    {
+        foreach ($headers as $header) {
+            if (! in_array($header, self::X_FORWARDED_HEADERS, true)) {
+                throw InvalidForwardedHeaderNameException::forHeader($header);
+            }
+        }
+    }
+
+    /**
+     * @param list&lt;non-empty-string&gt; $proxyCIDRList
+     * @return list&lt;non-empty-string&gt;
+     * @throws InvalidProxyAddressException
+     */
+    private static function normalizeProxiesList(array $proxyCIDRList): array
+    {
+        $foundWildcard = false;
+
+        foreach ($proxyCIDRList as $index =&gt; $cidr) {
+            if ($cidr === &#039;*&#039;) {
+                unset($proxyCIDRList[$index]);
+                $foundWildcard = true;
+                continue;
+            }
+
+            if (! self::validateProxyCIDR($cidr)) {
+                throw InvalidProxyAddressException::forAddress($cidr);
+            }
+        }
+
+        if ($foundWildcard) {
+            $proxyCIDRList[] = &#039;0.0.0.0/0&#039;;
+            $proxyCIDRList[] = &#039;::/0&#039;;
+        }
+
+        return array_values($proxyCIDRList);
+    }
+
+    private static function validateProxyCIDR(mixed $cidr): bool
+    {
+        if (! is_string($cidr) || &#039;&#039; === $cidr) {
+            return false;
+        }
+
+        $address = $cidr;
+        $mask    = null;
+        if (str_contains($cidr, &#039;/&#039;)) {
+            $parts = explode(&#039;/&#039;, $cidr, 2);
+            assert(count($parts) &gt;= 2);
+            [$address, $mask] = $parts;
+            $mask             = (int) $mask;
+        }
+
+        if (str_contains($address, &#039;:&#039;)) {
+            // is IPV6
+            return filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)
+                &amp;&amp; (
+                    $mask === null
+                    || (
+                        $mask &lt;= 128
+                        &amp;&amp; $mask &gt;= 0
+                    )
+                );
+        }
+
+        // is IPV4
+        return filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+            &amp;&amp; (
+                $mask === null
+                || (
+                    $mask &lt;= 32
+                    &amp;&amp; $mask &gt;= 0
+                )
+            );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laminas/laminas-diactoros/src/ServerRequestFilter/IPRange.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laminas/laminas-diactoros/src/functions -->
+
+</body>
+</html>

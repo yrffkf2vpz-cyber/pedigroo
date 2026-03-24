@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/league/uri-interfaces/IPv4/Converter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * League.Uri (https://uri.thephpleague.com)
+ *
+ * (c) Ignace Nyamagana Butera &lt;nyamsprod@gmail.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+declare(strict_types=1);
+
+namespace League\Uri\IPv4;
+
+use BackedEnum;
+use League\Uri\Exceptions\MissingFeature;
+use League\Uri\FeatureDetection;
+use Stringable;
+
+use function array_pop;
+use function count;
+use function explode;
+use function extension_loaded;
+use function hexdec;
+use function long2ip;
+use function ltrim;
+use function preg_match;
+use function str_ends_with;
+use function substr;
+
+use const FILTER_FLAG_IPV4;
+use const FILTER_FLAG_IPV6;
+use const FILTER_VALIDATE_IP;
+
+final class Converter
+{
+    private const REGEXP_IPV4_HOST = &#039;/
+        (?(DEFINE) # . is missing as it is used to separate labels
+            (?&lt;hexadecimal&gt;0x[[:xdigit:]]*)
+            (?&lt;octal&gt;0[0-7]*)
+            (?&lt;decimal&gt;\d+)
+            (?&lt;ipv4_part&gt;(?:(?&amp;hexadecimal)|(?&amp;octal)|(?&amp;decimal))*)
+        )
+        ^(?:(?&amp;ipv4_part)\.){0,3}(?&amp;ipv4_part)\.?$
+    /x&#039;;
+    private const REGEXP_IPV4_NUMBER_PER_BASE = [
+        &#039;/^0x(?&lt;number&gt;[[:xdigit:]]*)$/&#039; =&gt; 16,
+        &#039;/^0(?&lt;number&gt;[0-7]*)$/&#039; =&gt; 8,
+        &#039;/^(?&lt;number&gt;\d+)$/&#039; =&gt; 10,
+    ];
+
+    private const IPV6_6TO4_PREFIX = &#039;2002:&#039;;
+    private const IPV4_MAPPED_PREFIX = &#039;::ffff:&#039;;
+
+    private readonly mixed $maxIPv4Number;
+
+    public function __construct(
+        private readonly Calculator $calculator
+    ) {
+        $this-&gt;maxIPv4Number = $calculator-&gt;sub($calculator-&gt;pow(2, 32), 1);
+    }
+
+    /**
+     * Returns an instance using a GMP calculator.
+     */
+    public static function fromGMP(): self
+    {
+        return new self(new GMPCalculator());
+    }
+
+    /**
+     * Returns an instance using a Bcmath calculator.
+     */
+    public static function fromBCMath(): self
+    {
+        return new self(new BCMathCalculator());
+    }
+
+    /**
+     * Returns an instance using a PHP native calculator (requires 64bits PHP).
+     */
+    public static function fromNative(): self
+    {
+        return new self(new NativeCalculator());
+    }
+
+    /**
+     * Returns an instance using a detected calculator depending on the PHP environment.
+     *
+     * @throws MissingFeature If no Calculator implementing object can be used on the platform
+     *
+     * @codeCoverageIgnore
+     */
+    public static function fromEnvironment(): self
+    {
+        FeatureDetection::supportsIPv4Conversion();
+
+        return match (true) {
+            extension_loaded(&#039;gmp&#039;) =&gt; self::fromGMP(),
+            extension_loaded(&#039;bcmath&#039;) =&gt; self::fromBCMath(),
+            default =&gt; self::fromNative(),
+        };
+    }
+
+    public function isIpv4(BackedEnum|Stringable|string|null $host): bool
+    {
+        if ($host instanceof BackedEnum) {
+            $host = (string) $host-&gt;value;
+        }
+
+        if (null === $host) {
+            return false;
+        }
+
+        if (null !== $this-&gt;toDecimal($host)) {
+            return true;
+        }
+
+        $host = (string) $host;
+        if (false === filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return false;
+        }
+
+        $ipAddress = strtolower((string) inet_ntop((string) inet_pton($host)));
+        if (str_starts_with($ipAddress, self::IPV4_MAPPED_PREFIX)) {
+            return false !== filter_var(substr($ipAddress, 7), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4);
+        }
+
+        if (!str_starts_with($ipAddress, self::IPV6_6TO4_PREFIX)) {
+            return false;
+        }
+
+        $hexParts = explode(&#039;:&#039;, substr($ipAddress, 5, 9));
+        if (count($hexParts) &lt; 2) {
+            return false;
+        }
+
+        $ipAddress = long2ip((int) hexdec($hexParts[0]) * 65536 + (int) hexdec($hexParts[1]));
+
+        return &#039;&#039; !== &#039;&#039;.$ipAddress;
+    }
+
+    public function toIPv6Using6to4(BackedEnum|Stringable|string|null $host): ?string
+    {
+        $host = $this-&gt;toDecimal($host);
+        if (null === $host) {
+            return null;
+        }
+
+        /** @var array&lt;string&gt; $parts */
+        $parts = array_map(
+            fn (string $part): string =&gt; sprintf(&#039;%02x&#039;, $part),
+            explode(&#039;.&#039;, $host)
+        );
+
+        return &#039;[&#039;.self::IPV6_6TO4_PREFIX.$parts[0].$parts[1].&#039;:&#039;.$parts[2].$parts[3].&#039;::]&#039;;
+    }
+
+    public function toIPv6UsingMapping(BackedEnum|Stringable|string|null $host): ?string
+    {
+        $host = $this-&gt;toDecimal($host);
+        if (null === $host) {
+            return null;
+        }
+
+        return &#039;[&#039;.self::IPV4_MAPPED_PREFIX.$host.&#039;]&#039;;
+    }
+
+    public function toOctal(BackedEnum|Stringable|string|null $host): ?string
+    {
+        $host = $this-&gt;toDecimal($host);
+
+        return match (null) {
+            $host =&gt; null,
+            default =&gt; implode(&#039;.&#039;, array_map(
+                fn ($value) =&gt; str_pad(decoct((int) $value), 4, &#039;0&#039;, STR_PAD_LEFT),
+                explode(&#039;.&#039;, $host)
+            )),
+        };
+    }
+
+    public function toHexadecimal(BackedEnum|Stringable|string|null $host): ?string
+    {
+        $host = $this-&gt;toDecimal($host);
+
+        return match (null) {
+            $host =&gt; null,
+            default =&gt; &#039;0x&#039;.implode(&#039;&#039;, array_map(
+                fn ($value) =&gt; dechex((int) $value),
+                explode(&#039;.&#039;, $host)
+            )),
+        };
+    }
+
+    /**
+     * Tries to convert a IPv4 hexadecimal or a IPv4 octal notation into a IPv4 dot-decimal notation if possible
+     * otherwise returns null.
+     *
+     * @see https://url.spec.whatwg.org/#concept-ipv4-parser
+     */
+    public function toDecimal(BackedEnum|Stringable|string|null $host): ?string
+    {
+        if ($host instanceof BackedEnum) {
+            $host = $host-&gt;value;
+        }
+
+        $host = (string) $host;
+        if (str_starts_with($host, &#039;[&#039;) &amp;&amp; str_ends_with($host, &#039;]&#039;)) {
+            $host = substr($host, 1, -1);
+            if (false === filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                return null;
+            }
+
+            $ipAddress = strtolower((string) inet_ntop((string) inet_pton($host)));
+            if (str_starts_with($ipAddress, self::IPV4_MAPPED_PREFIX)) {
+                return substr($ipAddress, 7);
+            }
+
+            if (!str_starts_with($ipAddress, self::IPV6_6TO4_PREFIX)) {
+                return null;
+            }
+
+            $hexParts = explode(&#039;:&#039;, substr($ipAddress, 5, 9));
+
+            return (string) match (true) {
+                count($hexParts) &lt; 2 =&gt; null,
+                default =&gt; long2ip((int) hexdec($hexParts[0]) * 65536 + (int) hexdec($hexParts[1])),
+            };
+        }
+
+        if (1 !== preg_match(self::REGEXP_IPV4_HOST, $host)) {
+            return null;
+        }
+
+        if (str_ends_with($host, &#039;.&#039;)) {
+            $host = substr($host, 0, -1);
+        }
+
+        $numbers = [];
+        foreach (explode(&#039;.&#039;, $host) as $label) {
+            $number = $this-&gt;labelToNumber($label);
+            if (null === $number) {
+                return null;
+            }
+
+            $numbers[] = $number;
+        }
+
+        $ipv4 = array_pop($numbers);
+        $max = $this-&gt;calculator-&gt;pow(256, 6 - count($numbers));
+        if ($this-&gt;calculator-&gt;compare($ipv4, $max) &gt; 0) {
+            return null;
+        }
+
+        foreach ($numbers as $offset =&gt; $number) {
+            if ($this-&gt;calculator-&gt;compare($number, 255) &gt; 0) {
+                return null;
+            }
+
+            $ipv4 = $this-&gt;calculator-&gt;add($ipv4, $this-&gt;calculator-&gt;multiply(
+                $number,
+                $this-&gt;calculator-&gt;pow(256, 3 - $offset)
+            ));
+        }
+
+        return $this-&gt;long2Ip($ipv4);
+    }
+
+    /**
+     * Converts a domain label into a IPv4 integer part.
+     *
+     * @see https://url.spec.whatwg.org/#ipv4-number-parser
+     *
+     * @return mixed returns null if it cannot correctly convert the label
+     */
+    private function labelToNumber(string $label): mixed
+    {
+        foreach (self::REGEXP_IPV4_NUMBER_PER_BASE as $regexp =&gt; $base) {
+            if (1 !== preg_match($regexp, $label, $matches)) {
+                continue;
+            }
+
+            $number = ltrim($matches[&#039;number&#039;], &#039;0&#039;);
+            if (&#039;&#039; === $number) {
+                return 0;
+            }
+
+            $number = $this-&gt;calculator-&gt;baseConvert($number, $base);
+            if (0 &lt;= $this-&gt;calculator-&gt;compare($number, 0) &amp;&amp; 0 &gt;= $this-&gt;calculator-&gt;compare($number, $this-&gt;maxIPv4Number)) {
+                return $number;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Generates the dot-decimal notation for IPv4.
+     *
+     * @see https://url.spec.whatwg.org/#concept-ipv4-parser
+     *
+     * @param mixed $ipAddress the number representation of the IPV4address
+     */
+    private function long2Ip(mixed $ipAddress): string
+    {
+        $output = &#039;&#039;;
+        for ($offset = 0; $offset &lt; 4; $offset++) {
+            $output = $this-&gt;calculator-&gt;mod($ipAddress, 256).$output;
+            if ($offset &lt; 3) {
+                $output = &#039;.&#039;.$output;
+            }
+            $ipAddress = $this-&gt;calculator-&gt;div($ipAddress, 256);
+        }
+
+        return $output;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/league/uri-interfaces/IPv4/GMPCalculator.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/league/uri-interfaces/IPv6 -->
+
+</body>
+</html>

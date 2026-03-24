@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Http/Controllers/Web/Setup/Update/UpdateController.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Http\Controllers\Web\Setup\Update;
+
+// Increase the server resources
+$iniConfigFile = __DIR__ . &#039;/../../../../../Helpers/Common/Functions/ini.php&#039;;
+if (file_exists($iniConfigFile)) {
+	include_once $iniConfigFile;
+}
+
+use App\Exceptions\Custom\AppVersionNotFoundException;
+use App\Helpers\Services\CacheRegenerator;
+use App\Http\Controllers\Controller;
+use App\Http\Controllers\Web\Setup\Update\Traits\ApiTrait;
+use App\Http\Controllers\Web\Setup\Update\Traits\CleanUpTrait;
+use App\Http\Controllers\Web\Setup\Update\Traits\DbTrait;
+use App\Http\Controllers\Web\Setup\Update\Traits\EnvTrait;
+use App\Http\Controllers\Web\Setup\Update\Traits\LanguageTrait;
+use App\Http\Controllers\Web\Setup\Update\Traits\RoutesTrait;
+use App\Models\Setting;
+use Illuminate\Contracts\View\View;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Support\Facades\Artisan;
+use Throwable;
+
+class UpdateController extends Controller
+{
+	use CleanUpTrait, DbTrait, EnvTrait, RoutesTrait, LanguageTrait, ApiTrait;
+	
+	protected static bool $useNonSecureUpgrade = false;
+	
+	/**
+	 * UpdateController constructor.
+	 *
+	 * @throws \App\Exceptions\Custom\CustomException
+	 */
+	public function __construct()
+	{
+		$this-&gt;setDatabaseConfigIfMissing();
+		
+		self::$useNonSecureUpgrade = self::useNonSecureUpgrade(self::$useNonSecureUpgrade);
+	}
+	
+	/**
+	 * Get the middleware that should be assigned to the controller.
+	 */
+	public static function middleware(): array
+	{
+		/*
+		 * Check if non-secure upgrade is allowed
+		 * ---
+		 * Note: The middleware() method is called before the constructor, so
+		 * we need to useNonSecureUpgrade() method here and in the constructor
+		 */
+		$isNonSecuredUpgradeAllowed = self::useNonSecureUpgrade(self::$useNonSecureUpgrade);
+		
+		$array = [];
+		if (!$isNonSecuredUpgradeAllowed) {
+			$array[] = &#039;admin&#039;;
+		}
+		
+		return array_merge(parent::middleware(), $array);
+	}
+	
+	/**
+	 * @param bool $useNonSecureUpgrade
+	 * @return bool
+	 */
+	private static function useNonSecureUpgrade(bool $useNonSecureUpgrade = false): bool
+	{
+		// Allow non-secure upgrade, when the database is not up-to-date
+		if (!self::areDatabaseUpToDate()) {
+			$useNonSecureUpgrade = true;
+		}
+		
+		// Allow non-secure upgrade, when admin user(s) cannot be found
+		if (!self::isAdminUserCanBeFound()) {
+			$useNonSecureUpgrade = true;
+		}
+		
+		// Force non-secure upgrade with FORCE_NON_SECURE_UPGRADE=true
+		// in the /.env file through the &#039;larapen.core.nonSecureUpgrade&#039; config (return boolean or null)
+		$forceNonSecureUpgrade = config(&#039;larapen.core.forceNonSecureUpgrade&#039;);
+		
+		return ($forceNonSecureUpgrade === true) ? true : $useNonSecureUpgrade;
+	}
+	
+	/**
+	 * Start Upgrade
+	 * URL: /upgrade
+	 *
+	 * @return \Illuminate\Contracts\View\View
+	 */
+	public function index(): View
+	{
+		return view(&#039;setup.update&#039;);
+	}
+	
+	/**
+	 * Run the Upgrade
+	 * URL: /upgrade/run
+	 *
+	 * @return \Illuminate\Http\RedirectResponse
+	 * @throws \App\Exceptions\Custom\AppVersionNotFoundException
+	 */
+	public function run(): RedirectResponse
+	{
+		// Lunch the installation if the /.env file doesn&#039;t exist
+		if (!appEnvFileExists()) {
+			return redirect()-&gt;to(&#039;/install&#039;);
+		}
+		
+		// Get eventual new version value &amp; the current (installed) version value
+		$lastVersion = getLatestVersion();
+		$currentVersion = getCurrentVersion();
+		
+		// All is up-to-date
+		if (version_compare($lastVersion, $currentVersion, &#039;&lt;=&#039;)) {
+			// If non-secured upgrade is allowed due to Admin User permission issue,
+			// then, fix the Admin User Permissions
+			if (self::$useNonSecureUpgrade) {
+				$this-&gt;fixAdminUserPermissions();
+			}
+			
+			$appName = config(&#039;larapen.core.item.name&#039;, &#039;App&#039;);
+			
+			$message = &#039;You website is up-to-date! &#039;;
+			$message .= &quot;$appName v$lastVersion is currently the newest version available.&quot;;
+			flash($message)-&gt;info();
+			
+			return redirect()-&gt;to(&#039;/&#039;);
+		}
+		
+		// Installed version number is NOT found
+		if (version_compare(&#039;1.0.0&#039;, $currentVersion, &#039;&gt;&#039;)) {
+			$message = &#039;Cannot find the app\&#039;s current version number in the &quot;/.env&quot; file.&#039;;
+			throw new AppVersionNotFoundException($message);
+		}
+		
+		// Go to maintenance with DOWN status
+		Artisan::call(&#039;down&#039;);
+		
+		// Perform the application cleanup
+		$this-&gt;performApplicationCleanup();
+		
+		// Update files &amp; Upgrade the database
+		$this-&gt;applyUpdateChanges($lastVersion, $currentVersion);
+		
+		// If non-secured upgrade is allowed due to Admin User permission issue,
+		// then, fix the Admin User Permissions
+		if (self::$useNonSecureUpgrade) {
+			$this-&gt;fixAdminUserPermissions();
+		}
+		
+		// (Try to) Sync. the multi-country URLs with the dynamics routes
+		$this-&gt;syncMultiCountryUrlsAndRoutes();
+		
+		// Update the current version to last version
+		$this-&gt;setCurrentVersion($lastVersion);
+		
+		// (Try to) Fill the missing lines in all languages files
+		$this-&gt;syncLanguageFilesLines();
+		
+		// Check the Purchase Code
+		$this-&gt;checkPurchaseCode();
+		
+		// Perform the application cleanup
+		$this-&gt;performApplicationCleanup();
+		
+		// Regenerate route and config caches if enabled
+		// The caches were cleared in public/index.php when update was detected
+		// Now regenerate them after all update operations are complete
+		CacheRegenerator::regenerateAllCaches();
+		
+		// Restore system UP status
+		Artisan::call(&#039;up&#039;);
+		
+		// Success message
+		$successMessage = &#039;&lt;strong&gt;Congratulations!&lt;/strong&gt; Your website has been upgraded to v&#039; . $lastVersion;
+		flash($successMessage)-&gt;success();
+		
+		// Warning message
+		$warningMessage = &#039;IMPORTANT: If you have installed addons, you should also upgrade them to their latest version.&#039;;
+		flash($warningMessage)-&gt;warning();
+		
+		// Redirection
+		$defaultCountryCode = $this-&gt;getDefaultCountryCode();
+		if (empty($defaultCountryCode)) {
+			if (doesCountriesPageCanBeHomepage()) {
+				return redirect()-&gt;to(&#039;/&#039;);
+			} else {
+				$countryListPageUri = config(&#039;larapen.localization.countries_list_uri&#039;, &#039;/&#039;);
+				$countryListPageUri = castToString($countryListPageUri, &#039;/&#039;);
+				
+				return redirect()-&gt;to($countryListPageUri);
+			}
+		} else {
+			return redirect()-&gt;to(&#039;/&#039;);
+		}
+	}
+	
+	/**
+	 * Get the app&#039;s default country
+	 *
+	 * @return string|null
+	 */
+	private function getDefaultCountryCode(): ?string
+	{
+		$defaultCountryCode = config(&#039;settings.localization.default_country_code&#039;);
+		
+		try {
+			$setting = Setting::query()
+				-&gt;isActive()
+				-&gt;where(&#039;name&#039;, &#039;=&#039;, &#039;localization&#039;)
+				-&gt;first();
+			
+			if (!empty($setting)) {
+				$fieldValues = $setting-&gt;field_values ?? [];
+				$defaultCountryCode = $fieldValues[&#039;default_country_code&#039;] ?? $defaultCountryCode;
+			}
+		} catch (Throwable $e) {
+		}
+		
+		return $defaultCountryCode;
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Http/Kernel.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Http/Controllers/Web/Setup/Update/Traits -->
+
+</body>
+</html>

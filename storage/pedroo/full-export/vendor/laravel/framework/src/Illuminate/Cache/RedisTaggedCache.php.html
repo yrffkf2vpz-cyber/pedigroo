@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Cache/RedisTaggedCache.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Cache;
+
+use Illuminate\Cache\Events\CacheFlushed;
+use Illuminate\Cache\Events\CacheFlushing;
+use Illuminate\Redis\Connections\PhpRedisClusterConnection;
+use Illuminate\Redis\Connections\PhpRedisConnection;
+use Illuminate\Redis\Connections\PredisClusterConnection;
+use Illuminate\Redis\Connections\PredisConnection;
+
+class RedisTaggedCache extends TaggedCache
+{
+    /**
+     * Store an item in the cache if the key does not exist.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  \DateTimeInterface|\DateInterval|int|null  $ttl
+     * @return bool
+     */
+    public function add($key, $value, $ttl = null)
+    {
+        $seconds = null;
+
+        if ($ttl !== null) {
+            $seconds = $this-&gt;getSeconds($ttl);
+
+            if ($seconds &gt; 0) {
+                $this-&gt;tags-&gt;addEntry(
+                    $this-&gt;itemKey($key),
+                    $seconds
+                );
+            }
+        }
+
+        return parent::add($key, $value, $ttl);
+    }
+
+    /**
+     * Store an item in the cache.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  \DateTimeInterface|\DateInterval|int|null  $ttl
+     * @return bool
+     */
+    public function put($key, $value, $ttl = null)
+    {
+        if (is_null($ttl)) {
+            return $this-&gt;forever($key, $value);
+        }
+
+        $seconds = $this-&gt;getSeconds($ttl);
+
+        if ($seconds &gt; 0) {
+            $this-&gt;tags-&gt;addEntry(
+                $this-&gt;itemKey($key),
+                $seconds
+            );
+        }
+
+        return parent::put($key, $value, $ttl);
+    }
+
+    /**
+     * Increment the value of an item in the cache.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return int|bool
+     */
+    public function increment($key, $value = 1)
+    {
+        $this-&gt;tags-&gt;addEntry($this-&gt;itemKey($key), updateWhen: &#039;NX&#039;);
+
+        return parent::increment($key, $value);
+    }
+
+    /**
+     * Decrement the value of an item in the cache.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return int|bool
+     */
+    public function decrement($key, $value = 1)
+    {
+        $this-&gt;tags-&gt;addEntry($this-&gt;itemKey($key), updateWhen: &#039;NX&#039;);
+
+        return parent::decrement($key, $value);
+    }
+
+    /**
+     * Store an item in the cache indefinitely.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return bool
+     */
+    public function forever($key, $value)
+    {
+        $this-&gt;tags-&gt;addEntry($this-&gt;itemKey($key));
+
+        return parent::forever($key, $value);
+    }
+
+    /**
+     * Remove all items from the cache.
+     *
+     * @return bool
+     */
+    public function flush()
+    {
+        $connection = $this-&gt;store-&gt;connection();
+
+        if ($connection instanceof PredisClusterConnection ||
+            $connection instanceof PhpRedisClusterConnection) {
+            return $this-&gt;flushClusteredConnection();
+        }
+
+        $this-&gt;event(new CacheFlushing($this-&gt;getName()));
+
+        $redisPrefix = match (true) {
+            $connection instanceof PhpRedisConnection =&gt; $connection-&gt;client()-&gt;getOption(\Redis::OPT_PREFIX),
+            $connection instanceof PredisConnection =&gt; $connection-&gt;client()-&gt;getOptions()-&gt;prefix,
+        };
+
+        $cachePrefix = $redisPrefix.$this-&gt;store-&gt;getPrefix();
+
+        $cacheTags = [];
+
+        foreach ($this-&gt;tags-&gt;getNames() as $name) {
+            $cacheTags[] = $cachePrefix.$this-&gt;tags-&gt;tagId($name);
+        }
+
+        $script = &lt;&lt;&lt;&#039;LUA&#039;
+            local prefix = table.remove(ARGV, 1)
+
+            for i, key in ipairs(KEYS) do
+                redis.call(&#039;DEL&#039;, key)
+
+                for j, arg in ipairs(ARGV) do
+                    local zkey = string.gsub(key, prefix, &quot;&quot;)
+                    redis.call(&#039;ZREM&#039;, arg, zkey)
+                end
+            end
+        LUA;
+
+        $entries = $this-&gt;tags-&gt;entries()
+            -&gt;map(fn (string $key) =&gt; $this-&gt;store-&gt;getPrefix().$key)
+            -&gt;chunk(1000);
+
+        foreach ($entries as $keysToBeDeleted) {
+            $connection-&gt;eval(
+                $script,
+                count($keysToBeDeleted),
+                ...$keysToBeDeleted,
+                ...[str_replace(&#039;-&#039;, &#039;%-&#039;, $cachePrefix), ...$cacheTags]
+            );
+        }
+
+        $this-&gt;event(new CacheFlushed($this-&gt;getName()));
+
+        return true;
+    }
+
+    /**
+     * Remove all items from the cache.
+     *
+     * @return bool
+     */
+    protected function flushClusteredConnection()
+    {
+        $this-&gt;event(new CacheFlushing($this-&gt;getName()));
+
+        $this-&gt;flushValues();
+        $this-&gt;tags-&gt;flush();
+
+        $this-&gt;event(new CacheFlushed($this-&gt;getName()));
+
+        return true;
+    }
+
+    /**
+     * Flush the individual cache entries for the tags.
+     *
+     * @return void
+     */
+    protected function flushValues()
+    {
+        $entries = $this-&gt;tags-&gt;entries()
+            -&gt;map(fn (string $key) =&gt; $this-&gt;store-&gt;getPrefix().$key)
+            -&gt;chunk(1000);
+
+        $connection = $this-&gt;store-&gt;connection();
+
+        foreach ($entries as $cacheKeys) {
+            if ($connection instanceof PredisClusterConnection) {
+                $connection-&gt;pipeline(function ($connection) use ($cacheKeys) {
+                    foreach ($cacheKeys as $cacheKey) {
+                        $connection-&gt;del($cacheKey);
+                    }
+                });
+            } else {
+                $connection-&gt;del(...$cacheKeys);
+            }
+        }
+    }
+
+    /**
+     * Remove all stale reference entries from the tag set.
+     *
+     * @return bool
+     */
+    public function flushStale()
+    {
+        $this-&gt;tags-&gt;flushStaleEntries();
+
+        return true;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Cache/Repository.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Cache/Console -->
+
+</body>
+</html>

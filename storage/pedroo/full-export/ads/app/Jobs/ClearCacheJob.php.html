@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Jobs/ClearCacheJob.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Jobs;
+
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+/*
+ * Clear Cache Background Job
+ *
+ * Purpose: Runs cache clearing operations in the background to prevent blocking user requests
+ * Queue: Runs on the &#039;maintenance&#039; queue (priority queue for maintenance operations)
+ *
+ * How it works:
+ * 1. User clicks &quot;Clear Cache&quot; button
+ * 2. Controller dispatches this job with a unique job ID
+ * 3. Job status is tracked in cache (queued -&gt; processing -&gt; completed/failed)
+ * 4. JavaScript polls the status endpoint every 2 seconds
+ * 5. When completed, user sees PNotify notification automatically
+ *
+ * Running the Queue Worker:
+ * - Development: php artisan queue:listen --queue=maintenance,default --tries=1
+ * - Production: Configure Supervisor to run queue:work with maintenance queue
+ *
+ * IMPORTANT: Queue worker MUST listen to &#039;maintenance&#039; queue or jobs won&#039;t process!
+ *
+ * Documentation:
+ * https://laravel.com/docs/12.x/queues#running-the-queue-worker
+ *
+ * Supervisor:
+ * https://medium.com/@danielarcher/how-to-use-supervisord-for-your-laravel-application-66015f104703
+ * https://gist.github.com/deepak-cotocus/6b9865784dee18966e15c74ec6e487c4
+ * https://dev.to/edgaras/supervisor-guide-for-laravel-developers-configuration-and-use-cases-20i4
+ */
+
+class ClearCacheJob implements ShouldQueue
+{
+	use Queueable;
+	
+	/**
+	 * The number of times the job may be attempted.
+	 * Set to 1 because cache clearing should not be retried if it fails.
+	 *
+	 * @var int
+	 */
+	public int $tries = 1;
+	
+	/**
+	 * The number of seconds the job can run before timing out.
+	 * Cache clearing typically takes 3-5 seconds, but we allow 5 minutes for safety.
+	 *
+	 * @var int
+	 */
+	public int $timeout = 300;
+	
+	/**
+	 * Unique identifier for tracking this job&#039;s status.
+	 * Used to store and retrieve job progress in cache.
+	 *
+	 * @var string
+	 */
+	protected string $jobId;
+	
+	/**
+	 * Create a new job instance.
+	 *
+	 * @param string $jobId Unique identifier (UUID) for tracking job status
+	 */
+	public function __construct(string $jobId)
+	{
+		$this-&gt;jobId = $jobId;
+		
+		// Assign this job to the &#039;maintenance&#039; queue (priority queue)
+		$this-&gt;onQueue(&#039;maintenance&#039;);
+		
+		// Set initial status in cache so polling can immediately detect the job
+		// Cache TTL: 600 seconds (10 minutes) - enough time for job to complete and user to see result
+		Cache::put(&quot;cacheClearJob:{$jobId}&quot;, [
+			&#039;status&#039;    =&gt; &#039;queued&#039;,
+			&#039;message&#039;   =&gt; trans(&#039;admin.cache_clear_job_queued&#039;),
+			&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+		], 600);
+	}
+	
+	/**
+	 * Execute the cache clearing job.
+	 *
+	 * This method performs the following operations:
+	 * 1. Flush application cache
+	 * 2. Clear compiled views
+	 * 3. Delete log files
+	 *
+	 * Status is tracked in cache throughout the process so the frontend
+	 * can poll and show real-time progress to the user.
+	 *
+	 * @return void
+	 */
+	public function handle(): void
+	{
+		// Update status to &#039;processing&#039; so user knows job started
+		Cache::put(&quot;cacheClearJob:{$this-&gt;jobId}&quot;, [
+			&#039;status&#039;    =&gt; &#039;processing&#039;,
+			&#039;message&#039;   =&gt; trans(&#039;admin.cache_clear_job_processing&#039;),
+			&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+		], 600);
+		
+		// Track any errors that occur
+		$errors = [];
+		
+		// ===================================================================
+		// Step 1: Flush Application Cache
+		// ===================================================================
+		try {
+			// IMPORTANT: Save job status before flushing cache
+			// The flush() operation will delete ALL cache including our job status
+			// We need to preserve it so JavaScript polling continues to work
+			$jobStatusKey = &quot;cacheClearJob:{$this-&gt;jobId}&quot;;
+			$currentJobStatus = Cache::get($jobStatusKey);
+			
+			// Flush all cache
+			cache()-&gt;flush();
+			Log::info(&#039;Cache flushed successfully&#039;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+			
+			// Restore job status immediately after flush
+			if (!empty($currentJobStatus)) {
+				Cache::put($jobStatusKey, $currentJobStatus, 600);
+			}
+		} catch (Throwable $e) {
+			$errors[] = &#039;Cache flush error: &#039; . $e-&gt;getMessage();
+			Log::error(&#039;Cache flush error&#039;, [
+				&#039;jobId&#039; =&gt; $this-&gt;jobId,
+				&#039;error&#039; =&gt; $e-&gt;getMessage(),
+			]);
+		}
+		
+		// Brief pause to prevent overwhelming the system
+		sleep(1);
+		
+		// ===================================================================
+		// Step 2: Clear Compiled Views
+		// ===================================================================
+		try {
+			Artisan::call(&#039;view:clear&#039;);
+			Log::info(&#039;View cache cleared successfully&#039;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+		} catch (Throwable $e) {
+			$errors[] = &#039;View cache clear error: &#039; . $e-&gt;getMessage();
+			Log::error(&#039;View cache clear error&#039;, [
+				&#039;jobId&#039; =&gt; $this-&gt;jobId,
+				&#039;error&#039; =&gt; $e-&gt;getMessage(),
+			]);
+		}
+		
+		// Brief pause
+		sleep(1);
+		
+		// ===================================================================
+		// Step 6: Delete Log Files
+		// ===================================================================
+		try {
+			// Delete all .log files in storage/logs
+			File::delete(File::glob(storage_path(&#039;logs&#039;) . DIRECTORY_SEPARATOR . &#039;*.log&#039;));
+			
+			// Delete debugbar JSON files if debugbar directory exists
+			$debugBarPath = storage_path(&#039;debugbar&#039;);
+			if (File::exists($debugBarPath)) {
+				File::delete(File::glob($debugBarPath . DIRECTORY_SEPARATOR . &#039;*.json&#039;));
+			}
+			
+			Log::info(&#039;Logs cleared successfully&#039;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+		} catch (Throwable $e) {
+			$errors[] = &#039;Logs clear error: &#039; . $e-&gt;getMessage();
+			Log::error(&#039;Logs clear error&#039;, [
+				&#039;jobId&#039; =&gt; $this-&gt;jobId,
+				&#039;error&#039; =&gt; $e-&gt;getMessage(),
+			]);
+		}
+		
+		// ===================================================================
+		// Step 7: Update Final Status
+		// ===================================================================
+		if (empty($errors)) {
+			// Success! Update cache with completed status
+			Cache::put(&quot;cacheClearJob:{$this-&gt;jobId}&quot;, [
+				&#039;status&#039;    =&gt; &#039;completed&#039;,
+				&#039;message&#039;   =&gt; trans(&#039;admin.cache_clear_job_completed&#039;),
+				&#039;level&#039;     =&gt; &#039;success&#039;,
+				&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+			], 600);
+			
+			Log::info(&#039;ClearCacheJob completed successfully&#039;, [&#039;jobId&#039; =&gt; $this-&gt;jobId]);
+		} else {
+			// Partial failure - some operations had errors
+			$message = &#039;Cache clearing completed with errors: &#039; . implode(&#039;; &#039;, $errors);
+			
+			Cache::put(&quot;cacheClearJob:{$this-&gt;jobId}&quot;, [
+				&#039;status&#039;    =&gt; &#039;failed&#039;,
+				&#039;message&#039;   =&gt; $message,
+				&#039;level&#039;     =&gt; &#039;error&#039;,
+				&#039;errors&#039;    =&gt; $errors,
+				&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+			], 600);
+			
+			Log::warning(&#039;ClearCacheJob completed with errors&#039;, [
+				&#039;jobId&#039;  =&gt; $this-&gt;jobId,
+				&#039;errors&#039; =&gt; $errors,
+			]);
+		}
+	}
+	
+	/**
+	 * Handle a job failure.
+	 *
+	 * Called when the job throws an exception or times out.
+	 * Updates cache status so the frontend can show an error notification.
+	 *
+	 * @param \Throwable $exception
+	 * @return void
+	 */
+	public function failed(Throwable $exception): void
+	{
+		$message = &#039;Cache clearing failed: &#039; . $exception-&gt;getMessage();
+		
+		// Update cache with failed status
+		Cache::put(&quot;cacheClearJob:{$this-&gt;jobId}&quot;, [
+			&#039;status&#039;    =&gt; &#039;failed&#039;,
+			&#039;message&#039;   =&gt; $message,
+			&#039;level&#039;     =&gt; &#039;error&#039;,
+			&#039;timestamp&#039; =&gt; now()-&gt;toDateTimeString(),
+		], 600);
+		
+		// Log the failure for debugging
+		Log::error(&#039;ClearCacheJob failed&#039;, [
+			&#039;jobId&#039;     =&gt; $this-&gt;jobId,
+			&#039;exception&#039; =&gt; $exception-&gt;getMessage(),
+			&#039;trace&#039;     =&gt; $exception-&gt;getTraceAsString(),
+		]);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Jobs/ClearImageThumbsJob.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Listeners -->
+
+</body>
+</html>

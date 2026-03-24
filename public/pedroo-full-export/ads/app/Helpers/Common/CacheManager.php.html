@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Helpers/Common/CacheManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Helpers\Common;
+
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Model Cache Manager
+ *
+ * Intelligent caching system that adapts to different cache drivers.
+ * For drivers that support tags (Redis, Memcached, Database), it uses native tag-based invalidation.
+ * For drivers that don&#039;t support tags (File), it uses versioning for cache invalidation.
+ * This allows seamless switching between cache drivers without code changes.
+ */
+class CacheManager
+{
+	/**
+	 * Cached driver support check result
+	 *
+	 * @var bool|null
+	 */
+	private bool|null $supportsTags = null;
+	
+	/**
+	 * Sentinel value to distinguish null from cache miss
+	 *
+	 * @var string
+	 */
+	private const NULL_CACHE_VALUE = &#039;__LARAVEL_CACHE_NULL_SENTINEL__&#039;;
+	
+	/**
+	 * Cache data with automatic invalidation strategy
+	 *
+	 * This method intelligently caches data using the best strategy for the current cache driver:
+	 * - For Redis/Memcached/Database: Uses cache tags for native invalidation
+	 * - For File driver: Uses versioning for invalidation
+	 *
+	 * @param object|string $model The model class or instance
+	 * @param array $params Parameters that make the cache key unique (search terms, filters, etc.)
+	 * @param callable $callback Function that returns the data to cache
+	 * @param int|null $ttl Time to live in seconds (default: 1 hour)
+	 * @return mixed The cached or freshly computed data
+	 *
+	 * @throws \InvalidArgumentException When callback is not callable
+	 *
+	 * @example
+	 * $users = $cache-&gt;remember(User::class, [
+	 *     &#039;search&#039; =&gt; &#039;john&#039;,
+	 *     &#039;country&#039; =&gt; &#039;US&#039;,
+	 *     &#039;page&#039; =&gt; 1
+	 * ], function() {
+	 *     return User::where(&#039;name&#039;, &#039;like&#039;, &#039;%john%&#039;)-&gt;paginate();
+	 * });
+	 */
+	public function remember(object|string $model, array $params, callable $callback, ?int $ttl = null): mixed
+	{
+		if (!is_callable($callback)) {
+			throw new \InvalidArgumentException(&#039;Callback must be callable&#039;);
+		}
+		
+		// Use provided TTL or get default
+		$ttl = $ttl ?? $this-&gt;getDefaultTtl($model);
+		
+		// Wrap $callback data to handle null values
+		$wrappedCallback = function () use ($callback) {
+			return $this-&gt;wrapValue($callback());
+		};
+		
+		if ($this-&gt;supportsTags()) {
+			// Use cache tags for drivers that support them
+			$key = $this-&gt;generateBaseKey($model, $params);
+			$tags = $this-&gt;getModelTags($model);
+			
+			$data = Cache::tags($tags)-&gt;remember($key, $ttl, $wrappedCallback);
+		} else {
+			// Use versioning for file driver
+			$version = $this-&gt;getModelVersion($model);
+			$baseKey = $this-&gt;generateBaseKey($model, $params);
+			$versionedKey = $baseKey . &#039;_v&#039; . $version;
+			
+			$data = Cache::remember($versionedKey, $ttl, $wrappedCallback);
+		}
+		
+		// Unwrap the callback data
+		return $this-&gt;unwrapValue($data);
+	}
+	
+	/**
+	 * Store data in cache with automatic invalidation strategy
+	 *
+	 * Stores data using the appropriate method for the current cache driver.
+	 *
+	 * @param object|string $model The model class or instance
+	 * @param array $params Parameters that make the cache key unique
+	 * @param mixed $data The data to cache
+	 * @param int|null $ttl Time to live in seconds (default: 1 hour)
+	 * @return mixed The stored data
+	 *
+	 * @example
+	 * $cache-&gt;put(User::class, [&#039;search&#039; =&gt; &#039;john&#039;], $users, 7200);
+	 */
+	public function put(object|string $model, array $params, mixed $data, ?int $ttl = null): mixed
+	{
+		// Use provided TTL or get default
+		$ttl = $ttl ?? $this-&gt;getDefaultTtl($model);
+		
+		// Wrap data to handle null values
+		$wrappedData = $this-&gt;wrapValue($data);
+		
+		if ($this-&gt;supportsTags()) {
+			$key = $this-&gt;generateBaseKey($model, $params);
+			$tags = $this-&gt;getModelTags($model);
+			
+			Cache::tags($tags)-&gt;put($key, $wrappedData, $ttl);
+		} else {
+			$version = $this-&gt;getModelVersion($model);
+			$baseKey = $this-&gt;generateBaseKey($model, $params);
+			$versionedKey = $baseKey . &#039;_v&#039; . $version;
+			
+			Cache::put($versionedKey, $wrappedData, $ttl);
+		}
+		
+		return $data;
+	}
+	
+	/**
+	 * Retrieve data from cache if exists
+	 *
+	 * Gets cached data using the appropriate strategy for the current driver.
+	 *
+	 * @param object|string $model The model class or instance
+	 * @param array $params Parameters that make the cache key unique
+	 * @return mixed|null The cached data or null if not found
+	 */
+	public function get(object|string $model, array $params): mixed
+	{
+		if ($this-&gt;supportsTags()) {
+			$key = $this-&gt;generateBaseKey($model, $params);
+			$tags = $this-&gt;getModelTags($model);
+			
+			$wrapped = Cache::tags($tags)-&gt;get($key);
+		} else {
+			$version = $this-&gt;getModelVersion($model);
+			$baseKey = $this-&gt;generateBaseKey($model, $params);
+			$versionedKey = $baseKey . &#039;_v&#039; . $version;
+			
+			$wrapped = Cache::get($versionedKey);
+		}
+		
+		return $wrapped === null ? null : $this-&gt;unwrapValue($wrapped);
+	}
+	
+	/**
+	 * Check if data exists in cache
+	 *
+	 * @param object|string $model The model class or instance
+	 * @param array $params Parameters that make the cache key unique
+	 * @return bool True if data exists
+	 */
+	public function has(object|string $model, array $params): bool
+	{
+		if ($this-&gt;supportsTags()) {
+			$key = $this-&gt;generateBaseKey($model, $params);
+			$tags = $this-&gt;getModelTags($model);
+			
+			$wrapped = Cache::tags($tags)-&gt;get($key);
+		} else {
+			$version = $this-&gt;getModelVersion($model);
+			$baseKey = $this-&gt;generateBaseKey($model, $params);
+			$versionedKey = $baseKey . &#039;_v&#039; . $version;
+			
+			$wrapped = Cache::get($versionedKey);
+		}
+		
+		// Check if wrapped value exists (not null means it&#039;s cached)
+		return ($wrapped !== null);
+	}
+	
+	/**
+	 * Remove specific cached data
+	 *
+	 * @param object|string $model The model class or instance
+	 * @param array $params Parameters that make the cache key unique
+	 * @return bool True if data was removed
+	 */
+	public function forget(object|string $model, array $params): bool
+	{
+		if ($this-&gt;supportsTags()) {
+			$key = $this-&gt;generateBaseKey($model, $params);
+			$tags = $this-&gt;getModelTags($model);
+			
+			return Cache::tags($tags)-&gt;forget($key);
+		} else {
+			$version = $this-&gt;getModelVersion($model);
+			$baseKey = $this-&gt;generateBaseKey($model, $params);
+			$versionedKey = $baseKey . &#039;_v&#039; . $version;
+			
+			return Cache::forget($versionedKey);
+		}
+	}
+	
+	/**
+	 * Invalidate all cache entries for a specific model
+	 *
+	 * Uses the most efficient invalidation method for the current cache driver:
+	 * - Redis/Memcached/Database: Flushes cache tags (instant invalidation)
+	 * - File driver: Increments version number (makes old keys inaccessible)
+	 *
+	 * @param object|string $model The model class or instance to invalidate
+	 * @return int|bool Version number for file driver, true for tag-based drivers
+	 *
+	 * @example
+	 * // After creating/updating/deleting a user
+	 * $cache-&gt;invalidate(User::class);
+	 */
+	public function invalidate(object|string $model): bool|int
+	{
+		$modelName = $this-&gt;getModelName($model);
+		$versionTtl = $this-&gt;getVersionTtl();
+		
+		if ($this-&gt;supportsTags()) {
+			// Use cache tags for immediate invalidation
+			$tags = $this-&gt;getModelTags($model);
+			Cache::tags($tags)-&gt;flush();
+			
+			if ($this-&gt;isLoggingEnabled()) {
+				Log::info(&quot;Cache invalidated using tags for model: {$modelName}&quot;);
+			}
+			
+			return true;
+		} else {
+			// Use versioning for file driver
+			$versionKey = $this-&gt;getVersionPrefix() . $modelName;
+			
+			try {
+				// Get current version or initialize to 0
+				$currentVersion = Cache::get($versionKey, 0);
+				$currentVersion = castToInt($currentVersion);
+				
+				// Increment and store new version
+				$newVersion = $currentVersion + 1;
+				Cache::put($versionKey, $newVersion, $versionTtl);
+				
+				if ($this-&gt;isLoggingEnabled()) {
+					Log::info(&quot;Cache invalidated using versioning for model: {$modelName}, new version: {$newVersion}&quot;);
+				}
+				
+				return $newVersion;
+			} catch (\Exception $e) {
+				// If operation fails, use timestamp as fallback version
+				if ($this-&gt;isLoggingEnabled()) {
+					Log::warning(&quot;Cache increment failed for {$modelName}, using timestamp fallback: &quot; . $e-&gt;getMessage());
+				}
+				
+				$newVersion = time();
+				Cache::put($versionKey, $newVersion, $versionTtl);
+				
+				return $newVersion;
+			}
+		}
+	}
+	
+	/**
+	 * Invalidate cache for multiple models at once
+	 *
+	 * Efficiently invalidates cache for multiple models using the best method for each driver.
+	 *
+	 * @param array $models Array of model classes or instances
+	 * @return array Results of invalidation operations
+	 *
+	 * @example
+	 * // After an operation that affects both users and posts
+	 * $cache-&gt;invalidateMultiple([User::class, Post::class]);
+	 */
+	public function invalidateMultiple(array $models): array
+	{
+		$results = [];
+		
+		if ($this-&gt;supportsTags()) {
+			// Batch invalidate using tags for efficiency
+			$allTags = [];
+			foreach ($models as $model) {
+				$modelName = $this-&gt;getModelName($model);
+				$tags = $this-&gt;getModelTags($model);
+				$allTags = array_merge($allTags, $tags);
+				$results[$modelName] = true;
+			}
+			
+			// Remove duplicates and flush all tags at once
+			$allTags = array_unique($allTags);
+			Cache::tags($allTags)-&gt;flush();
+			
+			if ($this-&gt;isLoggingEnabled()) {
+				Log::info(&quot;Batch cache invalidation using tags for models: &quot; . implode(&#039;, &#039;, array_keys($results)));
+			}
+		} else {
+			// Individual invalidation for file driver
+			foreach ($models as $model) {
+				$modelName = $this-&gt;getModelName($model);
+				$results[$modelName] = $this-&gt;invalidate($model);
+			}
+		}
+		
+		return $results;
+	}
+	
+	/**
+	 * Clear all cache data (driver-specific implementation)
+	 *
+	 * Uses Laravel&#039;s flush() for a complete clear across drivers.
+	 * Use with extreme caution - this invalidates ALL cached data.
+	 *
+	 * @return bool True if successful
+	 */
+	public function clearAllCache(): bool
+	{
+		try {
+			Cache::flush();
+			
+			if ($this-&gt;isLoggingEnabled()) {
+				Log::warning(&#039;Full cache cleared for all data. Performance impact expected&#039;);
+			}
+			
+			return true;
+		} catch (\Exception $e) {
+			return $this-&gt;clearAllCacheManually();
+		}
+	}
+	
+	/**
+	 * Clear all cache data (driver-specific implementation)
+	 *
+	 * For tag-based drivers: This is not needed since tags provide granular control
+	 * For file driver: Clears all version keys making all cache effectively invalid
+	 *
+	 * Use with extreme caution - this invalidates ALL cached data.
+	 *
+	 * @return bool True if successful
+	 */
+	public function clearAllCacheManually(): bool
+	{
+		try {
+			if ($this-&gt;supportsTags()) {
+				// For tag-based drivers, we could flush all tags, but it&#039;s better to be specific
+				// This is a placeholder - in practice you&#039;d want to track used tags
+				if ($this-&gt;isLoggingEnabled()) {
+					Log::info(&quot;Cache clearing not implemented for tag-based drivers. Use specific model invalidation&quot;);
+				}
+			} else {
+				// Clear all version keys for file driver
+				$cachePath = storage_path(&#039;framework/cache/data&#039;);
+				
+				if (!is_dir($cachePath)) {
+					return true; // Nothing to clear
+				}
+				
+				// Get all cache files that look like version keys
+				$iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($cachePath));
+				
+				$cleared = 0;
+				foreach ($iterator as $file) {
+					if ($file-&gt;isFile()) {
+						$content = file_get_contents($file-&gt;getPathname());
+						
+						// Look for version key pattern in file content
+						if (str_contains($content, $this-&gt;getVersionPrefix())) {
+							unlink($file-&gt;getPathname());
+							$cleared++;
+						}
+					}
+				}
+				
+				if ($this-&gt;isLoggingEnabled()) {
+					Log::warning(&quot;Cleared {$cleared} version cache files. Performance impact expected&quot;);
+				}
+			}
+			
+			return true;
+		} catch (\Exception $e) {
+			if ($this-&gt;isLoggingEnabled()) {
+				Log::error(&quot;Failed to clear cache: &quot; . $e-&gt;getMessage());
+			}
+			
+			return false;
+		}
+	}
+	
+	// PRIVATE
+	
+	/**
+	 * Get default TTL for cached data
+	 *
+	 * @param object|string|null $model Optional model to get specific TTL
+	 * @return int TTL in seconds
+	 */
+	private function getDefaultTtl(object|string|null $model = null): int
+	{
+		// Check for model-specific TTL
+		if ($model) {
+			$modelName = $this-&gt;getModelName($model);
+			$modelConfig = config(&quot;cache-manager.models.{$modelName}&quot;);
+			
+			$defaultTtl = (int)($modelConfig[&#039;default_ttl&#039;] ?? 0);
+			if ($defaultTtl &gt; 0) {
+				return $defaultTtl;
+			}
+		}
+		
+		// Check for environment-specific TTL
+		$environment = app()-&gt;environment();
+		$envTtl = (int)config(&quot;cache-manager.environments.{$environment}.default_ttl&quot;);
+		
+		if ($envTtl &gt; 0) {
+			return $envTtl;
+		}
+		
+		// Get global default TTL
+		$defaultTtl = (int)config(&#039;cache-manager.default_ttl&#039;);
+		
+		$fallbackTtl = 3600; // 1 hour
+		
+		// Return global default or fallback TTL
+		return $defaultTtl &gt; 0 ? $defaultTtl : $fallbackTtl;
+	}
+	
+	/**
+	 * Get TTL for version keys
+	 *
+	 * @return int TTL in seconds
+	 */
+	private function getVersionTtl(): int
+	{
+		$fallbackTtl = 2592000; // 30 days
+		
+		// Check for environment-specific version TTL
+		$environment = app()-&gt;environment();
+		$envTtl = config(&quot;cache-manager.environments.{$environment}.version_ttl&quot;);
+		
+		if ($envTtl !== null) {
+			return castToInt($envTtl, $fallbackTtl);
+		}
+		
+		// Return global version TTL
+		$ttl = config(&#039;cache-manager.version_ttl&#039;);
+		
+		return castToInt($ttl, $fallbackTtl);
+	}
+	
+	/**
+	 * Get version key prefix
+	 *
+	 * @return string
+	 */
+	private function getVersionPrefix(): string
+	{
+		$fallback = &#039;cache_version_&#039;;
+		$versionPrefix = config(&#039;cache-manager.version_prefix&#039;, $fallback);
+		
+		return castToString($versionPrefix, $fallback);
+	}
+	
+	/**
+	 * Check if logging is enabled
+	 *
+	 * @return bool
+	 */
+	private function isLoggingEnabled(): bool
+	{
+		$enableLogging = config(&#039;cache-manager.enable_logging&#039;, false);
+		
+		return castToBool($enableLogging);
+	}
+	
+	/**
+	 * Get current version number for a model (used only for file driver)
+	 *
+	 * Retrieves the current version number for cache invalidation.
+	 * If no version exists, creates version 1.
+	 *
+	 * @param object|string $model The model class or instance
+	 * @return int Current version number
+	 */
+	private function getModelVersion(object|string $model): int
+	{
+		$modelName = $this-&gt;getModelName($model);
+		$versionKey = $this-&gt;getVersionPrefix() . $modelName;
+		
+		// Get or create version number with longer TTL
+		return Cache::remember($versionKey, $this-&gt;getVersionTtl(), fn () =&gt; 1);
+	}
+	
+	/**
+	 * Check if the current cache driver supports tags
+	 *
+	 * Cache tags are supported by Redis, Memcached, DynamoDB, and Database drivers.
+	 * File and Array drivers do not support tags.
+	 *
+	 * @return bool True if tags are supported
+	 */
+	private function supportsTags(): bool
+	{
+		// Reduces overhead of checking if driver supports tags on every operation
+		$cacheDriverCheck = (bool)config(&#039;cache-manager.performance.cache_driver_check&#039;, true);
+		
+		// Use cached result if available and caching is enabled
+		if ($cacheDriverCheck &amp;&amp; $this-&gt;supportsTags !== null) {
+			return $this-&gt;supportsTags;
+		}
+		
+		$storeName = config(&#039;cache.default&#039;);
+		$storeConfig = config(&quot;cache.stores.{$storeName}&quot;);
+		$driver = $storeConfig[&#039;driver&#039;] ?? &#039;&#039;; // Always use inner driver, default empty (non-support)
+		
+		// Cache Tags (Supported Drivers)
+		// https://laravel.com/docs/12.x/cache#cache-tags
+		$supportedDrivers = [&#039;redis&#039;, &#039;memcached&#039;];
+		$unsupportedDrivers = [&#039;file&#039;, &#039;database&#039;, &#039;dynamodb&#039;, &#039;array&#039;];
+		
+		if (in_array($driver, $unsupportedDrivers, true)) {
+			$this-&gt;supportsTags = false;
+			
+			return $this-&gt;supportsTags;
+		}
+		
+		$this-&gt;supportsTags = in_array($driver, $supportedDrivers, true);
+		
+		return $this-&gt;supportsTags;
+	}
+	
+	/**
+	 * Get cache tags for a model
+	 *
+	 * Generates appropriate cache tags for tag-based invalidation.
+	 * Includes basic model tag plus relational tags if the model supports them.
+	 * Override in models via getCacheTags() for custom logic.
+	 *
+	 * @param object|string $model The model class or instance
+	 * @return array Array of cache tags
+	 */
+	private function getModelTags(object|string $model): array
+	{
+		$modelName = $this-&gt;getModelName($model);
+		
+		$tags = [&quot;models:{$modelName}&quot;]; // Single, namespaced tag
+		
+		// Add custom tags from model
+		// Check if model has custom tags (e.g., via trait or method)
+		try {
+			$customTags = [];
+			if (method_exists($model, &#039;getCacheTags&#039;)) {
+				$customTags = is_string($model)
+					? call_user_func([$model, &#039;getCacheTags&#039;])
+					: $model-&gt;getCacheTags();
+			}
+			$customTags = is_array($customTags) ? $customTags : [$customTags];
+			$tags = array_merge($tags, $customTags);
+		} catch (\Exception $e) {
+			if ($this-&gt;isLoggingEnabled()) {
+				Log::warning(&quot;Error getting cache tags for {$modelName}: &quot; . $e-&gt;getMessage());
+			}
+		}
+		
+		// Remove duplicates and return
+		return array_unique($tags);
+	}
+	
+	/**
+	 * Generate base cache key from model and parameters
+	 *
+	 * Creates a unique, deterministic cache key based on the model
+	 * and provided parameters. Uses MD5 hash to keep key length manageable.
+	 * Or uses SHA-256 hash to minimizing collision risk, and short the hash
+	 * to keep key length manageable (since first 16 chars sufficient for uniqueness).
+	 *
+	 * @param object|string $model The model class or instance
+	 * @param array $params Parameters to include in the key
+	 * @return string Base cache key (without version)
+	 */
+	private function generateBaseKey(object|string $model, array $params): string
+	{
+		$modelName = $this-&gt;getModelName($model);
+		
+		// Sort params to ensure consistent key generation regardless of order
+		ksort($params);
+		
+		// Get configured serialization method
+		$serializeMethod = config(&#039;cache-manager.performance.serialize_method&#039;, &#039;serialize&#039;);
+		
+		// Hash serialized parameters using configured algorithm
+		$serializedParams = ($serializeMethod === &#039;json&#039;)
+			? json_encode($params)
+			: serialize($params);
+		$paramHash = $this-&gt;hashValue($serializedParams);
+		
+		// Truncate hash for brevity (Note: first 16 chars sufficient for uniqueness)
+		$shortHash = substr($paramHash, 0, 32);
+		
+		return &quot;{$modelName}_{$shortHash}&quot;;
+	}
+	
+	/**
+	 * Hash a value using the configured algorithm
+	 *
+	 * Retrieves the hash algorithm from config(&#039;cache-manager.hash_algorithm&#039;).
+	 * Falls back to &#039;md5&#039; if invalid. Supports PHP 8.1+ for xxHash variants.
+	 *
+	 * @param string $data The data to hash (e.g., serialized params)
+	 * @return string The hex-encoded hash
+	 */
+	private function hashValue(string $data): string
+	{
+		$allowedAlgorithms = [&#039;md5&#039;, &#039;sha1&#039;, &#039;sha256&#039;, &#039;xxh64&#039;, &#039;xxh128&#039;];
+		
+		$fallbackAlgorithm = &#039;md5&#039;;
+		$algorithm = config(&#039;cache-manager.hash_algorithm&#039;, $fallbackAlgorithm);
+		
+		if (!in_array($algorithm, $allowedAlgorithms, true)) {
+			Log::warning(&quot;Invalid hash algorithm &#039;{$algorithm}&#039; in cache-manager config; falling back to &#039;{$fallbackAlgorithm}&#039;&quot;);
+			$algorithm = $fallbackAlgorithm;
+		}
+		
+		return hash($algorithm, $data);
+	}
+	
+	/**
+	 * Extract model name from class or instance
+	 *
+	 * Handles both class strings and object instances to get a
+	 * consistent model name for cache keys.
+	 *
+	 * @param object|string $model The model class or instance
+	 * @return string Lowercase model name
+	 *
+	 * @throws \InvalidArgumentException When model parameter is invalid
+	 */
+	private function getModelName(object|string $model): string
+	{
+		if (is_string($model)) {
+			// Handle class string like &quot;App\Models\User&quot;
+			return strtolower(class_basename($model));
+		} else if (is_object($model)) {
+			// Handle model instance
+			return strtolower(class_basename(get_class($model)));
+		}
+		
+		throw new \InvalidArgumentException(&#039;Model must be a class string or object instance&#039;);
+	}
+	
+	/**
+	 * Wrap value to handle null caching
+	 *
+	 * Laravel&#039;s cache drivers ignore null values, so we wrap them
+	 * in an array to distinguish between &quot;cache miss&quot; and &quot;cached null&quot;.
+	 *
+	 * Info: https://laravel.com/docs/12.x/cache#determining-item-existence
+	 *
+	 * @param mixed $value The value to wrap
+	 * @return array Wrapped value
+	 */
+	private function wrapValue(mixed $value): array
+	{
+		return [
+			&#039;value&#039;   =&gt; $value === null ? self::NULL_CACHE_VALUE : $value,
+			&#039;is_null&#039; =&gt; $value === null,
+		];
+	}
+	
+	/**
+	 * Unwrap value from cache
+	 *
+	 * Extracts the original value from the wrapper, properly handling null.
+	 *
+	 * @param mixed $wrapped The wrapped value from cache
+	 * @return mixed The original value
+	 */
+	private function unwrapValue(mixed $wrapped): mixed
+	{
+		// If not wrapped (backward compatibility or direct cache access)
+		if (!is_array($wrapped) || !isset($wrapped[&#039;is_null&#039;])) {
+			return $wrapped;
+		}
+		
+		// Return null if it was explicitly cached as null
+		if ($wrapped[&#039;is_null&#039;] === true) {
+			return null;
+		}
+		
+		return $wrapped[&#039;value&#039;];
+	}
+	
+	// FOR DEBUG
+	
+	/**
+	 * Get cache statistics for a model
+	 *
+	 * Returns information about the current cache state for debugging.
+	 * Information differs based on cache driver.
+	 *
+	 * @param object|string $model The model class or instance
+	 * @return array Statistics about cache state
+	 */
+	public function getStats(object|string $model): array
+	{
+		$modelName = $this-&gt;getModelName($model);
+		$supportsTags = $this-&gt;supportsTags();
+		
+		$stats = [
+			&#039;model&#039;               =&gt; $modelName,
+			&#039;driver&#039;              =&gt; config(&#039;cache.default&#039;),
+			&#039;supports_tags&#039;       =&gt; $supportsTags,
+			&#039;invalidation_method&#039; =&gt; $supportsTags ? &#039;tags&#039; : &#039;versioning&#039;,
+		];
+		
+		if ($supportsTags) {
+			$stats[&#039;tags&#039;] = $this-&gt;getModelTags($model);
+		} else {
+			$versionKey = $this-&gt;getVersionPrefix() . $modelName;
+			$stats[&#039;version_key&#039;] = $versionKey;
+			$stats[&#039;current_version&#039;] = $this-&gt;getModelVersion($model);
+			$stats[&#039;version_exists&#039;] = Cache::has($versionKey);
+		}
+		
+		return $stats;
+	}
+	
+	/**
+	 * Get current cache driver information
+	 *
+	 * @return array Information about the current cache configuration
+	 */
+	public function getDriverInfo(): array
+	{
+		$driver = config(&#039;cache.default&#039;);
+		$driverConfig = config(&quot;cache.stores.{$driver}&quot;);
+		
+		return [
+			&#039;current_driver&#039;        =&gt; $driver,
+			&#039;driver_config&#039;         =&gt; $driverConfig,
+			&#039;supports_tags&#039;         =&gt; $this-&gt;supportsTags(),
+			&#039;invalidation_strategy&#039; =&gt; $this-&gt;supportsTags() ? &#039;tags&#039; : &#039;versioning&#039;,
+		];
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Helpers/Common/CacheManager/InvalidatesCache.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Helpers/Common/CacheManager -->
+
+</body>
+</html>

@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Foundation/Console/DocsCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Foundation\Console;
+
+use Carbon\CarbonInterval;
+use Illuminate\Console\Command;
+use Illuminate\Contracts\Cache\Repository as Cache;
+use Illuminate\Http\Client\Factory as Http;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Env;
+use Illuminate\Support\Str;
+use Symfony\Component\Console\Attribute\AsCommand;
+use Symfony\Component\Process\Exception\ProcessFailedException;
+use Symfony\Component\Process\ExecutableFinder;
+use Symfony\Component\Process\Process;
+use Throwable;
+
+use function Laravel\Prompts\suggest;
+
+#[AsCommand(name: &#039;docs&#039;)]
+class DocsCommand extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = &#039;docs {page? : The documentation page to open} {section? : The section of the page to open}&#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;Access the Laravel documentation&#039;;
+
+    /**
+     * The console command help text.
+     *
+     * @var string
+     */
+    protected $help = &#039;If you would like to perform a content search against the documentation, you may call: &lt;fg=green&gt;php artisan docs -- &lt;/&gt;&lt;fg=green;options=bold;&gt;search query here&lt;/&gt;&#039;;
+
+    /**
+     * The HTTP client instance.
+     *
+     * @var \Illuminate\Http\Client\Factory
+     */
+    protected $http;
+
+    /**
+     * The cache repository implementation.
+     *
+     * @var \Illuminate\Contracts\Cache\Repository
+     */
+    protected $cache;
+
+    /**
+     * The custom URL opener.
+     *
+     * @var callable|null
+     */
+    protected $urlOpener;
+
+    /**
+     * The custom documentation version to open.
+     *
+     * @var string|null
+     */
+    protected $version;
+
+    /**
+     * The operating system family.
+     *
+     * @var string
+     */
+    protected $systemOsFamily = PHP_OS_FAMILY;
+
+    /**
+     * Configure the current command.
+     *
+     * @return void
+     */
+    protected function configure()
+    {
+        parent::configure();
+
+        if ($this-&gt;isSearching()) {
+            $this-&gt;ignoreValidationErrors();
+        }
+    }
+
+    /**
+     * Execute the console command.
+     *
+     * @param  \Illuminate\Http\Client\Factory  $http
+     * @param  \Illuminate\Contracts\Cache\Repository  $cache
+     * @return int
+     */
+    public function handle(Http $http, Cache $cache)
+    {
+        $this-&gt;http = $http;
+        $this-&gt;cache = $cache;
+
+        try {
+            $this-&gt;openUrl();
+        } catch (ProcessFailedException $e) {
+            if ($e-&gt;getProcess()-&gt;getExitCodeText() === &#039;Interrupt&#039;) {
+                return $e-&gt;getProcess()-&gt;getExitCode();
+            }
+
+            throw $e;
+        }
+
+        $this-&gt;refreshDocs();
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * Open the documentation URL.
+     *
+     * @return void
+     */
+    protected function openUrl()
+    {
+        $url = $this-&gt;url();
+
+        $this-&gt;components-&gt;info(&quot;Opening the docs to: &lt;fg=yellow&gt;{$url}&lt;/&gt;&quot;);
+
+        $this-&gt;open($url);
+    }
+
+    /**
+     * The URL to the documentation page.
+     *
+     * @return string
+     */
+    protected function url()
+    {
+        if ($this-&gt;isSearching()) {
+            return &quot;https://laravel.com/docs/{$this-&gt;version()}?&quot;.Arr::query([
+                &#039;q&#039; =&gt; $this-&gt;searchQuery(),
+            ]);
+        }
+
+        $page = $this-&gt;page();
+
+        return trim(&quot;https://laravel.com/docs/{$this-&gt;version()}/{$page}#{$this-&gt;section($page)}&quot;, &#039;#/&#039;);
+    }
+
+    /**
+     * The page the user is opening.
+     *
+     * @return string
+     */
+    protected function page()
+    {
+        $page = $this-&gt;resolvePage();
+
+        if ($page === null) {
+            $this-&gt;components-&gt;warn(&#039;Unable to determine the page you are trying to visit.&#039;);
+
+            return &#039;/&#039;;
+        }
+
+        return $page;
+    }
+
+    /**
+     * Determine the page to open.
+     *
+     * @return string|null
+     */
+    protected function resolvePage()
+    {
+        if ($this-&gt;option(&#039;no-interaction&#039;) &amp;&amp; $this-&gt;didNotRequestPage()) {
+            return &#039;/&#039;;
+        }
+
+        return $this-&gt;didNotRequestPage()
+            ? $this-&gt;askForPage()
+            : $this-&gt;guessPage($this-&gt;argument(&#039;page&#039;));
+    }
+
+    /**
+     * Determine if the user requested a specific page when calling the command.
+     *
+     * @return bool
+     */
+    protected function didNotRequestPage()
+    {
+        return $this-&gt;argument(&#039;page&#039;) === null;
+    }
+
+    /**
+     * Ask the user which page they would like to open.
+     *
+     * @return string|null
+     */
+    protected function askForPage()
+    {
+        return $this-&gt;askForPageViaCustomStrategy() ?? $this-&gt;askForPageViaAutocomplete();
+    }
+
+    /**
+     * Ask the user which page they would like to open via a custom strategy.
+     *
+     * @return string|null
+     */
+    protected function askForPageViaCustomStrategy()
+    {
+        try {
+            $strategy = require Env::get(&#039;ARTISAN_DOCS_ASK_STRATEGY&#039;);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if (! is_callable($strategy)) {
+            return null;
+        }
+
+        return $strategy($this) ?? &#039;/&#039;;
+    }
+
+    /**
+     * Ask the user which page they would like to open using autocomplete.
+     *
+     * @return string|null
+     */
+    protected function askForPageViaAutocomplete()
+    {
+        $choice = suggest(
+            label: &#039;Which page would you like to open?&#039;,
+            options: fn ($value) =&gt; $this-&gt;pages()
+                -&gt;mapWithKeys(fn ($option) =&gt; [
+                    Str::lower($option[&#039;title&#039;]) =&gt; $option[&#039;title&#039;],
+                ])
+                -&gt;filter(fn ($title) =&gt; str_contains(Str::lower($title), Str::lower($value)))
+                -&gt;all(),
+            placeholder: &#039;E.g. Collections&#039;
+        );
+
+        return $this-&gt;pages()-&gt;filter(
+            fn ($page) =&gt; $page[&#039;title&#039;] === $choice || Str::lower($page[&#039;title&#039;]) === $choice
+        )-&gt;keys()-&gt;first() ?: $this-&gt;guessPage($choice);
+    }
+
+    /**
+     * Guess the page the user is attempting to open.
+     *
+     * @return string|null
+     */
+    protected function guessPage($search)
+    {
+        return $this-&gt;pages()
+            -&gt;filter(fn ($page) =&gt; str_starts_with(
+                Str::slug($page[&#039;title&#039;], &#039; &#039;),
+                Str::slug($search, &#039; &#039;)
+            ))-&gt;keys()-&gt;first() ?? $this-&gt;pages()-&gt;map(fn ($page) =&gt; similar_text(
+                Str::slug($page[&#039;title&#039;], &#039; &#039;),
+                Str::slug($search, &#039; &#039;),
+            ))
+            -&gt;filter(fn ($score) =&gt; $score &gt;= min(3, Str::length($search)))
+            -&gt;sortDesc()
+            -&gt;keys()
+            -&gt;sortByDesc(fn ($slug) =&gt; Str::contains(
+                Str::slug($this-&gt;pages()[$slug][&#039;title&#039;], &#039; &#039;),
+                Str::slug($search, &#039; &#039;)
+            ) ? 1 : 0)
+            -&gt;first();
+    }
+
+    /**
+     * The section the user specifically asked to open.
+     *
+     * @param  string  $page
+     * @return string|null
+     */
+    protected function section($page)
+    {
+        return $this-&gt;didNotRequestSection()
+            ? null
+            : $this-&gt;guessSection($page);
+    }
+
+    /**
+     * Determine if the user requested a specific section when calling the command.
+     *
+     * @return bool
+     */
+    protected function didNotRequestSection()
+    {
+        return $this-&gt;argument(&#039;section&#039;) === null;
+    }
+
+    /**
+     * Guess the section the user is attempting to open.
+     *
+     * @param  string  $page
+     * @return string|null
+     */
+    protected function guessSection($page)
+    {
+        return $this-&gt;sectionsFor($page)
+            -&gt;filter(fn ($section) =&gt; str_starts_with(
+                Str::slug($section[&#039;title&#039;], &#039; &#039;),
+                Str::slug($this-&gt;argument(&#039;section&#039;), &#039; &#039;)
+            ))-&gt;keys()-&gt;first() ?? $this-&gt;sectionsFor($page)-&gt;map(fn ($section) =&gt; similar_text(
+                Str::slug($section[&#039;title&#039;], &#039; &#039;),
+                Str::slug($this-&gt;argument(&#039;section&#039;), &#039; &#039;),
+            ))
+            -&gt;filter(fn ($score) =&gt; $score &gt;= min(3, Str::length($this-&gt;argument(&#039;section&#039;))))
+            -&gt;sortDesc()
+            -&gt;keys()
+            -&gt;sortByDesc(fn ($slug) =&gt; Str::contains(
+                Str::slug($this-&gt;sectionsFor($page)[$slug][&#039;title&#039;], &#039; &#039;),
+                Str::slug($this-&gt;argument(&#039;section&#039;), &#039; &#039;)
+            ) ? 1 : 0)
+            -&gt;first();
+    }
+
+    /**
+     * Open the URL in the user&#039;s browser.
+     *
+     * @param  string  $url
+     * @return void
+     */
+    protected function open($url)
+    {
+        ($this-&gt;urlOpener ?? function ($url) {
+            if (Env::get(&#039;ARTISAN_DOCS_OPEN_STRATEGY&#039;)) {
+                $this-&gt;openViaCustomStrategy($url);
+            } elseif (in_array($this-&gt;systemOsFamily, [&#039;Darwin&#039;, &#039;Windows&#039;, &#039;Linux&#039;])) {
+                $this-&gt;openViaBuiltInStrategy($url);
+            } else {
+                $this-&gt;components-&gt;warn(&#039;Unable to open the URL on your system. You will need to open it yourself or create a custom opener for your system.&#039;);
+            }
+        })($url);
+    }
+
+    /**
+     * Open the URL via a custom strategy.
+     *
+     * @param  string  $url
+     * @return void
+     */
+    protected function openViaCustomStrategy($url)
+    {
+        try {
+            $command = require Env::get(&#039;ARTISAN_DOCS_OPEN_STRATEGY&#039;);
+        } catch (Throwable) {
+            $command = null;
+        }
+
+        if (! is_callable($command)) {
+            $this-&gt;components-&gt;warn(&#039;Unable to open the URL with your custom strategy. You will need to open it yourself.&#039;);
+
+            return;
+        }
+
+        $command($url);
+    }
+
+    /**
+     * Open the URL via the built in strategy.
+     *
+     * @param  string  $url
+     * @return void
+     */
+    protected function openViaBuiltInStrategy($url)
+    {
+        if ($this-&gt;systemOsFamily === &#039;Windows&#039;) {
+            $process = tap(Process::fromShellCommandline(escapeshellcmd(&quot;start {$url}&quot;)))-&gt;run();
+
+            if (! $process-&gt;isSuccessful()) {
+                throw new ProcessFailedException($process);
+            }
+
+            return;
+        }
+
+        $binary = (new Collection(match ($this-&gt;systemOsFamily) {
+            &#039;Darwin&#039; =&gt; [&#039;open&#039;],
+            &#039;Linux&#039; =&gt; [&#039;xdg-open&#039;, &#039;wslview&#039;],
+        }))-&gt;first(fn ($binary) =&gt; (new ExecutableFinder)-&gt;find($binary) !== null);
+
+        if ($binary === null) {
+            $this-&gt;components-&gt;warn(&#039;Unable to open the URL on your system. You will need to open it yourself or create a custom opener for your system.&#039;);
+
+            return;
+        }
+
+        $process = tap(Process::fromShellCommandline(escapeshellcmd(&quot;{$binary} {$url}&quot;)))-&gt;run();
+
+        if (! $process-&gt;isSuccessful()) {
+            throw new ProcessFailedException($process);
+        }
+    }
+
+    /**
+     * The available sections for the page.
+     *
+     * @param  string  $page
+     * @return \Illuminate\Support\Collection
+     */
+    public function sectionsFor($page)
+    {
+        return new Collection($this-&gt;pages()[$page][&#039;sections&#039;]);
+    }
+
+    /**
+     * The pages available to open.
+     *
+     * @return \Illuminate\Support\Collection
+     */
+    public function pages()
+    {
+        return new Collection($this-&gt;docs()[&#039;pages&#039;]);
+    }
+
+    /**
+     * Get the documentation index as a collection.
+     *
+     * @return \Illuminate\Support\Collection
+     */
+    public function docs()
+    {
+        return $this-&gt;cache-&gt;remember(
+            &quot;artisan.docs.{{$this-&gt;version()}}.index&quot;,
+            CarbonInterval::months(2),
+            fn () =&gt; $this-&gt;fetchDocs()-&gt;throw()-&gt;collect()
+        );
+    }
+
+    /**
+     * Refresh the cached copy of the documentation index.
+     *
+     * @return void
+     */
+    protected function refreshDocs()
+    {
+        $response = $this-&gt;fetchDocs();
+
+        if ($response-&gt;successful()) {
+            $this-&gt;cache-&gt;put(&quot;artisan.docs.{{$this-&gt;version()}}.index&quot;, $response-&gt;collect(), CarbonInterval::months(2));
+        }
+    }
+
+    /**
+     * Fetch the documentation index from the Laravel website.
+     *
+     * @return \Illuminate\Http\Client\Response
+     */
+    protected function fetchDocs()
+    {
+        return $this-&gt;http-&gt;get(&quot;https://laravel.com/docs/{$this-&gt;version()}/index.json&quot;);
+    }
+
+    /**
+     * Determine the version of the docs to open.
+     *
+     * @return string
+     */
+    protected function version()
+    {
+        return Str::before($this-&gt;version ?? $this-&gt;laravel-&gt;version(), &#039;.&#039;).&#039;.x&#039;;
+    }
+
+    /**
+     * The search query the user provided.
+     *
+     * @return string
+     */
+    protected function searchQuery()
+    {
+        return (new Collection($_SERVER[&#039;argv&#039;]))-&gt;skip(3)-&gt;implode(&#039; &#039;);
+    }
+
+    /**
+     * Determine if the command is intended to perform a search.
+     *
+     * @return bool
+     */
+    protected function isSearching()
+    {
+        return ($_SERVER[&#039;argv&#039;][2] ?? null) === &#039;--&#039;;
+    }
+
+    /**
+     * Set the documentation version.
+     *
+     * @param  string  $version
+     * @return $this
+     */
+    public function setVersion($version)
+    {
+        $this-&gt;version = $version;
+
+        return $this;
+    }
+
+    /**
+     * Set a custom URL opener.
+     *
+     * @param  callable|null  $opener
+     * @return $this
+     */
+    public function setUrlOpener($opener)
+    {
+        $this-&gt;urlOpener = $opener;
+
+        return $this;
+    }
+
+    /**
+     * Set the system operating system family.
+     *
+     * @param  string  $family
+     * @return $this
+     */
+    public function setSystemOsFamily($family)
+    {
+        $this-&gt;systemOsFamily = $family;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Foundation/Console/DownCommand.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Foundation/Console/stubs -->
+
+</body>
+</html>

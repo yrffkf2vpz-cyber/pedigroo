@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest-plugin-mutate/src/Tester/MutationTestRunner.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Mutate\Tester;
+
+use Composer\InstalledVersions;
+use Pest\Mutate\Contracts\MutationTestRunner as MutationTestRunnerContract;
+use Pest\Mutate\Contracts\Printer;
+use Pest\Mutate\Event\Facade;
+use Pest\Mutate\MutationSuite;
+use Pest\Mutate\MutationTest;
+use Pest\Mutate\Plugins\Mutate;
+use Pest\Mutate\Repositories\ConfigurationRepository;
+use Pest\Mutate\Repositories\TelemetryRepository;
+use Pest\Mutate\Support\Configuration\Configuration;
+use Pest\Mutate\Support\FileFinder;
+use Pest\Mutate\Support\MutationGenerator;
+use Pest\Support\Container;
+use Pest\Support\Coverage;
+use Psr\SimpleCache\CacheInterface;
+use SebastianBergmann\CodeCoverage\CodeCoverage;
+
+class MutationTestRunner implements MutationTestRunnerContract
+{
+    private bool $enabled = false;
+
+    private bool $codeCoverageRequested = false;
+
+    private bool $stop = false;
+
+    /**
+     * @var array&lt;int, string&gt;
+     */
+    private array $originalArguments;
+
+    /**
+     * @var array&lt;int, ?MutationTest&gt;
+     */
+    private array $runningTests;
+
+    private float $startTime;
+
+    public static function fake(): MutationTestRunnerFake
+    {
+        $fake = new MutationTestRunnerFake;
+
+        Container::getInstance()-&gt;add(MutationTestRunnerContract::class, $fake);
+
+        return $fake;
+    }
+
+    public function stopExecution(): void
+    {
+        $this-&gt;stop = true;
+    }
+
+    /**
+     * @param  array&lt;int, string&gt;  $arguments
+     */
+    public function setOriginalArguments(array $arguments): void
+    {
+        $this-&gt;originalArguments = $arguments;
+    }
+
+    public function enable(): void
+    {
+        if (getenv(Mutate::ENV_MUTATION_TESTING) !== false) {
+            return;
+        }
+
+        $this-&gt;enabled = true;
+    }
+
+    public function isEnabled(): bool
+    {
+        if (str_starts_with((string) $this-&gt;enabled, ConfigurationRepository::FAKE)) {
+            return false;
+        }
+
+        return $this-&gt;enabled;
+    }
+
+    public function doNotDisableCodeCoverage(): void
+    {
+        $this-&gt;codeCoverageRequested = true;
+    }
+
+    public function isCodeCoverageRequested(): bool
+    {
+        return $this-&gt;codeCoverageRequested;
+    }
+
+    public function run(): int
+    {
+        Container::getInstance()-&gt;get(TelemetryRepository::class)-&gt;initialTestSuiteDuration( // @phpstan-ignore-line
+            microtime(true) - $this-&gt;startTime
+        );
+
+        if (! Coverage::isAvailable() || ! file_exists($reportPath = Coverage::getPath())) {
+            Container::getInstance()-&gt;get(Printer::class)-&gt;reportError(&#039;No coverage report found, aborting mutation testing.&#039;); // @phpstan-ignore-line
+
+            return 1;
+        }
+
+        $this-&gt;clearCacheIfPluginVersionChanged();
+
+        $mutationSuite = MutationSuite::instance();
+
+        Facade::instance()-&gt;emitter()-&gt;startMutationGeneration($mutationSuite);
+
+        /** @var CodeCoverage $codeCoverage */
+        $codeCoverage = require $reportPath;
+
+        unlink($reportPath);
+        $coveredLines = array_map(fn (array $lines): array =&gt; array_filter($lines, fn (?array $tests): bool =&gt; $tests !== [] &amp;&amp; $tests !== null), $codeCoverage-&gt;getData()-&gt;lineCoverage());
+        $coveredLines = array_filter($coveredLines, fn (array $lines): bool =&gt; $lines !== []);
+
+        $files = FileFinder::files($this-&gt;getConfiguration()-&gt;paths, $this-&gt;getConfiguration()-&gt;pathsToIgnore);
+
+        /** @var MutationGenerator $generator */
+        $generator = Container::getInstance()-&gt;get(MutationGenerator::class);
+
+        foreach ($files as $file) {
+            $linesToMutate = [];
+
+            if ($this-&gt;getConfiguration()-&gt;coveredOnly) {
+
+                if (! isset($coveredLines[$file-&gt;getRealPath()])) {
+                    continue;
+                }
+
+                $linesToMutate = array_keys($coveredLines[$file-&gt;getRealPath()]);
+            }
+
+            foreach ($generator-&gt;generate(
+                file: $file,
+                mutators: $this-&gt;getConfiguration()-&gt;mutators,
+                linesToMutate: $linesToMutate,
+                classesToMutate: $this-&gt;getConfiguration()-&gt;everything ? [] : $this-&gt;getConfiguration()-&gt;classes,
+            ) as $mutation) {
+                if ($this-&gt;getConfiguration()-&gt;mutationId !== null &amp;&amp; $mutation-&gt;id !== $this-&gt;getConfiguration()-&gt;mutationId) {
+                    continue;
+                }
+
+                $mutationSuite-&gt;repository-&gt;add($mutation);
+            }
+        }
+
+        Facade::instance()-&gt;emitter()-&gt;finishMutationGeneration($mutationSuite);
+
+        if ($this-&gt;getConfiguration()-&gt;retry) {
+            $mutationSuite-&gt;repository-&gt;sortByEscapedFirst();
+        }
+
+        Facade::instance()-&gt;emitter()-&gt;startMutationSuite($mutationSuite);
+
+        if ($this-&gt;getConfiguration()-&gt;parallel) {
+            $this-&gt;runTestsInParallel(
+                mutationSuite: $mutationSuite,
+                coveredLines: $coveredLines,
+                processes: $this-&gt;getConfiguration()-&gt;processes,
+            );
+        } else {
+            $this-&gt;runTests(
+                mutationSuite: $mutationSuite,
+                coveredLines: $coveredLines,
+            );
+        }
+
+        $mutationSuite-&gt;repository-&gt;saveResults();
+
+        Facade::instance()-&gt;emitter()-&gt;finishMutationSuite($mutationSuite);
+
+        return $this-&gt;isMinScoreIsReached($mutationSuite) ? 0 : 1;
+    }
+
+    private function getConfiguration(): Configuration
+    {
+        return Container::getInstance()-&gt;get(ConfigurationRepository::class)-&gt;mergedConfiguration(); // @phpstan-ignore-line
+    }
+
+    private function isMinScoreIsReached(MutationSuite $mutationSuite): bool
+    {
+        /** @var Configuration $configuration */
+        $configuration = Container::getInstance()-&gt;get(ConfigurationRepository::class) // @phpstan-ignore-line
+            -&gt;mergedConfiguration();
+
+        $minScore = $configuration-&gt;minScore;
+
+        if ($minScore === null) {
+            return true;
+        }
+
+        if ($mutationSuite-&gt;repository-&gt;count() === 0 &amp;&amp; $configuration-&gt;ignoreMinScoreOnZeroMutations) {
+            return true;
+        }
+
+        $score = $mutationSuite-&gt;score();
+        if ($score &gt;= $minScore) {
+            return true;
+        }
+
+        Container::getInstance()-&gt;get(Printer::class) // @phpstan-ignore-line
+            -&gt;reportScoreNotReached($score, $minScore);
+
+        return false;
+    }
+
+    /**
+     * @param  array&lt;string, array&lt;int, array&lt;int, string&gt;&gt;&gt;  $coveredLines
+     */
+    private function runTestsInParallel(MutationSuite $mutationSuite, array $coveredLines, int $processes): void
+    {
+        $tests = [];
+        foreach ($mutationSuite-&gt;repository-&gt;all() as $testCollection) {
+            foreach ($testCollection-&gt;tests() as $test) {
+                $tests[] = $test;
+            }
+        }
+
+        $this-&gt;runningTests = array_fill(1, $processes, null);
+
+        foreach ($tests as $test) {
+            if ($this-&gt;stop) {
+                break;
+            }
+
+            while (count(array_filter($this-&gt;runningTests, fn (?MutationTest $process): bool =&gt; $process instanceof MutationTest)) &gt;= $processes) {
+                if ($this-&gt;checkRunningTestsHaveFinished()) {
+                    continue;
+                }
+
+                usleep(1000); // @pest-arch-ignore-line
+            }
+
+            $processId = (int) array_key_first(array_filter($this-&gt;runningTests, fn (?MutationTest $process): bool =&gt; ! $process instanceof MutationTest));
+            if ($test-&gt;start($coveredLines, $this-&gt;getConfiguration(), $this-&gt;originalArguments, $processId)) {
+                $this-&gt;runningTests[$processId] = $test;
+            }
+        }
+
+        while (! $this-&gt;stop &amp;&amp; array_filter($this-&gt;runningTests, fn (?MutationTest $process): bool =&gt; $process instanceof MutationTest) !== []) {
+            $this-&gt;checkRunningTestsHaveFinished();
+        }
+    }
+
+    /**
+     * @param  array&lt;string, array&lt;int, array&lt;int, string&gt;&gt;&gt;  $coveredLines
+     */
+    private function runTests(MutationSuite $mutationSuite, array $coveredLines): void
+    {
+        foreach ($mutationSuite-&gt;repository-&gt;all() as $testCollection) {
+            Facade::instance()-&gt;emitter()-&gt;startTestCollection($testCollection);
+
+            foreach ($testCollection-&gt;tests() as $test) {
+                if ($this-&gt;stop) {
+                    break 2;
+                }
+
+                if ($test-&gt;start($coveredLines, $this-&gt;getConfiguration(), $this-&gt;originalArguments)) {
+                    while (! $test-&gt;hasFinished()) {
+                        usleep(1000);
+                    }
+                }
+            }
+        }
+    }
+
+    private function checkRunningTestsHaveFinished(): bool
+    {
+        foreach ($this-&gt;runningTests as $index =&gt; $runningTest) {
+            if (! $runningTest instanceof MutationTest) {
+                continue;
+            }
+
+            if ($runningTest-&gt;hasFinished()) {
+                $this-&gt;runningTests[$index] = null;
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function clearCacheIfPluginVersionChanged(): void
+    {
+        $cache = Container::getInstance()-&gt;get(CacheInterface::class);
+
+        $pluginVersion = InstalledVersions::getVersion(&#039;pestphp/pest-plugin-mutate&#039;);
+
+        /** @var ?string $previousVersion */
+        $previousVersion = $cache-&gt;get(&#039;mutation-plugin-version&#039;); // @phpstan-ignore-line
+
+        if ($previousVersion === null || $previousVersion !== $pluginVersion) {
+            $cache-&gt;clear(); // @phpstan-ignore-line
+        }
+
+        $cache-&gt;set(&#039;mutation-plugin-version&#039;, $pluginVersion); // @phpstan-ignore-line
+    }
+
+    public function setStartTime(float $startTime): void
+    {
+        $this-&gt;startTime = $startTime;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest-plugin-mutate/src/Tester/MutationTestRunnerFake.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest-plugin-profanity -->
+
+</body>
+</html>

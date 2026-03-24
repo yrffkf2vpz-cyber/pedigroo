@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Queue/Console/RetryCommand.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Queue\Console;
+
+use DateTimeInterface;
+use Illuminate\Console\Command;
+use Illuminate\Contracts\Encryption\Encrypter;
+use Illuminate\Queue\Events\JobRetryRequested;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use RuntimeException;
+use Symfony\Component\Console\Attribute\AsCommand;
+
+#[AsCommand(name: &#039;queue:retry&#039;)]
+class RetryCommand extends Command
+{
+    /**
+     * The console command signature.
+     *
+     * @var string
+     */
+    protected $signature = &#039;queue:retry
+                            {id?* : The ID of the failed job or &quot;all&quot; to retry all jobs}
+                            {--queue= : Retry all of the failed jobs for the specified queue}
+                            {--range=* : Range of job IDs (numeric) to be retried (e.g. 1-5)}&#039;;
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = &#039;Retry a failed queue job&#039;;
+
+    /**
+     * Execute the console command.
+     *
+     * @return void
+     */
+    public function handle()
+    {
+        $jobsFound = count($ids = $this-&gt;getJobIds()) &gt; 0;
+
+        if ($jobsFound) {
+            $this-&gt;components-&gt;info(&#039;Pushing failed queue jobs back onto the queue.&#039;);
+        }
+
+        foreach ($ids as $id) {
+            $job = $this-&gt;laravel[&#039;queue.failer&#039;]-&gt;find($id);
+
+            if (is_null($job)) {
+                $this-&gt;components-&gt;error(&quot;Unable to find failed job with ID [{$id}].&quot;);
+            } else {
+                $this-&gt;laravel[&#039;events&#039;]-&gt;dispatch(new JobRetryRequested($job));
+
+                $this-&gt;components-&gt;task($id, fn () =&gt; $this-&gt;retryJob($job));
+
+                $this-&gt;laravel[&#039;queue.failer&#039;]-&gt;forget($id);
+            }
+        }
+
+        $jobsFound ? $this-&gt;newLine() : $this-&gt;components-&gt;info(&#039;No retryable jobs found.&#039;);
+    }
+
+    /**
+     * Get the job IDs to be retried.
+     *
+     * @return array
+     */
+    protected function getJobIds()
+    {
+        $ids = (array) $this-&gt;argument(&#039;id&#039;);
+
+        if (count($ids) === 1 &amp;&amp; $ids[0] === &#039;all&#039;) {
+            $failer = $this-&gt;laravel[&#039;queue.failer&#039;];
+
+            return method_exists($failer, &#039;ids&#039;)
+                ? $failer-&gt;ids()
+                : Arr::pluck($failer-&gt;all(), &#039;id&#039;);
+        }
+
+        if ($queue = $this-&gt;option(&#039;queue&#039;)) {
+            return $this-&gt;getJobIdsByQueue($queue);
+        }
+
+        if ($ranges = (array) $this-&gt;option(&#039;range&#039;)) {
+            $ids = array_merge($ids, $this-&gt;getJobIdsByRanges($ranges));
+        }
+
+        return array_values(array_filter(array_unique($ids)));
+    }
+
+    /**
+     * Get the job IDs by queue, if applicable.
+     *
+     * @param  string  $queue
+     * @return array
+     */
+    protected function getJobIdsByQueue($queue)
+    {
+        $failer = $this-&gt;laravel[&#039;queue.failer&#039;];
+
+        $ids = method_exists($failer, &#039;ids&#039;)
+            ? $failer-&gt;ids($queue)
+            : (new Collection($failer-&gt;all()))
+                -&gt;where(&#039;queue&#039;, $queue)
+                -&gt;pluck(&#039;id&#039;)
+                -&gt;toArray();
+
+        if (count($ids) === 0) {
+            $this-&gt;components-&gt;error(&quot;Unable to find failed jobs for queue [{$queue}].&quot;);
+        }
+
+        return $ids;
+    }
+
+    /**
+     * Get the job IDs ranges, if applicable.
+     *
+     * @param  array  $ranges
+     * @return array
+     */
+    protected function getJobIdsByRanges(array $ranges)
+    {
+        $ids = [];
+
+        foreach ($ranges as $range) {
+            if (preg_match(&#039;/^[0-9]+\-[0-9]+$/&#039;, $range)) {
+                $ids = array_merge($ids, range(...explode(&#039;-&#039;, $range)));
+            }
+        }
+
+        return $ids;
+    }
+
+    /**
+     * Retry the queue job.
+     *
+     * @param  \stdClass  $job
+     * @return void
+     */
+    protected function retryJob($job)
+    {
+        $this-&gt;laravel[&#039;queue&#039;]-&gt;connection($job-&gt;connection)-&gt;pushRaw(
+            $this-&gt;refreshRetryUntil($this-&gt;resetAttempts($job-&gt;payload)), $job-&gt;queue
+        );
+    }
+
+    /**
+     * Reset the payload attempts.
+     *
+     * Applicable to Redis and other jobs which store attempts in their payload.
+     *
+     * @param  string  $payload
+     * @return string
+     */
+    protected function resetAttempts($payload)
+    {
+        $payload = json_decode($payload, true);
+
+        if (isset($payload[&#039;attempts&#039;])) {
+            $payload[&#039;attempts&#039;] = 0;
+        }
+
+        return json_encode($payload);
+    }
+
+    /**
+     * Refresh the &quot;retry until&quot; timestamp for the job.
+     *
+     * @param  string  $payload
+     * @return string
+     *
+     * @throws \RuntimeException
+     */
+    protected function refreshRetryUntil($payload)
+    {
+        $payload = json_decode($payload, true);
+
+        if (! isset($payload[&#039;data&#039;][&#039;command&#039;])) {
+            return json_encode($payload);
+        }
+
+        if (str_starts_with($payload[&#039;data&#039;][&#039;command&#039;], &#039;O:&#039;)) {
+            $instance = unserialize($payload[&#039;data&#039;][&#039;command&#039;]);
+        } elseif ($this-&gt;laravel-&gt;bound(Encrypter::class)) {
+            $instance = unserialize($this-&gt;laravel-&gt;make(Encrypter::class)-&gt;decrypt($payload[&#039;data&#039;][&#039;command&#039;]));
+        }
+
+        if (! isset($instance)) {
+            throw new RuntimeException(&#039;Unable to extract job payload.&#039;);
+        }
+
+        if (is_object($instance) &amp;&amp; ! $instance instanceof \__PHP_Incomplete_Class &amp;&amp; method_exists($instance, &#039;retryUntil&#039;)) {
+            $retryUntil = $instance-&gt;retryUntil();
+
+            $payload[&#039;retryUntil&#039;] = $retryUntil instanceof DateTimeInterface
+                ? $retryUntil-&gt;getTimestamp()
+                : $retryUntil;
+        }
+
+        return json_encode($payload);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Queue/Console/TableCommand.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Queue/Console/Concerns -->
+
+</body>
+</html>

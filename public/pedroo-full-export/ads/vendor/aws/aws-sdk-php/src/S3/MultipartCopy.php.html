@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/MultipartCopy.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Aws\S3;
+
+use Aws\Arn\ArnParser;
+use Aws\Multipart\AbstractUploadManager;
+use Aws\ResultInterface;
+use GuzzleHttp\Psr7;
+
+class MultipartCopy extends AbstractUploadManager
+{
+    use MultipartUploadingTrait;
+
+    /** @var string|array */
+    private $source;
+    /** @var string */
+    private $sourceVersionId;
+    /** @var ResultInterface */
+    private $sourceMetadata;
+
+    /**
+     * Creates a multipart upload for copying an S3 object.
+     *
+     * The valid configuration options are as follows:
+     *
+     * - acl: (string) ACL to set on the object being upload. Objects are
+     *   private by default.
+     * - before_complete: (callable) Callback to invoke before the
+     *   `CompleteMultipartUpload` operation. The callback should have a
+     *   function signature like `function (Aws\Command $command) {...}`.
+     * - before_initiate: (callable) Callback to invoke before the
+     *   `CreateMultipartUpload` operation. The callback should have a function
+     *   signature like `function (Aws\Command $command) {...}`.
+     * - before_upload: (callable) Callback to invoke before `UploadPartCopy`
+     *   operations. The callback should have a function signature like
+     *   `function (Aws\Command $command) {...}`.
+     * - bucket: (string, required) Name of the bucket to which the object is
+     *   being uploaded.
+     * - concurrency: (int, default=int(5)) Maximum number of concurrent
+     *   `UploadPart` operations allowed during the multipart upload.
+     * - key: (string, required) Key to use for the object being uploaded.
+     * - params: (array) An array of key/value parameters that will be applied
+     *   to each of the sub-commands run by the uploader as a base.
+     *   Auto-calculated options will override these parameters. If you need
+     *   more granularity over parameters to each sub-command, use the before_*
+     *   options detailed above to update the commands directly.
+     * - part_size: (int, default=int(5242880)) Part size, in bytes, to use when
+     *   doing a multipart upload. This must between 5 MB and 5 GB, inclusive.
+     * - state: (Aws\Multipart\UploadState) An object that represents the state
+     *   of the multipart upload and that is used to resume a previous upload.
+     *   When this option is provided, the `bucket`, `key`, and `part_size`
+     *   options are ignored.
+     * - source_metadata: (Aws\ResultInterface) An object that represents the
+     *   result of executing a HeadObject command on the copy source.
+     * - display_progress: (boolean) Set true to track status in 1/8th increments
+     *   for upload.
+     *
+     * @param S3ClientInterface $client Client used for the upload.
+     * @param string|array $source Location of the data to be copied (in the
+     *                       form /&lt;bucket&gt;/&lt;key&gt;).  If the key contains a &#039;?&#039;
+     *                       character, instead pass an array of source_key,
+     *                       source_bucket, and source_version_id.
+     * @param array $config Configuration used to perform the upload.
+     */
+    public function __construct(
+        S3ClientInterface $client,
+        $source,
+        array $config = []
+    ) {
+        if (is_array($source)) {
+            $this-&gt;source = $source;
+        } else {
+            $this-&gt;source = $this-&gt;getInputSource($source);
+        }
+
+        parent::__construct(
+            $client,
+            array_change_key_case($config) + [&#039;source_metadata&#039; =&gt; null]
+        );
+
+        if ($this-&gt;displayProgress) {
+            $this-&gt;getState()-&gt;setProgressThresholds(
+                $this-&gt;sourceMetadata[&quot;ContentLength&quot;]
+            );
+        }
+    }
+
+    /**
+     * An alias of the self::upload method.
+     *
+     * @see self::upload
+     */
+    public function copy()
+    {
+        return $this-&gt;upload();
+    }
+
+    protected function loadUploadWorkflowInfo()
+    {
+        return [
+            &#039;command&#039; =&gt; [
+                &#039;initiate&#039; =&gt; &#039;CreateMultipartUpload&#039;,
+                &#039;upload&#039; =&gt; &#039;UploadPartCopy&#039;,
+                &#039;complete&#039; =&gt; &#039;CompleteMultipartUpload&#039;,
+            ],
+            &#039;id&#039; =&gt; [
+                &#039;bucket&#039; =&gt; &#039;Bucket&#039;,
+                &#039;key&#039; =&gt; &#039;Key&#039;,
+                &#039;upload_id&#039; =&gt; &#039;UploadId&#039;,
+            ],
+            &#039;part_num&#039; =&gt; &#039;PartNumber&#039;,
+        ];
+    }
+
+    protected function getUploadCommands(callable $resultHandler)
+    {
+        $parts = ceil($this-&gt;getSourceSize() / $this-&gt;determinePartSize());
+
+        for ($partNumber = 1; $partNumber &lt;= $parts; $partNumber++) {
+            // If we haven&#039;t already uploaded this part, yield a new part.
+            if (!$this-&gt;state-&gt;hasPartBeenUploaded($partNumber)) {
+                $command = $this-&gt;client-&gt;getCommand(
+                    $this-&gt;info[&#039;command&#039;][&#039;upload&#039;],
+                    $this-&gt;createPart($partNumber, $parts) + $this-&gt;getState()-&gt;getId()
+                );
+                $command-&gt;getHandlerList()-&gt;appendSign($resultHandler, &#039;mup&#039;);
+                yield $command;
+            }
+        }
+    }
+
+    private function createPart($partNumber, $partsCount)
+    {
+        $data = [];
+
+        // Apply custom params to UploadPartCopy data
+        $config = $this-&gt;getConfig();
+        $params = isset($config[&#039;params&#039;]) ? $config[&#039;params&#039;] : [];
+        foreach ($params as $k =&gt; $v) {
+            $data[$k] = $v;
+        }
+        // The source parameter here is usually a string, but can be overloaded as an array
+        // if the key contains a &#039;?&#039; character to specify where the query parameters start
+        if (is_array($this-&gt;source)) {
+            $key = str_replace(&#039;%2F&#039;, &#039;/&#039;, rawurlencode($this-&gt;source[&#039;source_key&#039;]));
+            $bucket = $this-&gt;source[&#039;source_bucket&#039;];
+        } else {
+            list($bucket, $key) = explode(&#039;/&#039;, ltrim($this-&gt;source, &#039;/&#039;), 2);
+            $key = implode(
+                &#039;/&#039;,
+                array_map(
+                    &#039;urlencode&#039;,
+                    explode(&#039;/&#039;, rawurldecode($key))
+                )
+            );
+        }
+
+        $uri = ArnParser::isArn($bucket) ? &#039;&#039; : &#039;/&#039;;
+        $uri .= $bucket . &#039;/&#039; . $key;
+        $data[&#039;CopySource&#039;] = $uri;
+        $data[&#039;PartNumber&#039;] = $partNumber;
+        if (!empty($this-&gt;sourceVersionId)) {
+            $data[&#039;CopySource&#039;] .= &quot;?versionId=&quot; . $this-&gt;sourceVersionId;
+        }
+
+        $defaultPartSize = $this-&gt;determinePartSize();
+        $startByte = $defaultPartSize * ($partNumber - 1);
+        $data[&#039;ContentLength&#039;] = $partNumber &lt; $partsCount
+            ? $defaultPartSize
+            : $this-&gt;getSourceSize() - ($defaultPartSize * ($partsCount - 1));
+        $endByte = $startByte + $data[&#039;ContentLength&#039;] - 1;
+        $data[&#039;CopySourceRange&#039;] = &quot;bytes=$startByte-$endByte&quot;;
+
+        return $data;
+    }
+
+    protected function extractETag(ResultInterface $result)
+    {
+        return $result-&gt;search(&#039;CopyPartResult.ETag&#039;);
+    }
+
+    protected function getSourceMimeType()
+    {
+        return $this-&gt;getSourceMetadata()[&#039;ContentType&#039;];
+    }
+
+    protected function getSourceSize()
+    {
+        return $this-&gt;getSourceMetadata()[&#039;ContentLength&#039;];
+    }
+
+    private function getSourceMetadata()
+    {
+        if (empty($this-&gt;sourceMetadata)) {
+            $this-&gt;sourceMetadata = $this-&gt;fetchSourceMetadata();
+        }
+
+        return $this-&gt;sourceMetadata;
+    }
+
+    private function fetchSourceMetadata()
+    {
+        if ($this-&gt;config[&#039;source_metadata&#039;] instanceof ResultInterface) {
+            return $this-&gt;config[&#039;source_metadata&#039;];
+        }
+        //if the source variable was overloaded with an array, use the inputs for key and bucket
+        if (is_array($this-&gt;source)) {
+            $headParams = [
+                &#039;Key&#039; =&gt; $this-&gt;source[&#039;source_key&#039;],
+                &#039;Bucket&#039; =&gt; $this-&gt;source[&#039;source_bucket&#039;]
+            ];
+            if (isset($this-&gt;source[&#039;source_version_id&#039;])) {
+                $this-&gt;sourceVersionId = $this-&gt;source[&#039;source_version_id&#039;];
+                $headParams[&#039;VersionId&#039;] = $this-&gt;sourceVersionId;
+            }
+        //otherwise, use the default source parsing behavior
+        } else {
+            list($bucket, $key) = explode(&#039;/&#039;, ltrim($this-&gt;source, &#039;/&#039;), 2);
+            $headParams = [
+                &#039;Bucket&#039; =&gt; $bucket,
+                &#039;Key&#039; =&gt; $key,
+            ];
+            if (strpos($key, &#039;?&#039;)) {
+                list($key, $query) = explode(&#039;?&#039;, $key, 2);
+                $headParams[&#039;Key&#039;] = $key;
+                $query = Psr7\Query::parse($query, false);
+                if (isset($query[&#039;versionId&#039;])) {
+                    $this-&gt;sourceVersionId = $query[&#039;versionId&#039;];
+                    $headParams[&#039;VersionId&#039;] = $this-&gt;sourceVersionId;
+                }
+            }
+        }
+        return $this-&gt;client-&gt;headObject($headParams);
+    }
+
+    /**
+     * Get the url decoded input source, starting with a slash if it is not an
+     * ARN to standardize the source location syntax.
+     *
+     * @param string $inputSource The source that was passed to the constructor
+     * @return string The source, starting with a slash if it&#039;s not an arn
+     */
+    private function getInputSource($inputSource)
+    {
+        $sourceBuilder = ArnParser::isArn($inputSource) ? &#039;&#039; : &#039;/&#039;;
+        $sourceBuilder .= ltrim(rawurldecode($inputSource), &#039;/&#039;);
+        return $sourceBuilder;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/MultipartUploader.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/Crypto -->
+
+</body>
+</html>

@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Cache/CacheManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Cache;
+
+use Aws\DynamoDb\DynamoDbClient;
+use Closure;
+use Illuminate\Contracts\Cache\Factory as FactoryContract;
+use Illuminate\Contracts\Cache\Store;
+use Illuminate\Contracts\Events\Dispatcher as DispatcherContract;
+use Illuminate\Support\Arr;
+use InvalidArgumentException;
+use Mockery;
+use Mockery\LegacyMockInterface;
+
+/**
+ * @mixin \Illuminate\Cache\Repository
+ * @mixin \Illuminate\Contracts\Cache\LockProvider
+ */
+class CacheManager implements FactoryContract
+{
+    /**
+     * The application instance.
+     *
+     * @var \Illuminate\Contracts\Foundation\Application
+     */
+    protected $app;
+
+    /**
+     * The array of resolved cache stores.
+     *
+     * @var array
+     */
+    protected $stores = [];
+
+    /**
+     * The registered custom driver creators.
+     *
+     * @var array
+     */
+    protected $customCreators = [];
+
+    /**
+     * Create a new Cache manager instance.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     */
+    public function __construct($app)
+    {
+        $this-&gt;app = $app;
+    }
+
+    /**
+     * Get a cache store instance by name, wrapped in a repository.
+     *
+     * @param  string|null  $name
+     * @return \Illuminate\Contracts\Cache\Repository
+     */
+    public function store($name = null)
+    {
+        $name = $name ?? $this-&gt;getDefaultDriver();
+
+        return $this-&gt;stores[$name] ??= $this-&gt;resolve($name);
+    }
+
+    /**
+     * Get a cache driver instance.
+     *
+     * @param  string|null  $driver
+     * @return \Illuminate\Contracts\Cache\Repository
+     */
+    public function driver($driver = null)
+    {
+        return $this-&gt;store($driver);
+    }
+
+    /**
+     * Get a memoized cache driver instance.
+     *
+     * @param  string|null  $driver
+     * @return \Illuminate\Contracts\Cache\Repository
+     */
+    public function memo($driver = null)
+    {
+        $driver = $driver ?? $this-&gt;getDefaultDriver();
+
+        $bindingKey = &quot;cache.__memoized:{$driver}&quot;;
+
+        $isSpy = isset($this-&gt;app[&#039;cache&#039;]) &amp;&amp; $this-&gt;app[&#039;cache&#039;] instanceof LegacyMockInterface;
+
+        $this-&gt;app-&gt;scopedIf($bindingKey, function () use ($driver, $isSpy) {
+            $repository = $this-&gt;repository(
+                new MemoizedStore($driver, $this-&gt;store($driver)), [&#039;events&#039; =&gt; false]
+            );
+
+            return $isSpy ? Mockery::spy($repository) : $repository;
+        });
+
+        return $this-&gt;app-&gt;make($bindingKey);
+    }
+
+    /**
+     * Resolve the given store.
+     *
+     * @param  string  $name
+     * @return \Illuminate\Contracts\Cache\Repository
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function resolve($name)
+    {
+        $config = $this-&gt;getConfig($name);
+
+        if (is_null($config)) {
+            throw new InvalidArgumentException(&quot;Cache store [{$name}] is not defined.&quot;);
+        }
+
+        $config = Arr::add($config, &#039;store&#039;, $name);
+
+        return $this-&gt;build($config);
+    }
+
+    /**
+     * Build a cache repository with the given configuration.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function build(array $config)
+    {
+        $config = Arr::add($config, &#039;store&#039;, $config[&#039;name&#039;] ?? &#039;ondemand&#039;);
+
+        if (isset($this-&gt;customCreators[$config[&#039;driver&#039;]])) {
+            return $this-&gt;callCustomCreator($config);
+        }
+
+        $driverMethod = &#039;create&#039;.ucfirst($config[&#039;driver&#039;]).&#039;Driver&#039;;
+
+        if (method_exists($this, $driverMethod)) {
+            return $this-&gt;{$driverMethod}($config);
+        }
+
+        throw new InvalidArgumentException(&quot;Driver [{$config[&#039;driver&#039;]}] is not supported.&quot;);
+    }
+
+    /**
+     * Call a custom driver creator.
+     *
+     * @param  array  $config
+     * @return mixed
+     */
+    protected function callCustomCreator(array $config)
+    {
+        return $this-&gt;customCreators[$config[&#039;driver&#039;]]($this-&gt;app, $config);
+    }
+
+    /**
+     * Create an instance of the APC cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createApcDriver(array $config)
+    {
+        $prefix = $this-&gt;getPrefix($config);
+
+        return $this-&gt;repository(new ApcStore(new ApcWrapper, $prefix), $config);
+    }
+
+    /**
+     * Create an instance of the array cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createArrayDriver(array $config)
+    {
+        return $this-&gt;repository(new ArrayStore(
+            $config[&#039;serialize&#039;] ?? false,
+            $this-&gt;getSerializableClasses($config),
+        ), $config);
+    }
+
+    /**
+     * Create an instance of the database cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createDatabaseDriver(array $config)
+    {
+        $connection = $this-&gt;app[&#039;db&#039;]-&gt;connection($config[&#039;connection&#039;] ?? null);
+
+        $store = new DatabaseStore(
+            $connection,
+            $config[&#039;table&#039;],
+            $this-&gt;getPrefix($config),
+            $config[&#039;lock_table&#039;] ?? &#039;cache_locks&#039;,
+            $config[&#039;lock_lottery&#039;] ?? [2, 100],
+            $config[&#039;lock_timeout&#039;] ?? 86400,
+            $this-&gt;getSerializableClasses($config),
+        );
+
+        return $this-&gt;repository(
+            $store-&gt;setLockConnection(
+                $this-&gt;app[&#039;db&#039;]-&gt;connection($config[&#039;lock_connection&#039;] ?? $config[&#039;connection&#039;] ?? null)
+            ),
+            $config
+        );
+    }
+
+    /**
+     * Create an instance of the DynamoDB cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createDynamodbDriver(array $config)
+    {
+        $client = $this-&gt;newDynamodbClient($config);
+
+        return $this-&gt;repository(
+            new DynamoDbStore(
+                $client,
+                $config[&#039;table&#039;],
+                $config[&#039;attributes&#039;][&#039;key&#039;] ?? &#039;key&#039;,
+                $config[&#039;attributes&#039;][&#039;value&#039;] ?? &#039;value&#039;,
+                $config[&#039;attributes&#039;][&#039;expiration&#039;] ?? &#039;expires_at&#039;,
+                $this-&gt;getPrefix($config),
+                $this-&gt;getSerializableClasses($config),
+            ),
+            $config
+        );
+    }
+
+    /**
+     * Create new DynamoDb Client instance.
+     *
+     * @return \Aws\DynamoDb\DynamoDbClient
+     */
+    protected function newDynamodbClient(array $config)
+    {
+        $dynamoConfig = [
+            &#039;region&#039; =&gt; $config[&#039;region&#039;],
+            &#039;version&#039; =&gt; &#039;latest&#039;,
+            &#039;endpoint&#039; =&gt; $config[&#039;endpoint&#039;] ?? null,
+        ];
+
+        if (! empty($config[&#039;key&#039;]) &amp;&amp; ! empty($config[&#039;secret&#039;])) {
+            $dynamoConfig[&#039;credentials&#039;] = Arr::only(
+                $config, [&#039;key&#039;, &#039;secret&#039;]
+            );
+
+            if (! empty($config[&#039;token&#039;])) {
+                $dynamoConfig[&#039;credentials&#039;][&#039;token&#039;] = $config[&#039;token&#039;];
+            }
+        }
+
+        return new DynamoDbClient($dynamoConfig);
+    }
+
+    /**
+     * Create an instance of the failover cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createFailoverDriver(array $config)
+    {
+        return $this-&gt;repository(new FailoverStore(
+            $this,
+            $this-&gt;app-&gt;make(DispatcherContract::class),
+            $config[&#039;stores&#039;]
+        ), [&#039;events&#039; =&gt; false, ...$config]);
+    }
+
+    /**
+     * Create an instance of the file cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createFileDriver(array $config)
+    {
+        return $this-&gt;repository(
+            (new FileStore(
+                $this-&gt;app[&#039;files&#039;],
+                $config[&#039;path&#039;],
+                $config[&#039;permission&#039;] ?? null,
+                $this-&gt;getSerializableClasses($config),
+            ))
+                -&gt;setLockDirectory($config[&#039;lock_path&#039;] ?? null),
+            $config
+        );
+    }
+
+    /**
+     * Create an instance of the Memcached cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createMemcachedDriver(array $config)
+    {
+        $prefix = $this-&gt;getPrefix($config);
+
+        $memcached = $this-&gt;app[&#039;memcached.connector&#039;]-&gt;connect(
+            $config[&#039;servers&#039;],
+            $config[&#039;persistent_id&#039;] ?? null,
+            $config[&#039;options&#039;] ?? [],
+            array_filter($config[&#039;sasl&#039;] ?? [])
+        );
+
+        return $this-&gt;repository(new MemcachedStore($memcached, $prefix), $config);
+    }
+
+    /**
+     * Create an instance of the Null cache driver.
+     *
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createNullDriver()
+    {
+        return $this-&gt;repository(new NullStore, []);
+    }
+
+    /**
+     * Create an instance of the Redis cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createRedisDriver(array $config)
+    {
+        $redis = $this-&gt;app[&#039;redis&#039;];
+
+        $connection = $config[&#039;connection&#039;] ?? &#039;default&#039;;
+
+        $store = new RedisStore(
+            $redis,
+            $this-&gt;getPrefix($config),
+            $connection,
+            $this-&gt;getSerializableClasses($config),
+        );
+
+        return $this-&gt;repository(
+            $store-&gt;setLockConnection($config[&#039;lock_connection&#039;] ?? $connection),
+            $config
+        );
+    }
+
+    /**
+     * Create an instance of the session cache driver.
+     *
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    protected function createSessionDriver(array $config)
+    {
+        return $this-&gt;repository(
+            new SessionStore(
+                $this-&gt;getSession(),
+                $config[&#039;key&#039;] ?? &#039;_cache&#039;,
+            ),
+            $config
+        );
+    }
+
+    /**
+     * Get the session store implementation.
+     *
+     * @return \Illuminate\Contracts\Session\Session
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function getSession()
+    {
+        $session = $this-&gt;app[&#039;session&#039;] ?? null;
+
+        if (! $session) {
+            throw new InvalidArgumentException(&#039;Session store requires session manager to be available in container.&#039;);
+        }
+
+        return $session;
+    }
+
+    /**
+     * Create a new cache repository with the given implementation.
+     *
+     * @param  \Illuminate\Contracts\Cache\Store  $store
+     * @param  array  $config
+     * @return \Illuminate\Cache\Repository
+     */
+    public function repository(Store $store, array $config = [])
+    {
+        return tap(new Repository($store, Arr::only($config, [&#039;store&#039;])), function ($repository) use ($config) {
+            if ($config[&#039;events&#039;] ?? true) {
+                $this-&gt;setEventDispatcher($repository);
+            }
+        });
+    }
+
+    /**
+     * Set the event dispatcher on the given repository instance.
+     *
+     * @param  \Illuminate\Cache\Repository  $repository
+     * @return void
+     */
+    protected function setEventDispatcher(Repository $repository)
+    {
+        if (! $this-&gt;app-&gt;bound(DispatcherContract::class)) {
+            return;
+        }
+
+        $repository-&gt;setEventDispatcher(
+            $this-&gt;app[DispatcherContract::class]
+        );
+    }
+
+    /**
+     * Re-set the event dispatcher on all resolved cache repositories.
+     *
+     * @return void
+     */
+    public function refreshEventDispatcher()
+    {
+        array_map($this-&gt;setEventDispatcher(...), $this-&gt;stores);
+    }
+
+    /**
+     * Get the cache prefix.
+     *
+     * @param  array  $config
+     * @return string
+     */
+    protected function getPrefix(array $config)
+    {
+        return $config[&#039;prefix&#039;] ?? $this-&gt;app[&#039;config&#039;][&#039;cache.prefix&#039;];
+    }
+
+    /**
+     * Get the classes that should be allowed during unserialization.
+     *
+     * @param  array  $config
+     * @return array|bool|null
+     */
+    protected function getSerializableClasses(array $config)
+    {
+        return $this-&gt;app[&#039;config&#039;][&#039;cache.serializable_classes&#039;] ?? null;
+    }
+
+    /**
+     * Get the cache connection configuration.
+     *
+     * @param  string  $name
+     * @return array|null
+     */
+    protected function getConfig($name)
+    {
+        return $name !== &#039;null&#039;
+            ? $this-&gt;app[&#039;config&#039;][&quot;cache.stores.{$name}&quot;]
+            : [&#039;driver&#039; =&gt; &#039;null&#039;];
+    }
+
+    /**
+     * Get the default cache driver name.
+     *
+     * @return string
+     */
+    public function getDefaultDriver()
+    {
+        return $this-&gt;app[&#039;config&#039;][&#039;cache.default&#039;] ?? &#039;null&#039;;
+    }
+
+    /**
+     * Set the default cache driver name.
+     *
+     * @param  string  $name
+     * @return void
+     */
+    public function setDefaultDriver($name)
+    {
+        $this-&gt;app[&#039;config&#039;][&#039;cache.default&#039;] = $name;
+    }
+
+    /**
+     * Unset the given driver instances.
+     *
+     * @param  array|string|null  $name
+     * @return $this
+     */
+    public function forgetDriver($name = null)
+    {
+        $name ??= $this-&gt;getDefaultDriver();
+
+        foreach ((array) $name as $cacheName) {
+            if (isset($this-&gt;stores[$cacheName])) {
+                unset($this-&gt;stores[$cacheName]);
+            }
+        }
+
+        return $this;
+    }
+
+    /**
+     * Disconnect the given driver and remove from local cache.
+     *
+     * @param  string|null  $name
+     * @return void
+     */
+    public function purge($name = null)
+    {
+        $name ??= $this-&gt;getDefaultDriver();
+
+        unset($this-&gt;stores[$name]);
+    }
+
+    /**
+     * Register a custom driver creator Closure.
+     *
+     * @param  string  $driver
+     * @param  \Closure  $callback
+     *
+     * @param-closure-this  $this  $callback
+     *
+     * @return $this
+     */
+    public function extend($driver, Closure $callback)
+    {
+        $this-&gt;customCreators[$driver] = $callback-&gt;bindTo($this, $this);
+
+        return $this;
+    }
+
+    /**
+     * Set the application instance used by the manager.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     * @return $this
+     */
+    public function setApplication($app)
+    {
+        $this-&gt;app = $app;
+
+        return $this;
+    }
+
+    /**
+     * Dynamically call the default driver instance.
+     *
+     * @param  string  $method
+     * @param  array  $parameters
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        return $this-&gt;store()-&gt;$method(...$parameters);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Cache/CacheServiceProvider.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Cache/Console -->
+
+</body>
+</html>

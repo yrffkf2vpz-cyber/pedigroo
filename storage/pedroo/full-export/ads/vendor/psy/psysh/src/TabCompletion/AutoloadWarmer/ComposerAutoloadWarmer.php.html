@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/psy/psysh/src/TabCompletion/AutoloadWarmer/ComposerAutoloadWarmer.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\TabCompletion\AutoloadWarmer;
+
+use Psy\Shell;
+
+/**
+ * Composer autoload warmer.
+ *
+ * Loads classes from Composer&#039;s autoload configuration. By default, loads
+ * application classes but excludes vendor packages and test files to balance
+ * startup time with completion quality.
+ *
+ * Example configuration:
+ *
+ *     // Enable autoload warming with default settings
+ *     $config-&gt;setWarmAutoload(true);
+ *
+ *     // Disable autoload warming (default)
+ *     $config-&gt;setWarmAutoload(false);
+ *
+ *     // Configure ComposerAutoloadWarmer options
+ *     $config-&gt;setWarmAutoload([
+ *         &#039;includeVendor&#039;     =&gt; true,                   // Include all vendor packages
+ *         &#039;includeTests&#039;      =&gt; false,                  // Exclude test namespaces
+ *         &#039;includeNamespaces&#039; =&gt; [&#039;App\\&#039;, &#039;Lib\\&#039;],     // Only these namespaces
+ *         &#039;excludeNamespaces&#039; =&gt; [&#039;App\\Legacy\\&#039;],      // Exclude specific namespaces
+ *     ]);
+ *
+ *     // Include specific vendor packages only
+ *     $config-&gt;setWarmAutoload([
+ *         &#039;includeVendorNamespaces&#039; =&gt; [&#039;Symfony\\&#039;, &#039;Doctrine\\&#039;],
+ *     ]);
+ *
+ *     // Include all vendor except specific packages
+ *     $config-&gt;setWarmAutoload([
+ *         &#039;includeVendor&#039; =&gt; true,
+ *         &#039;excludeVendorNamespaces&#039; =&gt; [&#039;Symfony\\Debug\\&#039;],
+ *     ]);
+ *
+ *     // Use custom warmers only
+ *     $config-&gt;setWarmAutoload([
+ *         &#039;warmers&#039; =&gt; [$myCustomWarmer],
+ *     ]);
+ *
+ *     // Combine custom warmers with configured ComposerAutoloadWarmer
+ *     $config-&gt;setWarmAutoload([
+ *         &#039;warmers&#039;                 =&gt; [$myCustomWarmer],
+ *         &#039;includeVendorNamespaces&#039; =&gt; [&#039;Symfony\\&#039;],
+ *     ]);
+ */
+class ComposerAutoloadWarmer implements AutoloadWarmerInterface
+{
+    private bool $includeVendor;
+    private bool $includeTests;
+    private array $includeNamespaces;
+    private array $excludeNamespaces;
+    private array $includeVendorNamespaces;
+    private array $excludeVendorNamespaces;
+    private ?string $vendorDir = null;
+    private ?string $pharPrefix = null;
+
+    private const KNOWN_BAD_NAMESPACES = [
+        &#039;Psy\\Readline\\Hoa\\&#039;,
+        &#039;Composer\\&#039;, // Autoloading Composer classes breaks Composer autoloading :grimacing:
+    ];
+
+    /**
+     * PsySH&#039;s php-scoper prefix pattern for PHAR builds.
+     *
+     * Vendor dependencies in the PHAR are prefixed with &quot;_Psy&lt;hash&gt;\&quot; to avoid
+     * conflicts with user dependencies. The hash is randomly generated per build.
+     */
+    private const PHAR_SCOPED_PREFIX_PATTERN = &#039;/^_Psy[a-f0-9]+\\\\/&#039;;
+
+    /**
+     * @param array       $config    Configuration options
+     * @param string|null $vendorDir Optional vendor directory path (auto-detected if not provided)
+     */
+    public function __construct(array $config = [], ?string $vendorDir = null)
+    {
+        $hasVendorFilters = isset($config[&#039;includeVendorNamespaces&#039;]) || isset($config[&#039;excludeVendorNamespaces&#039;]);
+
+        // Validate conflicting config
+        if ($hasVendorFilters &amp;&amp; isset($config[&#039;includeVendor&#039;]) &amp;&amp; $config[&#039;includeVendor&#039;] === false) {
+            throw new \InvalidArgumentException(&#039;Cannot use includeVendorNamespaces or excludeVendorNamespaces when includeVendor is false&#039;);
+        }
+
+        // Vendor namespace filters imply includeVendor: true
+        $this-&gt;includeVendor = $config[&#039;includeVendor&#039;] ?? $hasVendorFilters;
+        $this-&gt;includeTests = $config[&#039;includeTests&#039;] ?? false;
+        $this-&gt;includeNamespaces = $this-&gt;normalizeNamespaces($config[&#039;includeNamespaces&#039;] ?? []);
+        $this-&gt;excludeNamespaces = $this-&gt;normalizeNamespaces($config[&#039;excludeNamespaces&#039;] ?? []);
+        $this-&gt;includeVendorNamespaces = $this-&gt;normalizeNamespaces($config[&#039;includeVendorNamespaces&#039;] ?? []);
+        $this-&gt;excludeVendorNamespaces = $this-&gt;normalizeNamespaces($config[&#039;excludeVendorNamespaces&#039;] ?? []);
+
+        // Cache PHAR prefix to avoid repeated Phar::running() calls
+        if (Shell::isPhar()) {
+            $runningPhar = \Phar::running(false);
+            $this-&gt;pharPrefix = &#039;phar://&#039;.$runningPhar.&#039;/&#039;;
+        }
+
+        $vendorDir = $vendorDir ?? $this-&gt;findVendorDir();
+        if ($vendorDir !== null) {
+            $resolvedVendorDir = \realpath($vendorDir);
+            if ($resolvedVendorDir !== false) {
+                $this-&gt;vendorDir = \str_replace(&#039;\\&#039;, &#039;/&#039;, $resolvedVendorDir);
+            }
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function warm(): int
+    {
+        // Get count of already-loaded classes before we start
+        $beforeCount = \count(\get_declared_classes()) +
+                       \count(\get_declared_interfaces()) +
+                       \count(\get_declared_traits());
+
+        $classes = $this-&gt;getClassNames();
+        foreach ($classes as $class) {
+            try {
+                // Skip if already loaded (check without autoloading first)
+                if (
+                    \class_exists($class, false) ||
+                    \interface_exists($class, false) ||
+                    \trait_exists($class, false)
+                ) {
+                    continue;
+                }
+
+                // Try to load the class/interface/trait
+                // The autoload parameter (true) will trigger autoloading
+                \class_exists($class, true) ||
+                \interface_exists($class, true) ||
+                \trait_exists($class, true);
+            } catch (\Throwable $e) {
+                // Ignore classes that fail to load
+                // This is expected for classes with missing dependencies, etc.
+            }
+        }
+
+        // Return the number of newly loaded classes
+        $afterCount = \count(\get_declared_classes()) +
+                      \count(\get_declared_interfaces()) +
+                      \count(\get_declared_traits());
+
+        return $afterCount - $beforeCount;
+    }
+
+    /**
+     * Discover classes from available sources.
+     *
+     * Uses two complementary strategies:
+     * 1. ClassLoader&#039;s classmap (from optimized autoload or registered classes)
+     * 2. ClassMapGenerator to scan PSR-4 directories (if available, safe, no side effects)
+     *
+     * Both strategies are attempted and results are combined, since ClassLoader
+     * may have an optimized classmap while ClassMapGenerator can discover new
+     * classes added during development.
+     *
+     * @internal This method is exported for testability and is not part of the public API
+     *
+     * @return string[] Fully-qualified class names
+     */
+    public function getClassNames(): array
+    {
+        $autoloadMap = $this-&gt;getAutoloadClassMap();
+        $generatedMap = $this-&gt;generateClassMap();
+
+        return $this-&gt;classesFromClassMap(\array_merge($autoloadMap, $generatedMap));
+    }
+
+    /**
+     * Get class map from the registered Composer ClassLoader, if available.
+     *
+     * This map is populated by running `composer dump-autoload`
+     *
+     * @return array Map of class name =&gt; file path
+     */
+    private function getAutoloadClassMap(): array
+    {
+        // If we found a project vendor dir, try to register their autoloader (if it hasn&#039;t been already)
+        // Skip if vendor dir is inside a PHAR (don&#039;t re-require the PHAR&#039;s autoloader)
+        if ($this-&gt;vendorDir !== null &amp;&amp; \substr($this-&gt;vendorDir, 0, 7) !== &#039;phar://&#039;) {
+            $projectAutoload = $this-&gt;vendorDir.&#039;/autoload.php&#039;;
+            if (\file_exists($projectAutoload)) {
+                try {
+                    require_once $projectAutoload;
+                } catch (\Throwable $e) {
+                    // Ignore autoloader errors
+                }
+            }
+        }
+
+        foreach (\spl_autoload_functions() as $autoloader) {
+            if (!\is_array($autoloader)) {
+                continue;
+            }
+
+            $loader = $autoloader[0] ?? null;
+            if (!\is_object($loader) || \get_class($loader) !== &#039;Composer\Autoload\ClassLoader&#039;) {
+                continue;
+            }
+
+            // Check if this loader contains scoped classes (indicates it&#039;s from the PHAR)
+            if (\method_exists($loader, &#039;getClassMap&#039;)) {
+                $classMap = $loader-&gt;getClassMap();
+                foreach (\array_keys($classMap) as $class) {
+                    if (\preg_match(self::PHAR_SCOPED_PREFIX_PATTERN, $class)) {
+                        continue 2; // Skip to next autoloader
+                    }
+                }
+            }
+
+            // If we have an explicit vendor dir, check if this loader serves that directory
+            if ($this-&gt;vendorDir !== null) {
+                $hasTargetPaths = false;
+
+                if (\method_exists($loader, &#039;getPrefixesPsr4&#039;)) {
+                    $prefixes = $loader-&gt;getPrefixesPsr4();
+                    foreach ($prefixes as $namespace =&gt; $paths) {
+                        foreach ($paths as $path) {
+                            if (\strpos($path, $this-&gt;vendorDir.&#039;/&#039;) === 0) {
+                                $hasTargetPaths = true;
+                                break 2;
+                            }
+                        }
+                    }
+                }
+
+                if (!$hasTargetPaths) {
+                    continue;
+                }
+            }
+
+            if (\method_exists($loader, &#039;getClassMap&#039;)) {
+                return $loader-&gt;getClassMap();
+            }
+
+            return [];
+        }
+
+        return [];
+    }
+
+    /**
+     * Scan autoload directories using a Composer ClassMapGenerator, if available.
+     *
+     * @return array Map of class name =&gt; file path
+     */
+    private function generateClassMap(): array
+    {
+        if ($this-&gt;vendorDir === null || !\class_exists(&#039;Composer\\ClassMapGenerator\\ClassMapGenerator&#039;, true)) {
+            return [];
+        }
+
+        // Get PSR-4 mappings from Composer
+        $psr4File = $this-&gt;vendorDir.&#039;/composer/autoload_psr4.php&#039;;
+        if (!\file_exists($psr4File)) {
+            return [];
+        }
+
+        try {
+            $psr4Map = require $psr4File;
+            if (!\is_array($psr4Map)) {
+                return [];
+            }
+
+            $generator = new \Composer\ClassMapGenerator\ClassMapGenerator();
+
+            foreach ($psr4Map as $prefix =&gt; $paths) {
+                foreach ($paths as $path) {
+                    if (!\is_dir($path) || $this-&gt;shouldSkipPath($path)) {
+                        continue;
+                    }
+
+                    try {
+                        $generator-&gt;scanPaths($path);
+                    } catch (\Throwable $e) {
+                        // Ignore errors (permissions, malformed files, etc.)
+                    }
+                }
+            }
+
+            return $generator-&gt;getClassMap()-&gt;getMap();
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Find the vendor directory by checking registered autoloaders, falling
+     * back to filesystem search.
+     *
+     * @return string|null
+     */
+    private function findVendorDir(): ?string
+    {
+        // When running the PsySH PHAR, skip autoloader detection. It will just return the internal
+        // vendor directory.
+        if ($this-&gt;pharPrefix !== null) {
+            // Try to find from autoloader
+            foreach (\spl_autoload_functions() as $autoloader) {
+                if (!\is_array($autoloader)) {
+                    continue;
+                }
+
+                $loader = $autoloader[0] ?? null;
+                if (!\is_object($loader)) {
+                    continue;
+                }
+
+                try {
+                    $reflection = new \ReflectionClass($loader);
+                    $loaderPath = $reflection-&gt;getFileName();
+                    $normalizedPath = \str_replace(&#039;\\&#039;, &#039;/&#039;, $loaderPath);
+
+                    // Skip any other PHAR-based autoloaders
+                    if (\strpos($normalizedPath, &#039;phar://&#039;) === 0) {
+                        continue;
+                    }
+
+                    // ClassLoader is typically at vendor/composer/ClassLoader.php
+                    if (\strpos($normalizedPath, &#039;/vendor/composer/&#039;) !== false) {
+                        return \dirname($loaderPath, 2);
+                    }
+                } catch (\Throwable $e) {
+                    // Ignore and try next autoloader
+                }
+            }
+        }
+
+        // Walk up the directory tree from cwd looking for vendor directory
+        $dir = \getcwd();
+        $root = \dirname($dir);
+
+        while ($dir !== $root) {
+            $vendorDir = $dir.&#039;/vendor&#039;;
+            if (\is_dir($vendorDir) &amp;&amp; \file_exists($vendorDir.&#039;/composer/autoload_psr4.php&#039;)) {
+                return $vendorDir;
+            }
+
+            $root = $dir;
+            $dir = \dirname($dir);
+        }
+
+        return null;
+    }
+
+    /**
+     * Normalize namespace prefixes.
+     *
+     * Removes leading backslash and ensures trailing backslash.
+     *
+     * @param string[] $namespaces
+     *
+     * @return string[]
+     */
+    private function normalizeNamespaces(array $namespaces): array
+    {
+        return \array_map(function ($namespace) {
+            return \trim($namespace, &#039;\\&#039;).&#039;\\&#039;;
+        }, $namespaces);
+    }
+
+    /**
+     * Check if a path should be skipped based on configuration.
+     *
+     * @param string $path File or directory path
+     *
+     * @return bool True if the path should be skipped
+     */
+    private function shouldSkipPath(string $path): bool
+    {
+        $normalizedPath = \str_replace(&#039;\\&#039;, &#039;/&#039;, $path);
+
+        // Skip paths from PsySH&#039;s own PHAR; these are PsySH&#039;s bundled dependencies, not user dependencies
+        if ($this-&gt;isPathFromPhar($normalizedPath)) {
+            return true;
+        }
+
+        // Check if path is under vendor directory
+        if (!$this-&gt;includeVendor &amp;&amp; $this-&gt;vendorDir !== null) {
+            // Resolve relative paths like &quot;vendor/composer/../../src/Cache.php&quot; before comparing
+            $resolvedPath = \realpath($path);
+            if ($resolvedPath === false) {
+                // File doesn&#039;t exist, permissions, etc. /shrug
+                return true;
+            }
+
+            $resolvedPath = \str_replace(&#039;\\&#039;, &#039;/&#039;, $resolvedPath);
+            if (\strpos($resolvedPath, $this-&gt;vendorDir.&#039;/&#039;) === 0) {
+                return true;
+            }
+        }
+
+        // Check test paths
+        if (!$this-&gt;includeTests) {
+            $patterns = [&#039;/test/&#039;, &#039;/tests/&#039;, &#039;/spec/&#039;, &#039;/specs/&#039;];
+            foreach ($patterns as $pattern) {
+                if (\stripos($normalizedPath, $pattern) !== false) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Get classes from class map, filtered based on configured namespace rules and excluded paths.
+     *
+     * @param array $classMap Map of class name =&gt; file path
+     *
+     * @return string[]
+     */
+    private function classesFromClassMap(array $classMap): array
+    {
+        // First filter the map by path
+        $classMap = \array_filter($classMap, function ($path) {
+            return !$this-&gt;shouldSkipPath($path);
+        });
+
+        $classes = \array_keys($classMap);
+
+        // Then filter by namespace
+        return \array_values(
+            \array_filter($classes, function ($class) use ($classMap) {
+                // Exclude PsySH&#039;s scoped PHAR dependencies (e.g., _Psy3684f4474398\Symfony\...)
+                if (\preg_match(self::PHAR_SCOPED_PREFIX_PATTERN, $class)) {
+                    return false;
+                }
+
+                // Hardcode excluding known-bad classes
+                foreach (self::KNOWN_BAD_NAMESPACES as $namespace) {
+                    if (\stripos($class, $namespace) === 0) {
+                        return false;
+                    }
+                }
+
+                $isVendorClass = $this-&gt;isVendorClass($class, $classMap);
+
+                // Apply vendor-specific exclude filters
+                if ($isVendorClass &amp;&amp; !empty($this-&gt;excludeVendorNamespaces)) {
+                    foreach ($this-&gt;excludeVendorNamespaces as $namespace) {
+                        if (\stripos($class, $namespace) === 0) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Apply general exclude filters
+                foreach ($this-&gt;excludeNamespaces as $namespace) {
+                    if (\stripos($class, $namespace) === 0) {
+                        return false;
+                    }
+                }
+
+                // Apply vendor-specific include filters
+                if ($isVendorClass &amp;&amp; !empty($this-&gt;includeVendorNamespaces)) {
+                    foreach ($this-&gt;includeVendorNamespaces as $namespace) {
+                        if (\stripos($class, $namespace) === 0) {
+                            return true;
+                        }
+                    }
+
+                    return false; // Vendor class doesn&#039;t match vendor filters
+                }
+
+                // Apply general include filters
+                if (!empty($this-&gt;includeNamespaces)) {
+                    foreach ($this-&gt;includeNamespaces as $namespace) {
+                        if (\stripos($class, $namespace) === 0) {
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                // No include filters provided, and didn&#039;t match exclude filters
+                return true;
+            }),
+        );
+    }
+
+    /**
+     * Check if a class is from the vendor directory.
+     *
+     * @param string $class    Class name
+     * @param array  $classMap Map of class name =&gt; file path
+     *
+     * @return bool
+     */
+    private function isVendorClass(string $class, array $classMap): bool
+    {
+        if ($this-&gt;vendorDir === null || !isset($classMap[$class])) {
+            return false;
+        }
+
+        $path = $classMap[$class];
+
+        // Resolve relative paths like &quot;vendor/composer/../../src/Cache.php&quot; before comparing
+        // This ensures consistency with shouldSkipPath() logic
+        $resolvedPath = \realpath($path);
+        if ($resolvedPath === false) {
+            // If realpath fails, fall back to raw path comparison
+            // This matches the behavior in shouldSkipPath()
+            $normalizedPath = \str_replace(&#039;\\&#039;, &#039;/&#039;, $path);
+
+            return \strpos($normalizedPath, $this-&gt;vendorDir.&#039;/&#039;) === 0;
+        }
+
+        $normalizedPath = \str_replace(&#039;\\&#039;, &#039;/&#039;, $resolvedPath);
+
+        return \strpos($normalizedPath, $this-&gt;vendorDir.&#039;/&#039;) === 0;
+    }
+
+    /**
+     * Check if a path is from PsySH&#039;s own PHAR.
+     *
+     * @param string $path File path to check
+     *
+     * @return bool True if the path is from PsySH&#039;s PHAR
+     */
+    private function isPathFromPhar(string $path): bool
+    {
+        if ($this-&gt;pharPrefix === null || \strpos($path, &#039;phar://&#039;) !== 0) {
+            return false;
+        }
+
+        return \strpos($path, $this-&gt;pharPrefix) === 0;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/psy/psysh/src/TabCompletion/Matcher/AbstractContextAwareMatcher.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/psy/psysh/src/TabCompletion/Matcher -->
+
+</body>
+</html>

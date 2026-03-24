@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Database/Query/Grammars/SqlServerGrammar.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database\Query\Grammars;
+
+use Illuminate\Database\Query\Builder;
+use Illuminate\Database\Query\JoinLateralClause;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
+use InvalidArgumentException;
+
+class SqlServerGrammar extends Grammar
+{
+    /**
+     * All of the available clause operators.
+     *
+     * @var string[]
+     */
+    protected $operators = [
+        &#039;=&#039;, &#039;&lt;&#039;, &#039;&gt;&#039;, &#039;&lt;=&#039;, &#039;&gt;=&#039;, &#039;!&lt;&#039;, &#039;!&gt;&#039;, &#039;&lt;&gt;&#039;, &#039;!=&#039;,
+        &#039;like&#039;, &#039;not like&#039;, &#039;ilike&#039;,
+        &#039;&amp;&#039;, &#039;&amp;=&#039;, &#039;|&#039;, &#039;|=&#039;, &#039;^&#039;, &#039;^=&#039;,
+    ];
+
+    /**
+     * The components that make up a select clause.
+     *
+     * @var string[]
+     */
+    protected $selectComponents = [
+        &#039;aggregate&#039;,
+        &#039;columns&#039;,
+        &#039;from&#039;,
+        &#039;indexHint&#039;,
+        &#039;joins&#039;,
+        &#039;wheres&#039;,
+        &#039;groups&#039;,
+        &#039;havings&#039;,
+        &#039;orders&#039;,
+        &#039;offset&#039;,
+        &#039;limit&#039;,
+        &#039;lock&#039;,
+    ];
+
+    /**
+     * Compile a select query into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
+     */
+    public function compileSelect(Builder $query)
+    {
+        // An order by clause is required for SQL Server offset to function...
+        if ($query-&gt;offset &amp;&amp; empty($query-&gt;orders)) {
+            $query-&gt;orders[] = [&#039;sql&#039; =&gt; &#039;(SELECT 0)&#039;];
+        }
+
+        return parent::compileSelect($query);
+    }
+
+    /**
+     * Compile the &quot;select *&quot; portion of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $columns
+     * @return string|null
+     */
+    protected function compileColumns(Builder $query, $columns)
+    {
+        if (! is_null($query-&gt;aggregate)) {
+            return;
+        }
+
+        $select = $query-&gt;distinct ? &#039;select distinct &#039; : &#039;select &#039;;
+
+        // If there is a limit on the query, but not an offset, we will add the top
+        // clause to the query, which serves as a &quot;limit&quot; type clause within the
+        // SQL Server system similar to the limit keywords available in MySQL.
+        if (is_numeric($query-&gt;limit) &amp;&amp; $query-&gt;limit &gt; 0 &amp;&amp; $query-&gt;offset &lt;= 0) {
+            $select .= &#039;top &#039;.((int) $query-&gt;limit).&#039; &#039;;
+        }
+
+        return $select.$this-&gt;columnize($columns);
+    }
+
+    /**
+     * Compile the &quot;from&quot; portion of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  string  $table
+     * @return string
+     */
+    protected function compileFrom(Builder $query, $table)
+    {
+        $from = parent::compileFrom($query, $table);
+
+        if (is_string($query-&gt;lock)) {
+            return $from.&#039; &#039;.$query-&gt;lock;
+        }
+
+        if (! is_null($query-&gt;lock)) {
+            return $from.&#039; with(rowlock,&#039;.($query-&gt;lock ? &#039;updlock,&#039; : &#039;&#039;).&#039;holdlock)&#039;;
+        }
+
+        return $from;
+    }
+
+    /**
+     * Compile the index hints for the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  \Illuminate\Database\Query\IndexHint  $indexHint
+     * @return string
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function compileIndexHint(Builder $query, $indexHint)
+    {
+        if ($indexHint-&gt;type !== &#039;force&#039;) {
+            return &#039;&#039;;
+        }
+
+        $index = $indexHint-&gt;index;
+
+        if (! preg_match(&#039;/^[a-zA-Z0-9_$]+$/&#039;, $index)) {
+            throw new InvalidArgumentException(&#039;Index name contains invalid characters.&#039;);
+        }
+
+        return &quot;with (index([{$index}]))&quot;;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereBitwise(Builder $query, $where)
+    {
+        $value = $this-&gt;parameter($where[&#039;value&#039;]);
+
+        $operator = str_replace(&#039;?&#039;, &#039;??&#039;, $where[&#039;operator&#039;]);
+
+        return &#039;(&#039;.$this-&gt;wrap($where[&#039;column&#039;]).&#039; &#039;.$operator.&#039; &#039;.$value.&#039;) != 0&#039;;
+    }
+
+    /**
+     * Compile a &quot;where null safe equals&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereNullSafeEquals(Builder $query, $where)
+    {
+        return &#039;exists (select &#039;.$this-&gt;wrap($where[&#039;column&#039;]).&#039; intersect select &#039;.$this-&gt;parameter($where[&#039;value&#039;]).&#039;)&#039;;
+    }
+
+    /**
+     * Compile a &quot;where date&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereDate(Builder $query, $where)
+    {
+        $value = $this-&gt;parameter($where[&#039;value&#039;]);
+
+        return &#039;cast(&#039;.$this-&gt;wrap($where[&#039;column&#039;]).&#039; as date) &#039;.$where[&#039;operator&#039;].&#039; &#039;.$value;
+    }
+
+    /**
+     * Compile a &quot;where time&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $where
+     * @return string
+     */
+    protected function whereTime(Builder $query, $where)
+    {
+        $value = $this-&gt;parameter($where[&#039;value&#039;]);
+
+        return &#039;cast(&#039;.$this-&gt;wrap($where[&#039;column&#039;]).&#039; as time) &#039;.$where[&#039;operator&#039;].&#039; &#039;.$value;
+    }
+
+    /**
+     * Compile a &quot;JSON contains&quot; statement into SQL.
+     *
+     * @param  string  $column
+     * @param  string  $value
+     * @return string
+     */
+    protected function compileJsonContains($column, $value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($column);
+
+        return $value.&#039; in (select [value] from openjson(&#039;.$field.$path.&#039;))&#039;;
+    }
+
+    /**
+     * Prepare the binding for a &quot;JSON contains&quot; statement.
+     *
+     * @param  mixed  $binding
+     * @return string
+     */
+    public function prepareBindingForJsonContains($binding)
+    {
+        return is_bool($binding) ? json_encode($binding) : $binding;
+    }
+
+    /**
+     * Compile a &quot;JSON contains key&quot; statement into SQL.
+     *
+     * @param  string  $column
+     * @return string
+     */
+    protected function compileJsonContainsKey($column)
+    {
+        $segments = explode(&#039;-&gt;&#039;, $column);
+
+        $lastSegment = array_pop($segments);
+
+        if (preg_match(&#039;/\[([0-9]+)\]$/&#039;, $lastSegment, $matches)) {
+            $segments[] = Str::beforeLast($lastSegment, $matches[0]);
+
+            $key = $matches[1];
+        } else {
+            $key = &quot;&#039;&quot;.str_replace(&quot;&#039;&quot;, &quot;&#039;&#039;&quot;, $lastSegment).&quot;&#039;&quot;;
+        }
+
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath(implode(&#039;-&gt;&#039;, $segments));
+
+        return $key.&#039; in (select [key] from openjson(&#039;.$field.$path.&#039;))&#039;;
+    }
+
+    /**
+     * Compile a &quot;JSON length&quot; statement into SQL.
+     *
+     * @param  string  $column
+     * @param  string  $operator
+     * @param  string  $value
+     * @return string
+     */
+    protected function compileJsonLength($column, $operator, $value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($column);
+
+        return &#039;(select count(*) from openjson(&#039;.$field.$path.&#039;)) &#039;.$operator.&#039; &#039;.$value;
+    }
+
+    /**
+     * Compile a &quot;JSON value cast&quot; statement into SQL.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    public function compileJsonValueCast($value)
+    {
+        return &#039;json_query(&#039;.$value.&#039;)&#039;;
+    }
+
+    /**
+     * Compile a single having clause.
+     *
+     * @param  array  $having
+     * @return string
+     */
+    protected function compileHaving(array $having)
+    {
+        if ($having[&#039;type&#039;] === &#039;Bitwise&#039;) {
+            return $this-&gt;compileHavingBitwise($having);
+        }
+
+        return parent::compileHaving($having);
+    }
+
+    /**
+     * Compile a having clause involving a bitwise operator.
+     *
+     * @param  array  $having
+     * @return string
+     */
+    protected function compileHavingBitwise($having)
+    {
+        $column = $this-&gt;wrap($having[&#039;column&#039;]);
+
+        $parameter = $this-&gt;parameter($having[&#039;value&#039;]);
+
+        return &#039;(&#039;.$column.&#039; &#039;.$having[&#039;operator&#039;].&#039; &#039;.$parameter.&#039;) != 0&#039;;
+    }
+
+    /**
+     * Compile a delete statement without joins into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  string  $table
+     * @param  string  $where
+     * @return string
+     */
+    protected function compileDeleteWithoutJoins(Builder $query, $table, $where)
+    {
+        $sql = parent::compileDeleteWithoutJoins($query, $table, $where);
+
+        return ! is_null($query-&gt;limit) &amp;&amp; $query-&gt;limit &gt; 0 &amp;&amp; $query-&gt;offset &lt;= 0
+            ? Str::replaceFirst(&#039;delete&#039;, &#039;delete top (&#039;.$query-&gt;limit.&#039;)&#039;, $sql)
+            : $sql;
+    }
+
+    /**
+     * Compile the random statement into SQL.
+     *
+     * @param  string|int  $seed
+     * @return string
+     */
+    public function compileRandom($seed)
+    {
+        return &#039;NEWID()&#039;;
+    }
+
+    /**
+     * Compile the &quot;limit&quot; portions of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  int  $limit
+     * @return string
+     */
+    protected function compileLimit(Builder $query, $limit)
+    {
+        $limit = (int) $limit;
+
+        if ($limit &amp;&amp; $query-&gt;offset &gt; 0) {
+            return &quot;fetch next {$limit} rows only&quot;;
+        }
+
+        return &#039;&#039;;
+    }
+
+    /**
+     * Compile a row number clause.
+     *
+     * @param  string  $partition
+     * @param  string  $orders
+     * @return string
+     */
+    protected function compileRowNumber($partition, $orders)
+    {
+        if (empty($orders)) {
+            $orders = &#039;order by (select 0)&#039;;
+        }
+
+        return parent::compileRowNumber($partition, $orders);
+    }
+
+    /**
+     * Compile the &quot;offset&quot; portions of the query.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  int  $offset
+     * @return string
+     */
+    protected function compileOffset(Builder $query, $offset)
+    {
+        $offset = (int) $offset;
+
+        if ($offset) {
+            return &quot;offset {$offset} rows&quot;;
+        }
+
+        return &#039;&#039;;
+    }
+
+    /**
+     * Compile the lock into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  bool|string  $value
+     * @return string
+     */
+    protected function compileLock(Builder $query, $value)
+    {
+        return &#039;&#039;;
+    }
+
+    /**
+     * Wrap a union subquery in parentheses.
+     *
+     * @param  string  $sql
+     * @return string
+     */
+    protected function wrapUnion($sql)
+    {
+        return &#039;select * from (&#039;.$sql.&#039;) as &#039;.$this-&gt;wrapTable(&#039;temp_table&#039;);
+    }
+
+    /**
+     * Compile an exists statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @return string
+     */
+    public function compileExists(Builder $query)
+    {
+        $existsQuery = clone $query;
+
+        $existsQuery-&gt;columns = [];
+
+        return $this-&gt;compileSelect($existsQuery-&gt;selectRaw(&#039;1 [exists]&#039;)-&gt;limit(1));
+    }
+
+    /**
+     * Compile an update statement with joins into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  string  $table
+     * @param  string  $columns
+     * @param  string  $where
+     * @return string
+     */
+    protected function compileUpdateWithJoins(Builder $query, $table, $columns, $where)
+    {
+        $alias = last(explode(&#039; as &#039;, $table));
+
+        $joins = $this-&gt;compileJoins($query, $query-&gt;joins);
+
+        return &quot;update {$alias} set {$columns} from {$table} {$joins} {$where}&quot;;
+    }
+
+    /**
+     * Compile an &quot;upsert&quot; statement into SQL.
+     *
+     * @param  \Illuminate\Database\Query\Builder  $query
+     * @param  array  $values
+     * @param  array  $uniqueBy
+     * @param  array  $update
+     * @return string
+     */
+    public function compileUpsert(Builder $query, array $values, array $uniqueBy, array $update)
+    {
+        $columns = $this-&gt;columnize(array_keys(array_first($values)));
+
+        $sql = &#039;merge &#039;.$this-&gt;wrapTable($query-&gt;from).&#039; &#039;;
+
+        $parameters = (new Collection($values))
+            -&gt;map(fn ($record) =&gt; &#039;(&#039;.$this-&gt;parameterize($record).&#039;)&#039;)
+            -&gt;implode(&#039;, &#039;);
+
+        $sql .= &#039;using (values &#039;.$parameters.&#039;) &#039;.$this-&gt;wrapTable(&#039;laravel_source&#039;).&#039; (&#039;.$columns.&#039;) &#039;;
+
+        $on = (new Collection($uniqueBy))
+            -&gt;map(fn ($column) =&gt; $this-&gt;wrap(&#039;laravel_source.&#039;.$column).&#039; = &#039;.$this-&gt;wrap($query-&gt;from.&#039;.&#039;.$column))
+            -&gt;implode(&#039; and &#039;);
+
+        $sql .= &#039;on &#039;.$on.&#039; &#039;;
+
+        if ($update) {
+            $update = (new Collection($update))-&gt;map(function ($value, $key) {
+                return is_numeric($key)
+                    ? $this-&gt;wrap($value).&#039; = &#039;.$this-&gt;wrap(&#039;laravel_source.&#039;.$value)
+                    : $this-&gt;wrap($key).&#039; = &#039;.$this-&gt;parameter($value);
+            })-&gt;implode(&#039;, &#039;);
+
+            $sql .= &#039;when matched then update set &#039;.$update.&#039; &#039;;
+        }
+
+        $sql .= &#039;when not matched then insert (&#039;.$columns.&#039;) values (&#039;.$columns.&#039;);&#039;;
+
+        return $sql;
+    }
+
+    /**
+     * Prepare the bindings for an update statement.
+     *
+     * @param  array  $bindings
+     * @param  array  $values
+     * @return array
+     */
+    #[\Override]
+    public function prepareBindingsForUpdate(array $bindings, array $values)
+    {
+        $cleanBindings = Arr::except($bindings, &#039;select&#039;);
+
+        $values = Arr::flatten(array_map(fn ($value) =&gt; value($value), $values));
+
+        return array_values(
+            array_merge($values, Arr::flatten($cleanBindings))
+        );
+    }
+
+    /**
+     * Compile a &quot;lateral join&quot; clause.
+     *
+     * @param  \Illuminate\Database\Query\JoinLateralClause  $join
+     * @param  string  $expression
+     * @return string
+     */
+    public function compileJoinLateral(JoinLateralClause $join, string $expression): string
+    {
+        $type = $join-&gt;type == &#039;left&#039; ? &#039;outer&#039; : &#039;cross&#039;;
+
+        return trim(&quot;{$type} apply {$expression}&quot;);
+    }
+
+    /**
+     * Compile the SQL statement to define a savepoint.
+     *
+     * @param  string  $name
+     * @return string
+     */
+    public function compileSavepoint($name)
+    {
+        return &#039;SAVE TRANSACTION &#039;.$name;
+    }
+
+    /**
+     * Compile the SQL statement to execute a savepoint rollback.
+     *
+     * @param  string  $name
+     * @return string
+     */
+    public function compileSavepointRollBack($name)
+    {
+        return &#039;ROLLBACK TRANSACTION &#039;.$name;
+    }
+
+    /**
+     * Compile a query to get the number of open connections for a database.
+     *
+     * @return string
+     */
+    public function compileThreadCount()
+    {
+        return &#039;select count(*) Value from sys.dm_exec_sessions where status = N\&#039;running\&#039;&#039;;
+    }
+
+    /**
+     * Get the format for database stored dates.
+     *
+     * @return string
+     */
+    public function getDateFormat()
+    {
+        return &#039;Y-m-d H:i:s.v&#039;;
+    }
+
+    /**
+     * Wrap a single string in keyword identifiers.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function wrapValue($value)
+    {
+        return $value === &#039;*&#039; ? $value : &#039;[&#039;.str_replace(&#039;]&#039;, &#039;]]&#039;, $value).&#039;]&#039;;
+    }
+
+    /**
+     * Wrap the given JSON selector.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function wrapJsonSelector($value)
+    {
+        [$field, $path] = $this-&gt;wrapJsonFieldAndPath($value);
+
+        return &#039;json_value(&#039;.$field.$path.&#039;)&#039;;
+    }
+
+    /**
+     * Wrap the given JSON boolean value.
+     *
+     * @param  string  $value
+     * @return string
+     */
+    protected function wrapJsonBooleanValue($value)
+    {
+        return &quot;&#039;&quot;.$value.&quot;&#039;&quot;;
+    }
+
+    /**
+     * Wrap a table in keyword identifiers.
+     *
+     * @param  \Illuminate\Contracts\Database\Query\Expression|string  $table
+     * @param  string|null  $prefix
+     * @return string
+     */
+    public function wrapTable($table, $prefix = null)
+    {
+        if (! $this-&gt;isExpression($table)) {
+            return $this-&gt;wrapTableValuedFunction(parent::wrapTable($table, $prefix));
+        }
+
+        return $this-&gt;getValue($table);
+    }
+
+    /**
+     * Wrap a table in keyword identifiers.
+     *
+     * @param  string  $table
+     * @return string
+     */
+    protected function wrapTableValuedFunction($table)
+    {
+        if (preg_match(&#039;/^(.+?)(\(.*?\))]$/&#039;, $table, $matches) === 1) {
+            $table = $matches[1].&#039;]&#039;.$matches[2];
+        }
+
+        return $table;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Database/Query/IndexHint.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Database/Query/Processors -->
+
+</body>
+</html>

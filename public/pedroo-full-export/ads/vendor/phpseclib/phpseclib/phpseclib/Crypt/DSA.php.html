@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/DSA.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * Pure-PHP FIPS 186-4 compliant implementation of DSA.
+ *
+ * PHP version 5
+ *
+ * Here&#039;s an example of how to create signatures and verify signatures with this library:
+ * &lt;code&gt;
+ * &lt;?php
+ * include &#039;vendor/autoload.php&#039;;
+ *
+ * $private = \phpseclib3\Crypt\DSA::createKey();
+ * $public = $private-&gt;getPublicKey();
+ *
+ * $plaintext = &#039;terrafrost&#039;;
+ *
+ * $signature = $private-&gt;sign($plaintext);
+ *
+ * echo $public-&gt;verify($plaintext, $signature) ? &#039;verified&#039; : &#039;unverified&#039;;
+ * ?&gt;
+ * &lt;/code&gt;
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2016 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\Crypt;
+
+use phpseclib3\Crypt\Common\AsymmetricKey;
+use phpseclib3\Crypt\DSA\Parameters;
+use phpseclib3\Crypt\DSA\PrivateKey;
+use phpseclib3\Crypt\DSA\PublicKey;
+use phpseclib3\Exception\InsufficientSetupException;
+use phpseclib3\Math\BigInteger;
+
+/**
+ * Pure-PHP FIPS 186-4 compliant implementation of DSA.
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+abstract class DSA extends AsymmetricKey
+{
+    /**
+     * Algorithm Name
+     *
+     * @var string
+     */
+    const ALGORITHM = &#039;DSA&#039;;
+
+    /**
+     * DSA Prime P
+     *
+     * @var BigInteger
+     */
+    protected $p;
+
+    /**
+     * DSA Group Order q
+     *
+     * Prime divisor of p-1
+     *
+     * @var BigInteger
+     */
+    protected $q;
+
+    /**
+     * DSA Group Generator G
+     *
+     * @var BigInteger
+     */
+    protected $g;
+
+    /**
+     * DSA public key value y
+     *
+     * @var BigInteger
+     */
+    protected $y;
+
+    /**
+     * Signature Format
+     *
+     * @var string
+     */
+    protected $sigFormat;
+
+    /**
+     * Signature Format (Short)
+     *
+     * @var string
+     */
+    protected $shortFormat;
+
+    /**
+     * Create DSA parameters
+     *
+     * @param int $L
+     * @param int $N
+     * @return DSA|bool
+     */
+    public static function createParameters($L = 2048, $N = 224)
+    {
+        self::initialize_static_variables();
+
+        $class = new \ReflectionClass(static::class);
+        if ($class-&gt;isFinal()) {
+            throw new \RuntimeException(&#039;createParameters() should not be called from final classes (&#039; . static::class . &#039;)&#039;);
+        }
+
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+
+        switch (true) {
+            case $N == 160:
+            /*
+              in FIPS 186-1 and 186-2 N was fixed at 160 whereas K had an upper bound of 1024.
+              RFC 4253 (SSH Transport Layer Protocol) references FIPS 186-2 and as such most
+              SSH DSA implementations only support keys with an N of 160.
+              puttygen let&#039;s you set the size of L (but not the size of N) and uses 2048 as the
+              default L value. that&#039;s not really compliant with any of the FIPS standards, however,
+              for the purposes of maintaining compatibility with puttygen, we&#039;ll support it
+            */
+            //case ($L &gt;= 512 || $L &lt;= 1024) &amp;&amp; (($L &amp; 0x3F) == 0) &amp;&amp; $N == 160:
+            // FIPS 186-3 changed this as follows:
+            //case $L == 1024 &amp;&amp; $N == 160:
+            case $L == 2048 &amp;&amp; $N == 224:
+            case $L == 2048 &amp;&amp; $N == 256:
+            case $L == 3072 &amp;&amp; $N == 256:
+                break;
+            default:
+                throw new \InvalidArgumentException(&#039;Invalid values for N and L&#039;);
+        }
+
+        $two = new BigInteger(2);
+
+        $q = BigInteger::randomPrime($N);
+        $divisor = $q-&gt;multiply($two);
+
+        do {
+            $x = BigInteger::random($L);
+            list(, $c) = $x-&gt;divide($divisor);
+            $p = $x-&gt;subtract($c-&gt;subtract(self::$one));
+        } while ($p-&gt;getLength() != $L || !$p-&gt;isPrime());
+
+        $p_1 = $p-&gt;subtract(self::$one);
+        list($e) = $p_1-&gt;divide($q);
+
+        // quoting http://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.186-4.pdf#page=50 ,
+        // &quot;h could be obtained from a random number generator or from a counter that
+        //  changes after each use&quot;. PuTTY (sshdssg.c) starts h off at 1 and increments
+        // it on each loop. wikipedia says &quot;commonly h = 2 is used&quot; so we&#039;ll just do that
+        $h = clone $two;
+        while (true) {
+            $g = $h-&gt;powMod($e, $p);
+            if (!$g-&gt;equals(self::$one)) {
+                break;
+            }
+            $h = $h-&gt;add(self::$one);
+        }
+
+        $dsa = new Parameters();
+        $dsa-&gt;p = $p;
+        $dsa-&gt;q = $q;
+        $dsa-&gt;g = $g;
+
+        return $dsa;
+    }
+
+    /**
+     * Create public / private key pair.
+     *
+     * This method is a bit polymorphic. It can take a DSA/Parameters object, L / N as two distinct parameters or
+     * no parameters (at which point L and N will be generated with this method)
+     *
+     * Returns the private key, from which the publickey can be extracted
+     *
+     * @param int[] ...$args
+     * @return PrivateKey
+     */
+    public static function createKey(...$args)
+    {
+        self::initialize_static_variables();
+
+        $class = new \ReflectionClass(static::class);
+        if ($class-&gt;isFinal()) {
+            throw new \RuntimeException(&#039;createKey() should not be called from final classes (&#039; . static::class . &#039;)&#039;);
+        }
+
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+
+        if (count($args) == 2 &amp;&amp; is_int($args[0]) &amp;&amp; is_int($args[1])) {
+            $params = self::createParameters($args[0], $args[1]);
+        } elseif (count($args) == 1 &amp;&amp; $args[0] instanceof Parameters) {
+            $params = $args[0];
+        } elseif (!count($args)) {
+            $params = self::createParameters();
+        } else {
+            throw new InsufficientSetupException(&#039;Valid parameters are either two integers (L and N), a single DSA object or no parameters at all.&#039;);
+        }
+
+        $private = new PrivateKey();
+        $private-&gt;p = $params-&gt;p;
+        $private-&gt;q = $params-&gt;q;
+        $private-&gt;g = $params-&gt;g;
+
+        $private-&gt;x = BigInteger::randomRange(self::$one, $private-&gt;q-&gt;subtract(self::$one));
+        $private-&gt;y = $private-&gt;g-&gt;powMod($private-&gt;x, $private-&gt;p);
+
+        //$public = clone $private;
+        //unset($public-&gt;x);
+
+        return $private
+            -&gt;withHash($params-&gt;hash-&gt;getHash())
+            -&gt;withSignatureFormat($params-&gt;shortFormat);
+    }
+
+    /**
+     * OnLoad Handler
+     *
+     * @return bool
+     */
+    protected static function onLoad(array $components)
+    {
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+
+        if (!isset($components[&#039;x&#039;]) &amp;&amp; !isset($components[&#039;y&#039;])) {
+            $new = new Parameters();
+        } elseif (isset($components[&#039;x&#039;])) {
+            $new = new PrivateKey();
+            $new-&gt;x = $components[&#039;x&#039;];
+        } else {
+            $new = new PublicKey();
+        }
+
+        $new-&gt;p = $components[&#039;p&#039;];
+        $new-&gt;q = $components[&#039;q&#039;];
+        $new-&gt;g = $components[&#039;g&#039;];
+
+        if (isset($components[&#039;y&#039;])) {
+            $new-&gt;y = $components[&#039;y&#039;];
+        }
+
+        return $new;
+    }
+
+    /**
+     * Constructor
+     *
+     * PublicKey and PrivateKey objects can only be created from abstract RSA class
+     */
+    protected function __construct()
+    {
+        $this-&gt;sigFormat = self::validatePlugin(&#039;Signature&#039;, &#039;ASN1&#039;);
+        $this-&gt;shortFormat = &#039;ASN1&#039;;
+
+        parent::__construct();
+    }
+
+    /**
+     * Returns the key size
+     *
+     * More specifically, this L (the length of DSA Prime P) and N (the length of DSA Group Order q)
+     *
+     * @return array
+     */
+    public function getLength()
+    {
+        return [&#039;L&#039; =&gt; $this-&gt;p-&gt;getLength(), &#039;N&#039; =&gt; $this-&gt;q-&gt;getLength()];
+    }
+
+    /**
+     * Returns the current engine being used
+     *
+     * @see self::useInternalEngine()
+     * @see self::useBestEngine()
+     * @return string
+     */
+    public function getEngine()
+    {
+        if (!isset(self::$engines[&#039;PHP&#039;])) {
+            self::useBestEngine();
+        }
+        return self::$engines[&#039;OpenSSL&#039;] &amp;&amp; in_array($this-&gt;hash-&gt;getHash(), openssl_get_md_methods()) ?
+            &#039;OpenSSL&#039; : &#039;PHP&#039;;
+    }
+
+    /**
+     * Returns the parameters
+     *
+     * A public / private key is only returned if the currently loaded &quot;key&quot; contains an x or y
+     * value.
+     *
+     * @see self::getPublicKey()
+     * @return mixed
+     */
+    public function getParameters()
+    {
+        $type = self::validatePlugin(&#039;Keys&#039;, &#039;PKCS1&#039;, &#039;saveParameters&#039;);
+
+        $key = $type::saveParameters($this-&gt;p, $this-&gt;q, $this-&gt;g);
+        return DSA::load($key, &#039;PKCS1&#039;)
+            -&gt;withHash($this-&gt;hash-&gt;getHash())
+            -&gt;withSignatureFormat($this-&gt;shortFormat);
+    }
+
+    /**
+     * Determines the signature padding mode
+     *
+     * Valid values are: ASN1, SSH2, Raw
+     *
+     * @param string $format
+     */
+    public function withSignatureFormat($format)
+    {
+        $new = clone $this;
+        $new-&gt;shortFormat = $format;
+        $new-&gt;sigFormat = self::validatePlugin(&#039;Signature&#039;, $format);
+        return $new;
+    }
+
+    /**
+     * Returns the signature format currently being used
+     *
+     */
+    public function getSignatureFormat()
+    {
+        return $this-&gt;shortFormat;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/DSA/Formats/Keys/OpenSSH.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/Common -->
+
+</body>
+</html>

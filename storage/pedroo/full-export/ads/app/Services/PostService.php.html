@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Services/PostService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Services;
+
+// Increase the server resources
+$iniConfigFile = __DIR__ . &#039;/../Helpers/Common/Functions/ini.php&#039;;
+if (file_exists($iniConfigFile)) {
+	$configForUpload = true;
+	include_once $iniConfigFile;
+}
+
+use App\Helpers\Common\Arr;
+use App\Http\Requests\Front\PostRequest;
+use App\Http\Requests\Front\PostRequest\LimitationCompliance;
+use App\Models\Post;
+use App\Models\Scopes\ReviewedScope;
+use App\Models\Scopes\VerifiedScope;
+use App\Notifications\PostDeleted;
+use App\Services\Auth\Traits\Custom\VerificationTrait;
+use App\Services\Payment\HasPaymentTrigger;
+use App\Services\Payment\Promotion\SingleStepPayment;
+use App\Services\Picture\SingleStepPictures;
+use App\Services\Post\ListTrait;
+use App\Services\Post\ShowTrait;
+use App\Services\Post\StoreTrait;
+use App\Services\Post\UpdateTrait;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Notification;
+use NotificationChannels\Twilio\TwilioChannel;
+use Throwable;
+
+class PostService extends BaseService
+{
+	use VerificationTrait;
+	
+	use ListTrait;
+	use ShowTrait;
+	use StoreTrait;
+	use UpdateTrait;
+	
+	use SingleStepPictures;
+	use SingleStepPayment, HasPaymentTrigger;
+	
+	/**
+	 * List listings
+	 *
+	 * @param array $params
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function getEntries(array $params = []): JsonResponse
+	{
+		// Advanced Query (Query with the &#039;op&#039; parameter)
+		$searchOptions = [&#039;search&#039;, &#039;premium&#039;, &#039;latest&#039;, &#039;free&#039;, &#039;premiumFirst&#039;];
+		
+		$op = $params[&#039;op&#039;] ?? null;
+		$op = is_string($op) ? $op : null;
+		
+		if (in_array($op, $searchOptions)) {
+			return $this-&gt;getPostsBySearch($op, $params);
+		}
+		if ($op == &#039;similar&#039;) {
+			return $this-&gt;getSimilarPosts($params);
+		}
+		
+		return $this-&gt;getPostsList($params);
+	}
+	
+	/**
+	 * Get listing
+	 *
+	 * @param $id
+	 * @param array $params
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function getEntry($id, array $params = []): JsonResponse
+	{
+		$embed = castCommaSeparatedStrToArray($params[&#039;embed&#039;] ?? []);
+		$isDetailed = castIntToBool($params[&#039;detailed&#039;] ?? 0);
+		
+		if ($isDetailed) {
+			$defaultEmbed = [
+				&#039;user&#039;,
+				&#039;category&#039;,
+				&#039;parent&#039;,
+				&#039;postType&#039;,
+				&#039;city&#039;,
+				&#039;subAdmin1&#039;,
+				&#039;currency&#039;,
+				&#039;savedByLoggedUser&#039;,
+				&#039;picture&#039;,
+				&#039;pictures&#039;,
+				&#039;payment&#039;,
+				&#039;package&#039;,
+			];
+			$params[&#039;embed&#039;] = !empty($embed) ? array_merge($defaultEmbed, $embed) : $defaultEmbed;
+			
+			return $this-&gt;showDetailedPost($id, $params);
+		}
+		
+		return $this-&gt;showPost($id, $params);
+	}
+	
+	/**
+	 * Store listing
+	 *
+	 * For both types of listing&#039;s creation (Single step or Multi steps).
+	 * Note: The field &#039;admin_code&#039; is only available when the country&#039;s &#039;admin_type&#039; column of the listing is set to 1 or 2.
+	 *
+	 * @param \Illuminate\Http\Request $request
+	 * @return \Illuminate\Http\JsonResponse|mixed
+	 */
+	public function store(Request $request)
+	{
+		$this-&gt;setPaymentSettingsForPromotion();
+		
+		return $this-&gt;storePost($request);
+	}
+	
+	/**
+	 * Update listing
+	 *
+	 * Note: The fields &#039;pictures&#039;, &#039;package_id&#039; and &#039;payment_method_id&#039; are only available with the single step listing edition.
+	 * The field &#039;admin_code&#039; is only available when the country&#039;s &#039;admin_type&#039; column of the listing is set to 1 or 2.
+	 *
+	 * @param $id
+	 * @param \App\Http\Requests\Front\PostRequest $request
+	 * @return array|\Illuminate\Http\JsonResponse|mixed
+	 */
+	public function update($id, PostRequest $request)
+	{
+		// Single-Step Form
+		if (isSingleStepFormEnabled()) {
+			$this-&gt;setPaymentSettingsForPromotion();
+			
+			return $this-&gt;singleStepFormUpdate($id, $request);
+		}
+		
+		return $this-&gt;multiStepsFormUpdate($id, $request);
+	}
+	
+	/**
+	 * Delete listing(s)
+	 *
+	 * @param string $ids
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function destroy(string $ids): JsonResponse
+	{
+		$authUser = auth(getAuthGuard())-&gt;user();
+		
+		if (empty($authUser)) {
+			return apiResponse()-&gt;unauthorized();
+		}
+		
+		$data = [
+			&#039;success&#039; =&gt; false,
+			&#039;message&#039; =&gt; trans(&#039;global.no_deletion_is_done&#039;),
+			&#039;result&#039;  =&gt; null,
+		];
+		
+		$extra = [];
+		
+		// Get Entries ID (IDs separated by comma accepted)
+		$ids = explode(&#039;,&#039;, $ids);
+		
+		// Delete
+		$res = false;
+		foreach ($ids as $postId) {
+			$post = Post::withoutGlobalScopes([VerifiedScope::class, ReviewedScope::class])
+				-&gt;where(&#039;user_id&#039;, $authUser-&gt;getAuthIdentifier())
+				-&gt;where(&#039;id&#039;, $postId)
+				-&gt;first();
+			
+			if (!empty($post)) {
+				$tmpPost = Arr::toObject($post-&gt;toArray());
+				
+				// Delete Entry
+				$res = $post-&gt;delete();
+				
+				// Send an Email or SMS confirmation
+				$emailNotificationCanBeSent = (config(&#039;settings.mail.confirmation&#039;) == &#039;1&#039; &amp;&amp; !empty($tmpPost-&gt;email));
+				$smsNotificationCanBeSent = (
+					isPhoneAsAuthFieldEnabled()
+					&amp;&amp; config(&#039;settings.sms.confirmation&#039;) == &#039;1&#039;
+					&amp;&amp; $tmpPost-&gt;auth_field == &#039;phone&#039;
+					&amp;&amp; !empty($tmpPost-&gt;phone)
+					&amp;&amp; !isDemoDomain()
+				);
+				try {
+					if ($emailNotificationCanBeSent) {
+						Notification::route(&#039;mail&#039;, $tmpPost-&gt;email)-&gt;notify(new PostDeleted($tmpPost));
+					}
+					if ($smsNotificationCanBeSent) {
+						$smsChannel = (config(&#039;settings.sms.driver&#039;) == &#039;twilio&#039;)
+							? TwilioChannel::class
+							: &#039;vonage&#039;;
+						Notification::route($smsChannel, $tmpPost-&gt;phone)-&gt;notify(new PostDeleted($tmpPost));
+					}
+				} catch (Throwable $e) {
+					$extra[&#039;mail&#039;][&#039;success&#039;] = false;
+					$extra[&#039;mail&#039;][&#039;message&#039;] = $e-&gt;getMessage();
+				}
+			}
+		}
+		
+		// Confirmation
+		if ($res) {
+			$data[&#039;success&#039;] = true;
+			
+			$count = count($ids);
+			if ($count &gt; 1) {
+				$data[&#039;message&#039;] = trans(&#039;global.x entities have been deleted successfully&#039;, [&#039;entities&#039; =&gt; trans(&#039;global.listings&#039;), &#039;count&#039; =&gt; $count]);
+			} else {
+				$data[&#039;message&#039;] = trans(&#039;global.1 entity has been deleted successfully&#039;, [&#039;entity&#039; =&gt; trans(&#039;global.listing&#039;)]);
+			}
+		}
+		
+		$data[&#039;extra&#039;] = $extra;
+		
+		return apiResponse()-&gt;json($data);
+	}
+	
+	/**
+	 * Archive a listing
+	 *
+	 * Put a listing offline
+	 *
+	 * @authenticated
+	 * @header Authorization Bearer {YOUR_AUTH_TOKEN}
+	 *
+	 * @urlParam id int required The post/listing&#039;s ID.
+	 *
+	 * @param $id
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function offline($id): JsonResponse
+	{
+		return $this-&gt;takePostOffline($id);
+	}
+	
+	/**
+	 * Repost a listing
+	 *
+	 * Repost a listing by un-archiving it.
+	 *
+	 * @authenticated
+	 * @header Authorization Bearer {YOUR_AUTH_TOKEN}
+	 *
+	 * @urlParam id int required The post/listing&#039;s ID.
+	 *
+	 * @param $id
+	 * @param \App\Http\Requests\Front\PostRequest\LimitationCompliance $request
+	 * @return \Illuminate\Http\JsonResponse
+	 */
+	public function repost($id, LimitationCompliance $request): JsonResponse
+	{
+		return $this-&gt;repostPost($id, $request);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Services/PostTypeService.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Services/Auth -->
+
+</body>
+</html>

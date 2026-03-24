@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/app/Services/Pipeline/PipelineService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Services\Pipeline;
+
+use App\Models\PipelineTask;
+use App\Services\Pedroo\PedrooEngine;
+use App\Services\Agent\PedrooAgentService;
+use App\Services\Agent\PedrooAgentValidatorService;
+use Illuminate\Support\Facades\Http;
+
+class PipelineService
+{
+    /**
+     * Új pipeline task létrehozása
+     */
+    public function addTask(string $type, ?string $payload = null): PipelineTask
+    {
+        return PipelineTask::create([
+            &#039;type&#039;    =&gt; $type,
+            &#039;payload&#039; =&gt; $payload,
+            &#039;status&#039;  =&gt; &#039;pending&#039;,
+            &#039;log&#039;     =&gt; null,
+        ]);
+    }
+
+    /**
+     * Egy konkrét task lefuttatása (KÖZPONTI VÉGREHAJTÓ MOTOR)
+     */
+    public function runTask(PipelineTask $task): PipelineTask
+    {
+        // 1) Task státusz: running
+        $task-&gt;update([
+            &#039;status&#039; =&gt; &#039;running&#039;,
+            &#039;log&#039;    =&gt; &#039;Futtatás indult...&#039;,
+        ]);
+
+        try {
+            // �� 1) Először megpróbáljuk AGENT-ként futtatni (lokális műveletek)
+            $agentResult = $this-&gt;tryRunAgentTask($task);
+
+            if ($agentResult !== null) {
+                $task-&gt;update([
+                    &#039;status&#039; =&gt; &#039;done&#039;,
+                    &#039;log&#039;    =&gt; &quot;Agent result: &quot; . json_encode($agentResult, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
+                ]);
+
+                return $task;
+            }
+
+            // �� 2) Ha nem agent task, akkor AI-vezérelt pipeline
+            $response = Http::timeout(60)-&gt;post(
+                url(&#039;/api/ai/task&#039;),
+                [
+                    &#039;task&#039;    =&gt; $task-&gt;type,
+                    &#039;payload&#039; =&gt; $task-&gt;payload, // stringként küldjük, AI oldalon parse-oljuk
+                ]
+            );
+
+            // AI válasz feldolgozása
+            $aiJson = $response-&gt;json();
+
+            $aiOutput = $aiJson[&#039;result&#039;]
+                ?? $aiJson
+                ?? $response-&gt;body()
+                ?? &#039;AI response: null&#039;;
+
+            // Task frissítése
+            $task-&gt;update([
+                &#039;status&#039; =&gt; &#039;done&#039;,
+                &#039;log&#039;    =&gt; &quot;AI response: &quot; . json_encode($aiOutput, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
+            ]);
+
+        } catch (\Throwable $e) {
+
+            // 3) Hiba esetén
+            $task-&gt;update([
+                &#039;status&#039; =&gt; &#039;error&#039;,
+                &#039;log&#039;    =&gt; $e-&gt;getMessage(),
+            ]);
+        }
+
+        return $task;
+    }
+
+    /**
+     * Következő pending task lekérése
+     */
+    public function getNextTask(): ?PipelineTask
+    {
+        return PipelineTask::where(&#039;status&#039;, &#039;pending&#039;)
+            -&gt;orderBy(&#039;id&#039;)
+            -&gt;first();
+    }
+
+    /**
+     * Következő pending task lefuttatása
+     * → CSAK ROUTER, a runTask() a motor
+     */
+    public function runNextTask(): ?PipelineTask
+    {
+        $task = $this-&gt;getNextTask();
+
+        if (!$task) {
+            return null;
+        }
+
+        return $this-&gt;runTask($task);
+    }
+
+    /**
+     * �� AGENT TASKOK + VALIDÁCIÓ
+     * Ha nem null-t ad vissza, akkor a taskot lokálisan kezeltük,
+     * és NEM kell AI-hoz fordulni.
+     */
+    private function tryRunAgentTask(PipelineTask $task): ?array
+    {
+        $agent     = app(PedrooAgentService::class);
+        $validator = app(PedrooAgentValidatorService::class);
+
+        $payload = $task-&gt;payload ? json_decode($task-&gt;payload) : null;
+
+        // 1) Fájl létrehozása
+        if ($task-&gt;type === &#039;agent.file.create&#039;) {
+            $ok = $agent-&gt;createFile($payload-&gt;path, $payload-&gt;contents);
+
+            return [
+                &#039;action&#039;  =&gt; &#039;file.create&#039;,
+                &#039;success&#039; =&gt; $ok,
+                &#039;path&#039;    =&gt; $payload-&gt;path,
+            ];
+        }
+
+        // 2) Fájl frissítése
+        if ($task-&gt;type === &#039;agent.file.update&#039;) {
+            $ok = $agent-&gt;updateFile($payload-&gt;path, $payload-&gt;contents);
+
+            return [
+                &#039;action&#039;  =&gt; &#039;file.update&#039;,
+                &#039;success&#039; =&gt; $ok,
+                &#039;path&#039;    =&gt; $payload-&gt;path,
+            ];
+        }
+
+        // 3) Fájl végére írás
+        if ($task-&gt;type === &#039;agent.file.append&#039;) {
+            $ok = $agent-&gt;appendToFile($payload-&gt;path, $payload-&gt;snippet);
+
+            return [
+                &#039;action&#039;  =&gt; &#039;file.append&#039;,
+                &#039;success&#039; =&gt; $ok,
+                &#039;path&#039;    =&gt; $payload-&gt;path,
+            ];
+        }
+
+        // 4) SERVICE VALIDÁCIÓ
+        if ($task-&gt;type === &#039;agent.validate.service&#039;) {
+            $result = $validator-&gt;validateService($payload-&gt;path, $payload-&gt;class);
+
+            return [
+                &#039;action&#039; =&gt; &#039;validate.service&#039;,
+                &#039;path&#039;   =&gt; $payload-&gt;path,
+                &#039;class&#039;  =&gt; $payload-&gt;class,
+                &#039;result&#039; =&gt; $result,
+            ];
+        }
+
+        // 5) MEGLÉVŐ FÁJLOK TELJES VALIDÁCIÓJA
+        if ($task-&gt;type === &#039;agent.validate.existing_files&#039;) {
+            $result = $validator-&gt;validateExistingFiles();
+
+            return [
+                &#039;action&#039; =&gt; &#039;validate.existing_files&#039;,
+                &#039;result&#039; =&gt; $result,
+            ];
+        }
+
+        // Ha nem agent task → menjen AI-hoz
+        return null;
+    }
+
+    /**
+     * Régi placeholder – most már csak dokumentációs célra
+     */
+    private function execute(PipelineTask $task): string
+    {
+        return &quot;AI vezérelt pipeline – nincs lokális végrehajtás.&quot;;
+    }
+
+    private function runPedrooEngine(): string
+    {
+        $engine = new PedrooEngine();
+        $result = $engine-&gt;scan();
+
+        return json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    }
+
+    private function syncDatabase(): string
+    {
+        return &#039;Adatbázis szinkron / előkészítés lefutott.&#039;;
+    }
+
+    private function generateModule(string $module): string
+    {
+        return &quot;Modul generálva: {$module}&quot;;
+    }
+}
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /app/Services/Pipeline/PipelineTaskGenerator.php -->
+<!-- PEDROO_NEXT_DIR: /app/Services/Promotion -->
+
+</body>
+</html>

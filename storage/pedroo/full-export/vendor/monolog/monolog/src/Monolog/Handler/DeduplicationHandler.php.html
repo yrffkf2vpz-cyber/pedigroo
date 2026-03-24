@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/monolog/monolog/src/Monolog/Handler/DeduplicationHandler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+
+/*
+ * This file is part of the Monolog package.
+ *
+ * (c) Jordi Boggiano &lt;j.boggiano@seld.be&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Monolog\Handler;
+
+use Monolog\Level;
+use Monolog\Logger;
+use Psr\Log\LogLevel;
+use Monolog\LogRecord;
+
+/**
+ * Simple handler wrapper that deduplicates log records across multiple requests
+ *
+ * It also includes the BufferHandler functionality and will buffer
+ * all messages until the end of the request or flush() is called.
+ *
+ * This works by storing all log records&#039; messages above $deduplicationLevel
+ * to the file specified by $deduplicationStore. When further logs come in at the end of the
+ * request (or when flush() is called), all those above $deduplicationLevel are checked
+ * against the existing stored logs. If they match and the timestamps in the stored log is
+ * not older than $time seconds, the new log record is discarded. If no log record is new, the
+ * whole data set is discarded.
+ *
+ * This is mainly useful in combination with Mail handlers or things like Slack or HipChat handlers
+ * that send messages to people, to avoid spamming with the same message over and over in case of
+ * a major component failure like a database server being down which makes all requests fail in the
+ * same way.
+ *
+ * @author Jordi Boggiano &lt;j.boggiano@seld.be&gt;
+ */
+class DeduplicationHandler extends BufferHandler
+{
+    protected string $deduplicationStore;
+
+    protected Level $deduplicationLevel;
+
+    protected int $time;
+    protected bool $gc = false;
+
+    /**
+     * @param HandlerInterface             $handler            Handler.
+     * @param string|null                  $deduplicationStore The file/path where the deduplication log should be kept
+     * @param int|string|Level|LogLevel::* $deduplicationLevel The minimum logging level for log records to be looked at for deduplication purposes
+     * @param int                          $time               The period (in seconds) during which duplicate entries should be suppressed after a given log is sent through
+     * @param bool                         $bubble             Whether the messages that are handled can bubble up the stack or not
+     *
+     * @phpstan-param value-of&lt;Level::VALUES&gt;|value-of&lt;Level::NAMES&gt;|Level|LogLevel::* $deduplicationLevel
+     */
+    public function __construct(HandlerInterface $handler, ?string $deduplicationStore = null, int|string|Level $deduplicationLevel = Level::Error, int $time = 60, bool $bubble = true)
+    {
+        parent::__construct($handler, 0, Level::Debug, $bubble, false);
+
+        $this-&gt;deduplicationStore = $deduplicationStore === null ? sys_get_temp_dir() . &#039;/monolog-dedup-&#039; . substr(md5(__FILE__), 0, 20) .&#039;.log&#039; : $deduplicationStore;
+        $this-&gt;deduplicationLevel = Logger::toMonologLevel($deduplicationLevel);
+        $this-&gt;time = $time;
+    }
+
+    public function flush(): void
+    {
+        if ($this-&gt;bufferSize === 0) {
+            return;
+        }
+
+        $store = null;
+
+        if (file_exists($this-&gt;deduplicationStore)) {
+            $store = file($this-&gt;deduplicationStore, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        }
+
+        $passthru = null;
+
+        foreach ($this-&gt;buffer as $record) {
+            if ($record-&gt;level-&gt;value &gt;= $this-&gt;deduplicationLevel-&gt;value) {
+                $passthru = $passthru === true || !\is_array($store) || !$this-&gt;isDuplicate($store, $record);
+                if ($passthru) {
+                    $line = $this-&gt;buildDeduplicationStoreEntry($record);
+                    file_put_contents($this-&gt;deduplicationStore, $line . &quot;\n&quot;, FILE_APPEND);
+                    if (!\is_array($store)) {
+                        $store = [];
+                    }
+                    $store[] = $line;
+                }
+            }
+        }
+
+        // default of null is valid as well as if no record matches duplicationLevel we just pass through
+        if ($passthru === true || $passthru === null) {
+            $this-&gt;handler-&gt;handleBatch($this-&gt;buffer);
+        }
+
+        $this-&gt;clear();
+
+        if ($this-&gt;gc) {
+            $this-&gt;collectLogs();
+        }
+    }
+
+    /**
+     * If there is a store entry older than e.g. a day, this method should set `$this-&gt;gc` to `true` to trigger garbage collection.
+     * @param string[] $store The deduplication store
+     */
+    protected function isDuplicate(array $store, LogRecord $record): bool
+    {
+        $timestampValidity = $record-&gt;datetime-&gt;getTimestamp() - $this-&gt;time;
+        $expectedMessage = preg_replace(&#039;{[\r\n].*}&#039;, &#039;&#039;, $record-&gt;message);
+        $yesterday = time() - 86400;
+
+        for ($i = \count($store) - 1; $i &gt;= 0; $i--) {
+            list($timestamp, $level, $message) = explode(&#039;:&#039;, $store[$i], 3);
+
+            if ($level === $record-&gt;level-&gt;getName() &amp;&amp; $message === $expectedMessage &amp;&amp; $timestamp &gt; $timestampValidity) {
+                return true;
+            }
+
+            if ($timestamp &lt; $yesterday) {
+                $this-&gt;gc = true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return string The given record serialized as a single line of text
+     */
+    protected function buildDeduplicationStoreEntry(LogRecord $record): string
+    {
+        return $record-&gt;datetime-&gt;getTimestamp() . &#039;:&#039; . $record-&gt;level-&gt;getName() . &#039;:&#039; . preg_replace(&#039;{[\r\n].*}&#039;, &#039;&#039;, $record-&gt;message);
+    }
+
+    private function collectLogs(): void
+    {
+        if (!file_exists($this-&gt;deduplicationStore)) {
+            return;
+        }
+
+        $handle = fopen($this-&gt;deduplicationStore, &#039;rw+&#039;);
+
+        if (false === $handle) {
+            throw new \RuntimeException(&#039;Failed to open file for reading and writing: &#039; . $this-&gt;deduplicationStore);
+        }
+
+        if (false === flock($handle, LOCK_EX)) {
+            return;
+        }
+        $validLogs = [];
+
+        $timestampValidity = time() - $this-&gt;time;
+
+        while (!feof($handle)) {
+            $log = fgets($handle);
+            if (\is_string($log) &amp;&amp; &#039;&#039; !== $log &amp;&amp; substr($log, 0, 10) &gt;= $timestampValidity) {
+                $validLogs[] = $log;
+            }
+        }
+
+        ftruncate($handle, 0);
+        rewind($handle);
+        foreach ($validLogs as $log) {
+            fwrite($handle, $log);
+        }
+
+        flock($handle, LOCK_UN);
+        fclose($handle);
+
+        $this-&gt;gc = false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/monolog/monolog/src/Monolog/Handler/DoctrineCouchDBHandler.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/monolog/monolog/src/Monolog/Handler/Curl -->
+
+</body>
+</html>

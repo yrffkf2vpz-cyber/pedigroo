@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpunit/php-code-coverage/src/Report/Xml/Facade.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of phpunit/php-code-coverage.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace SebastianBergmann\CodeCoverage\Report\Xml;
+
+use const DIRECTORY_SEPARATOR;
+use function count;
+use function dirname;
+use function file_get_contents;
+use function is_array;
+use function is_dir;
+use function is_file;
+use function is_writable;
+use function phpversion;
+use function sprintf;
+use function strlen;
+use function substr;
+use DateTimeImmutable;
+use SebastianBergmann\CodeCoverage\CodeCoverage;
+use SebastianBergmann\CodeCoverage\Data\ProcessedClassType;
+use SebastianBergmann\CodeCoverage\Data\ProcessedFunctionType;
+use SebastianBergmann\CodeCoverage\Data\ProcessedTraitType;
+use SebastianBergmann\CodeCoverage\Node\AbstractNode;
+use SebastianBergmann\CodeCoverage\Node\Directory as DirectoryNode;
+use SebastianBergmann\CodeCoverage\Node\File as FileNode;
+use SebastianBergmann\CodeCoverage\PathExistsButIsNotDirectoryException;
+use SebastianBergmann\CodeCoverage\Util\Filesystem;
+use SebastianBergmann\CodeCoverage\Version;
+use SebastianBergmann\CodeCoverage\WriteOperationFailedException;
+use SebastianBergmann\CodeCoverage\XmlException;
+use SebastianBergmann\Environment\Runtime;
+use XMLWriter;
+
+/**
+ * @phpstan-import-type TestType from CodeCoverage
+ */
+final class Facade
+{
+    public const string XML_NAMESPACE = &#039;https://schema.phpunit.de/coverage/1.0&#039;;
+    private string $target;
+    private Project $project;
+    private readonly string $phpUnitVersion;
+    private readonly bool $includeSource;
+
+    public function __construct(string $version, bool $includeSource = true)
+    {
+        $this-&gt;phpUnitVersion = $version;
+        $this-&gt;includeSource  = $includeSource;
+    }
+
+    /**
+     * @throws XmlException
+     */
+    public function process(CodeCoverage $coverage, string $target): void
+    {
+        if (substr($target, -1, 1) !== DIRECTORY_SEPARATOR) {
+            $target .= DIRECTORY_SEPARATOR;
+        }
+
+        $this-&gt;target = $target;
+        $this-&gt;initTargetDirectory($target);
+
+        $report = $coverage-&gt;getReport();
+
+        $writer = new XMLWriter;
+        $writer-&gt;openUri($this-&gt;targetFilePath(&#039;index&#039;));
+        $writer-&gt;setIndent(true);
+        $writer-&gt;setIndentString(&#039;  &#039;);
+        $this-&gt;project = new Project(
+            $writer,
+            $coverage-&gt;getReport()-&gt;name(),
+        );
+
+        $this-&gt;setBuildInformation($coverage);
+
+        $this-&gt;project-&gt;startProject();
+        $this-&gt;processTests($coverage-&gt;getTests());
+        $this-&gt;processDirectory($report, $this-&gt;project);
+        $this-&gt;project-&gt;finalize();
+    }
+
+    private function setBuildInformation(CodeCoverage $coverage): void
+    {
+        if ($coverage-&gt;driverIsPcov()) {
+            $driverExtensionName    = &#039;pcov&#039;;
+            $driverExtensionVersion = phpversion(&#039;pcov&#039;);
+        } elseif ($coverage-&gt;driverIsXdebug()) {
+            $driverExtensionName    = &#039;xdebug&#039;;
+            $driverExtensionVersion = phpversion(&#039;xdebug&#039;);
+        } else {
+            // @codeCoverageIgnoreStart
+            $driverExtensionName    = &#039;unknown&#039;;
+            $driverExtensionVersion = &#039;unknown&#039;;
+            // @codeCoverageIgnoreEnd
+        }
+
+        $this-&gt;project-&gt;buildInformation(
+            new Runtime,
+            new DateTimeImmutable,
+            $this-&gt;phpUnitVersion,
+            Version::id(),
+            $driverExtensionName,
+            $driverExtensionVersion,
+        );
+    }
+
+    /**
+     * @throws PathExistsButIsNotDirectoryException
+     * @throws WriteOperationFailedException
+     */
+    private function initTargetDirectory(string $directory): void
+    {
+        if (is_file($directory)) {
+            // @codeCoverageIgnoreStart
+            if (!is_dir($directory)) {
+                throw new PathExistsButIsNotDirectoryException($directory);
+            }
+
+            if (!is_writable($directory)) {
+                throw new WriteOperationFailedException($directory);
+            }
+            // @codeCoverageIgnoreEnd
+        }
+
+        Filesystem::createDirectory($directory);
+    }
+
+    /**
+     * @throws XmlException
+     */
+    private function processDirectory(DirectoryNode $directory, Node $context): void
+    {
+        $directoryName = $directory-&gt;name();
+
+        if ($this-&gt;project-&gt;projectSourceDirectory() === $directoryName) {
+            $directoryName = &#039;/&#039;;
+        }
+
+        $writer = $this-&gt;project-&gt;getWriter();
+        $writer-&gt;startElement(&#039;directory&#039;);
+        $writer-&gt;writeAttribute(&#039;name&#039;, $directoryName);
+        $directoryObject = $context-&gt;addDirectory();
+
+        $this-&gt;setTotals($directory, $directoryObject-&gt;totals());
+
+        foreach ($directory-&gt;directories() as $node) {
+            $this-&gt;processDirectory($node, $directoryObject);
+        }
+
+        foreach ($directory-&gt;files() as $node) {
+            $this-&gt;processFile($node, $directoryObject);
+        }
+        $writer-&gt;endElement();
+    }
+
+    /**
+     * @throws XmlException
+     */
+    private function processFile(FileNode $file, Directory $context): void
+    {
+        $context-&gt;getWriter()-&gt;startElement(&#039;file&#039;);
+        $context-&gt;getWriter()-&gt;writeAttribute(&#039;name&#039;, $file-&gt;name());
+        $context-&gt;getWriter()-&gt;writeAttribute(&#039;href&#039;, $file-&gt;id() . &#039;.xml&#039;);
+        $context-&gt;getWriter()-&gt;writeAttribute(&#039;hash&#039;, $file-&gt;sha1());
+
+        $fileObject = $context-&gt;addFile();
+
+        $this-&gt;setTotals($file, $fileObject-&gt;totals());
+
+        $context-&gt;getWriter()-&gt;endElement();
+
+        $path = substr(
+            $file-&gt;pathAsString(),
+            strlen($this-&gt;project-&gt;projectSourceDirectory()),
+        );
+
+        $writer = new XMLWriter;
+        $writer-&gt;openUri($this-&gt;targetFilePath($file-&gt;id()));
+        $writer-&gt;setIndent(true);
+        $writer-&gt;setIndentString(&#039;  &#039;);
+        $fileReport = new Report($writer, $path, $file-&gt;sha1());
+
+        $this-&gt;setTotals($file, $fileReport-&gt;totals());
+
+        foreach ($file-&gt;classesAndTraits() as $unit) {
+            $this-&gt;processUnit($unit, $fileReport);
+        }
+
+        foreach ($file-&gt;functions() as $function) {
+            $this-&gt;processFunction($function, $fileReport);
+        }
+
+        $fileReport-&gt;getWriter()-&gt;startElement(&#039;coverage&#039;);
+
+        foreach ($file-&gt;lineCoverageData() as $line =&gt; $tests) {
+            if (!is_array($tests) || count($tests) === 0) {
+                continue;
+            }
+
+            $coverage = $fileReport-&gt;lineCoverage((string) $line);
+            $coverage-&gt;finalize($tests);
+        }
+        $fileReport-&gt;getWriter()-&gt;endElement();
+
+        if ($this-&gt;includeSource) {
+            $fileReport-&gt;source()-&gt;setSourceCode(
+                file_get_contents($file-&gt;pathAsString()),
+            );
+        }
+
+        $fileReport-&gt;finalize();
+    }
+
+    private function processUnit(ProcessedClassType|ProcessedTraitType $unit, Report $report): void
+    {
+        if ($unit instanceof ProcessedClassType) {
+            $report-&gt;getWriter()-&gt;startElement(&#039;class&#039;);
+
+            $unitObject = $report-&gt;classObject(
+                $unit-&gt;className,
+                $unit-&gt;namespace,
+                $unit-&gt;startLine,
+                $unit-&gt;executableLines,
+                $unit-&gt;executedLines,
+                (float) $unit-&gt;crap,
+            );
+        } else {
+            $report-&gt;getWriter()-&gt;startElement(&#039;trait&#039;);
+
+            $unitObject = $report-&gt;traitObject(
+                $unit-&gt;traitName,
+                $unit-&gt;namespace,
+                $unit-&gt;startLine,
+                $unit-&gt;executableLines,
+                $unit-&gt;executedLines,
+                (float) $unit-&gt;crap,
+            );
+        }
+
+        foreach ($unit-&gt;methods as $method) {
+            $report-&gt;getWriter()-&gt;startElement(&#039;method&#039;);
+
+            $unitObject-&gt;addMethod(
+                $method-&gt;methodName,
+                $method-&gt;signature,
+                (string) $method-&gt;startLine,
+                (string) $method-&gt;endLine,
+                (string) $method-&gt;executableLines,
+                (string) $method-&gt;executedLines,
+                (string) $method-&gt;coverage,
+                $method-&gt;crap,
+            );
+
+            $report-&gt;getWriter()-&gt;endElement();
+        }
+
+        $report-&gt;getWriter()-&gt;endElement();
+    }
+
+    private function processFunction(ProcessedFunctionType $function, Report $report): void
+    {
+        $report-&gt;getWriter()-&gt;startElement(&#039;function&#039;);
+
+        $report-&gt;functionObject(
+            $function-&gt;functionName,
+            $function-&gt;signature,
+            (string) $function-&gt;startLine,
+            null,
+            (string) $function-&gt;executableLines,
+            (string) $function-&gt;executedLines,
+            (string) $function-&gt;coverage,
+            $function-&gt;crap,
+        );
+
+        $report-&gt;getWriter()-&gt;endElement();
+    }
+
+    /**
+     * @param array&lt;string, TestType&gt; $tests
+     */
+    private function processTests(array $tests): void
+    {
+        $this-&gt;project-&gt;getWriter()-&gt;startElement(&#039;tests&#039;);
+
+        $testsObject = $this-&gt;project-&gt;tests();
+
+        foreach ($tests as $test =&gt; $result) {
+            $testsObject-&gt;addTest($test, $result);
+        }
+
+        $this-&gt;project-&gt;getWriter()-&gt;endElement();
+    }
+
+    private function setTotals(AbstractNode $node, Totals $totals): void
+    {
+        $totals-&gt;getWriter()-&gt;startElement(&#039;totals&#039;);
+
+        $loc = $node-&gt;linesOfCode();
+
+        $totals-&gt;setNumLines(
+            $loc-&gt;linesOfCode(),
+            $loc-&gt;commentLinesOfCode(),
+            $loc-&gt;nonCommentLinesOfCode(),
+            $node-&gt;numberOfExecutableLines(),
+            $node-&gt;numberOfExecutedLines(),
+        );
+
+        $totals-&gt;setNumMethods(
+            $node-&gt;numberOfMethods(),
+            $node-&gt;numberOfTestedMethods(),
+        );
+
+        $totals-&gt;setNumFunctions(
+            $node-&gt;numberOfFunctions(),
+            $node-&gt;numberOfTestedFunctions(),
+        );
+
+        $totals-&gt;setNumClasses(
+            $node-&gt;numberOfClasses(),
+            $node-&gt;numberOfTestedClasses(),
+        );
+
+        $totals-&gt;setNumTraits(
+            $node-&gt;numberOfTraits(),
+            $node-&gt;numberOfTestedTraits(),
+        );
+
+        $totals-&gt;getWriter()-&gt;endElement();
+    }
+
+    private function targetDirectory(): string
+    {
+        return $this-&gt;target;
+    }
+
+    private function targetFilePath(string $name): string
+    {
+        $filename = sprintf(&#039;%s/%s.xml&#039;, $this-&gt;targetDirectory(), $name);
+
+        $this-&gt;initTargetDirectory(dirname($filename));
+
+        return $filename;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpunit/php-code-coverage/src/Report/Xml/File.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpunit/php-code-coverage/src/StaticAnalysis -->
+
+</body>
+</html>

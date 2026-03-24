@@ -1,0 +1,1974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/psy/psysh/src/Shell.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy;
+
+use Psy\CodeCleaner\NoReturnValue;
+use Psy\Exception\BreakException;
+use Psy\Exception\ErrorException;
+use Psy\Exception\Exception as PsyException;
+use Psy\Exception\InterruptException;
+use Psy\Exception\RuntimeException;
+use Psy\Exception\ThrowUpException;
+use Psy\ExecutionLoop\ProcessForker;
+use Psy\ExecutionLoop\RunkitReloader;
+use Psy\ExecutionLoop\SignalHandler;
+use Psy\ExecutionLoop\UopzReloader;
+use Psy\Formatter\TraceFormatter;
+use Psy\Input\ShellInput;
+use Psy\Input\SilentInput;
+use Psy\Output\ShellOutput;
+use Psy\Readline\Readline;
+use Psy\Readline\ReadlineAware;
+use Psy\TabCompletion\AutoCompleter;
+use Psy\TabCompletion\Matcher;
+use Psy\TabCompletion\Matcher\CommandsMatcher;
+use Psy\VarDumper\PresenterAware;
+use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Command\Command as BaseCommand;
+use Symfony\Component\Console\Exception\ExceptionInterface as SymfonyConsoleException;
+use Symfony\Component\Console\Formatter\OutputFormatter;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputDefinition;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Input\StringInput;
+use Symfony\Component\Console\Output\ConsoleOutput;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * The Psy Shell application.
+ *
+ * Usage:
+ *
+ *     $shell = new Shell;
+ *     $shell-&gt;run();
+ *
+ * @author Justin Hileman &lt;justin@justinhileman.info&gt;
+ */
+class Shell extends Application
+{
+    const VERSION = &#039;v0.12.20&#039;;
+
+    private Configuration $config;
+    private ?CodeCleaner $cleaner = null;
+    private OutputInterface $output;
+    private ?int $originalVerbosity = null;
+    private ?Readline $readline = null;
+    private array $inputBuffer;
+    /** @var string|false|null */
+    private $code = null;
+    private array $codeBuffer = [];
+    private bool $codeBufferOpen = false;
+    private array $codeStack;
+    private string $stdoutBuffer;
+    private Context $context;
+    private array $includes;
+    private bool $outputWantsNewline = false;
+    private array $loopListeners;
+    private bool $booted = false;
+    private bool $autoloadWarmed = false;
+    private ?AutoCompleter $autoCompleter = null;
+    private array $matchers = [];
+    private ?CommandsMatcher $commandsMatcher = null;
+    private bool $lastExecSuccess = true;
+    private bool $nonInteractive = false;
+    private ?int $errorReporting = null;
+
+    /**
+     * Create a new Psy Shell.
+     *
+     * @param Configuration|null $config (default: null)
+     */
+    public function __construct(?Configuration $config = null)
+    {
+        $this-&gt;config = $config ?: new Configuration();
+        $this-&gt;context = new Context();
+        $this-&gt;includes = [];
+        $this-&gt;inputBuffer = [];
+        $this-&gt;codeStack = [];
+        $this-&gt;stdoutBuffer = &#039;&#039;;
+        $this-&gt;loopListeners = $this-&gt;getDefaultLoopListeners();
+
+        parent::__construct(&#039;Psy Shell&#039;, self::VERSION);
+
+        $this-&gt;config-&gt;setShell($this);
+
+        // Register the current shell session&#039;s config with \Psy\info
+        \Psy\info($this-&gt;config);
+    }
+
+    /**
+     * Warm the autoloader by loading classes at startup.
+     *
+     * This improves tab completion by making classes available via get_declared_classes()
+     * rather than maintaining a separate list of available classes.
+     */
+    private function warmAutoloader(): void
+    {
+        if ($this-&gt;autoloadWarmed) {
+            return;
+        }
+        $this-&gt;autoloadWarmed = true;
+
+        $warmers = $this-&gt;config-&gt;getAutoloadWarmers();
+        if (empty($warmers)) {
+            return;
+        }
+
+        $output = $this-&gt;config-&gt;getOutput();
+        if ($output instanceof ConsoleOutput) {
+            $output = $output-&gt;getErrorOutput();
+        }
+
+        $start = \microtime(true);
+        $loadedCount = 0;
+
+        foreach ($warmers as $warmer) {
+            try {
+                $loadedCount += $warmer-&gt;warm();
+            } catch (\Throwable $e) {
+                $output-&gt;writeln($this-&gt;formatException($e), OutputInterface::VERBOSITY_DEBUG);
+            }
+        }
+
+        $message = \sprintf(
+            &#039;&lt;whisper&gt;Autoload warming: loaded %d classes in %.1fms&lt;/whisper&gt;&#039;,
+            $loadedCount,
+            (\microtime(true) - $start) * 1000
+        );
+
+        $output-&gt;writeln($message, OutputInterface::VERBOSITY_DEBUG);
+
+        if (!\class_exists(&#039;Composer\\ClassMapGenerator\\ClassMapGenerator&#039;, false)) {
+            $output-&gt;writeln(&#039;&lt;whisper&gt;Autoload warming works best with composer/class-map-generator installed&lt;/whisper&gt;&#039;);
+        }
+    }
+
+    /**
+     * Boot the shell, initializing the CodeCleaner and Readline.
+     *
+     * This is called lazily when commands or methods require these dependencies.
+     * If input/output are provided, they&#039;ll be used for trust prompts. Otherwise,
+     * falls back to config defaults.
+     */
+    public function boot(?InputInterface $input = null, ?OutputInterface $output = null): void
+    {
+        if ($this-&gt;booted) {
+            return;
+        }
+
+        $this-&gt;loadLocalConfig($input, $output);
+
+        $this-&gt;cleaner = $this-&gt;config-&gt;getCodeCleaner();
+        $this-&gt;readline = $this-&gt;config-&gt;getReadline();
+        $this-&gt;booted = true;
+
+        $this-&gt;refreshCommandDependencies();
+    }
+
+    /**
+     * Load local config with trust prompt if needed.
+     */
+    private function loadLocalConfig(?InputInterface $input, ?OutputInterface $output): void
+    {
+        if ($output === null) {
+            $output = $this-&gt;config-&gt;getOutput();
+        }
+
+        if ($input === null) {
+            $input = new ArrayInput([]);
+            // Programmatic callers (e.g. Shell::execute) don&#039;t provide a real
+            // interactive input stream, so trust prompts must not block.
+            $input-&gt;setInteractive(false);
+        }
+
+        $this-&gt;config-&gt;loadLocalConfigWithPrompt($input, $output);
+    }
+
+    /**
+     * Refresh dependencies on all registered commands.
+     */
+    private function refreshCommandDependencies(): void
+    {
+        foreach ($this-&gt;all() as $command) {
+            $this-&gt;configureCommand($command);
+        }
+    }
+
+    /**
+     * Configure a command with context and dependencies.
+     */
+    private function configureCommand(BaseCommand $command): void
+    {
+        if ($command instanceof ContextAware) {
+            $command-&gt;setContext($this-&gt;context);
+        }
+
+        if ($this-&gt;booted) {
+            if ($command instanceof CodeCleanerAware &amp;&amp; $this-&gt;cleaner !== null) {
+                $command-&gt;setCodeCleaner($this-&gt;cleaner);
+            }
+
+            if ($command instanceof PresenterAware) {
+                $command-&gt;setPresenter($this-&gt;config-&gt;getPresenter());
+            }
+
+            if ($command instanceof ReadlineAware &amp;&amp; $this-&gt;readline !== null) {
+                $command-&gt;setReadline($this-&gt;readline);
+            }
+        }
+    }
+
+    /**
+     * Check whether the first thing in a backtrace is an include call.
+     *
+     * This is used by the psysh bin to decide whether to start a shell on boot,
+     * or to simply autoload the library.
+     */
+    public static function isIncluded(array $trace): bool
+    {
+        $isIncluded = isset($trace[0][&#039;function&#039;]) &amp;&amp;
+          \in_array($trace[0][&#039;function&#039;], [&#039;require&#039;, &#039;include&#039;, &#039;require_once&#039;, &#039;include_once&#039;]);
+
+        // Detect Composer PHP bin proxies.
+        if ($isIncluded &amp;&amp; \array_key_exists(&#039;_composer_autoload_path&#039;, $GLOBALS) &amp;&amp; \preg_match(&#039;{[\\\\/]psysh$}&#039;, $trace[0][&#039;file&#039;])) {
+            // If we&#039;re in a bin proxy, we&#039;ll *always* see one include, but we
+            // care if we see a second immediately after that.
+            return isset($trace[1][&#039;function&#039;]) &amp;&amp;
+                \in_array($trace[1][&#039;function&#039;], [&#039;require&#039;, &#039;include&#039;, &#039;require_once&#039;, &#039;include_once&#039;]);
+        }
+
+        return $isIncluded;
+    }
+
+    /**
+     * Check if the currently running PsySH bin is a phar archive.
+     */
+    public static function isPhar(): bool
+    {
+        return \class_exists(&quot;\Phar&quot;) &amp;&amp; \Phar::running() !== &#039;&#039; &amp;&amp; \strpos(__FILE__, \Phar::running(true)) === 0;
+    }
+
+    /**
+     * Invoke a Psy Shell from the current context.
+     *
+     * @see Psy\debug
+     * @deprecated will be removed in 1.0. Use \Psy\debug instead
+     *
+     * @param array         $vars   Scope variables from the calling context (default: [])
+     * @param object|string $bindTo Bound object ($this) or class (self) value for the shell
+     *
+     * @return array Scope variables from the debugger session
+     */
+    public static function debug(array $vars = [], $bindTo = null): array
+    {
+        @\trigger_error(&#039;`Psy\\Shell::debug` is deprecated; call `Psy\\debug` instead.&#039;, \E_USER_DEPRECATED);
+
+        return \Psy\debug($vars, $bindTo);
+    }
+
+    /**
+     * Adds a command object.
+     *
+     * @deprecated since Symfony Console 7.4, use addCommand() instead
+     *
+     * @param BaseCommand $command A Symfony Console Command object
+     *
+     * @return BaseCommand The registered command
+     */
+    public function add(BaseCommand $command): BaseCommand
+    {
+        return $this-&gt;addCommand($command);
+    }
+
+    /**
+     * Adds a command object.
+     *
+     * @param BaseCommand|callable $command A Symfony Console Command object or callable
+     *
+     * @return BaseCommand|null The registered command, or null
+     */
+    public function addCommand($command): ?BaseCommand
+    {
+        // For Symfony Console &lt; 7.4, use parent::add()
+        if (\method_exists(Application::class, &#039;addCommand&#039;)) {
+            /** @phan-suppress-next-line PhanUndeclaredStaticMethod (Symfony Console 7.4+) */
+            $ret = parent::addCommand($command);
+        } else {
+            $ret = parent::add($command);
+        }
+
+        if ($ret) {
+            $this-&gt;configureCommand($ret);
+
+            if (isset($this-&gt;commandsMatcher)) {
+                $this-&gt;commandsMatcher-&gt;setCommands($this-&gt;all());
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * Gets the default input definition.
+     *
+     * @return InputDefinition An InputDefinition instance
+     */
+    protected function getDefaultInputDefinition(): InputDefinition
+    {
+        return new InputDefinition([
+            new InputArgument(&#039;command&#039;, InputArgument::REQUIRED, &#039;The command to execute&#039;),
+            new InputOption(&#039;--help&#039;, &#039;-h&#039;, InputOption::VALUE_NONE, &#039;Display this help message.&#039;),
+        ]);
+    }
+
+    /**
+     * Gets the default commands that should always be available.
+     *
+     * @return array An array of default Command instances
+     */
+    protected function getDefaultCommands(): array
+    {
+        $sudo = new Command\SudoCommand();
+
+        $hist = new Command\HistoryCommand();
+
+        $doc = new Command\DocCommand();
+        $doc-&gt;setConfiguration($this-&gt;config);
+
+        $commands = [
+            new Command\HelpCommand(),
+            new Command\ListCommand(),
+            new Command\DumpCommand(),
+            $doc,
+            new Command\ShowCommand(),
+            new Command\WtfCommand(),
+            new Command\WhereamiCommand(),
+            new Command\ThrowUpCommand(),
+            new Command\TimeitCommand(),
+            new Command\TraceCommand(),
+            new Command\BufferCommand(),
+            new Command\ClearCommand(),
+            new Command\EditCommand($this-&gt;config-&gt;getRuntimeDir(false)),
+            // new Command\PsyVersionCommand(),
+            $sudo,
+            $hist,
+            new Command\ExitCommand(),
+        ];
+
+        // Only add yolo command if UopzReloader is supported
+        if (UopzReloader::isSupported()) {
+            $yolo = new Command\YoloCommand();
+            $commands[] = $yolo;
+        }
+
+        return $commands;
+    }
+
+    /**
+     * @return Matcher\AbstractMatcher[]
+     */
+    protected function getDefaultMatchers(): array
+    {
+        // Store the Commands Matcher for later. If more commands are added,
+        // we&#039;ll update the Commands Matcher too.
+        $this-&gt;commandsMatcher = new CommandsMatcher($this-&gt;all());
+
+        return [
+            $this-&gt;commandsMatcher,
+            new Matcher\KeywordsMatcher(),
+            new Matcher\VariablesMatcher(),
+            new Matcher\ConstantsMatcher(),
+            new Matcher\FunctionsMatcher(),
+            new Matcher\ClassNamesMatcher(),
+            new Matcher\ClassMethodsMatcher(),
+            new Matcher\ClassAttributesMatcher(),
+            new Matcher\ObjectMethodsMatcher(),
+            new Matcher\ObjectAttributesMatcher(),
+            new Matcher\MagicMethodsMatcher(),
+            new Matcher\MagicPropertiesMatcher(),
+            new Matcher\ClassMethodDefaultParametersMatcher(),
+            new Matcher\ObjectMethodDefaultParametersMatcher(),
+            new Matcher\FunctionDefaultParametersMatcher(),
+        ];
+    }
+
+    /**
+     * Gets the default command loop listeners.
+     *
+     * @return array An array of Execution Loop Listener instances
+     */
+    protected function getDefaultLoopListeners(): array
+    {
+        $listeners = [];
+
+        if ($inputLogger = $this-&gt;config-&gt;getInputLogger()) {
+            $listeners[] = $inputLogger;
+        }
+
+        if (ProcessForker::isSupported() &amp;&amp; $this-&gt;config-&gt;usePcntl()) {
+            $listeners[] = new ProcessForker();
+        } elseif (SignalHandler::isSupported()) {
+            // Only use SignalHandler when process forking is disabled
+            // ProcessForker handles SIGINT in the parent process, which is cleaner
+            $listeners[] = new SignalHandler();
+        }
+
+        if (RunkitReloader::isSupported()) {
+            $listeners[] = new RunkitReloader();
+        } elseif (UopzReloader::isSupported()) {
+            $listeners[] = new UopzReloader();
+        }
+
+        if ($executionLogger = $this-&gt;config-&gt;getExecutionLogger()) {
+            $listeners[] = $executionLogger;
+        }
+
+        return $listeners;
+    }
+
+    /**
+     * Enable or disable force-reload mode for code reloaders.
+     *
+     * Used by the `yolo` command to bypass safety warnings when reloading code.
+     */
+    public function setForceReload(bool $force): void
+    {
+        foreach ($this-&gt;loopListeners as $listener) {
+            if (\method_exists($listener, &#039;setForceReload&#039;)) {
+                $listener-&gt;setForceReload($force);
+            }
+        }
+    }
+
+    /**
+     * Add tab completion matchers.
+     *
+     * @param array $matchers
+     */
+    public function addMatchers(array $matchers)
+    {
+        $this-&gt;matchers = \array_merge($this-&gt;matchers, $matchers);
+
+        if (isset($this-&gt;autoCompleter)) {
+            $this-&gt;addMatchersToAutoCompleter($matchers);
+        }
+    }
+
+    /**
+     * @deprecated Call `addMatchers` instead
+     *
+     * @param array $matchers
+     */
+    public function addTabCompletionMatchers(array $matchers)
+    {
+        @\trigger_error(&#039;`addTabCompletionMatchers` is deprecated; call `addMatchers` instead.&#039;, \E_USER_DEPRECATED);
+
+        $this-&gt;addMatchers($matchers);
+    }
+
+    /**
+     * Set the Shell output.
+     *
+     * @param OutputInterface $output
+     */
+    public function setOutput(OutputInterface $output)
+    {
+        $this-&gt;output = $output;
+        $this-&gt;originalVerbosity = $output-&gt;getVerbosity();
+    }
+
+    /**
+     * Runs PsySH.
+     *
+     * @param InputInterface|null  $input  An Input instance
+     * @param OutputInterface|null $output An Output instance
+     *
+     * @return int 0 if everything went fine, or an error code
+     */
+    public function run(?InputInterface $input = null, ?OutputInterface $output = null): int
+    {
+        // We&#039;ll just ignore the input passed in, and set up our own!
+        $input = new ArrayInput([]);
+
+        if ($output === null) {
+            $output = $this-&gt;config-&gt;getOutput();
+        }
+
+        $this-&gt;setAutoExit(false);
+        $this-&gt;setCatchExceptions(false);
+
+        try {
+            return parent::run($input, $output);
+        } catch (BreakException $e) {
+            // BreakException from ProcessForker or exit() - return its exit code
+            return $e-&gt;getCode();
+        } catch (\Throwable $e) {
+            $this-&gt;writeException($e);
+        }
+
+        return 1;
+    }
+
+    /**
+     * Runs PsySH.
+     *
+     * @throws \Throwable if thrown via the `throw-up` command
+     *
+     * @param InputInterface  $input  An Input instance
+     * @param OutputInterface $output An Output instance
+     *
+     * @return int 0 if everything went fine, or an error code
+     */
+    public function doRun(InputInterface $input, OutputInterface $output): int
+    {
+        $this-&gt;setOutput($output);
+        $this-&gt;boot($input, $output);
+        $this-&gt;resetCodeBuffer();
+        $this-&gt;warmAutoloader();
+
+        if ($input-&gt;isInteractive()) {
+            // @todo should it be possible to have raw output in an interactive run?
+            return $this-&gt;doInteractiveRun();
+        } else {
+            return $this-&gt;doNonInteractiveRun($this-&gt;config-&gt;rawOutput());
+        }
+    }
+
+    /**
+     * Run PsySH in interactive mode.
+     *
+     * Initializes tab completion and readline history, then spins up the
+     * execution loop.
+     *
+     * @throws \Throwable if thrown via the `throw-up` command
+     *
+     * @return int 0 if everything went fine, or an error code
+     */
+    private function doInteractiveRun(): int
+    {
+        $this-&gt;initializeTabCompletion();
+        $this-&gt;readline-&gt;readHistory();
+
+        $this-&gt;output-&gt;writeln($this-&gt;getHeader());
+        $this-&gt;writeVersionInfo();
+        $this-&gt;writeManualUpdateInfo();
+        $this-&gt;writeStartupMessage();
+
+        try {
+            $this-&gt;beforeRun();
+            $this-&gt;loadIncludes();
+            $loop = new ExecutionLoopClosure($this);
+            $exitCode = $loop-&gt;execute();
+            $this-&gt;afterRun($exitCode ?? 0);
+
+            return $exitCode ?? 0;
+        } catch (ThrowUpException $e) {
+            throw $e-&gt;getPrevious();
+        } catch (BreakException $e) {
+            // The ProcessForker throws a BreakException to finish the main thread.
+            return $e-&gt;getCode();
+        }
+    }
+
+    /**
+     * Run PsySH in non-interactive mode.
+     *
+     * Note that this isn&#039;t very useful unless you supply &quot;include&quot; arguments at
+     * the command line, or code via stdin.
+     *
+     * @param bool $rawOutput
+     *
+     * @return int 0 if everything went fine, or an error code
+     */
+    private function doNonInteractiveRun(bool $rawOutput): int
+    {
+        $this-&gt;nonInteractive = true;
+
+        // If raw output is enabled (or output is piped) we don&#039;t want startup messages.
+        if (!$rawOutput &amp;&amp; !$this-&gt;config-&gt;outputIsPiped()) {
+            $this-&gt;output-&gt;writeln($this-&gt;getHeader());
+            $this-&gt;writeVersionInfo();
+            $this-&gt;writeManualUpdateInfo();
+            $this-&gt;writeStartupMessage();
+        }
+
+        $this-&gt;beforeRun();
+        $this-&gt;loadIncludes();
+
+        // For non-interactive execution, read only from the input buffer or from piped input.
+        // Otherwise it&#039;ll try to readline and hang, waiting for user input with no indication of
+        // what&#039;s holding things up.
+        if (!empty($this-&gt;inputBuffer) || $this-&gt;config-&gt;inputIsPiped()) {
+            $this-&gt;getInput(false);
+        }
+
+        try {
+            if ($this-&gt;hasCode()) {
+                $ret = $this-&gt;execute($this-&gt;flushCode());
+                $this-&gt;writeReturnValue($ret, $rawOutput);
+            }
+        } catch (BreakException $e) {
+            // User called exit() in non-interactive mode
+            $this-&gt;afterRun($e-&gt;getCode());
+            $this-&gt;nonInteractive = false;
+
+            return $e-&gt;getCode();
+        }
+
+        $this-&gt;afterRun(0);
+        $this-&gt;nonInteractive = false;
+
+        return 0;
+    }
+
+    /**
+     * Configures the input and output instances based on the user arguments and options.
+     */
+    protected function configureIO(InputInterface $input, OutputInterface $output): void
+    {
+        // @todo overrides via environment variables (or should these happen in config? ... probably config)
+        $input-&gt;setInteractive($this-&gt;config-&gt;getInputInteractive());
+
+        if ($this-&gt;config-&gt;getOutputDecorated() !== null) {
+            $output-&gt;setDecorated($this-&gt;config-&gt;getOutputDecorated());
+        }
+
+        $output-&gt;setVerbosity($this-&gt;config-&gt;getOutputVerbosity());
+    }
+
+    /**
+     * Load user-defined includes.
+     */
+    private function loadIncludes()
+    {
+        // Load user-defined includes
+        $load = function (self $__psysh__) {
+            \set_error_handler([$__psysh__, &#039;handleError&#039;]);
+            foreach ($__psysh__-&gt;getIncludes() as $__psysh_include__) {
+                try {
+                    include_once $__psysh_include__;
+                } catch (\Exception $_e) {
+                    $__psysh__-&gt;writeException($_e);
+                }
+            }
+            \restore_error_handler();
+            unset($__psysh_include__);
+
+            // Override any new local variables with pre-defined scope variables
+            \extract($__psysh__-&gt;getScopeVariables(false));
+
+            // ... then add the whole mess of variables back.
+            $__psysh__-&gt;setScopeVariables(\get_defined_vars());
+        };
+
+        $load($this);
+    }
+
+    /**
+     * Read user input.
+     *
+     * This will continue fetching user input until the code buffer contains
+     * valid code.
+     *
+     * @throws BreakException if user hits Ctrl+D
+     *
+     * @param bool $interactive
+     */
+    public function getInput(bool $interactive = true)
+    {
+        $this-&gt;boot();
+
+        $this-&gt;codeBufferOpen = false;
+
+        do {
+            // reset output verbosity (in case it was altered by a subcommand)
+            $this-&gt;output-&gt;setVerbosity($this-&gt;originalVerbosity);
+
+            $input = $this-&gt;readline();
+
+            /*
+             * Handle Ctrl+D. It behaves differently in different cases:
+             *
+             *   1) In an expression, like a function or &quot;if&quot; block, clear the input buffer
+             *   2) At top-level session, behave like the exit command
+             *   3) When non-interactive, return, because that&#039;s the end of stdin
+             */
+            if ($input === false) {
+                if (!$interactive) {
+                    return;
+                }
+
+                $this-&gt;output-&gt;writeln(&#039;&#039;);
+
+                if ($this-&gt;hasCode()) {
+                    $this-&gt;resetCodeBuffer();
+                } else {
+                    throw new BreakException(&#039;Ctrl+D&#039;);
+                }
+            }
+
+            // handle empty input
+            if (\trim($input) === &#039;&#039; &amp;&amp; !$this-&gt;codeBufferOpen) {
+                continue;
+            }
+
+            $input = $this-&gt;onInput($input);
+
+            // If the input isn&#039;t in an open string or comment, check for commands to run.
+            if ($this-&gt;hasCommand($input) &amp;&amp; !$this-&gt;inputInOpenStringOrComment($input)) {
+                $this-&gt;addHistory($input);
+                $this-&gt;runCommand($input);
+
+                continue;
+            }
+
+            $this-&gt;addCode($input);
+        } while (!$interactive || !$this-&gt;hasValidCode());
+    }
+
+    /**
+     * Check whether the code buffer (plus current input) is in an open string or comment.
+     *
+     * @param string $input current line of input
+     *
+     * @return bool true if the input is in an open string or comment
+     */
+    private function inputInOpenStringOrComment(string $input): bool
+    {
+        if (!$this-&gt;hasCode()) {
+            return false;
+        }
+
+        $code = $this-&gt;codeBuffer;
+        $code[] = $input;
+        $tokens = @\token_get_all(&#039;&lt;?php &#039;.\implode(&quot;\n&quot;, $code));
+        $last = \array_pop($tokens);
+
+        return $last === &#039;&quot;&#039; || $last === &#039;`&#039; ||
+            (\is_array($last) &amp;&amp; \in_array($last[0], [\T_ENCAPSED_AND_WHITESPACE, \T_START_HEREDOC, \T_COMMENT]));
+    }
+
+    /**
+     * Run execution loop listeners before the shell session.
+     */
+    protected function beforeRun()
+    {
+        foreach ($this-&gt;loopListeners as $listener) {
+            if ($listener instanceof OutputAware) {
+                $listener-&gt;setOutput($this-&gt;output);
+            }
+        }
+
+        foreach ($this-&gt;loopListeners as $listener) {
+            $listener-&gt;beforeRun($this);
+        }
+    }
+
+    /**
+     * Run execution loop listeners at the start of each loop.
+     */
+    public function beforeLoop()
+    {
+        foreach ($this-&gt;loopListeners as $listener) {
+            $listener-&gt;beforeLoop($this);
+        }
+    }
+
+    /**
+     * Run execution loop listeners on user input.
+     *
+     * @param string $input
+     */
+    public function onInput(string $input): string
+    {
+        foreach ($this-&gt;loopListeners as $listeners) {
+            if (($return = $listeners-&gt;onInput($this, $input)) !== null) {
+                $input = $return;
+            }
+        }
+
+        return $input;
+    }
+
+    /**
+     * Run execution loop listeners on code to be executed.
+     *
+     * @param string $code
+     */
+    public function onExecute(string $code): string
+    {
+        $this-&gt;errorReporting = \error_reporting();
+
+        foreach ($this-&gt;loopListeners as $listener) {
+            if (($return = $listener-&gt;onExecute($this, $code)) !== null) {
+                $code = $return;
+            }
+        }
+
+        $output = $this-&gt;output;
+        if ($output instanceof ConsoleOutput) {
+            $output = $output-&gt;getErrorOutput();
+        }
+
+        $output-&gt;writeln(\sprintf(&#039;&lt;whisper&gt;%s&lt;/whisper&gt;&#039;, OutputFormatter::escape($code)), ConsoleOutput::VERBOSITY_DEBUG);
+
+        return $code;
+    }
+
+    /**
+     * Run execution loop listeners after each loop.
+     */
+    public function afterLoop()
+    {
+        foreach (\array_reverse($this-&gt;loopListeners) as $listener) {
+            $listener-&gt;afterLoop($this);
+        }
+    }
+
+    /**
+     * Run execution loop listers after the shell session.
+     *
+     * @param int $exitCode Exit code from the execution loop
+     */
+    protected function afterRun(int $exitCode = 0)
+    {
+        foreach (\array_reverse($this-&gt;loopListeners) as $listener) {
+            $listener-&gt;afterRun($this, $exitCode);
+        }
+    }
+
+    /**
+     * Set the variables currently in scope.
+     *
+     * @param array $vars
+     */
+    public function setScopeVariables(array $vars)
+    {
+        $this-&gt;context-&gt;setAll($vars);
+    }
+
+    /**
+     * Return the set of variables currently in scope.
+     *
+     * @param bool $includeBoundObject Pass false to exclude &#039;this&#039;. If you&#039;re
+     *                                 passing the scope variables to `extract`
+     *                                 you _must_ exclude &#039;this&#039;
+     *
+     * @return array Associative array of scope variables
+     */
+    public function getScopeVariables(bool $includeBoundObject = true): array
+    {
+        $vars = $this-&gt;context-&gt;getAll();
+
+        if (!$includeBoundObject) {
+            unset($vars[&#039;this&#039;]);
+        }
+
+        return $vars;
+    }
+
+    /**
+     * Return the set of magic variables currently in scope.
+     *
+     * @param bool $includeBoundObject Pass false to exclude &#039;this&#039;. If you&#039;re
+     *                                 passing the scope variables to `extract`
+     *                                 you _must_ exclude &#039;this&#039;
+     *
+     * @return array Associative array of magic scope variables
+     */
+    public function getSpecialScopeVariables(bool $includeBoundObject = true): array
+    {
+        $vars = $this-&gt;context-&gt;getSpecialVariables();
+
+        if (!$includeBoundObject) {
+            unset($vars[&#039;this&#039;]);
+        }
+
+        return $vars;
+    }
+
+    /**
+     * Return the set of variables currently in scope which differ from the
+     * values passed as $currentVars.
+     *
+     * This is used inside the Execution Loop Closure to pick up scope variable
+     * changes made by commands while the loop is running.
+     *
+     * @param array $currentVars
+     *
+     * @return array Associative array of scope variables which differ from $currentVars
+     */
+    public function getScopeVariablesDiff(array $currentVars): array
+    {
+        $newVars = [];
+
+        foreach ($this-&gt;getScopeVariables(false) as $key =&gt; $value) {
+            if (!\array_key_exists($key, $currentVars) || $currentVars[$key] !== $value) {
+                $newVars[$key] = $value;
+            }
+        }
+
+        return $newVars;
+    }
+
+    /**
+     * Get the set of unused command-scope variable names.
+     *
+     * @return array Array of unused variable names
+     */
+    public function getUnusedCommandScopeVariableNames(): array
+    {
+        return $this-&gt;context-&gt;getUnusedCommandScopeVariableNames();
+    }
+
+    /**
+     * Get the set of variable names currently in scope.
+     *
+     * @return array Array of variable names
+     */
+    public function getScopeVariableNames(): array
+    {
+        return \array_keys($this-&gt;context-&gt;getAll());
+    }
+
+    /**
+     * Get a scope variable value by name.
+     *
+     * @param string $name
+     *
+     * @return mixed
+     */
+    public function getScopeVariable(string $name)
+    {
+        return $this-&gt;context-&gt;get($name);
+    }
+
+    /**
+     * Set the bound object ($this variable) for the interactive shell.
+     *
+     * @param object|null $boundObject
+     */
+    public function setBoundObject($boundObject)
+    {
+        $this-&gt;context-&gt;setBoundObject($boundObject);
+    }
+
+    /**
+     * Get the bound object ($this variable) for the interactive shell.
+     *
+     * @return object|null
+     */
+    public function getBoundObject()
+    {
+        return $this-&gt;context-&gt;getBoundObject();
+    }
+
+    /**
+     * Set the bound class (self) for the interactive shell.
+     *
+     * @param string|null $boundClass
+     */
+    public function setBoundClass($boundClass)
+    {
+        $this-&gt;context-&gt;setBoundClass($boundClass);
+    }
+
+    /**
+     * Get the bound class (self) for the interactive shell.
+     *
+     * @return string|null
+     */
+    public function getBoundClass()
+    {
+        return $this-&gt;context-&gt;getBoundClass();
+    }
+
+    /**
+     * Add includes, to be parsed and executed before running the interactive shell.
+     *
+     * @param array $includes
+     */
+    public function setIncludes(array $includes = [])
+    {
+        $this-&gt;includes = $includes;
+    }
+
+    /**
+     * Get PHP files to be parsed and executed before running the interactive shell.
+     *
+     * @return string[]
+     */
+    public function getIncludes(): array
+    {
+        return \array_merge($this-&gt;config-&gt;getDefaultIncludes(), $this-&gt;includes);
+    }
+
+    /**
+     * Check whether this shell&#039;s code buffer contains code.
+     *
+     * @return bool True if the code buffer contains code
+     */
+    public function hasCode(): bool
+    {
+        return !empty($this-&gt;codeBuffer);
+    }
+
+    /**
+     * Check whether the code in this shell&#039;s code buffer is valid.
+     *
+     * If the code is valid, the code buffer should be flushed and evaluated.
+     *
+     * @return bool True if the code buffer content is valid
+     */
+    protected function hasValidCode(): bool
+    {
+        return !$this-&gt;codeBufferOpen &amp;&amp; $this-&gt;code !== false;
+    }
+
+    /**
+     * Add code to the code buffer.
+     *
+     * @param string $code
+     * @param bool   $silent
+     */
+    public function addCode(string $code, bool $silent = false)
+    {
+        $this-&gt;boot();
+
+        try {
+            // Code lines ending in \ keep the buffer open
+            if (\substr(\rtrim($code), -1) === &#039;\\&#039;) {
+                $this-&gt;codeBufferOpen = true;
+                $code = \substr(\rtrim($code), 0, -1);
+            } else {
+                $this-&gt;codeBufferOpen = false;
+            }
+
+            $this-&gt;codeBuffer[] = $silent ? new SilentInput($code) : $code;
+            $this-&gt;code = $this-&gt;cleaner-&gt;clean($this-&gt;codeBuffer, $this-&gt;config-&gt;requireSemicolons());
+
+            if (!$silent &amp;&amp; $this-&gt;code !== false) {
+                $this-&gt;writeCleanerMessages();
+            }
+        } catch (\Throwable $e) {
+            // Add failed code blocks to the readline history.
+            $this-&gt;addCodeBufferToHistory();
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Set the code buffer.
+     *
+     * This is mostly used by `Shell::execute`. Any existing code in the input
+     * buffer is pushed onto a stack and will come back after this new code is
+     * executed.
+     *
+     * @throws \InvalidArgumentException if $code isn&#039;t a complete statement
+     *
+     * @param string $code
+     * @param bool   $silent
+     */
+    private function setCode(string $code, bool $silent = false)
+    {
+        if ($this-&gt;hasCode()) {
+            $this-&gt;codeStack[] = [$this-&gt;codeBuffer, $this-&gt;codeBufferOpen, $this-&gt;code];
+        }
+
+        $this-&gt;resetCodeBuffer();
+        try {
+            $this-&gt;addCode($code, $silent);
+        } catch (\Throwable $e) {
+            $this-&gt;popCodeStack();
+
+            throw $e;
+        }
+
+        if (!$this-&gt;hasValidCode()) {
+            $this-&gt;popCodeStack();
+
+            throw new \InvalidArgumentException(&#039;Unexpected end of input&#039;);
+        }
+    }
+
+    /**
+     * Get the current code buffer.
+     *
+     * This is useful for commands which manipulate the buffer.
+     *
+     * @return string[]
+     */
+    public function getCodeBuffer(): array
+    {
+        return $this-&gt;codeBuffer;
+    }
+
+    /**
+     * Run a Psy Shell command given the user input.
+     *
+     * @throws \InvalidArgumentException if the input is not a valid command
+     *
+     * @param string $input User input string
+     *
+     * @return mixed Who knows?
+     */
+    protected function runCommand(string $input)
+    {
+        $command = $this-&gt;getCommand($input);
+
+        if (empty($command)) {
+            throw new \InvalidArgumentException(&#039;Command not found: &#039;.$input);
+        }
+
+        if ($logger = $this-&gt;config-&gt;getLogger()) {
+            $logger-&gt;logCommand($input);
+        }
+
+        $input = new ShellInput(\str_replace(&#039;\\&#039;, &#039;\\\\&#039;, \rtrim($input, &quot; \t\n\r\0\x0B;&quot;)));
+
+        if (!$input-&gt;hasParameterOption([&#039;--help&#039;, &#039;-h&#039;])) {
+            try {
+                return $command-&gt;run($input, $this-&gt;output);
+            } catch (\Exception $e) {
+                if (!self::needsInputHelp($e)) {
+                    throw $e;
+                }
+
+                $this-&gt;writeException($e);
+
+                $this-&gt;output-&gt;writeln(&#039;--&#039;);
+                if (!$this-&gt;config-&gt;theme()-&gt;compact()) {
+                    $this-&gt;output-&gt;writeln(&#039;&#039;);
+                }
+            }
+        }
+
+        $helpCommand = $this-&gt;get(&#039;help&#039;);
+        if (!$helpCommand instanceof Command\HelpCommand) {
+            throw new RuntimeException(&#039;Invalid help command instance&#039;);
+        }
+        $helpCommand-&gt;setCommand($command);
+
+        return $helpCommand-&gt;run(new StringInput(&#039;&#039;), $this-&gt;output);
+    }
+
+    /**
+     * Check whether a given input error would benefit from --help.
+     *
+     * @return bool
+     */
+    private static function needsInputHelp(\Exception $e): bool
+    {
+        if (!($e instanceof \RuntimeException || $e instanceof SymfonyConsoleException)) {
+            return false;
+        }
+
+        $inputErrors = [
+            &#039;Not enough arguments&#039;,
+            &#039;option does not accept a value&#039;,
+            &#039;option does not exist&#039;,
+            &#039;option requires a value&#039;,
+        ];
+
+        $msg = $e-&gt;getMessage();
+        foreach ($inputErrors as $errorMsg) {
+            if (\strpos($msg, $errorMsg) !== false) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Whisper messages from CodeCleaner passes.
+     */
+    private function writeCleanerMessages(): void
+    {
+        if (!isset($this-&gt;output)) {
+            return;
+        }
+
+        $output = $this-&gt;output;
+        if ($output instanceof ConsoleOutput) {
+            $output = $output-&gt;getErrorOutput();
+        }
+
+        foreach ($this-&gt;cleaner-&gt;getMessages() as $message) {
+            $output-&gt;writeln(\sprintf(&#039;&lt;whisper&gt;%s&lt;/whisper&gt;&#039;, OutputFormatter::escape($message)));
+        }
+    }
+
+    /**
+     * Reset the current code buffer.
+     *
+     * This should be run after evaluating user input, catching exceptions, or
+     * on demand by commands such as BufferCommand.
+     */
+    public function resetCodeBuffer()
+    {
+        $this-&gt;codeBuffer = [];
+        $this-&gt;code = false;
+    }
+
+    /**
+     * Inject input into the input buffer.
+     *
+     * This is useful for commands which want to replay history.
+     *
+     * @param string|array $input
+     * @param bool         $silent
+     */
+    public function addInput($input, bool $silent = false)
+    {
+        foreach ((array) $input as $line) {
+            $this-&gt;inputBuffer[] = $silent ? new SilentInput($line) : $line;
+        }
+    }
+
+    /**
+     * Flush the current (valid) code buffer.
+     *
+     * If the code buffer is valid, resets the code buffer and returns the
+     * current code.
+     *
+     * @return string|null PHP code buffer contents
+     */
+    public function flushCode()
+    {
+        if ($this-&gt;hasValidCode()) {
+            $this-&gt;addCodeBufferToHistory();
+            $code = $this-&gt;code;
+            $this-&gt;popCodeStack();
+
+            return $code;
+        }
+
+        return null;
+    }
+
+    /**
+     * Reset the code buffer and restore any code pushed during `execute` calls.
+     */
+    private function popCodeStack()
+    {
+        $this-&gt;resetCodeBuffer();
+
+        if (empty($this-&gt;codeStack)) {
+            return;
+        }
+
+        list($codeBuffer, $codeBufferOpen, $code) = \array_pop($this-&gt;codeStack);
+
+        $this-&gt;codeBuffer = $codeBuffer;
+        $this-&gt;codeBufferOpen = $codeBufferOpen;
+        $this-&gt;code = $code;
+    }
+
+    /**
+     * (Possibly) add a line to the readline history.
+     *
+     * Like Bash, if the line starts with a space character, it will be omitted
+     * from history. Note that an entire block multi-line code input will be
+     * omitted iff the first line begins with a space.
+     *
+     * Additionally, if a line is &quot;silent&quot;, i.e. it was initially added with the
+     * silent flag, it will also be omitted.
+     *
+     * @param string|SilentInput $line
+     */
+    private function addHistory($line)
+    {
+        if ($line instanceof SilentInput) {
+            return;
+        }
+
+        // Skip empty lines and lines starting with a space
+        if (\trim($line) !== &#039;&#039; &amp;&amp; \substr($line, 0, 1) !== &#039; &#039;) {
+            $this-&gt;readline-&gt;addHistory($line);
+        }
+    }
+
+    /**
+     * Filter silent input from code buffer, write the rest to readline history.
+     */
+    private function addCodeBufferToHistory()
+    {
+        $codeBuffer = \array_filter($this-&gt;codeBuffer, function ($line) {
+            return !$line instanceof SilentInput;
+        });
+
+        $this-&gt;addHistory(\implode(&quot;\n&quot;, $codeBuffer));
+    }
+
+    /**
+     * Get the current evaluation scope namespace.
+     *
+     * @see CodeCleaner::getNamespace
+     *
+     * @return string|null Current code namespace
+     */
+    public function getNamespace()
+    {
+        $this-&gt;boot();
+
+        if ($namespace = $this-&gt;cleaner-&gt;getNamespace()) {
+            return \implode(&#039;\\&#039;, $namespace);
+        }
+
+        return null;
+    }
+
+    /**
+     * Write a string to stdout.
+     *
+     * This is used by the shell loop for rendering output from evaluated code.
+     *
+     * @param string $out
+     * @param int    $phase Output buffering phase
+     *
+     * @return string Empty string
+     */
+    public function writeStdout(string $out, int $phase = \PHP_OUTPUT_HANDLER_END): string
+    {
+        if ($phase &amp; \PHP_OUTPUT_HANDLER_START) {
+            if ($this-&gt;output instanceof ShellOutput) {
+                $this-&gt;output-&gt;startPaging();
+            }
+        }
+
+        $isCleaning = $phase &amp; \PHP_OUTPUT_HANDLER_CLEAN;
+
+        // Incremental flush
+        if ($out !== &#039;&#039; &amp;&amp; !$isCleaning) {
+            $this-&gt;output-&gt;write($out, false, OutputInterface::OUTPUT_RAW);
+            $this-&gt;outputWantsNewline = (\substr($out, -1) !== &quot;\n&quot;);
+            $this-&gt;stdoutBuffer .= $out;
+        }
+
+        // Output buffering is done!
+        if ($phase &amp; \PHP_OUTPUT_HANDLER_END) {
+            // Write an extra newline if stdout didn&#039;t end with one
+            if ($this-&gt;outputWantsNewline) {
+                if (!$this-&gt;config-&gt;rawOutput() &amp;&amp; !$this-&gt;config-&gt;outputIsPiped()) {
+                    $this-&gt;output-&gt;writeln(\sprintf(&#039;&lt;whisper&gt;%s&lt;/whisper&gt;&#039;, $this-&gt;config-&gt;useUnicode() ? &#039;⏎&#039; : &#039;\\n&#039;));
+                } else {
+                    $this-&gt;output-&gt;writeln(&#039;&#039;);
+                }
+                $this-&gt;outputWantsNewline = false;
+            }
+
+            // Save the stdout buffer as $__out
+            if ($this-&gt;stdoutBuffer !== &#039;&#039;) {
+                $this-&gt;context-&gt;setLastStdout($this-&gt;stdoutBuffer);
+                $this-&gt;stdoutBuffer = &#039;&#039;;
+            }
+
+            if ($this-&gt;output instanceof ShellOutput) {
+                $this-&gt;output-&gt;stopPaging();
+            }
+        }
+
+        return &#039;&#039;;
+    }
+
+    /**
+     * Write a return value to stdout.
+     *
+     * The return value is formatted or pretty-printed, and rendered in a
+     * visibly distinct manner (in this case, as cyan).
+     *
+     * @see self::presentValue
+     *
+     * @param mixed $ret
+     * @param bool  $rawOutput Write raw var_export-style values
+     */
+    public function writeReturnValue($ret, bool $rawOutput = false)
+    {
+        $this-&gt;lastExecSuccess = true;
+
+        if ($ret instanceof NoReturnValue) {
+            return;
+        }
+
+        $this-&gt;context-&gt;setReturnValue($ret);
+
+        if ($rawOutput) {
+            $formatted = \var_export($ret, true);
+        } else {
+            $prompt = $this-&gt;config-&gt;theme()-&gt;returnValue();
+            $indent = \str_repeat(&#039; &#039;, \strlen($prompt));
+            $formatted = $this-&gt;presentValue($ret);
+            $formattedRetValue = \sprintf(&#039;&lt;whisper&gt;%s&lt;/whisper&gt;&#039;, $prompt);
+
+            $formatted = $formattedRetValue.\str_replace(\PHP_EOL, \PHP_EOL.$indent, $formatted);
+        }
+
+        if ($this-&gt;output instanceof ShellOutput) {
+            $this-&gt;output-&gt;page($formatted.\PHP_EOL);
+        } else {
+            $this-&gt;output-&gt;writeln($formatted);
+        }
+    }
+
+    /**
+     * Renders a caught Exception or Error.
+     *
+     * Exceptions are formatted according to severity. ErrorExceptions which were
+     * warnings or Strict errors aren&#039;t rendered as harshly as real errors.
+     *
+     * Stores $e as the last Exception in the Shell Context.
+     *
+     * @param \Throwable $e An exception or error instance
+     */
+    public function writeException(\Throwable $e)
+    {
+        // No need to write the break exception during a non-interactive run.
+        if ($e instanceof BreakException &amp;&amp; $this-&gt;nonInteractive) {
+            $this-&gt;resetCodeBuffer();
+
+            return;
+        }
+
+        // Break exceptions don&#039;t count :)
+        if (!$e instanceof BreakException) {
+            $this-&gt;lastExecSuccess = false;
+            $this-&gt;context-&gt;setLastException($e);
+        }
+
+        $output = $this-&gt;output;
+        if ($output instanceof ConsoleOutput) {
+            $output = $output-&gt;getErrorOutput();
+        }
+
+        if (!$this-&gt;config-&gt;theme()-&gt;compact()) {
+            $output-&gt;writeln(&#039;&#039;);
+        }
+
+        $output-&gt;writeln($this-&gt;formatException($e));
+
+        if (!$this-&gt;config-&gt;theme()-&gt;compact()) {
+            $output-&gt;writeln(&#039;&#039;);
+        }
+
+        // Include an exception trace (as long as this isn&#039;t a BreakException).
+        if (!$e instanceof BreakException &amp;&amp; $output-&gt;getVerbosity() &gt;= OutputInterface::VERBOSITY_VERBOSE) {
+            $trace = TraceFormatter::formatTrace($e);
+            if (\count($trace) !== 0) {
+                $output-&gt;writeln(&#039;--&#039;);
+                $output-&gt;write($trace, true);
+                $output-&gt;writeln(&#039;&#039;);
+            }
+        }
+
+        $this-&gt;resetCodeBuffer();
+    }
+
+    /**
+     * Check whether the last exec was successful.
+     *
+     * Returns true if a return value was logged rather than an exception.
+     */
+    public function getLastExecSuccess(): bool
+    {
+        return $this-&gt;lastExecSuccess;
+    }
+
+    /**
+     * Helper for formatting an exception or error for writeException().
+     *
+     * @todo extract this to somewhere it makes more sense
+     *
+     * @param \Throwable $e
+     */
+    public function formatException(\Throwable $e): string
+    {
+        $indent = $this-&gt;config-&gt;theme()-&gt;compact() ? &#039;&#039; : &#039;  &#039;;
+
+        if ($e instanceof BreakException) {
+            return \sprintf(&#039;%s&lt;info&gt; INFO &lt;/info&gt; %s.&#039;, $indent, \rtrim($e-&gt;getRawMessage(), &#039;.&#039;));
+        } elseif ($e instanceof InterruptException) {
+            return \sprintf(&#039;%s&lt;warning&gt; INTERRUPT &lt;/warning&gt; %s.&#039;, $indent, $e-&gt;getRawMessage());
+        } elseif ($e instanceof PsyException) {
+            $message = $e-&gt;getLine() &gt; 1
+                ? \sprintf(&#039;%s in %s on line %d&#039;, $e-&gt;getRawMessage(), $e-&gt;getFile(), $e-&gt;getLine())
+                : \sprintf(&#039;%s in %s&#039;, $e-&gt;getRawMessage(), $e-&gt;getFile());
+
+            $messageLabel = \strtoupper($this-&gt;getMessageLabel($e));
+        } else {
+            $message = $e-&gt;getMessage();
+            $messageLabel = $this-&gt;getMessageLabel($e);
+        }
+
+        $message = \preg_replace(
+            &quot;#(\\w:)?([\\\\/]\\w+)*[\\\\/]src[\\\\/]Execution(?:Loop)?Closure.php\(\d+\) : eval\(\)&#039;d code#&quot;,
+            &quot;eval()&#039;d code&quot;,
+            $message
+        );
+
+        $message = \str_replace(&quot; in eval()&#039;d code&quot;, &#039;&#039;, $message);
+        $message = \trim($message);
+
+        // Ensures the given string ends with punctuation...
+        if (!empty($message) &amp;&amp; !\in_array(\substr($message, -1), [&#039;.&#039;, &#039;?&#039;, &#039;!&#039;, &#039;:&#039;])) {
+            $message = &quot;$message.&quot;;
+        }
+
+        // Ensures the given message only contains relative paths...
+        $message = \str_replace(\getcwd().\DIRECTORY_SEPARATOR, &#039;&#039;, $message);
+
+        $severity = ($e instanceof \ErrorException) ? $this-&gt;getSeverity($e) : &#039;error&#039;;
+
+        return \sprintf(&#039;%s&lt;%s&gt; %s &lt;/%s&gt; %s&#039;, $indent, $severity, $messageLabel, $severity, OutputFormatter::escape($message));
+    }
+
+    /**
+     * Helper for getting an output style for the given ErrorException&#039;s level.
+     *
+     * @param \ErrorException $e
+     */
+    protected function getSeverity(\ErrorException $e): string
+    {
+        $severity = $e-&gt;getSeverity();
+        if ($severity &amp; \error_reporting()) {
+            switch ($severity) {
+                case \E_WARNING:
+                case \E_NOTICE:
+                case \E_CORE_WARNING:
+                case \E_COMPILE_WARNING:
+                case \E_USER_WARNING:
+                case \E_USER_NOTICE:
+                case \E_USER_DEPRECATED:
+                case \E_DEPRECATED:
+                    return &#039;warning&#039;;
+
+                default:
+                    if ((\PHP_VERSION_ID &lt; 80400) &amp;&amp; $severity === \E_STRICT) {
+                        return &#039;warning&#039;;
+                    }
+
+                    return &#039;error&#039;;
+            }
+        } else {
+            // Since this is below the user&#039;s reporting threshold, it&#039;s always going to be a warning.
+            return &#039;warning&#039;;
+        }
+    }
+
+    /**
+     * Helper for getting an output style for the given ErrorException&#039;s level.
+     *
+     * @param \Throwable $e
+     */
+    protected function getMessageLabel(\Throwable $e): string
+    {
+        if ($e instanceof \ErrorException) {
+            $severity = $e-&gt;getSeverity();
+
+            if ($severity &amp; \error_reporting()) {
+                switch ($severity) {
+                    case \E_WARNING:
+                        return &#039;Warning&#039;;
+                    case \E_NOTICE:
+                        return &#039;Notice&#039;;
+                    case \E_CORE_WARNING:
+                        return &#039;Core Warning&#039;;
+                    case \E_COMPILE_WARNING:
+                        return &#039;Compile Warning&#039;;
+                    case \E_USER_WARNING:
+                        return &#039;User Warning&#039;;
+                    case \E_USER_NOTICE:
+                        return &#039;User Notice&#039;;
+                    case \E_USER_DEPRECATED:
+                        return &#039;User Deprecated&#039;;
+                    case \E_DEPRECATED:
+                        return &#039;Deprecated&#039;;
+                    default:
+                        if ((\PHP_VERSION_ID &lt; 80400) &amp;&amp; $severity === \E_STRICT) {
+                            return &#039;Strict&#039;;
+                        }
+                }
+            }
+        }
+
+        if ($e instanceof PsyException || $e instanceof SymfonyConsoleException) {
+            $exceptionShortName = (new \ReflectionClass($e))-&gt;getShortName();
+            $typeParts = \preg_split(&#039;/(?=[A-Z])/&#039;, $exceptionShortName);
+
+            switch ($exceptionShortName) {
+                case &#039;RuntimeException&#039;:
+                case &#039;LogicException&#039;:
+                    // These ones look weird without &#039;Exception&#039;
+                    break;
+                default:
+                    if (\end($typeParts) === &#039;Exception&#039;) {
+                        \array_pop($typeParts);
+                    }
+                    break;
+            }
+
+            return \trim(\strtoupper(\implode(&#039; &#039;, $typeParts)));
+        }
+
+        return \get_class($e);
+    }
+
+    /**
+     * Execute code in the shell execution context.
+     *
+     * @param string $code
+     * @param bool   $throwExceptions
+     *
+     * @return mixed
+     */
+    public function execute(string $code, bool $throwExceptions = false)
+    {
+        $this-&gt;boot();
+
+        $this-&gt;setCode($code, true);
+
+        if ($logger = $this-&gt;config-&gt;getLogger()) {
+            $logger-&gt;logExecute($code);
+        }
+
+        $closure = new ExecutionClosure($this);
+
+        if ($throwExceptions) {
+            return $closure-&gt;execute();
+        }
+
+        try {
+            return $closure-&gt;execute();
+        } catch (BreakException $_e) {
+            // Re-throw BreakException so it can propagate exit codes
+            throw $_e;
+        } catch (\Throwable $_e) {
+            $this-&gt;writeException($_e);
+        }
+    }
+
+    /**
+     * Helper for throwing an ErrorException.
+     *
+     * This allows us to:
+     *
+     *     set_error_handler([$psysh, &#039;handleError&#039;]);
+     *
+     * Unlike ErrorException::throwException, this error handler respects error
+     * levels; i.e. it logs warnings and notices, but doesn&#039;t throw exceptions.
+     * This should probably only be used in the inner execution loop of the
+     * shell, as most of the time a thrown exception is much more useful.
+     *
+     * If the error type matches the `errorLoggingLevel` config, it will be
+     * logged as well, regardless of the `error_reporting` level.
+     *
+     * @see \Psy\Exception\ErrorException::throwException
+     * @see \Psy\Shell::writeException
+     *
+     * @throws \Psy\Exception\ErrorException depending on the error level
+     *
+     * @param int    $errno   Error type
+     * @param string $errstr  Message
+     * @param string $errfile Filename
+     * @param int    $errline Line number
+     */
+    public function handleError($errno, $errstr, $errfile, $errline)
+    {
+        // This is an error worth throwing.
+        //
+        // n.b. Technically we can&#039;t handle all of these in userland code, but
+        // we&#039;ll list &#039;em all for good measure
+        if ($errno &amp; (\E_ERROR | \E_PARSE | \E_CORE_ERROR | \E_COMPILE_ERROR | \E_USER_ERROR | \E_RECOVERABLE_ERROR)) {
+            ErrorException::throwException($errno, $errstr, $errfile, $errline);
+        }
+
+        // When errors are suppressed, the error_reporting value will differ
+        // from when we started executing. In that case, we won&#039;t log errors.
+        $errorsSuppressed = $this-&gt;errorReporting !== null &amp;&amp; $this-&gt;errorReporting !== \error_reporting();
+
+        // Otherwise log it and continue.
+        if ($errno &amp; \error_reporting() || (!$errorsSuppressed &amp;&amp; ($errno &amp; $this-&gt;config-&gt;errorLoggingLevel()))) {
+            $this-&gt;writeException(new ErrorException($errstr, 0, $errno, $errfile, $errline));
+        }
+    }
+
+    /**
+     * Format a value for display.
+     *
+     * @see Presenter::present
+     *
+     * @param mixed $val
+     *
+     * @return string Formatted value
+     */
+    protected function presentValue($val): string
+    {
+        return $this-&gt;config-&gt;getPresenter()-&gt;present($val);
+    }
+
+    /**
+     * Get a command (if one exists) for the current input string.
+     *
+     * @param string $input
+     *
+     * @return BaseCommand|null
+     */
+    protected function getCommand(string $input)
+    {
+        $input = new StringInput($input);
+        if ($name = $input-&gt;getFirstArgument()) {
+            return $this-&gt;get($name);
+        }
+
+        return null;
+    }
+
+    /**
+     * Check whether a command is set for the current input string.
+     *
+     * @param string $input
+     *
+     * @return bool True if the shell has a command for the given input
+     */
+    protected function hasCommand(string $input): bool
+    {
+        if (\preg_match(&#039;/([^\s]+?)(?:\s|$)/A&#039;, \ltrim($input), $match)) {
+            return $this-&gt;has($match[1]);
+        }
+
+        return false;
+    }
+
+    /**
+     * Get the current input prompt.
+     *
+     * @return string|null
+     */
+    protected function getPrompt()
+    {
+        if ($this-&gt;output-&gt;isQuiet()) {
+            return null;
+        }
+
+        $theme = $this-&gt;config-&gt;theme();
+
+        if ($this-&gt;hasCode()) {
+            return $theme-&gt;bufferPrompt();
+        }
+
+        return $theme-&gt;prompt();
+    }
+
+    /**
+     * Read a line of user input.
+     *
+     * This will return a line from the input buffer (if any exist). Otherwise,
+     * it will ask the user for input.
+     *
+     * If readline is enabled, this delegates to readline. Otherwise, it&#039;s an
+     * ugly `fgets` call.
+     *
+     * @param bool $interactive
+     *
+     * @return string|false One line of user input
+     */
+    protected function readline(bool $interactive = true)
+    {
+        $prompt = $this-&gt;config-&gt;theme()-&gt;replayPrompt();
+
+        if (!empty($this-&gt;inputBuffer)) {
+            $line = \array_shift($this-&gt;inputBuffer);
+            if (!$line instanceof SilentInput) {
+                $this-&gt;output-&gt;writeln(\sprintf(&#039;&lt;whisper&gt;%s&lt;/whisper&gt;&lt;aside&gt;%s&lt;/aside&gt;&#039;, $prompt, OutputFormatter::escape($line)));
+            }
+
+            return $line;
+        }
+
+        $bracketedPaste = $interactive &amp;&amp; $this-&gt;config-&gt;useBracketedPaste();
+
+        if ($bracketedPaste) {
+            \printf(&quot;\e[?2004h&quot;); // Enable bracketed paste
+        }
+
+        $line = $this-&gt;readline-&gt;readline($this-&gt;getPrompt());
+
+        if ($bracketedPaste) {
+            \printf(&quot;\e[?2004l&quot;); // ... and disable it again
+        }
+
+        return $line;
+    }
+
+    /**
+     * Get the shell output header.
+     */
+    protected function getHeader(): string
+    {
+        return \sprintf(&#039;&lt;whisper&gt;%s by Justin Hileman&lt;/whisper&gt;&#039;, self::getVersionHeader($this-&gt;config-&gt;useUnicode()));
+    }
+
+    /**
+     * Get the current version of Psy Shell.
+     *
+     * @deprecated call self::getVersionHeader instead
+     */
+    public function getVersion(): string
+    {
+        @\trigger_error(&#039;`getVersion` is deprecated; call `self::getVersionHeader` instead.&#039;, \E_USER_DEPRECATED);
+
+        return self::getVersionHeader($this-&gt;config-&gt;useUnicode());
+    }
+
+    /**
+     * Get a pretty header including the current version of Psy Shell.
+     *
+     * @param bool $useUnicode
+     */
+    public static function getVersionHeader(bool $useUnicode = false): string
+    {
+        $separator = $useUnicode ? &#039;—&#039; : &#039;-&#039;;
+
+        return \sprintf(&#039;Psy Shell %s (PHP %s %s %s)&#039;, self::VERSION, \PHP_VERSION, $separator, \PHP_SAPI);
+    }
+
+    /**
+     * Get a PHP manual database instance.
+     *
+     * @deprecated Use getManual() instead for unified access to all manual formats
+     *
+     * @return \PDO|null
+     */
+    public function getManualDb()
+    {
+        return $this-&gt;config-&gt;getManualDb();
+    }
+
+    /**
+     * Get a PHP manual loader.
+     *
+     * @return Manual\ManualInterface|null
+     */
+    public function getManual()
+    {
+        return $this-&gt;config-&gt;getManual();
+    }
+
+    /**
+     * Initialize tab completion matchers.
+     *
+     * If tab completion is enabled this adds tab completion matchers to the
+     * auto completer and sets context if needed.
+     */
+    protected function initializeTabCompletion()
+    {
+        if (!$this-&gt;config-&gt;useTabCompletion()) {
+            return;
+        }
+
+        $this-&gt;autoCompleter = $this-&gt;config-&gt;getAutoCompleter();
+
+        // auto completer needs shell to be linked to configuration because of
+        // the context aware matchers
+        $this-&gt;addMatchersToAutoCompleter($this-&gt;getDefaultMatchers());
+        $this-&gt;addMatchersToAutoCompleter($this-&gt;matchers);
+
+        $this-&gt;autoCompleter-&gt;activate();
+    }
+
+    /**
+     * Add matchers to the auto completer, setting context if needed.
+     *
+     * @param array $matchers
+     */
+    private function addMatchersToAutoCompleter(array $matchers)
+    {
+        foreach ($matchers as $matcher) {
+            if ($matcher instanceof ContextAware) {
+                $matcher-&gt;setContext($this-&gt;context);
+            }
+            $this-&gt;autoCompleter-&gt;addMatcher($matcher);
+        }
+    }
+
+    /**
+     * @todo Implement prompt to start update
+     *
+     * @return void|string
+     */
+    protected function writeVersionInfo()
+    {
+        if (\PHP_SAPI !== &#039;cli&#039;) {
+            return;
+        }
+
+        try {
+            $client = $this-&gt;config-&gt;getChecker();
+            if (!$client-&gt;isLatest()) {
+                $this-&gt;output-&gt;writeln(\sprintf(&#039;&lt;whisper&gt;New version is available at psysh.org/psysh (current: %s, latest: %s)&lt;/whisper&gt;&#039;, self::VERSION, $client-&gt;getLatest()));
+            }
+        } catch (\InvalidArgumentException $e) {
+            $this-&gt;output-&gt;writeln($e-&gt;getMessage());
+        }
+    }
+
+    /**
+     * Check for manual updates and write notification if available.
+     */
+    protected function writeManualUpdateInfo()
+    {
+        if (\PHP_SAPI !== &#039;cli&#039;) {
+            return;
+        }
+
+        try {
+            $checker = $this-&gt;config-&gt;getManualChecker();
+            if ($checker &amp;&amp; !$checker-&gt;isLatest()) {
+                $this-&gt;output-&gt;writeln(\sprintf(&#039;&lt;whisper&gt;New PHP manual is available (latest: %s). Update with `doc --update-manual`&lt;/whisper&gt;&#039;, $checker-&gt;getLatest()));
+            }
+        } catch (\Exception $e) {
+            // Silently ignore manual update check failures
+        }
+    }
+
+    /**
+     * Write a startup message if set.
+     */
+    protected function writeStartupMessage()
+    {
+        $message = $this-&gt;config-&gt;getStartupMessage();
+        if ($message !== null &amp;&amp; $message !== &#039;&#039;) {
+            $this-&gt;output-&gt;writeln($message);
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/psy/psysh/src/ShellLogger.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/psy/psysh/src/CodeCleaner -->
+
+</body>
+</html>

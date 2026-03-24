@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/GetFromInlineValidatorBase.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Extracting\Strategies;
+
+use Knuckles\Camel\Extraction\ExtractedEndpointData;
+use Knuckles\Scribe\Extracting\MethodAstParser;
+use Knuckles\Scribe\Extracting\ParsesValidationRules;
+use Knuckles\Scribe\Extracting\Shared\ValidationRulesFinders\RequestValidate;
+use Knuckles\Scribe\Extracting\Shared\ValidationRulesFinders\RequestValidateFacade;
+use Knuckles\Scribe\Extracting\Shared\ValidationRulesFinders\ThisValidate;
+use Knuckles\Scribe\Extracting\Shared\ValidationRulesFinders\ValidatorMake;
+use PhpParser\Node;
+use PhpParser\Node\Stmt\ClassMethod;
+
+class GetFromInlineValidatorBase extends Strategy
+{
+    use ParsesValidationRules;
+
+    public function __invoke(ExtractedEndpointData $endpointData, array $routeRules = []): ?array
+    {
+        if (!$endpointData-&gt;method instanceof \ReflectionMethod) {
+            return [];
+        }
+
+        $methodAst = MethodAstParser::getMethodAst($endpointData-&gt;method);
+        [$validationRules, $customParameterData] = $this-&gt;lookForInlineValidationRules($methodAst);
+
+        $bodyParametersFromValidationRules = $this-&gt;getParametersFromValidationRules($validationRules, $customParameterData);
+        return $this-&gt;normaliseArrayAndObjectParameters($bodyParametersFromValidationRules);
+    }
+
+    public function lookForInlineValidationRules(ClassMethod $methodAst): array
+    {
+        // Validation usually happens early on, so let&#039;s assume it&#039;s in the first 10 statements
+        $statements = array_slice($methodAst-&gt;stmts, 0, 10);
+
+        [$index, $validationStatement, $validationRules] = $this-&gt;findValidationExpression($statements);
+
+        if ($validationStatement &amp;&amp;
+            !$this-&gt;isValidationStatementMeantForThisStrategy($validationStatement)) {
+            return [[], []];
+        }
+
+        // If validation rules were saved in a variable (like $rules),
+        // try to find the var and expand the value
+        if ($validationRules instanceof Node\Expr\Variable) {
+            foreach (array_reverse(array_slice($statements, 0, $index)) as $earlierStatement) {
+                if (
+                    $earlierStatement instanceof Node\Stmt\Expression
+                    &amp;&amp; $earlierStatement-&gt;expr instanceof Node\Expr\Assign
+                    &amp;&amp; $earlierStatement-&gt;expr-&gt;var instanceof Node\Expr\Variable
+                    &amp;&amp; $earlierStatement-&gt;expr-&gt;var-&gt;name == $validationRules-&gt;name
+                ) {
+                    $validationRules = $earlierStatement-&gt;expr-&gt;expr;
+                    break;
+                }
+            }
+        }
+
+        if (!$validationRules instanceof Node\Expr\Array_) {
+            return [[], []];
+        }
+
+        $rules = [];
+        $customParameterData = [];
+        foreach ($validationRules-&gt;items as $item) {
+            /** @var Node\ArrayItem $item */
+            if (!$item-&gt;key instanceof Node\Scalar\String_) {
+                continue;
+            }
+
+            $paramName = $item-&gt;key-&gt;value;
+
+            // Might be an expression or concatenated string, etc.
+            // For now, let&#039;s focus on simple strings and arrays of strings
+            if ($item-&gt;value instanceof Node\Scalar\String_) {
+                $rules[$paramName] = $item-&gt;value-&gt;value;
+            } else if ($item-&gt;value instanceof Node\Expr\Array_) {
+                $rulesList = [];
+                foreach ($item-&gt;value-&gt;items as $arrayItem) {
+                    /** @var Node\ArrayItem $arrayItem */
+                    if ($arrayItem-&gt;value instanceof Node\Scalar\String_) {
+                        $rulesList[] = $arrayItem-&gt;value-&gt;value;
+                    }
+                    // Try to extract Enum rule
+                    else if (
+                        ($enum = $this-&gt;extractEnumClassFromArrayItem($arrayItem)) &amp;&amp;
+                        enum_exists($enum) &amp;&amp; method_exists($enum, &#039;tryFrom&#039;)
+                    ) {
+                        // $case-&gt;value only exists on BackedEnums, not UnitEnums
+                        // method_exists($enum, &#039;tryFrom&#039;) implies the enum is a BackedEnum
+                        // @phpstan-ignore-next-line
+                        $rulesList[] = &#039;in:&#039; . implode(&#039;,&#039;, array_map(fn ($case) =&gt; $case-&gt;value, $enum::cases()));
+                    }
+                }
+                $rules[$paramName] = join(&#039;|&#039;, $rulesList);
+            } else {
+                $rules[$paramName] = [];
+            }
+
+            $dataFromComment = [];
+            $comments = join(&quot;\n&quot;, array_map(
+                    fn($comment) =&gt; ltrim(ltrim($comment-&gt;getReformattedText(), &quot;/&quot;)),
+                    $item-&gt;getComments()
+                ));
+
+            if ($comments) {
+                if (str_contains($comments, &#039;No-example&#039;)) $dataFromComment[&#039;example&#039;] = null;
+
+                $dataFromComment[&#039;description&#039;] = trim(str_replace([&#039;No-example.&#039;, &#039;No-example&#039;], &#039;&#039;, $comments));
+                if (preg_match(&#039;/(.*\s+|^)Example:\s*([\s\S]+)\s*/s&#039;, $dataFromComment[&#039;description&#039;], $matches)) {
+                    $dataFromComment[&#039;description&#039;] = trim($matches[1]);
+                    $dataFromComment[&#039;example&#039;] = $matches[2];
+                }
+            }
+
+            $customParameterData[$paramName] = $dataFromComment;
+        }
+
+        return [$rules, $customParameterData];
+    }
+
+    protected function extractEnumClassFromArrayItem(Node\ArrayItem $arrayItem): ?string
+    {
+        $args = [];
+
+        // Enum rule with the form &quot;new Enum(...)&quot;
+        if ($arrayItem-&gt;value instanceof Node\Expr\New_ &amp;&amp;
+            $arrayItem-&gt;value-&gt;class instanceof Node\Name &amp;&amp;
+            str_ends_with($arrayItem-&gt;value-&gt;class-&gt;name, &#039;Enum&#039;)
+        ) {
+            $args = $arrayItem-&gt;value-&gt;args;
+        }
+
+        // Enum rule with the form &quot;Rule::enum(...)&quot;
+        else if ($arrayItem-&gt;value instanceof Node\Expr\StaticCall &amp;&amp;
+            $arrayItem-&gt;value-&gt;class instanceof Node\Name &amp;&amp;
+            str_ends_with($arrayItem-&gt;value-&gt;class-&gt;name, &#039;Rule&#039;) &amp;&amp;
+            $arrayItem-&gt;value-&gt;name instanceof Node\Identifier &amp;&amp;
+            $arrayItem-&gt;value-&gt;name-&gt;name === &#039;enum&#039;
+        ) {
+            $args = $arrayItem-&gt;value-&gt;args;
+        }
+
+        if (count($args) !== 1 || !$args[0] instanceof Node\Arg) return null;
+
+        $arg = $args[0];
+        if ($arg-&gt;value instanceof Node\Expr\ClassConstFetch &amp;&amp;
+            $arg-&gt;value-&gt;class instanceof Node\Name
+        ) {
+            return &#039;\\&#039; . $arg-&gt;value-&gt;class-&gt;name;
+        } else if ($arg-&gt;value instanceof Node\Scalar\String_) {
+            return $arg-&gt;value-&gt;value;
+        }
+
+        return null;
+    }
+
+    protected function getMissingCustomDataMessage($parameterName)
+    {
+        return &quot;No extra data found for parameter &#039;$parameterName&#039; from your inline validator. You can add a comment above &#039;$parameterName&#039; with a description and example.&quot;;
+    }
+
+    protected function shouldCastUserExample()
+    {
+        return true;
+    }
+
+    protected function isValidationStatementMeantForThisStrategy(Node $validationStatement): bool
+    {
+        return true;
+    }
+
+    protected function findValidationExpression($statements): ?array
+    {
+        $strategies = [
+            RequestValidate::class, // $request-&gt;validate(...);
+            RequestValidateFacade::class, // Request::validate(...);
+            ValidatorMake::class, // Validator::make($request, ...)
+            ThisValidate::class, // $this-&gt;validate(...);
+        ];
+
+        foreach ($statements as $index =&gt; $node) {
+            foreach ($strategies as $strategy) {
+                if ($validationRules = $strategy::find($node)) {
+                    return [$index, $node, $validationRules];
+                }
+            }
+        }
+
+        return [null, null, null];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/GetParamsFromAttributeStrategy.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/BodyParameters -->
+
+</body>
+</html>

@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-debugbar/php-debugbar/src/DebugBar/Bridge/PropelCollector.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * This file is part of the DebugBar package.
+ *
+ * (c) 2013 Maxime Bouroumeau-Fuseau
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace DebugBar\Bridge;
+
+use BasicLogger;
+use DebugBar\DataCollector\AssetProvider;
+use DebugBar\DataCollector\DataCollector;
+use DebugBar\DataCollector\Renderable;
+use Propel;
+use PropelConfiguration;
+use PropelPDO;
+use Psr\Log\LogLevel;
+use Psr\Log\LoggerInterface;
+
+/**
+ * A Propel logger which acts as a data collector
+ *
+ * http://propelorm.org/
+ *
+ * Will log queries and display them using the SQLQueries widget.
+ * You can provide a LoggerInterface object to forward non-query related message to.
+ *
+ * Example:
+ * &lt;code&gt;
+ * $debugbar-&gt;addCollector(new PropelCollector($debugbar[&#039;messages&#039;]));
+ * PropelCollector::enablePropelProfiling();
+ * &lt;/code&gt;
+ */
+class PropelCollector extends DataCollector implements BasicLogger, Renderable, AssetProvider
+{
+    protected $logger;
+
+    protected $statements = array();
+
+    protected $accumulatedTime = 0;
+
+    protected $peakMemory = 0;
+
+    /**
+     * Sets the needed configuration option in propel to enable query logging
+     *
+     * @param PropelConfiguration $config Apply profiling on a specific config
+     */
+    public static function enablePropelProfiling(?PropelConfiguration $config = null)
+    {
+        if ($config === null) {
+            $config = Propel::getConfiguration(PropelConfiguration::TYPE_OBJECT);
+        }
+        $config-&gt;setParameter(&#039;debugpdo.logging.details.method.enabled&#039;, true);
+        $config-&gt;setParameter(&#039;debugpdo.logging.details.time.enabled&#039;, true);
+        $config-&gt;setParameter(&#039;debugpdo.logging.details.mem.enabled&#039;, true);
+        $allMethods = array(
+            &#039;PropelPDO::__construct&#039;,       // logs connection opening
+            &#039;PropelPDO::__destruct&#039;,        // logs connection close
+            &#039;PropelPDO::exec&#039;,              // logs a query
+            &#039;PropelPDO::query&#039;,             // logs a query
+            &#039;PropelPDO::beginTransaction&#039;,  // logs a transaction begin
+            &#039;PropelPDO::commit&#039;,            // logs a transaction commit
+            &#039;PropelPDO::rollBack&#039;,          // logs a transaction rollBack (watch out for the capital &#039;B&#039;)
+            &#039;DebugPDOStatement::execute&#039;,   // logs a query from a prepared statement
+        );
+        $config-&gt;setParameter(&#039;debugpdo.logging.methods&#039;, $allMethods, false);
+    }
+
+    /**
+     * @param LoggerInterface $logger A logger to forward non-query log lines to
+     * @param PropelPDO $conn Bound this collector to a connection only
+     */
+    public function __construct(?LoggerInterface $logger = null, ?PropelPDO $conn = null)
+    {
+        if ($conn) {
+            $conn-&gt;setLogger($this);
+        } else {
+            Propel::setLogger($this);
+        }
+        $this-&gt;logger = $logger;
+        $this-&gt;logQueriesToLogger = false;
+    }
+
+    public function setLogQueriesToLogger($enable = true)
+    {
+        $this-&gt;logQueriesToLogger = $enable;
+        return $this;
+    }
+
+    public function isLogQueriesToLogger()
+    {
+        return $this-&gt;logQueriesToLogger;
+    }
+
+    public function emergency($m)
+    {
+        $this-&gt;log($m, Propel::LOG_EMERG);
+    }
+
+    public function alert($m)
+    {
+        $this-&gt;log($m, Propel::LOG_ALERT);
+    }
+
+    public function crit($m)
+    {
+        $this-&gt;log($m, Propel::LOG_CRIT);
+    }
+
+    public function err($m)
+    {
+        $this-&gt;log($m, Propel::LOG_ERR);
+    }
+
+    public function warning($m)
+    {
+        $this-&gt;log($m, Propel::LOG_WARNING);
+    }
+
+    public function notice($m)
+    {
+        $this-&gt;log($m, Propel::LOG_NOTICE);
+    }
+
+    public function info($m)
+    {
+        $this-&gt;log($m, Propel::LOG_INFO);
+    }
+
+    public function debug($m)
+    {
+        $this-&gt;log($m, Propel::LOG_DEBUG);
+    }
+
+    public function log($message, $severity = null)
+    {
+        if (strpos($message, &#039;DebugPDOStatement::execute&#039;) !== false) {
+            list($sql, $duration_str) = $this-&gt;parseAndLogSqlQuery($message);
+            if (!$this-&gt;logQueriesToLogger) {
+                return;
+            }
+            $message = &quot;$sql ($duration_str)&quot;;
+        }
+
+        if ($this-&gt;logger !== null) {
+            $this-&gt;logger-&gt;log($this-&gt;convertLogLevel($severity), $message);
+        }
+    }
+
+    /**
+     * Converts Propel log levels to PSR log levels
+     *
+     * @param int $level
+     * @return string
+     */
+    protected function convertLogLevel($level)
+    {
+        $map = array(
+            Propel::LOG_EMERG =&gt; LogLevel::EMERGENCY,
+            Propel::LOG_ALERT =&gt; LogLevel::ALERT,
+            Propel::LOG_CRIT =&gt; LogLevel::CRITICAL,
+            Propel::LOG_ERR =&gt; LogLevel::ERROR,
+            Propel::LOG_WARNING =&gt; LogLevel::WARNING,
+            Propel::LOG_NOTICE =&gt; LogLevel::NOTICE,
+            Propel::LOG_DEBUG =&gt; LogLevel::DEBUG
+        );
+        return $map[$level];
+    }
+
+    /**
+     * Parse a log line to extract query information
+     *
+     * @param string $message
+     */
+    protected function parseAndLogSqlQuery($message)
+    {
+        $parts = explode(&#039;|&#039;, $message, 4);
+        $sql = trim($parts[3]);
+
+        $duration = 0;
+        if (preg_match(&#039;/([0-9]+\.[0-9]+)/&#039;, $parts[1], $matches)) {
+            $duration = (float) $matches[1];
+        }
+
+        $memory = 0;
+        if (preg_match(&#039;/([0-9]+\.[0-9]+) ([A-Z]{1,2})/&#039;, $parts[2], $matches)) {
+            $memory = (float) $matches[1];
+            if ($matches[2] == &#039;KB&#039;) {
+                $memory *= 1024;
+            } elseif ($matches[2] == &#039;MB&#039;) {
+                $memory *= 1024 * 1024;
+            }
+        }
+
+        $this-&gt;statements[] = array(
+            &#039;sql&#039; =&gt; $sql,
+            &#039;is_success&#039; =&gt; true,
+            &#039;duration&#039; =&gt; $duration,
+            &#039;duration_str&#039; =&gt; $this-&gt;formatDuration($duration),
+            &#039;memory&#039; =&gt; $memory,
+            &#039;memory_str&#039; =&gt; $this-&gt;formatBytes($memory)
+        );
+        $this-&gt;accumulatedTime += $duration;
+        $this-&gt;peakMemory = max($this-&gt;peakMemory, $memory);
+        return array($sql, $this-&gt;formatDuration($duration));
+    }
+
+    public function collect()
+    {
+        return array(
+            &#039;nb_statements&#039; =&gt; count($this-&gt;statements),
+            &#039;nb_failed_statements&#039; =&gt; 0,
+            &#039;accumulated_duration&#039; =&gt; $this-&gt;accumulatedTime,
+            &#039;accumulated_duration_str&#039; =&gt; $this-&gt;formatDuration($this-&gt;accumulatedTime),
+            &#039;peak_memory_usage&#039; =&gt; $this-&gt;peakMemory,
+            &#039;peak_memory_usage_str&#039; =&gt; $this-&gt;formatBytes($this-&gt;peakMemory),
+            &#039;statements&#039; =&gt; $this-&gt;statements
+        );
+    }
+
+    public function getName()
+    {
+        return &#039;propel&#039;;
+    }
+
+    public function getWidgets()
+    {
+        return array(
+            &quot;propel&quot; =&gt; array(
+                &quot;icon&quot; =&gt; &quot;bolt&quot;,
+                &quot;widget&quot; =&gt; &quot;PhpDebugBar.Widgets.SQLQueriesWidget&quot;,
+                &quot;map&quot; =&gt; &quot;propel&quot;,
+                &quot;default&quot; =&gt; &quot;[]&quot;
+            ),
+            &quot;propel:badge&quot; =&gt; array(
+                &quot;map&quot; =&gt; &quot;propel.nb_statements&quot;,
+                &quot;default&quot; =&gt; 0
+            )
+        );
+    }
+
+    public function getAssets()
+    {
+        return array(
+            &#039;css&#039; =&gt; &#039;widgets/sqlqueries/widget.css&#039;,
+            &#039;js&#039; =&gt; &#039;widgets/sqlqueries/widget.js&#039;
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-debugbar/php-debugbar/src/DebugBar/Bridge/SlimCollector.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-debugbar/php-debugbar/src/DebugBar/Bridge/SwiftMailer -->
+
+</body>
+</html>

@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/EC/Formats/Keys/XML.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * XML Formatted EC Key Handler
+ *
+ * More info:
+ *
+ * https://www.w3.org/TR/xmldsig-core/#sec-ECKeyValue
+ * http://en.wikipedia.org/wiki/XML_Signature
+ *
+ * PHP version 5
+ *
+ * @author    Jim Wigginton &lt;terrafrost@php.net&gt;
+ * @copyright 2015 Jim Wigginton
+ * @license   http://www.opensource.org/licenses/mit-license.html  MIT License
+ * @link      http://phpseclib.sourceforge.net
+ */
+
+namespace phpseclib3\Crypt\EC\Formats\Keys;
+
+use phpseclib3\Common\Functions\Strings;
+use phpseclib3\Crypt\EC\BaseCurves\Base as BaseCurve;
+use phpseclib3\Crypt\EC\BaseCurves\Montgomery as MontgomeryCurve;
+use phpseclib3\Crypt\EC\BaseCurves\Prime as PrimeCurve;
+use phpseclib3\Crypt\EC\BaseCurves\TwistedEdwards as TwistedEdwardsCurve;
+use phpseclib3\Exception\BadConfigurationException;
+use phpseclib3\Exception\UnsupportedCurveException;
+use phpseclib3\Math\BigInteger;
+
+/**
+ * XML Formatted EC Key Handler
+ *
+ * @author  Jim Wigginton &lt;terrafrost@php.net&gt;
+ */
+abstract class XML
+{
+    use Common;
+
+    /**
+     * Default namespace
+     *
+     * @var string
+     */
+    private static $namespace;
+
+    /**
+     * Flag for using RFC4050 syntax
+     *
+     * @var bool
+     */
+    private static $rfc4050 = false;
+
+    /**
+     * Break a public or private key down into its constituent components
+     *
+     * @param string $key
+     * @param string $password optional
+     * @return array
+     */
+    public static function load($key, $password = &#039;&#039;)
+    {
+        self::initialize_static_variables();
+
+        if (!Strings::is_stringable($key)) {
+            throw new \UnexpectedValueException(&#039;Key should be a string - not a &#039; . gettype($key));
+        }
+
+        if (!class_exists(&#039;DOMDocument&#039;)) {
+            throw new BadConfigurationException(&#039;The dom extension is not setup correctly on this system&#039;);
+        }
+
+        $use_errors = libxml_use_internal_errors(true);
+
+        if (substr($key, 0, 5) != &#039;&lt;?xml&#039;) {
+            $key = &#039;&lt;xml&gt;&#039; . $key . &#039;&lt;/xml&gt;&#039;;
+        }
+
+        $temp = self::isolateNamespace($key, &#039;http://www.w3.org/2009/xmldsig11#&#039;);
+        if ($temp) {
+            $key = $temp;
+        }
+
+        $temp = self::isolateNamespace($key, &#039;http://www.w3.org/2001/04/xmldsig-more#&#039;);
+        if ($temp) {
+            $key = $temp;
+        }
+
+        $dom = new \DOMDocument();
+
+        if (!$dom-&gt;loadXML($key)) {
+            libxml_use_internal_errors($use_errors);
+            throw new \UnexpectedValueException(&#039;Key does not appear to contain XML&#039;);
+        }
+        $xpath = new \DOMXPath($dom);
+        libxml_use_internal_errors($use_errors);
+        $curve = self::loadCurveByParam($xpath);
+
+        $pubkey = self::query($xpath, &#039;publickey&#039;, &#039;Public Key is not present&#039;);
+
+        $QA = self::query($xpath, &#039;ecdsakeyvalue&#039;)-&gt;length ?
+            self::extractPointRFC4050($xpath, $curve) :
+            self::extractPoint(&quot;\0&quot; . $pubkey, $curve);
+
+        libxml_use_internal_errors($use_errors);
+
+        return compact(&#039;curve&#039;, &#039;QA&#039;);
+    }
+
+    /**
+     * Case-insensitive xpath query
+     *
+     * @param \DOMXPath $xpath
+     * @param string $name
+     * @param string $error optional
+     * @param bool $decode optional
+     * @return \DOMNodeList
+     */
+    private static function query(\DOMXPath $xpath, $name, $error = null, $decode = true)
+    {
+        $query = &#039;/&#039;;
+        $names = explode(&#039;/&#039;, $name);
+        foreach ($names as $name) {
+            $query .= &quot;/*[translate(local-name(), &#039;ABCDEFGHIJKLMNOPQRSTUVWXYZ&#039;,&#039;abcdefghijklmnopqrstuvwxyz&#039;)=&#039;$name&#039;]&quot;;
+        }
+        $result = $xpath-&gt;query($query);
+        if (!isset($error)) {
+            return $result;
+        }
+
+        if (!$result-&gt;length) {
+            throw new \RuntimeException($error);
+        }
+        return $decode ? self::decodeValue($result-&gt;item(0)-&gt;textContent) : $result-&gt;item(0)-&gt;textContent;
+    }
+
+    /**
+     * Finds the first element in the relevant namespace, strips the namespacing and returns the XML for that element.
+     *
+     * @param string $xml
+     * @param string $ns
+     */
+    private static function isolateNamespace($xml, $ns)
+    {
+        $dom = new \DOMDocument();
+        if (!$dom-&gt;loadXML($xml)) {
+            return false;
+        }
+        $xpath = new \DOMXPath($dom);
+        $nodes = $xpath-&gt;query(&quot;//*[namespace::*[.=&#039;$ns&#039;] and not(../namespace::*[.=&#039;$ns&#039;])]&quot;);
+        if (!$nodes-&gt;length) {
+            return false;
+        }
+        $node = $nodes-&gt;item(0);
+        $ns_name = $node-&gt;lookupPrefix($ns);
+        if ($ns_name) {
+            $node-&gt;removeAttributeNS($ns, $ns_name);
+        }
+        return $dom-&gt;saveXML($node);
+    }
+
+    /**
+     * Decodes the value
+     *
+     * @param string $value
+     */
+    private static function decodeValue($value)
+    {
+        return Strings::base64_decode(str_replace([&quot;\r&quot;, &quot;\n&quot;, &#039; &#039;, &quot;\t&quot;], &#039;&#039;, $value));
+    }
+
+    /**
+     * Extract points from an XML document
+     *
+     * @param \DOMXPath $xpath
+     * @param BaseCurve $curve
+     * @return object[]
+     */
+    private static function extractPointRFC4050(\DOMXPath $xpath, BaseCurve $curve)
+    {
+        $x = self::query($xpath, &#039;publickey/x&#039;);
+        $y = self::query($xpath, &#039;publickey/y&#039;);
+        if (!$x-&gt;length || !$x-&gt;item(0)-&gt;hasAttribute(&#039;Value&#039;)) {
+            throw new \RuntimeException(&#039;Public Key / X coordinate not found&#039;);
+        }
+        if (!$y-&gt;length || !$y-&gt;item(0)-&gt;hasAttribute(&#039;Value&#039;)) {
+            throw new \RuntimeException(&#039;Public Key / Y coordinate not found&#039;);
+        }
+        $point = [
+            $curve-&gt;convertInteger(new BigInteger($x-&gt;item(0)-&gt;getAttribute(&#039;Value&#039;))),
+            $curve-&gt;convertInteger(new BigInteger($y-&gt;item(0)-&gt;getAttribute(&#039;Value&#039;)))
+        ];
+        if (!$curve-&gt;verifyPoint($point)) {
+            throw new \RuntimeException(&#039;Unable to verify that point exists on curve&#039;);
+        }
+        return $point;
+    }
+
+    /**
+     * Returns an instance of \phpseclib3\Crypt\EC\BaseCurves\Base based
+     * on the curve parameters
+     *
+     * @param \DomXPath $xpath
+     * @return BaseCurve|false
+     */
+    private static function loadCurveByParam(\DOMXPath $xpath)
+    {
+        $namedCurve = self::query($xpath, &#039;namedcurve&#039;);
+        if ($namedCurve-&gt;length == 1) {
+            $oid = $namedCurve-&gt;item(0)-&gt;getAttribute(&#039;URN&#039;);
+            $oid = preg_replace(&#039;#[^\d.]#&#039;, &#039;&#039;, $oid);
+            $name = array_search($oid, self::$curveOIDs);
+            if ($name === false) {
+                throw new UnsupportedCurveException(&#039;Curve with OID of &#039; . $oid . &#039; is not supported&#039;);
+            }
+
+            $curve = &#039;\phpseclib3\Crypt\EC\Curves\\&#039; . $name;
+            if (!class_exists($curve)) {
+                throw new UnsupportedCurveException(&#039;Named Curve of &#039; . $name . &#039; is not supported&#039;);
+            }
+            return new $curve();
+        }
+
+        $params = self::query($xpath, &#039;explicitparams&#039;);
+        if ($params-&gt;length) {
+            return self::loadCurveByParamRFC4050($xpath);
+        }
+
+        $params = self::query($xpath, &#039;ecparameters&#039;);
+        if (!$params-&gt;length) {
+            throw new \RuntimeException(&#039;No parameters are present&#039;);
+        }
+
+        $fieldTypes = [
+            &#039;prime-field&#039; =&gt; [&#039;fieldid/prime/p&#039;],
+            &#039;gnb&#039; =&gt; [&#039;fieldid/gnb/m&#039;],
+            &#039;tnb&#039; =&gt; [&#039;fieldid/tnb/k&#039;],
+            &#039;pnb&#039; =&gt; [&#039;fieldid/pnb/k1&#039;, &#039;fieldid/pnb/k2&#039;, &#039;fieldid/pnb/k3&#039;],
+            &#039;unknown&#039; =&gt; []
+        ];
+
+        foreach ($fieldTypes as $type =&gt; $queries) {
+            foreach ($queries as $query) {
+                $result = self::query($xpath, $query);
+                if (!$result-&gt;length) {
+                    continue 2;
+                }
+                $param = preg_replace(&#039;#.*/#&#039;, &#039;&#039;, $query);
+                $$param = self::decodeValue($result-&gt;item(0)-&gt;textContent);
+            }
+            break;
+        }
+
+        $a = self::query($xpath, &#039;curve/a&#039;, &#039;A coefficient is not present&#039;);
+        $b = self::query($xpath, &#039;curve/b&#039;, &#039;B coefficient is not present&#039;);
+        $base = self::query($xpath, &#039;base&#039;, &#039;Base point is not present&#039;);
+        $order = self::query($xpath, &#039;order&#039;, &#039;Order is not present&#039;);
+
+        switch ($type) {
+            case &#039;prime-field&#039;:
+                $curve = new PrimeCurve();
+                $curve-&gt;setModulo(new BigInteger($p, 256));
+                $curve-&gt;setCoefficients(
+                    new BigInteger($a, 256),
+                    new BigInteger($b, 256)
+                );
+                $point = self::extractPoint(&quot;\0&quot; . $base, $curve);
+                $curve-&gt;setBasePoint(...$point);
+                $curve-&gt;setOrder(new BigInteger($order, 256));
+                return $curve;
+            case &#039;gnb&#039;:
+            case &#039;tnb&#039;:
+            case &#039;pnb&#039;:
+            default:
+                throw new UnsupportedCurveException(&#039;Field Type of &#039; . $type . &#039; is not supported&#039;);
+        }
+    }
+
+    /**
+     * Returns an instance of \phpseclib3\Crypt\EC\BaseCurves\Base based
+     * on the curve parameters
+     *
+     * @param \DomXPath $xpath
+     * @return BaseCurve|false
+     */
+    private static function loadCurveByParamRFC4050(\DOMXPath $xpath)
+    {
+        $fieldTypes = [
+            &#039;prime-field&#039; =&gt; [&#039;primefieldparamstype/p&#039;],
+            &#039;unknown&#039; =&gt; []
+        ];
+
+        foreach ($fieldTypes as $type =&gt; $queries) {
+            foreach ($queries as $query) {
+                $result = self::query($xpath, $query);
+                if (!$result-&gt;length) {
+                    continue 2;
+                }
+                $param = preg_replace(&#039;#.*/#&#039;, &#039;&#039;, $query);
+                $$param = $result-&gt;item(0)-&gt;textContent;
+            }
+            break;
+        }
+
+        $a = self::query($xpath, &#039;curveparamstype/a&#039;, &#039;A coefficient is not present&#039;, false);
+        $b = self::query($xpath, &#039;curveparamstype/b&#039;, &#039;B coefficient is not present&#039;, false);
+        $x = self::query($xpath, &#039;basepointparams/basepoint/ecpointtype/x&#039;, &#039;Base Point X is not present&#039;, false);
+        $y = self::query($xpath, &#039;basepointparams/basepoint/ecpointtype/y&#039;, &#039;Base Point Y is not present&#039;, false);
+        $order = self::query($xpath, &#039;order&#039;, &#039;Order is not present&#039;, false);
+
+        switch ($type) {
+            case &#039;prime-field&#039;:
+                $curve = new PrimeCurve();
+
+                $p = str_replace([&quot;\r&quot;, &quot;\n&quot;, &#039; &#039;, &quot;\t&quot;], &#039;&#039;, $p);
+                $curve-&gt;setModulo(new BigInteger($p));
+
+                $a = str_replace([&quot;\r&quot;, &quot;\n&quot;, &#039; &#039;, &quot;\t&quot;], &#039;&#039;, $a);
+                $b = str_replace([&quot;\r&quot;, &quot;\n&quot;, &#039; &#039;, &quot;\t&quot;], &#039;&#039;, $b);
+                $curve-&gt;setCoefficients(
+                    new BigInteger($a),
+                    new BigInteger($b)
+                );
+
+                $x = str_replace([&quot;\r&quot;, &quot;\n&quot;, &#039; &#039;, &quot;\t&quot;], &#039;&#039;, $x);
+                $y = str_replace([&quot;\r&quot;, &quot;\n&quot;, &#039; &#039;, &quot;\t&quot;], &#039;&#039;, $y);
+                $curve-&gt;setBasePoint(
+                    new BigInteger($x),
+                    new BigInteger($y)
+                );
+
+                $order = str_replace([&quot;\r&quot;, &quot;\n&quot;, &#039; &#039;, &quot;\t&quot;], &#039;&#039;, $order);
+                $curve-&gt;setOrder(new BigInteger($order));
+                return $curve;
+            default:
+                throw new UnsupportedCurveException(&#039;Field Type of &#039; . $type . &#039; is not supported&#039;);
+        }
+    }
+
+    /**
+     * Sets the namespace. dsig11 is the most common one.
+     *
+     * Set to null to unset. Used only for creating public keys.
+     *
+     * @param string $namespace
+     */
+    public static function setNamespace($namespace)
+    {
+        self::$namespace = $namespace;
+    }
+
+    /**
+     * Uses the XML syntax specified in https://tools.ietf.org/html/rfc4050
+     */
+    public static function enableRFC4050Syntax()
+    {
+        self::$rfc4050 = true;
+    }
+
+    /**
+     * Uses the XML syntax specified in https://www.w3.org/TR/xmldsig-core/#sec-ECParameters
+     */
+    public static function disableRFC4050Syntax()
+    {
+        self::$rfc4050 = false;
+    }
+
+    /**
+     * Convert a public key to the appropriate format
+     *
+     * @param BaseCurve $curve
+     * @param \phpseclib3\Math\Common\FiniteField\Integer[] $publicKey
+     * @param array $options optional
+     * @return string
+     */
+    public static function savePublicKey(BaseCurve $curve, array $publicKey, array $options = [])
+    {
+        self::initialize_static_variables();
+
+        if ($curve instanceof TwistedEdwardsCurve || $curve instanceof MontgomeryCurve) {
+            throw new UnsupportedCurveException(&#039;TwistedEdwards and Montgomery Curves are not supported&#039;);
+        }
+
+        if (empty(static::$namespace)) {
+            $pre = $post = &#039;&#039;;
+        } else {
+            $pre = static::$namespace . &#039;:&#039;;
+            $post = &#039;:&#039; . static::$namespace;
+        }
+
+        if (self::$rfc4050) {
+            return &#039;&lt;&#039; . $pre . &#039;ECDSAKeyValue xmlns&#039; . $post . &#039;=&quot;http://www.w3.org/2001/04/xmldsig-more#&quot;&gt;&#039; . &quot;\r\n&quot; .
+                   self::encodeXMLParameters($curve, $pre, $options) . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;PublicKey&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;X Value=&quot;&#039; . $publicKey[0] . &#039;&quot; /&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;Y Value=&quot;&#039; . $publicKey[1] . &#039;&quot; /&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;PublicKey&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;ECDSAKeyValue&gt;&#039;;
+        }
+
+        $publicKey = &quot;\4&quot; . $publicKey[0]-&gt;toBytes() . $publicKey[1]-&gt;toBytes();
+
+        return &#039;&lt;&#039; . $pre . &#039;ECDSAKeyValue xmlns&#039; . $post . &#039;=&quot;http://www.w3.org/2009/xmldsig11#&quot;&gt;&#039; . &quot;\r\n&quot; .
+               self::encodeXMLParameters($curve, $pre, $options) . &quot;\r\n&quot; .
+               &#039;&lt;&#039; . $pre . &#039;PublicKey&gt;&#039; . Strings::base64_encode($publicKey) . &#039;&lt;/&#039; . $pre . &#039;PublicKey&gt;&#039; . &quot;\r\n&quot; .
+               &#039;&lt;/&#039; . $pre . &#039;ECDSAKeyValue&gt;&#039;;
+    }
+
+    /**
+     * Encode Parameters
+     *
+     * @param BaseCurve $curve
+     * @param string $pre
+     * @param array $options optional
+     * @return string|false
+     */
+    private static function encodeXMLParameters(BaseCurve $curve, $pre, array $options = [])
+    {
+        $result = self::encodeParameters($curve, true, $options);
+
+        if (isset($result[&#039;namedCurve&#039;])) {
+            $namedCurve = &#039;&lt;&#039; . $pre . &#039;NamedCurve URI=&quot;urn:oid:&#039; . self::$curveOIDs[$result[&#039;namedCurve&#039;]] . &#039;&quot; /&gt;&#039;;
+            return self::$rfc4050 ?
+                &#039;&lt;DomainParameters&gt;&#039; . str_replace(&#039;URI&#039;, &#039;URN&#039;, $namedCurve) . &#039;&lt;/DomainParameters&gt;&#039; :
+                $namedCurve;
+        }
+
+        if (self::$rfc4050) {
+            $xml = &#039;&lt;&#039; . $pre . &#039;ExplicitParams&gt;&#039; . &quot;\r\n&quot; .
+                  &#039;&lt;&#039; . $pre . &#039;FieldParams&gt;&#039; . &quot;\r\n&quot;;
+            $temp = $result[&#039;specifiedCurve&#039;];
+            switch ($temp[&#039;fieldID&#039;][&#039;fieldType&#039;]) {
+                case &#039;prime-field&#039;:
+                    $xml .= &#039;&lt;&#039; . $pre . &#039;PrimeFieldParamsType&gt;&#039; . &quot;\r\n&quot; .
+                           &#039;&lt;&#039; . $pre . &#039;P&gt;&#039; . $temp[&#039;fieldID&#039;][&#039;parameters&#039;] . &#039;&lt;/&#039; . $pre . &#039;P&gt;&#039; . &quot;\r\n&quot; .
+                           &#039;&lt;/&#039; . $pre . &#039;PrimeFieldParamsType&gt;&#039; . &quot;\r\n&quot;;
+                    $a = $curve-&gt;getA();
+                    $b = $curve-&gt;getB();
+                    list($x, $y) = $curve-&gt;getBasePoint();
+                    break;
+                default:
+                    throw new UnsupportedCurveException(&#039;Field Type of &#039; . $temp[&#039;fieldID&#039;][&#039;fieldType&#039;] . &#039; is not supported&#039;);
+            }
+            $xml .= &#039;&lt;/&#039; . $pre . &#039;FieldParams&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;CurveParamsType&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;A&gt;&#039; . $a . &#039;&lt;/&#039; . $pre . &#039;A&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;B&gt;&#039; . $b . &#039;&lt;/&#039; . $pre . &#039;B&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;CurveParamsType&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;BasePointParams&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;BasePoint&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;ECPointType&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;X&gt;&#039; . $x . &#039;&lt;/&#039; . $pre . &#039;X&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;Y&gt;&#039; . $y . &#039;&lt;/&#039; . $pre . &#039;Y&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;ECPointType&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;BasePoint&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;Order&gt;&#039; . $curve-&gt;getOrder() . &#039;&lt;/&#039; . $pre . &#039;Order&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;BasePointParams&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;ExplicitParams&gt;&#039; . &quot;\r\n&quot;;
+
+            return $xml;
+        }
+
+        if (isset($result[&#039;specifiedCurve&#039;])) {
+            $xml = &#039;&lt;&#039; . $pre . &#039;ECParameters&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;FieldID&gt;&#039; . &quot;\r\n&quot;;
+            $temp = $result[&#039;specifiedCurve&#039;];
+            switch ($temp[&#039;fieldID&#039;][&#039;fieldType&#039;]) {
+                case &#039;prime-field&#039;:
+                    $xml .= &#039;&lt;&#039; . $pre . &#039;Prime&gt;&#039; . &quot;\r\n&quot; .
+                           &#039;&lt;&#039; . $pre . &#039;P&gt;&#039; . Strings::base64_encode($temp[&#039;fieldID&#039;][&#039;parameters&#039;]-&gt;toBytes()) . &#039;&lt;/&#039; . $pre . &#039;P&gt;&#039; . &quot;\r\n&quot; .
+                           &#039;&lt;/&#039; . $pre . &#039;Prime&gt;&#039; . &quot;\r\n&quot; ;
+                    break;
+                default:
+                    throw new UnsupportedCurveException(&#039;Field Type of &#039; . $temp[&#039;fieldID&#039;][&#039;fieldType&#039;] . &#039; is not supported&#039;);
+            }
+            $xml .= &#039;&lt;/&#039; . $pre . &#039;FieldID&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;Curve&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;A&gt;&#039; . Strings::base64_encode($temp[&#039;curve&#039;][&#039;a&#039;]) . &#039;&lt;/&#039; . $pre . &#039;A&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;B&gt;&#039; . Strings::base64_encode($temp[&#039;curve&#039;][&#039;b&#039;]) . &#039;&lt;/&#039; . $pre . &#039;B&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;Curve&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;Base&gt;&#039; . Strings::base64_encode($temp[&#039;base&#039;]) . &#039;&lt;/&#039; . $pre . &#039;Base&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;&#039; . $pre . &#039;Order&gt;&#039; . Strings::base64_encode($temp[&#039;order&#039;]) . &#039;&lt;/&#039; . $pre . &#039;Order&gt;&#039; . &quot;\r\n&quot; .
+                   &#039;&lt;/&#039; . $pre . &#039;ECParameters&gt;&#039;;
+            return $xml;
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/EC/Formats/Keys/libsodium.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/phpseclib/phpseclib/phpseclib/Crypt/EC/Formats/Signature -->
+
+</body>
+</html>

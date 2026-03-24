@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Queue/Listener.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Queue;
+
+use Closure;
+use Symfony\Component\Process\Process;
+
+use function Illuminate\Support\artisan_binary;
+use function Illuminate\Support\php_binary;
+
+class Listener
+{
+    /**
+     * The command working path.
+     *
+     * @var string
+     */
+    protected $commandPath;
+
+    /**
+     * The environment the workers should run under.
+     *
+     * @var string
+     */
+    protected $environment;
+
+    /**
+     * The amount of seconds to wait before polling the queue.
+     *
+     * @var int
+     */
+    protected $sleep = 3;
+
+    /**
+     * The number of times to try a job before logging it failed.
+     *
+     * @var int
+     */
+    protected $maxTries = 0;
+
+    /**
+     * The output handler callback.
+     *
+     * @var \Closure|null
+     */
+    protected $outputHandler;
+
+    /**
+     * Create a new queue listener.
+     *
+     * @param  string  $commandPath
+     */
+    public function __construct($commandPath)
+    {
+        $this-&gt;commandPath = $commandPath;
+    }
+
+    /**
+     * Get the PHP binary.
+     *
+     * @return string
+     */
+    protected function phpBinary()
+    {
+        return php_binary();
+    }
+
+    /**
+     * Get the Artisan binary.
+     *
+     * @return string
+     */
+    protected function artisanBinary()
+    {
+        return artisan_binary();
+    }
+
+    /**
+     * Listen to the given queue connection.
+     *
+     * @param  string  $connection
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\ListenerOptions  $options
+     * @return void
+     */
+    public function listen($connection, $queue, ListenerOptions $options)
+    {
+        $process = $this-&gt;makeProcess($connection, $queue, $options);
+
+        while (true) {
+            $this-&gt;runProcess($process, $options-&gt;memory);
+
+            if ($options-&gt;rest) {
+                sleep($options-&gt;rest);
+            }
+        }
+    }
+
+    /**
+     * Create a new Symfony process for the worker.
+     *
+     * @param  string  $connection
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\ListenerOptions  $options
+     * @return \Symfony\Component\Process\Process
+     */
+    public function makeProcess($connection, $queue, ListenerOptions $options)
+    {
+        $command = $this-&gt;createCommand(
+            $connection,
+            $queue,
+            $options
+        );
+
+        // If the environment is set, we will append it to the command array so the
+        // workers will run under the specified environment. Otherwise, they will
+        // just run under the production environment which is not always right.
+        if (isset($options-&gt;environment)) {
+            $command = $this-&gt;addEnvironment($command, $options);
+        }
+
+        return new Process(
+            $command,
+            $this-&gt;commandPath,
+            null,
+            null,
+            $options-&gt;timeout
+        );
+    }
+
+    /**
+     * Add the environment option to the given command.
+     *
+     * @param  array  $command
+     * @param  \Illuminate\Queue\ListenerOptions  $options
+     * @return array
+     */
+    protected function addEnvironment($command, ListenerOptions $options)
+    {
+        return array_merge($command, [&quot;--env={$options-&gt;environment}&quot;]);
+    }
+
+    /**
+     * Create the command with the listener options.
+     *
+     * @param  string  $connection
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\ListenerOptions  $options
+     * @return array
+     */
+    protected function createCommand($connection, $queue, ListenerOptions $options)
+    {
+        return array_filter([
+            $this-&gt;phpBinary(),
+            $this-&gt;artisanBinary(),
+            &#039;queue:work&#039;,
+            $connection,
+            &#039;--once&#039;,
+            &quot;--name={$options-&gt;name}&quot;,
+            &quot;--queue={$queue}&quot;,
+            &quot;--backoff={$options-&gt;backoff}&quot;,
+            &quot;--memory={$options-&gt;memory}&quot;,
+            &quot;--sleep={$options-&gt;sleep}&quot;,
+            &quot;--tries={$options-&gt;maxTries}&quot;,
+            $options-&gt;force ? &#039;--force&#039; : null,
+        ], function ($value) {
+            return ! is_null($value);
+        });
+    }
+
+    /**
+     * Run the given process.
+     *
+     * @param  \Symfony\Component\Process\Process  $process
+     * @param  int  $memory
+     * @return void
+     */
+    public function runProcess(Process $process, $memory)
+    {
+        $process-&gt;run(function ($type, $line) {
+            $this-&gt;handleWorkerOutput($type, $line);
+        });
+
+        // Once we have run the job we&#039;ll go check if the memory limit has been exceeded
+        // for the script. If it has, we will kill this script so the process manager
+        // will restart this with a clean slate of memory automatically on exiting.
+        if ($this-&gt;memoryExceeded($memory)) {
+            $this-&gt;stop();
+        }
+    }
+
+    /**
+     * Handle output from the worker process.
+     *
+     * @param  int  $type
+     * @param  string  $line
+     * @return void
+     */
+    protected function handleWorkerOutput($type, $line)
+    {
+        if (isset($this-&gt;outputHandler)) {
+            call_user_func($this-&gt;outputHandler, $type, $line);
+        }
+    }
+
+    /**
+     * Determine if the memory limit has been exceeded.
+     *
+     * @param  int  $memoryLimit
+     * @return bool
+     */
+    public function memoryExceeded($memoryLimit)
+    {
+        return (memory_get_usage(true) / 1024 / 1024) &gt;= $memoryLimit;
+    }
+
+    /**
+     * Stop listening and bail out of the script.
+     *
+     * @return never
+     */
+    public function stop()
+    {
+        exit;
+    }
+
+    /**
+     * Set the output handler callback.
+     *
+     * @param  \Closure  $outputHandler
+     * @return void
+     */
+    public function setOutputHandler(Closure $outputHandler)
+    {
+        $this-&gt;outputHandler = $outputHandler;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Queue/ListenerOptions.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Queue/Attributes -->
+
+</body>
+</html>

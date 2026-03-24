@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/S3/Transfer.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\S3;
+
+use Aws;
+use Aws\CommandInterface;
+use Aws\Exception\AwsException;
+use Aws\MetricsBuilder;
+use GuzzleHttp\Promise;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Promise\PromisorInterface;
+use Iterator;
+
+/**
+ * Transfers files from the local filesystem to S3 or from S3 to the local
+ * filesystem.
+ *
+ * This class does not support copying from the local filesystem to somewhere
+ * else on the local filesystem or from one S3 bucket to another.
+ */
+class Transfer implements PromisorInterface
+{
+    private $client;
+    private $promise;
+    private $source;
+    private $sourceMetadata;
+    private $destination;
+    private $concurrency;
+    private $mupThreshold;
+    private $before;
+    private $after;
+    private $s3Args = [];
+    private $addContentMD5;
+
+    /**
+     * When providing the $source argument, you may provide a string referencing
+     * the path to a directory on disk to upload, an s3 scheme URI that contains
+     * the bucket and key (e.g., &quot;s3://bucket/key&quot;), or an \Iterator object
+     * that yields strings containing filenames that are the path to a file on
+     * disk or an s3 scheme URI. The bucket portion of the s3 URI may be an S3
+     * access point ARN. The &quot;/key&quot; portion of an s3 URI is optional.
+     *
+     * When providing an iterator for the $source argument, you must also
+     * provide a &#039;base_dir&#039; key value pair in the $options argument.
+     *
+     * The $dest argument can be the path to a directory on disk or an s3
+     * scheme URI (e.g., &quot;s3://bucket/key&quot;).
+     *
+     * The options array can contain the following key value pairs:
+     *
+     * - base_dir: (string) Base directory of the source, if $source is an
+     *   iterator. If the $source option is not an array, then this option is
+     *   ignored.
+     * - before: (callable) A callback to invoke before each transfer. The
+     *   callback accepts a single argument: Aws\CommandInterface $command.
+     *   The provided command will be either a GetObject, PutObject,
+     *   InitiateMultipartUpload, or UploadPart command.
+     * - after: (callable) A callback to invoke after each transfer promise is fulfilled.
+     *   The function is invoked with three arguments: the fulfillment value, the index
+     *   position from the iterable list of the promise, and the aggregate
+     *   promise that manages all the promises. The aggregate promise may
+     *   be resolved from within the callback to short-circuit the promise.
+     * - mup_threshold: (int) Size in bytes in which a multipart upload should
+     *   be used instead of PutObject. Defaults to 20971520 (20 MB).
+     * - concurrency: (int, default=5) Number of files to upload concurrently.
+     *   The ideal concurrency value will vary based on the number of files
+     *   being uploaded and the average size of each file. Generally speaking,
+     *   smaller files benefit from a higher concurrency while larger files
+     *   will not.
+     * - debug: (bool) Set to true to print out debug information for
+     *   transfers. Set to an fopen() resource to write to a specific stream
+     *   rather than writing to STDOUT.
+     *
+     * @param S3ClientInterface $client  Client used for transfers.
+     * @param string|Iterator   $source  Where the files are transferred from.
+     * @param string            $dest    Where the files are transferred to.
+     * @param array             $options Hash of options.
+     */
+    public function __construct(
+        S3ClientInterface $client,
+        $source,
+        $dest,
+        array $options = []
+    ) {
+        $this-&gt;client = $client;
+
+        // Prepare the destination.
+        $this-&gt;destination = $this-&gt;prepareTarget($dest);
+        if ($this-&gt;destination[&#039;scheme&#039;] === &#039;s3&#039;) {
+            $this-&gt;s3Args = $this-&gt;getS3Args($this-&gt;destination[&#039;path&#039;]);
+        }
+
+        // Prepare the source.
+        if (is_string($source)) {
+            $this-&gt;sourceMetadata = $this-&gt;prepareTarget($source);
+            $this-&gt;source = $source;
+        } elseif ($source instanceof Iterator) {
+            if (empty($options[&#039;base_dir&#039;])) {
+                throw new \InvalidArgumentException(&#039;You must provide the source&#039;
+                    . &#039; argument as a string or provide the &quot;base_dir&quot; option.&#039;);
+            }
+
+            $this-&gt;sourceMetadata = $this-&gt;prepareTarget($options[&#039;base_dir&#039;]);
+            $this-&gt;source = $source;
+        } else {
+            throw new \InvalidArgumentException(&#039;source must be the path to a &#039;
+                . &#039;directory or an iterator that yields file names.&#039;);
+        }
+
+        // Validate schemes.
+        if ($this-&gt;sourceMetadata[&#039;scheme&#039;] === $this-&gt;destination[&#039;scheme&#039;]) {
+            throw new \InvalidArgumentException(&quot;You cannot copy from&quot;
+                . &quot; {$this-&gt;sourceMetadata[&#039;scheme&#039;]} to&quot;
+                . &quot; {$this-&gt;destination[&#039;scheme&#039;]}.&quot;
+            );
+        }
+
+        // Handle multipart-related options.
+        $this-&gt;concurrency = isset($options[&#039;concurrency&#039;])
+            ? $options[&#039;concurrency&#039;]
+            : MultipartUploader::DEFAULT_CONCURRENCY;
+        $this-&gt;mupThreshold = isset($options[&#039;mup_threshold&#039;])
+            ? $options[&#039;mup_threshold&#039;]
+            : 16777216;
+        if ($this-&gt;mupThreshold &lt; MultipartUploader::PART_MIN_SIZE) {
+            throw new \InvalidArgumentException(&#039;mup_threshold must be &gt;= 5MB&#039;);
+        }
+
+        // Handle &quot;before&quot; callback option.
+        if (isset($options[&#039;before&#039;])) {
+            $this-&gt;before = $options[&#039;before&#039;];
+            if (!is_callable($this-&gt;before)) {
+                throw new \InvalidArgumentException(&#039;before must be a callable.&#039;);
+            }
+        }
+
+        // Handle &quot;after&quot; callback option.
+        if (isset($options[&#039;after&#039;])) {
+            $this-&gt;after = $options[&#039;after&#039;];
+            if (!is_callable($this-&gt;after)) {
+                throw new \InvalidArgumentException(&#039;after must be a callable.&#039;);
+            }
+        }
+
+        // Handle &quot;debug&quot; option.
+        if (isset($options[&#039;debug&#039;])) {
+            if ($options[&#039;debug&#039;] === true) {
+                $options[&#039;debug&#039;] = fopen(&#039;php://output&#039;, &#039;w&#039;);
+            }
+            if (is_resource($options[&#039;debug&#039;])) {
+                $this-&gt;addDebugToBefore($options[&#039;debug&#039;]);
+            }
+        }
+
+        // Handle &quot;add_content_md5&quot; option.
+        $this-&gt;addContentMD5 = isset($options[&#039;add_content_md5&#039;])
+            &amp;&amp; $options[&#039;add_content_md5&#039;] === true;
+        MetricsBuilder::appendMetricsCaptureMiddleware(
+            $this-&gt;client-&gt;getHandlerList(),
+            MetricsBuilder::S3_TRANSFER
+        );
+    }
+
+    /**
+     * Transfers the files.
+     *
+     * @return PromiseInterface
+     */
+    public function promise(): PromiseInterface
+    {
+        // If the promise has been created, just return it.
+        if (!$this-&gt;promise) {
+            // Create an upload/download promise for the transfer.
+            $this-&gt;promise = $this-&gt;sourceMetadata[&#039;scheme&#039;] === &#039;file&#039;
+                ? $this-&gt;createUploadPromise()
+                : $this-&gt;createDownloadPromise();
+        }
+
+        return $this-&gt;promise;
+    }
+
+    /**
+     * Transfers the files synchronously.
+     */
+    public function transfer()
+    {
+        $this-&gt;promise()-&gt;wait();
+    }
+
+    private function prepareTarget($targetPath)
+    {
+        $target = [
+            &#039;path&#039;   =&gt; $this-&gt;normalizePath($targetPath),
+            &#039;scheme&#039; =&gt; $this-&gt;determineScheme($targetPath),
+        ];
+
+        if ($target[&#039;scheme&#039;] !== &#039;s3&#039; &amp;&amp; $target[&#039;scheme&#039;] !== &#039;file&#039;) {
+            throw new \InvalidArgumentException(&#039;Scheme must be &quot;s3&quot; or &quot;file&quot;.&#039;);
+        }
+
+        return $target;
+    }
+
+    /**
+     * Creates an array that contains Bucket and Key by parsing the filename.
+     *
+     * @param string $path Path to parse.
+     *
+     * @return array
+     */
+    private function getS3Args($path)
+    {
+        $parts = explode(&#039;/&#039;, str_replace(&#039;s3://&#039;, &#039;&#039;, $path), 2);
+        $args = [&#039;Bucket&#039; =&gt; $parts[0]];
+        if (isset($parts[1])) {
+            $args[&#039;Key&#039;] = $parts[1];
+        }
+
+        return $args;
+    }
+
+    /**
+     * Parses the scheme from a filename.
+     *
+     * @param string $path Path to parse.
+     *
+     * @return string
+     */
+    private function determineScheme($path)
+    {
+        return !strpos($path, &#039;://&#039;) ? &#039;file&#039; : explode(&#039;://&#039;, $path)[0];
+    }
+
+    /**
+     * Normalize a path so that it has UNIX-style directory separators and no trailing /
+     *
+     * @param string $path
+     *
+     * @return string
+     */
+    private function normalizePath($path)
+    {
+        return rtrim(str_replace(&#039;\\&#039;, &#039;/&#039;, $path), &#039;/&#039;);
+    }
+
+    private function resolvesOutsideTargetDirectory($sink, $objectKey)
+    {
+        $resolved = [];
+        $sections = explode(&#039;/&#039;, $sink);
+        $targetSectionsLength = count(explode(&#039;/&#039;, $objectKey));
+        $targetSections = array_slice($sections, -($targetSectionsLength + 1));
+        $targetDirectory = $targetSections[0];
+
+        foreach ($targetSections as $section) {
+            if ($section === &#039;.&#039; || $section === &#039;&#039;) {
+                continue;
+            }
+            if ($section === &#039;..&#039;) {
+                array_pop($resolved);
+                if (empty($resolved) || $resolved[0] !== $targetDirectory) {
+                    return true;
+                }
+            } else {
+                $resolved []= $section;
+            }
+        }
+        return false;
+    }
+
+    private function createDownloadPromise()
+    {
+        $parts = $this-&gt;getS3Args($this-&gt;sourceMetadata[&#039;path&#039;]);
+        $prefix = &quot;s3://{$parts[&#039;Bucket&#039;]}/&quot;
+            . (isset($parts[&#039;Key&#039;]) ? $parts[&#039;Key&#039;] . &#039;/&#039; : &#039;&#039;);
+
+        $commands = [];
+        foreach ($this-&gt;getDownloadsIterator() as $object) {
+            // Prepare the sink.
+            $objectKey = preg_replace(&#039;/^&#039; . preg_quote($prefix, &#039;/&#039;) . &#039;/&#039;, &#039;&#039;, $object);
+            $sink = $this-&gt;destination[&#039;path&#039;] . &#039;/&#039; . $objectKey;
+
+            $command = $this-&gt;client-&gt;getCommand(
+                &#039;GetObject&#039;,
+                $this-&gt;getS3Args($object) + [&#039;@http&#039;  =&gt; [&#039;sink&#039;  =&gt; $sink]]
+            );
+
+            if ($this-&gt;resolvesOutsideTargetDirectory($sink, $objectKey)) {
+                throw new AwsException(
+                    &#039;Cannot download key &#039; . $objectKey
+                    . &#039;, its relative path resolves outside the&#039;
+                    . &#039; parent directory&#039;, $command);
+            }
+
+            // Create the directory if needed.
+            $dir = dirname($sink);
+            if (!is_dir($dir) &amp;&amp; !mkdir($dir, 0777, true)) {
+                throw new \RuntimeException(&quot;Could not create dir: {$dir}&quot;);
+            }
+
+            // Create the command.
+            $commands []= $command;
+        }
+
+        // Create a GetObject command pool and return the promise.
+        return (new Aws\CommandPool($this-&gt;client, $commands, [
+            &#039;concurrency&#039; =&gt; $this-&gt;concurrency,
+            &#039;before&#039;      =&gt; $this-&gt;before,
+            &#039;fulfill&#039;     =&gt; $this-&gt;after,
+            &#039;rejected&#039;    =&gt; function ($reason, $idx, Promise\PromiseInterface $p) {
+                $p-&gt;reject($reason);
+            }
+        ]))-&gt;promise();
+    }
+
+    private function createUploadPromise()
+    {
+        // Map each file into a promise that performs the actual transfer.
+        $files = \Aws\map($this-&gt;getUploadsIterator(), function ($file) {
+            return (filesize($file) &gt;= $this-&gt;mupThreshold)
+                ? $this-&gt;uploadMultipart($file)
+                : $this-&gt;upload($file);
+        });
+
+        // Create an EachPromise, that will concurrently handle the upload
+        // operations&#039; yielded promises from the iterator.
+        return Promise\Each::ofLimitAll($files, $this-&gt;concurrency, $this-&gt;after);
+    }
+
+    /** @return Iterator */
+    private function getUploadsIterator()
+    {
+        if (is_string($this-&gt;source)) {
+            return Aws\filter(
+                Aws\recursive_dir_iterator($this-&gt;sourceMetadata[&#039;path&#039;]),
+                function ($file) { return !is_dir($file); }
+            );
+        }
+
+        return $this-&gt;source;
+    }
+
+    /** @return Iterator */
+    private function getDownloadsIterator()
+    {
+        if (is_string($this-&gt;source)) {
+            $listArgs = $this-&gt;getS3Args($this-&gt;sourceMetadata[&#039;path&#039;]);
+            if (isset($listArgs[&#039;Key&#039;])) {
+                $listArgs[&#039;Prefix&#039;] = $listArgs[&#039;Key&#039;] . &#039;/&#039;;
+                unset($listArgs[&#039;Key&#039;]);
+            }
+
+            $files = $this-&gt;client
+                -&gt;getPaginator(&#039;ListObjects&#039;, $listArgs)
+                -&gt;search(&#039;Contents[].Key&#039;);
+            $files = Aws\map($files, function ($key) use ($listArgs) {
+                return &quot;s3://{$listArgs[&#039;Bucket&#039;]}/$key&quot;;
+            });
+            return Aws\filter($files, function ($key) {
+                return substr($key, -1, 1) !== &#039;/&#039;;
+            });
+        }
+
+        return $this-&gt;source;
+    }
+
+    private function upload($filename)
+    {
+        $args = $this-&gt;s3Args;
+        $args[&#039;SourceFile&#039;] = $filename;
+        $args[&#039;Key&#039;] = $this-&gt;createS3Key($filename);
+        $args[&#039;AddContentMD5&#039;] = $this-&gt;addContentMD5;
+        $command = $this-&gt;client-&gt;getCommand(&#039;PutObject&#039;, $args);
+        $this-&gt;before and call_user_func($this-&gt;before, $command);
+
+        return $this-&gt;client-&gt;executeAsync($command);
+    }
+
+    private function uploadMultipart($filename)
+    {
+        $args = $this-&gt;s3Args;
+        $args[&#039;Key&#039;] = $this-&gt;createS3Key($filename);
+        $filename = $filename instanceof \SplFileInfo ? $filename-&gt;getPathname() : $filename;
+
+        return (new MultipartUploader($this-&gt;client, $filename, [
+            &#039;bucket&#039;          =&gt; $args[&#039;Bucket&#039;],
+            &#039;key&#039;             =&gt; $args[&#039;Key&#039;],
+            &#039;before_initiate&#039; =&gt; $this-&gt;before,
+            &#039;before_upload&#039;   =&gt; $this-&gt;before,
+            &#039;before_complete&#039; =&gt; $this-&gt;before,
+            &#039;concurrency&#039;     =&gt; $this-&gt;concurrency,
+            &#039;add_content_md5&#039; =&gt; $this-&gt;addContentMD5
+        ]))-&gt;promise();
+    }
+
+    private function createS3Key($filename)
+    {
+        $filename = $this-&gt;normalizePath($filename);
+        $relative_file_path = ltrim(
+            preg_replace(&#039;#^&#039; . preg_quote($this-&gt;sourceMetadata[&#039;path&#039;]) . &#039;#&#039;, &#039;&#039;, $filename),
+            &#039;/\\&#039;
+        );
+
+        if (isset($this-&gt;s3Args[&#039;Key&#039;])) {
+            return rtrim($this-&gt;s3Args[&#039;Key&#039;], &#039;/&#039;).&#039;/&#039;.$relative_file_path;
+        }
+
+        return $relative_file_path;
+    }
+
+    private function addDebugToBefore($debug)
+    {
+        $before = $this-&gt;before;
+        $sourcePath = $this-&gt;sourceMetadata[&#039;path&#039;];
+        $s3Args = $this-&gt;s3Args;
+
+        $this-&gt;before = static function (
+            CommandInterface $command
+        ) use ($before, $debug, $sourcePath, $s3Args) {
+            // Call the composed before function.
+            $before and $before($command);
+
+            // Determine the source and dest values based on operation.
+            switch ($operation = $command-&gt;getName()) {
+                case &#039;GetObject&#039;:
+                    $source = &quot;s3://{$command[&#039;Bucket&#039;]}/{$command[&#039;Key&#039;]}&quot;;
+                    $dest = $command[&#039;@http&#039;][&#039;sink&#039;];
+                    break;
+                case &#039;PutObject&#039;:
+                    $source = $command[&#039;SourceFile&#039;];
+                    $dest = &quot;s3://{$command[&#039;Bucket&#039;]}/{$command[&#039;Key&#039;]}&quot;;
+                    break;
+                case &#039;UploadPart&#039;:
+                    $part = $command[&#039;PartNumber&#039;];
+                case &#039;CreateMultipartUpload&#039;:
+                case &#039;CompleteMultipartUpload&#039;:
+                    $sourceKey = $command[&#039;Key&#039;];
+                    if (isset($s3Args[&#039;Key&#039;]) &amp;&amp; strpos($sourceKey, $s3Args[&#039;Key&#039;]) === 0) {
+                        $sourceKey = substr($sourceKey, strlen($s3Args[&#039;Key&#039;]) + 1);
+                    }
+                    $source = &quot;{$sourcePath}/{$sourceKey}&quot;;
+                    $dest = &quot;s3://{$command[&#039;Bucket&#039;]}/{$command[&#039;Key&#039;]}&quot;;
+                    break;
+                default:
+                    throw new \UnexpectedValueException(
+                        &quot;Transfer encountered an unexpected operation: {$operation}.&quot;
+                    );
+            }
+
+            // Print the debugging message.
+            $context = sprintf(&#039;%s -&gt; %s (%s)&#039;, $source, $dest, $operation);
+            if (isset($part)) {
+                $context .= &quot; : Part={$part}&quot;;
+            }
+            fwrite($debug, &quot;Transferring {$context}\n&quot;);
+        };
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/S3/UseArnRegion/Configuration.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/S3/Crypto -->
+
+</body>
+</html>

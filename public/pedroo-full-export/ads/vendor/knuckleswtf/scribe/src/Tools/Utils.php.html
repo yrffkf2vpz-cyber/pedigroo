@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Tools/Utils.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Tools;
+
+use Closure;
+use DirectoryIterator;
+use Exception;
+use FastRoute\RouteParser\Std;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Routing\Route;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Str;
+use Knuckles\Scribe\Exceptions\CouldntFindFactory;
+use Knuckles\Scribe\Exceptions\CouldntGetRouteDetails;
+use Knuckles\Scribe\ScribeServiceProvider;
+use Knuckles\Scribe\Tools\ConsoleOutputUtils as c;
+use League\Flysystem\DirectoryListing;
+use League\Flysystem\Filesystem;
+use League\Flysystem\FilesystemException;
+use League\Flysystem\Local\LocalFilesystemAdapter;
+use Mpociot\Reflection\DocBlock\Tag;
+use ReflectionClass;
+use ReflectionException;
+use ReflectionFunction;
+use ReflectionFunctionAbstract;
+use Throwable;
+
+class Utils
+{
+    /**
+     * Sometimes you have a config array that can have items as keys or values, like this:
+     *
+     * [
+     *   &#039;a&#039;,
+     *   &#039;b&#039; =&gt; [ (options for b) ]
+     * ]
+     *
+     * This method extracts the top-level options ([&#039;a&#039;, &#039;b&#039;])
+     *
+     * @param array $mixedList
+     */
+    public static function getTopLevelItemsFromMixedConfigList(array $mixedList): array
+    {
+        $topLevels = [];
+        foreach ($mixedList as $item =&gt; $value) {
+            $topLevels[] = is_int($item) ? $value : $item;
+        }
+        return $topLevels;
+    }
+
+    public static function getUrlWithBoundParameters(string $uri, array $urlParameters = []): string
+    {
+        return self::replaceUrlParameterPlaceholdersWithValues($uri, $urlParameters);
+    }
+
+    /**
+     * Transform parameters in URLs into real values (/users/{user} -&gt; /users/2).
+     * Uses @urlParam values specified by caller, otherwise just uses &#039;1&#039;.
+     *
+     * @param string $uri
+     * @param array $urlParameters Dictionary of url params and example values
+     *
+     * @return string
+     */
+    public static function replaceUrlParameterPlaceholdersWithValues(string $uri, array $urlParameters): string
+    {
+        if (empty($urlParameters)) {
+            return $uri;
+        }
+
+        foreach ($urlParameters as $parameterName =&gt; $example) {
+            $uri = preg_replace(&#039;#\{&#039; . $parameterName . &#039;\??}#&#039;, $example, $uri);
+        }
+
+        // Remove unbound optional parameters with nothing
+        $uri = preg_replace(&#039;#{([^/]+\?)}#&#039;, &#039;&#039;, $uri);
+        // Replace any unbound non-optional parameters with &#039;1&#039;
+        $uri = preg_replace(&#039;#{([^/]+)}#&#039;, &#039;1&#039;, $uri);
+
+        return $uri;
+    }
+
+    public static function getRouteClassAndMethodNames(Route $route): array
+    {
+        $action = $route-&gt;getAction();
+
+        $uses = $action[&#039;uses&#039;];
+
+        if ($uses !== null) {
+            if (is_array($uses)) {
+                return $uses;
+            } elseif (is_string($uses)) {
+                $usesArray = explode(&#039;@&#039;, $uses);
+                if (count($usesArray) &lt; 2) {
+                    throw CouldntGetRouteDetails::new();
+                }
+                [$class, $method] = $usesArray;
+
+                // Support for the Laravel Actions package, docblock should be put on the asController method
+                if ($method === &#039;__invoke&#039; &amp;&amp; method_exists($class, &#039;asController&#039;))
+                {
+                    return [$class, &#039;asController&#039;];
+                }
+
+                return [$class, $method];
+            } elseif (static::isInvokableObject($uses)) {
+                return [$uses, &#039;__invoke&#039;];
+            }
+        }
+        if (array_key_exists(0, $action) &amp;&amp; array_key_exists(1, $action)) {
+            return [
+                0 =&gt; $action[0],
+                1 =&gt; $action[1],
+            ];
+        }
+
+        throw new Exception(&quot;Couldn&#039;t get class and method names for route &quot; . c::getRouteRepresentation($route) . &#039;.&#039;);
+    }
+
+    public static function deleteDirectoryAndContents(string $dir, ?string $workingDir = null): void
+    {
+        $workingDir ??= getcwd();
+        $adapter = new LocalFilesystemAdapter($workingDir);
+        $fs = new Filesystem($adapter);
+        $dir = str_replace($workingDir, &#039;&#039;, $dir);
+        $fs-&gt;deleteDirectory($dir);
+    }
+
+    /**
+     * @param string $dir
+     * @return DirectoryListing&lt;\League\Flysystem\StorageAttributes&gt;
+     * @throws FilesystemException
+     */
+    public static function listDirectoryContents(string $dir)
+    {
+        $adapter = new LocalFilesystemAdapter(getcwd());
+        $fs = new Filesystem($adapter);
+        return $fs-&gt;listContents($dir);
+    }
+
+    public static function copyDirectory(string $src, string $dest): void
+    {
+        if (!is_dir($src)) return;
+
+        // If the destination directory does not exist create it
+        if (!is_dir($dest)) {
+            if (!mkdir($dest, 0777, true)) {
+                // If the destination directory could not be created stop processing
+                throw new Exception(&quot;Failed to create target directory: $dest&quot;);
+            }
+        }
+
+        // Open the source directory to read in files
+        $i = new DirectoryIterator($src);
+        foreach ($i as $f) {
+            if ($f-&gt;isFile()) {
+                copy($f-&gt;getRealPath(), &quot;$dest/&quot; . $f-&gt;getFilename());
+            } else if (!$f-&gt;isDot() &amp;&amp; $f-&gt;isDir()) {
+                self::copyDirectory($f-&gt;getRealPath(), &quot;$dest/$f&quot;);
+            }
+        }
+    }
+
+    public static function makeDirectoryRecursive(string $dir): void
+    {
+        File::isDirectory($dir) || File::makeDirectory($dir, 0777, true, true);
+    }
+
+    public static function deleteFilesMatching(string $dir, callable $condition): void
+    {
+        if (class_exists(LocalFilesystemAdapter::class)) {
+            // Flysystem 2+
+            $adapter = new LocalFilesystemAdapter(getcwd());
+            $fs = new Filesystem($adapter);
+            $contents = $fs-&gt;listContents(ltrim($dir, &#039;/&#039;));
+        } else {
+            // v1
+            $adapter = new \League\Flysystem\Adapter\Local(getcwd()); // @phpstan-ignore-line
+            $fs = new Filesystem($adapter); // @phpstan-ignore-line
+            $dir = str_replace($adapter-&gt;getPathPrefix(), &#039;&#039;, $dir); // @phpstan-ignore-line
+            $contents = $fs-&gt;listContents(ltrim($dir, &#039;/&#039;));
+        }
+        foreach ($contents as $file) {
+            // Flysystem v1 had items as arrays; v2 has objects.
+            // v2 allows ArrayAccess, but when we drop v1 support (Laravel &lt;9), we should switch to methods
+            if ($file[&#039;type&#039;] == &#039;file&#039; &amp;&amp; $condition($file) === true) {
+                $fs-&gt;delete($file[&#039;path&#039;]);
+            }
+        }
+    }
+
+    /**
+     * @param mixed $value
+     *
+     * @return bool
+     */
+    public static function isInvokableObject($value): bool
+    {
+        return is_object($value) &amp;&amp; method_exists($value, &#039;__invoke&#039;);
+    }
+
+    /**
+     * Returns the route method or closure as an instance of ReflectionMethod or ReflectionFunction
+     *
+     * @param array $routeControllerAndMethod
+     *
+     * @return ReflectionFunctionAbstract
+     * @throws ReflectionException
+     *
+     */
+    public static function getReflectedRouteMethod(array $routeControllerAndMethod): ReflectionFunctionAbstract
+    {
+        if (count($routeControllerAndMethod) &lt; 2) {
+            throw CouldntGetRouteDetails::new();
+        }
+        [$class, $method] = $routeControllerAndMethod;
+
+        if ($class instanceof Closure) {
+            return new ReflectionFunction($class);
+        }
+
+        return (new ReflectionClass($class))-&gt;getMethod($method);
+    }
+
+    public static function isArrayType(string $typeName)
+    {
+        return Str::endsWith($typeName, &#039;[]&#039;);
+    }
+
+    public static function getBaseTypeFromArrayType(string $typeName)
+    {
+        return substr($typeName, 0, -2);
+    }
+
+    /**
+     * @param string $modelName
+     * @param string[] $states
+     * @param string[] $relations
+     *
+     * @return \Illuminate\Database\Eloquent\Factories\Factory
+     * @throws \Throwable
+     */
+    public static function getModelFactory(string $modelName, array $states = [], array $relations = [])
+    {
+        // Factories are usually defined without the leading \ in the class name,
+        // but the user might write it that way in a comment. Let&#039;s be safe.
+        $modelName = ltrim($modelName, &#039;\\&#039;);
+
+        if (method_exists($modelName, &#039;factory&#039;)) { // Laravel 8 type factory
+            /** @var \Illuminate\Database\Eloquent\Factories\Factory $factory */
+            $factory = call_user_func_array([$modelName, &#039;factory&#039;], []);
+            foreach ($states as $state) {
+                if (method_exists(get_class($factory), $state)) {
+                    $factory = $factory-&gt;$state();
+                }
+            }
+
+            foreach ($relations as $relation) {
+                // Support nested relations; see https://github.com/knuckleswtf/scribe/pull/364 for a detailed example
+                // Example: App\Models\Author with=posts.categories
+                $relationChain = explode(&#039;.&#039;, $relation);
+                $relationVector = array_shift($relationChain);
+
+                $relation = (new $modelName())-&gt;{$relationVector}();
+                $relationType = get_class($relation);
+                $relationModel = get_class($relation-&gt;getModel());
+
+                $factoryChain = empty($relationChain)
+                    ? call_user_func_array([$relationModel, &#039;factory&#039;], [])
+                    : Utils::getModelFactory($relationModel, $states, [implode(&#039;.&#039;, $relationChain)]);
+
+                if ($relation instanceof BelongsToMany) {
+                    $pivot = method_exists($factory, &#039;pivot&#039; . $relationVector)
+                        ? $factory-&gt;{&#039;pivot&#039; . $relationVector}()
+                        : [];
+
+                    $factory = $factory-&gt;hasAttached($factoryChain, $pivot, $relationVector);
+                } else if ($relationType === BelongsTo::class) {
+                    $factory = $factory-&gt;for($factoryChain, $relationVector);
+                } else {
+                    $factory = $factory-&gt;has($factoryChain, $relationVector);
+                }
+            }
+        } else {
+            try {
+                $factory = factory($modelName);
+            } catch (Throwable $e) {
+                if (Str::contains($e-&gt;getMessage(), &quot;Call to undefined function Knuckles\\Scribe\\Tools\\factory()&quot;)) {
+                    throw CouldntFindFactory::forModel($modelName);
+                } else {
+                    throw $e;
+                }
+            }
+            if (count($states)) {
+                $factory = $factory-&gt;states($states);
+            }
+        }
+
+        return $factory;
+    }
+
+    /**
+     * Filter a list of docblock tags to those matching the specified ones (case-insensitive).
+     *
+     * @param Tag[] $tags
+     * @param string ...$names
+     *
+     * @return Tag[]
+     */
+    public static function filterDocBlockTags(array $tags, string ...$names): array
+    {
+        // Avoid &quot;holes&quot; in the keys of the filtered array by using array_values
+        return array_values(
+            array_filter($tags, fn($tag) =&gt; in_array(strtolower($tag-&gt;getName()),$names))
+        );
+    }
+
+    /**
+     * Like Laravel&#039;s trans/__ function, but will fallback to using the default translation if translation fails.
+     * For instance, if the user&#039;s locale is DE, but they have no DE strings defined,
+     * Laravel simply renders the translation key.
+     * Instead, we render the EN version.
+     */
+    public static function trans(string $key, array $replace = [])
+    {
+        // We only load our custom translation layer if we really need it
+        if (!ScribeServiceProvider::$customTranslationLayerLoaded) {
+            app(ScribeServiceProvider::class, [&#039;app&#039; =&gt; app()])-&gt;loadCustomTranslationLayer();
+        }
+
+        $translation = trans($key, $replace);
+
+        /* @phpstan-ignore-next-line */
+        if ($translation === $key || $translation === null) {
+            $translation = trans($key, $replace, &#039;en&#039;);
+        }
+
+
+        if ($translation === $key) {
+            throw new \Exception(&quot;Translation not found for $key. You can add a translation for this in your `lang/scribe.php`, but this is likely a problem with the package. Please open an issue.&quot;);
+        }
+
+        return $translation;
+    }
+}
+
+function getTopLevelItemsFromMixedOrderList(array $mixedList): array
+{
+  $topLevels = [];
+  foreach ($mixedList as $item =&gt; $value) {
+    $topLevels[] = is_int($item) ? $value : $item;
+  }
+  return $topLevels;
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Tools/WritingUtils.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Writing -->
+
+</body>
+</html>

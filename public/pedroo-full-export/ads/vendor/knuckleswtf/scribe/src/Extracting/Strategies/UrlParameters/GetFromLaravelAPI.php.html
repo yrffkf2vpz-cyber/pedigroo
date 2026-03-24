@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/UrlParameters/GetFromLaravelAPI.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Extracting\Strategies\UrlParameters;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Str;
+use Knuckles\Camel\Extraction\ExtractedEndpointData;
+use Knuckles\Scribe\Extracting\ParamHelpers;
+use Knuckles\Scribe\Extracting\Shared\UrlParamsNormalizer;
+use Knuckles\Scribe\Extracting\Strategies\Strategy;
+use Knuckles\Scribe\Tools\Utils;
+use Throwable;
+
+class GetFromLaravelAPI extends Strategy
+{
+    use ParamHelpers;
+
+    public function __invoke(ExtractedEndpointData $endpointData, array $routeRules = []): ?array
+    {
+        $parameters = [];
+
+        $path = $endpointData-&gt;uri;
+        preg_match_all(&#039;/\{(.*?)\}/&#039;, $path, $matches);
+
+        foreach ($matches[1] as $match) {
+            $isOptional = Str::endsWith($match, &#039;?&#039;);
+            $name = rtrim($match, &#039;?&#039;);
+
+            $parameters[$name] = [
+                &#039;name&#039; =&gt; $name,
+                &#039;description&#039; =&gt; $this-&gt;inferUrlParamDescription($endpointData-&gt;uri, $name),
+                &#039;required&#039; =&gt; !$isOptional,
+            ];
+        }
+
+        $parameters = $this-&gt;inferBetterTypesAndExamplesForEloquentUrlParameters($parameters, $endpointData);
+        $parameters = $this-&gt;inferBetterTypesAndExamplesForEnumUrlParameters($parameters, $endpointData);
+        $parameters = $this-&gt;setTypesAndExamplesForOthers($parameters, $endpointData);
+
+        return $parameters;
+    }
+
+    protected function inferUrlParamDescription(string $url, string $paramName): string
+    {
+        // If $url is sth like /users/{id}, return &quot;The ID of the user.&quot;
+        // If $url is sth like /anything/{user_id}, return &quot;The ID of the user.&quot;
+
+        $strategies = collect([&quot;id&quot;, &quot;slug&quot;])-&gt;map(function ($name) {
+            $friendlyName = $name === &#039;id&#039; ? &quot;ID&quot; : $name;
+
+            return function ($url, $paramName) use ($name, $friendlyName) {
+                if ($paramName == $name) {
+                    $thing = $this-&gt;getNameOfUrlThing($url, $paramName);
+                    return &quot;The $friendlyName of the $thing.&quot;;
+                } else if (Str::is(&quot;*_$name&quot;, $paramName)) {
+                    $thing = str_replace([&quot;_&quot;, &quot;-&quot;], &quot; &quot;, str_replace(&quot;_$name&quot;, &#039;&#039;, $paramName));
+                    return &quot;The $friendlyName of the $thing.&quot;;
+                }
+            };
+        })-&gt;toArray();
+
+        // If $url is sth like /categories/{category}, return &quot;The category.&quot;
+        $strategies[] = function ($url, $paramName) {
+            $thing = $this-&gt;getNameOfUrlThing($url, $paramName);
+            if ($thing === $paramName) {
+                return &quot;The $thing.&quot;;
+            }
+        };
+
+        foreach ($strategies as $strategy) {
+            if ($inferred = $strategy($url, $paramName)) {
+                return $inferred;
+            }
+        }
+
+        return &#039;&#039;;
+    }
+
+    protected function inferBetterTypesAndExamplesForEloquentUrlParameters(array $parameters, ExtractedEndpointData $endpointData): array
+    {
+        //We&#039;ll gather Eloquent model instances that can be linked to a URl parameter
+        $modelInstances = [];
+
+        // First, any bound models
+        // Eg if route is /users/{id}, and (User $user) model is typehinted on method
+        // If User model has `id` as an integer, then {id} param should be an integer
+        $typeHintedEloquentModels = UrlParamsNormalizer::getTypeHintedEloquentModels($endpointData-&gt;method);
+        foreach ($typeHintedEloquentModels as $argumentName =&gt; $modelInstance) {
+            $routeKey = $modelInstance-&gt;getRouteKeyName();
+
+            // Find the param name. In our normalized URL, argument $user might be param {user}, or {user_id}, or {id},
+            if (isset($parameters[$argumentName])) {
+                $paramName = $argumentName;
+            } else if (isset($parameters[&quot;{$argumentName}_$routeKey&quot;])) {
+                $paramName = &quot;{$argumentName}_$routeKey&quot;;
+            } else if (isset($parameters[$routeKey])) {
+                $paramName = $routeKey;
+            } else {
+                continue;
+            }
+
+            $modelInstances[$paramName] = $modelInstance;
+        }
+
+        // Next, non-Eloquent-bound parameters. They might still be Eloquent models, but model binding wasn&#039;t used.
+        foreach ($parameters as $name =&gt; $data) {
+            if (isset($data[&#039;type&#039;])) continue;
+
+            // If the url is /things/{id}, try to find a Thing model
+            $urlThing = $this-&gt;getNameOfUrlThing($endpointData-&gt;uri, $name);
+            if ($urlThing &amp;&amp; ($modelInstance = $this-&gt;findModelFromUrlThing($urlThing))) {
+                $modelInstances[$name] = $modelInstance;
+            }
+        }
+
+        // Now infer.
+        foreach ($modelInstances as $paramName =&gt; $modelInstance) {
+            // If the routeKey is the same as the primary key in the database, use the PK&#039;s type.
+            $routeKey = $modelInstance-&gt;getRouteKeyName();
+            $type = $modelInstance-&gt;getKeyName() === $routeKey
+                ? static::normalizeTypeName($modelInstance-&gt;getKeyType()) : &#039;string&#039;;
+
+            $parameters[$paramName][&#039;type&#039;] = $type;
+
+            try {
+                $parameters[$paramName][&#039;example&#039;] = $modelInstance::first()-&gt;$routeKey ?? null;
+            } catch (Throwable) {
+                $parameters[$paramName][&#039;example&#039;] = null;
+            }
+
+        }
+        return $parameters;
+    }
+
+    protected function inferBetterTypesAndExamplesForEnumUrlParameters(array $parameters, ExtractedEndpointData $endpointData): array
+    {
+        $typeHintedEnums = UrlParamsNormalizer::getTypeHintedEnums($endpointData-&gt;method);
+        foreach ($typeHintedEnums as $argumentName =&gt; $enum) {
+            $parameters[$argumentName][&#039;type&#039;] = static::normalizeTypeName($enum-&gt;getBackingType());
+
+            try {
+                $parameters[$argumentName][&#039;example&#039;] = $enum-&gt;getCases()[0]-&gt;getBackingValue();
+            } catch (Throwable) {
+                $parameters[$argumentName][&#039;example&#039;] = null;
+            }
+        }
+
+        return $parameters;
+    }
+
+    protected function setTypesAndExamplesForOthers(array $parameters, ExtractedEndpointData $endpointData): array
+    {
+        foreach ($parameters as $name =&gt; $parameter) {
+            if (empty($parameter[&#039;type&#039;])) {
+                $parameters[$name][&#039;type&#039;] = &quot;string&quot;;
+            }
+
+            if (($parameter[&#039;example&#039;] ?? null) === null) {
+                // If the user explicitly set a `where()` constraint, use that to refine examples
+                $parameterRegex = $endpointData-&gt;route-&gt;wheres[$name] ?? null;
+                $parameters[$name][&#039;example&#039;] = $parameterRegex
+                    ? $this-&gt;castToType($this-&gt;getFaker()-&gt;regexify($parameterRegex), $parameters[$name][&#039;type&#039;])
+                    : $this-&gt;generateDummyValue($parameters[$name][&#039;type&#039;], hints: [&#039;name&#039; =&gt; $name]);
+            }
+        }
+        return $parameters;
+    }
+
+    /**
+     * Given a URL parameter $paramName, extract the &quot;thing&quot; that comes before it. eg::
+     * - /&lt;whatever&gt;/things/{paramName} -&gt; &quot;thing&quot;
+     * - animals/cats/{id} -&gt; &quot;cat&quot;
+     * - users/{user_id}/contracts -&gt; &quot;user&quot;
+     *
+     * @param string $url
+     * @param string $paramName
+     * @param string|null $alternateParamName A second paramName to try, if the original paramName isn&#039;t in the URL.
+     *
+     * @return string|null
+     */
+    protected function getNameOfUrlThing(string $url, string $paramName, ?string $alternateParamName = null): ?string
+    {
+        $parts = explode(&quot;/&quot;, $url);
+        if (count($parts) === 1) return null; // URL was &quot;/{thing}&quot;
+
+        $paramIndex = array_search(&quot;{{$paramName}}&quot;, $parts);
+
+        if ($paramIndex === false) {
+            $paramIndex = array_search(&quot;{{$alternateParamName}}&quot;, $parts);
+        }
+
+        if ($paramIndex === false || $paramIndex === 0) return null;
+
+        $things = $parts[$paramIndex - 1];
+        // Replace underscores/hyphens, so &quot;side_projects&quot; becomes &quot;side project&quot;
+        return str_replace([&quot;_&quot;, &quot;-&quot;], &quot; &quot;, Str::singular($things));
+    }
+
+    /**
+     * Given a URL &quot;thing&quot;, like the &quot;cat&quot; in /cats/{id}, try to locate a Cat model.
+     *
+     * @param string $urlThing
+     *
+     * @return Model|null
+     */
+    protected function findModelFromUrlThing(string $urlThing): ?Model
+    {
+        $className = str_replace([&#039;-&#039;, &#039;_&#039;, &#039; &#039;], &#039;&#039;, Str::title($urlThing));
+        $rootNamespace = app()-&gt;getNamespace();
+
+        if (class_exists($class = &quot;{$rootNamespace}Models\\&quot; . $className, autoload: false)
+            // For the heathens that don&#039;t use a Models\ directory
+            || class_exists($class = $rootNamespace . $className, autoload: false)) {
+            try {
+                $instance = new $class;
+            } catch (\Error) { // It might be an enum or some other non-instantiable class
+                return null;
+            }
+            return $instance instanceof Model ? $instance : null;
+        }
+
+        return null;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Extracting/Strategies/UrlParameters/GetFromUrlParamAttribute.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/GroupedEndpoints -->
+
+</body>
+</html>

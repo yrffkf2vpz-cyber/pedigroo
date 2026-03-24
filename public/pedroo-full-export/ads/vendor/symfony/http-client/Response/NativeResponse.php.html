@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/Response/NativeResponse.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient\Response;
+
+use Psr\Log\LoggerInterface;
+use Symfony\Component\HttpClient\Chunk\FirstChunk;
+use Symfony\Component\HttpClient\Exception\TransportException;
+use Symfony\Component\HttpClient\Internal\Canary;
+use Symfony\Component\HttpClient\Internal\ClientState;
+use Symfony\Component\HttpClient\Internal\NativeClientState;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+
+/**
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+final class NativeResponse implements ResponseInterface, StreamableInterface
+{
+    use CommonResponseTrait;
+    use TransportResponseTrait;
+
+    private \Closure $resolver;
+    private ?\Closure $onProgress;
+    private ?int $remaining = null;
+
+    /**
+     * @var resource|null
+     */
+    private $buffer;
+
+    private float $pauseExpiry = 0.0;
+
+    /**
+     * @internal
+     *
+     * @param $context resource
+     */
+    public function __construct(
+        private NativeClientState $multi,
+        private $context,
+        private string $url,
+        array $options,
+        array &amp;$info,
+        callable $resolver,
+        ?callable $onProgress,
+        ?LoggerInterface $logger,
+    ) {
+        $this-&gt;id = $id = (int) $context;
+        $this-&gt;logger = $logger;
+        $this-&gt;timeout = $options[&#039;timeout&#039;];
+        $this-&gt;info = &amp;$info;
+        $this-&gt;resolver = $resolver(...);
+        $this-&gt;onProgress = $onProgress ? $onProgress(...) : null;
+        $this-&gt;inflate = !isset($options[&#039;normalized_headers&#039;][&#039;accept-encoding&#039;]);
+        $this-&gt;shouldBuffer = $options[&#039;buffer&#039;] ?? true;
+
+        // Temporary resource to dechunk the response stream
+        $this-&gt;buffer = fopen(&#039;php://temp&#039;, &#039;w+&#039;);
+
+        $info[&#039;original_url&#039;] = implode(&#039;&#039;, $info[&#039;url&#039;]);
+        $info[&#039;user_data&#039;] = $options[&#039;user_data&#039;];
+        $info[&#039;max_duration&#039;] = $options[&#039;max_duration&#039;];
+        ++$multi-&gt;responseCount;
+
+        $this-&gt;initializer = static fn (self $response) =&gt; null === $response-&gt;remaining;
+
+        $pauseExpiry = &amp;$this-&gt;pauseExpiry;
+        $info[&#039;pause_handler&#039;] = static function (float $duration) use (&amp;$pauseExpiry) {
+            $pauseExpiry = 0 &lt; $duration ? hrtime(true) / 1E9 + $duration : 0;
+        };
+
+        $this-&gt;canary = new Canary(static function () use ($multi, $id) {
+            if (null !== ($host = $multi-&gt;openHandles[$id][6] ?? null) &amp;&amp; isset($multi-&gt;hosts[$host]) &amp;&amp; 0 &gt;= --$multi-&gt;hosts[$host]) {
+                unset($multi-&gt;hosts[$host]);
+            }
+            unset($multi-&gt;openHandles[$id], $multi-&gt;handlesActivity[$id]);
+        });
+    }
+
+    public function getInfo(?string $type = null): mixed
+    {
+        if (!$info = $this-&gt;finalInfo) {
+            $info = $this-&gt;info;
+            $info[&#039;url&#039;] = implode(&#039;&#039;, $info[&#039;url&#039;]);
+            unset($info[&#039;size_body&#039;], $info[&#039;request_header&#039;]);
+
+            if (null === $this-&gt;buffer) {
+                $this-&gt;finalInfo = $info;
+            }
+        }
+
+        return null !== $type ? $info[$type] ?? null : $info;
+    }
+
+    public function __destruct()
+    {
+        try {
+            $this-&gt;doDestruct();
+        } finally {
+            // Clear the DNS cache when all requests completed
+            if (0 &gt;= --$this-&gt;multi-&gt;responseCount) {
+                $this-&gt;multi-&gt;responseCount = 0;
+                $this-&gt;multi-&gt;dnsCache = [];
+            }
+        }
+    }
+
+    private function open(): void
+    {
+        $url = $this-&gt;url;
+
+        set_error_handler(function ($type, $msg) use (&amp;$url) {
+            if (\E_NOTICE !== $type || &#039;fopen(): Content-type not specified assuming application/x-www-form-urlencoded&#039; !== $msg) {
+                throw new TransportException($msg);
+            }
+
+            $this-&gt;logger?-&gt;info(\sprintf(&#039;%s for &quot;%s&quot;.&#039;, $msg, $url ?? $this-&gt;url));
+        });
+
+        try {
+            $this-&gt;info[&#039;start_time&#039;] = microtime(true);
+
+            [$resolver, $url] = ($this-&gt;resolver)($this-&gt;multi);
+
+            while (true) {
+                $context = stream_context_get_options($this-&gt;context);
+
+                if ($proxy = $context[&#039;http&#039;][&#039;proxy&#039;] ?? null) {
+                    $this-&gt;info[&#039;debug&#039;] .= &quot;* Establish HTTP proxy tunnel to {$proxy}\n&quot;;
+                    $this-&gt;info[&#039;request_header&#039;] = $url;
+                } else {
+                    $this-&gt;info[&#039;debug&#039;] .= &quot;*   Trying {$this-&gt;info[&#039;primary_ip&#039;]}...\n&quot;;
+                    $this-&gt;info[&#039;request_header&#039;] = $this-&gt;info[&#039;url&#039;][&#039;path&#039;].$this-&gt;info[&#039;url&#039;][&#039;query&#039;];
+                }
+
+                $this-&gt;info[&#039;request_header&#039;] = \sprintf(&quot;&gt; %s %s HTTP/%s \r\n&quot;, $context[&#039;http&#039;][&#039;method&#039;], $this-&gt;info[&#039;request_header&#039;], $context[&#039;http&#039;][&#039;protocol_version&#039;]);
+                $this-&gt;info[&#039;request_header&#039;] .= implode(&quot;\r\n&quot;, $context[&#039;http&#039;][&#039;header&#039;]).&quot;\r\n\r\n&quot;;
+
+                if (\array_key_exists(&#039;peer_name&#039;, $context[&#039;ssl&#039;]) &amp;&amp; null === $context[&#039;ssl&#039;][&#039;peer_name&#039;]) {
+                    unset($context[&#039;ssl&#039;][&#039;peer_name&#039;]);
+                    $this-&gt;context = stream_context_create([], [&#039;options&#039; =&gt; $context] + stream_context_get_params($this-&gt;context));
+                }
+
+                // Send request and follow redirects when needed
+                $this-&gt;handle = $h = fopen($url, &#039;r&#039;, false, $this-&gt;context);
+                self::addResponseHeaders(stream_get_meta_data($h)[&#039;wrapper_data&#039;], $this-&gt;info, $this-&gt;headers, $this-&gt;info[&#039;debug&#039;]);
+                $url = $resolver($this-&gt;multi, $this-&gt;headers[&#039;location&#039;][0] ?? null, $this-&gt;context);
+
+                if (null === $url) {
+                    break;
+                }
+
+                $this-&gt;logger?-&gt;info(\sprintf(&#039;Redirecting: &quot;%s %s&quot;&#039;, $this-&gt;info[&#039;http_code&#039;], $url ?? $this-&gt;url));
+            }
+        } catch (\Throwable $e) {
+            $this-&gt;close();
+            $this-&gt;multi-&gt;handlesActivity[$this-&gt;id][] = null;
+            $this-&gt;multi-&gt;handlesActivity[$this-&gt;id][] = $e;
+
+            return;
+        } finally {
+            $this-&gt;info[&#039;pretransfer_time&#039;] = $this-&gt;info[&#039;total_time&#039;] = microtime(true) - $this-&gt;info[&#039;start_time&#039;];
+            restore_error_handler();
+        }
+
+        if (isset($context[&#039;ssl&#039;][&#039;capture_peer_cert_chain&#039;]) &amp;&amp; isset(($context = stream_context_get_options($this-&gt;context))[&#039;ssl&#039;][&#039;peer_certificate_chain&#039;])) {
+            $this-&gt;info[&#039;peer_certificate_chain&#039;] = $context[&#039;ssl&#039;][&#039;peer_certificate_chain&#039;];
+        }
+
+        stream_set_blocking($h, false);
+        unset($this-&gt;context, $this-&gt;resolver);
+
+        // Create dechunk buffers
+        if (isset($this-&gt;headers[&#039;content-length&#039;])) {
+            $this-&gt;remaining = (int) $this-&gt;headers[&#039;content-length&#039;][0];
+        } elseif (&#039;chunked&#039; === ($this-&gt;headers[&#039;transfer-encoding&#039;][0] ?? null)) {
+            stream_filter_append($this-&gt;buffer, &#039;dechunk&#039;, \STREAM_FILTER_WRITE);
+            $this-&gt;remaining = -1;
+        } else {
+            $this-&gt;remaining = -2;
+        }
+
+        $this-&gt;multi-&gt;handlesActivity[$this-&gt;id] = [new FirstChunk()];
+
+        if (&#039;HEAD&#039; === $context[&#039;http&#039;][&#039;method&#039;] || \in_array($this-&gt;info[&#039;http_code&#039;], [204, 304], true)) {
+            $this-&gt;multi-&gt;handlesActivity[$this-&gt;id][] = null;
+            $this-&gt;multi-&gt;handlesActivity[$this-&gt;id][] = null;
+
+            return;
+        }
+
+        $host = parse_url($this-&gt;info[&#039;redirect_url&#039;] ?? $this-&gt;url, \PHP_URL_HOST);
+        $this-&gt;multi-&gt;lastTimeout = null;
+        $this-&gt;multi-&gt;openHandles[$this-&gt;id] = [&amp;$this-&gt;pauseExpiry, $h, $this-&gt;buffer, $this-&gt;onProgress, &amp;$this-&gt;remaining, &amp;$this-&gt;info, $host];
+        $this-&gt;multi-&gt;hosts[$host] = 1 + ($this-&gt;multi-&gt;hosts[$host] ?? 0);
+    }
+
+    private function close(): void
+    {
+        $this-&gt;canary-&gt;cancel();
+        $this-&gt;handle = $this-&gt;buffer = $this-&gt;inflate = $this-&gt;onProgress = null;
+    }
+
+    private static function schedule(self $response, array &amp;$runningResponses): void
+    {
+        if (!isset($runningResponses[$i = $response-&gt;multi-&gt;id])) {
+            $runningResponses[$i] = [$response-&gt;multi, []];
+        }
+
+        $runningResponses[$i][1][$response-&gt;id] = $response;
+
+        if (null === $response-&gt;buffer) {
+            // Response already completed
+            $response-&gt;multi-&gt;handlesActivity[$response-&gt;id][] = null;
+            $response-&gt;multi-&gt;handlesActivity[$response-&gt;id][] = null !== $response-&gt;info[&#039;error&#039;] ? new TransportException($response-&gt;info[&#039;error&#039;]) : null;
+        }
+    }
+
+    /**
+     * @param NativeClientState $multi
+     */
+    private static function perform(ClientState $multi, ?array $responses = null): void
+    {
+        foreach ($multi-&gt;openHandles as $i =&gt; [$pauseExpiry, $h, $buffer, $onProgress]) {
+            if ($pauseExpiry) {
+                if (hrtime(true) / 1E9 &lt; $pauseExpiry) {
+                    continue;
+                }
+
+                $multi-&gt;openHandles[$i][0] = 0;
+            }
+
+            $hasActivity = false;
+            $remaining = &amp;$multi-&gt;openHandles[$i][4];
+            $info = &amp;$multi-&gt;openHandles[$i][5];
+            $e = null;
+
+            // Read incoming buffer and write it to the dechunk one
+            try {
+                if ($remaining &amp;&amp; &#039;&#039; !== $data = (string) fread($h, 0 &gt; $remaining ? 16372 : $remaining)) {
+                    fwrite($buffer, $data);
+                    $hasActivity = true;
+                    $multi-&gt;sleep = false;
+
+                    if (-1 !== $remaining) {
+                        $remaining -= \strlen($data);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $hasActivity = $onProgress = false;
+            }
+
+            if (!$hasActivity) {
+                if ($onProgress) {
+                    try {
+                        // Notify the progress callback so that it can e.g. cancel
+                        // the request if the stream is inactive for too long
+                        $info[&#039;total_time&#039;] = microtime(true) - $info[&#039;start_time&#039;];
+                        $onProgress();
+                    } catch (\Throwable $e) {
+                        // no-op
+                    }
+                }
+            } elseif (&#039;&#039; !== $data = stream_get_contents($buffer, -1, 0)) {
+                rewind($buffer);
+                ftruncate($buffer, 0);
+
+                if (null === $e) {
+                    $multi-&gt;handlesActivity[$i][] = $data;
+                }
+            }
+
+            if (null !== $e || !$remaining || feof($h)) {
+                // Stream completed
+                $info[&#039;total_time&#039;] = microtime(true) - $info[&#039;start_time&#039;];
+                $info[&#039;starttransfer_time&#039;] = $info[&#039;starttransfer_time&#039;] ?: $info[&#039;total_time&#039;];
+
+                if ($onProgress) {
+                    try {
+                        $onProgress(-1);
+                    } catch (\Throwable $e) {
+                        // no-op
+                    }
+                }
+
+                if (null === $e) {
+                    if (0 &lt; $remaining) {
+                        $e = new TransportException(\sprintf(&#039;Transfer closed with %s bytes remaining to read.&#039;, $remaining));
+                    } elseif (-1 === $remaining &amp;&amp; fwrite($buffer, &#039;-&#039;) &amp;&amp; &#039;&#039; !== stream_get_contents($buffer, -1, 0)) {
+                        $e = new TransportException(&#039;Transfer closed with outstanding data remaining from chunked response.&#039;);
+                    }
+                }
+
+                $multi-&gt;handlesActivity[$i][] = null;
+                $multi-&gt;handlesActivity[$i][] = $e;
+                if (null !== ($host = $multi-&gt;openHandles[$i][6] ?? null) &amp;&amp; isset($multi-&gt;hosts[$host]) &amp;&amp; 0 &gt;= --$multi-&gt;hosts[$host]) {
+                    unset($multi-&gt;hosts[$host]);
+                }
+                unset($multi-&gt;openHandles[$i]);
+                $multi-&gt;sleep = false;
+            }
+        }
+
+        if (null === $responses) {
+            return;
+        }
+
+        $maxHosts = $multi-&gt;maxHostConnections;
+
+        foreach ($responses as $i =&gt; $response) {
+            if (null !== $response-&gt;remaining || null === $response-&gt;buffer) {
+                continue;
+            }
+
+            if ($response-&gt;pauseExpiry &amp;&amp; hrtime(true) / 1E9 &lt; $response-&gt;pauseExpiry) {
+                // Create empty open handles to tell we still have pending requests
+                $multi-&gt;openHandles[$i] = [\INF, null, null, null];
+            } elseif ($maxHosts &amp;&amp; $maxHosts &gt; ($multi-&gt;hosts[parse_url($response-&gt;url, \PHP_URL_HOST)] ?? 0)) {
+                // Open the next pending request - this is a blocking operation so we do only one of them
+                $response-&gt;open();
+                $multi-&gt;sleep = false;
+                self::perform($multi);
+                $maxHosts = 0;
+            }
+        }
+    }
+
+    /**
+     * @param NativeClientState $multi
+     */
+    private static function select(ClientState $multi, float $timeout): int
+    {
+        if (!$multi-&gt;sleep = !$multi-&gt;sleep) {
+            return -1;
+        }
+
+        $_ = $handles = [];
+        $now = null;
+
+        foreach ($multi-&gt;openHandles as [$pauseExpiry, $h]) {
+            if (null === $h) {
+                continue;
+            }
+
+            if ($pauseExpiry &amp;&amp; ($now ??= hrtime(true) / 1E9) &lt; $pauseExpiry) {
+                $timeout = min($timeout, $pauseExpiry - $now);
+                continue;
+            }
+
+            $handles[] = $h;
+        }
+
+        if (!$handles) {
+            usleep((int) (1E6 * $timeout));
+
+            return 0;
+        }
+
+        return stream_select($handles, $_, $_, (int) $timeout, (int) (1E6 * ($timeout - (int) $timeout)));
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/Response/ResponseStream.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Retry -->
+
+</body>
+</html>

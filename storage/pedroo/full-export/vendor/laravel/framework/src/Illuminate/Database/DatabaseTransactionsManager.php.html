@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Database/DatabaseTransactionsManager.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database;
+
+use Illuminate\Support\Collection;
+
+class DatabaseTransactionsManager
+{
+    /**
+     * All of the committed transactions.
+     *
+     * @var \Illuminate\Support\Collection&lt;int, \Illuminate\Database\DatabaseTransactionRecord&gt;
+     */
+    protected $committedTransactions;
+
+    /**
+     * All of the pending transactions.
+     *
+     * @var \Illuminate\Support\Collection&lt;int, \Illuminate\Database\DatabaseTransactionRecord&gt;
+     */
+    protected $pendingTransactions;
+
+    /**
+     * The current transaction.
+     *
+     * @var array
+     */
+    protected $currentTransaction = [];
+
+    /**
+     * Create a new database transactions manager instance.
+     */
+    public function __construct()
+    {
+        $this-&gt;committedTransactions = new Collection;
+        $this-&gt;pendingTransactions = new Collection;
+    }
+
+    /**
+     * Start a new database transaction.
+     *
+     * @param  string  $connection
+     * @param  int  $level
+     * @return void
+     */
+    public function begin($connection, $level)
+    {
+        $this-&gt;pendingTransactions-&gt;push(
+            $newTransaction = new DatabaseTransactionRecord(
+                $connection,
+                $level,
+                $this-&gt;currentTransaction[$connection] ?? null
+            )
+        );
+
+        $this-&gt;currentTransaction[$connection] = $newTransaction;
+    }
+
+    /**
+     * Commit the root database transaction and execute callbacks.
+     *
+     * @param  string  $connection
+     * @param  int  $levelBeingCommitted
+     * @param  int  $newTransactionLevel
+     * @return array
+     */
+    public function commit($connection, $levelBeingCommitted, $newTransactionLevel)
+    {
+        $this-&gt;stageTransactions($connection, $levelBeingCommitted);
+
+        if (isset($this-&gt;currentTransaction[$connection])) {
+            $this-&gt;currentTransaction[$connection] = $this-&gt;currentTransaction[$connection]-&gt;parent;
+        }
+
+        if (! $this-&gt;afterCommitCallbacksShouldBeExecuted($newTransactionLevel) &amp;&amp;
+            $newTransactionLevel !== 0) {
+            return [];
+        }
+
+        // This method is only called when the root database transaction is committed so there
+        // shouldn&#039;t be any pending transactions, but going to clear them here anyways just
+        // in case. This method could be refactored to receive a level in the future too.
+        $this-&gt;pendingTransactions = $this-&gt;pendingTransactions-&gt;reject(
+            fn ($transaction) =&gt; $transaction-&gt;connection === $connection &amp;&amp;
+                $transaction-&gt;level &gt;= $levelBeingCommitted
+        )-&gt;values();
+
+        [$forThisConnection, $forOtherConnections] = $this-&gt;committedTransactions-&gt;partition(
+            fn ($transaction) =&gt; $transaction-&gt;connection == $connection
+        );
+
+        $this-&gt;committedTransactions = $forOtherConnections-&gt;values();
+
+        $forThisConnection-&gt;map-&gt;executeCallbacks();
+
+        return $forThisConnection;
+    }
+
+    /**
+     * Move relevant pending transactions to a committed state.
+     *
+     * @param  string  $connection
+     * @param  int  $levelBeingCommitted
+     * @return void
+     */
+    public function stageTransactions($connection, $levelBeingCommitted)
+    {
+        $this-&gt;committedTransactions = $this-&gt;committedTransactions-&gt;merge(
+            $this-&gt;pendingTransactions-&gt;filter(
+                fn ($transaction) =&gt; $transaction-&gt;connection === $connection &amp;&amp;
+                                     $transaction-&gt;level &gt;= $levelBeingCommitted
+            )
+        );
+
+        $this-&gt;pendingTransactions = $this-&gt;pendingTransactions-&gt;reject(
+            fn ($transaction) =&gt; $transaction-&gt;connection === $connection &amp;&amp;
+                                 $transaction-&gt;level &gt;= $levelBeingCommitted
+        );
+    }
+
+    /**
+     * Rollback the active database transaction.
+     *
+     * @param  string  $connection
+     * @param  int  $newTransactionLevel
+     * @return void
+     */
+    public function rollback($connection, $newTransactionLevel)
+    {
+        if ($newTransactionLevel === 0) {
+            $this-&gt;removeAllTransactionsForConnection($connection);
+        } else {
+            $this-&gt;pendingTransactions = $this-&gt;pendingTransactions-&gt;reject(
+                fn ($transaction) =&gt; $transaction-&gt;connection == $connection &amp;&amp;
+                                     $transaction-&gt;level &gt; $newTransactionLevel
+            )-&gt;values();
+
+            if ($this-&gt;currentTransaction) {
+                do {
+                    $this-&gt;removeCommittedTransactionsThatAreChildrenOf($this-&gt;currentTransaction[$connection]);
+
+                    $this-&gt;currentTransaction[$connection]-&gt;executeCallbacksForRollback();
+
+                    $this-&gt;currentTransaction[$connection] = $this-&gt;currentTransaction[$connection]-&gt;parent;
+                } while (
+                    isset($this-&gt;currentTransaction[$connection]) &amp;&amp;
+                    $this-&gt;currentTransaction[$connection]-&gt;level &gt; $newTransactionLevel
+                );
+            }
+        }
+    }
+
+    /**
+     * Remove all pending, completed, and current transactions for the given connection name.
+     *
+     * @param  string  $connection
+     * @return void
+     */
+    protected function removeAllTransactionsForConnection($connection)
+    {
+        if ($this-&gt;currentTransaction) {
+            for ($currentTransaction = $this-&gt;currentTransaction[$connection]; isset($currentTransaction); $currentTransaction = $currentTransaction-&gt;parent) {
+                $currentTransaction-&gt;executeCallbacksForRollback();
+            }
+        }
+
+        $this-&gt;currentTransaction[$connection] = null;
+
+        $this-&gt;pendingTransactions = $this-&gt;pendingTransactions-&gt;reject(
+            fn ($transaction) =&gt; $transaction-&gt;connection == $connection
+        )-&gt;values();
+
+        $this-&gt;committedTransactions = $this-&gt;committedTransactions-&gt;reject(
+            fn ($transaction) =&gt; $transaction-&gt;connection == $connection
+        )-&gt;values();
+    }
+
+    /**
+     * Remove all transactions that are children of the given transaction.
+     *
+     * @param  \Illuminate\Database\DatabaseTransactionRecord  $transaction
+     * @return void
+     */
+    protected function removeCommittedTransactionsThatAreChildrenOf(DatabaseTransactionRecord $transaction)
+    {
+        [$removedTransactions, $this-&gt;committedTransactions] = $this-&gt;committedTransactions-&gt;partition(
+            fn ($committed) =&gt; $committed-&gt;connection == $transaction-&gt;connection &amp;&amp;
+                               $committed-&gt;parent === $transaction
+        );
+
+        // There may be multiple deeply nested transactions that have already committed that we
+        // also need to remove. We will recurse down the children of all removed transaction
+        // instances until there are no more deeply nested child transactions for removal.
+        $removedTransactions-&gt;each(
+            fn ($transaction) =&gt; $this-&gt;removeCommittedTransactionsThatAreChildrenOf($transaction)
+        );
+    }
+
+    /**
+     * Register a transaction callback.
+     *
+     * @param  callable  $callback
+     * @return void
+     */
+    public function addCallback($callback)
+    {
+        if ($current = $this-&gt;callbackApplicableTransactions()-&gt;last()) {
+            return $current-&gt;addCallback($callback);
+        }
+
+        $callback();
+    }
+
+    /**
+     * Register a callback for transaction rollback.
+     *
+     * @param  callable  $callback
+     * @return void
+     */
+    public function addCallbackForRollback($callback)
+    {
+        if ($current = $this-&gt;callbackApplicableTransactions()-&gt;last()) {
+            return $current-&gt;addCallbackForRollback($callback);
+        }
+    }
+
+    /**
+     * Get the transactions that are applicable to callbacks.
+     *
+     * @return \Illuminate\Support\Collection&lt;int, \Illuminate\Database\DatabaseTransactionRecord&gt;
+     */
+    public function callbackApplicableTransactions()
+    {
+        return $this-&gt;pendingTransactions;
+    }
+
+    /**
+     * Determine if after commit callbacks should be executed for the given transaction level.
+     *
+     * @param  int  $level
+     * @return bool
+     */
+    public function afterCommitCallbacksShouldBeExecuted($level)
+    {
+        return $level === 0;
+    }
+
+    /**
+     * Get all of the pending transactions.
+     *
+     * @return \Illuminate\Support\Collection
+     */
+    public function getPendingTransactions()
+    {
+        return $this-&gt;pendingTransactions;
+    }
+
+    /**
+     * Get all of the committed transactions.
+     *
+     * @return \Illuminate\Support\Collection
+     */
+    public function getCommittedTransactions()
+    {
+        return $this-&gt;committedTransactions;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Database/DeadlockException.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Database/Capsule -->
+
+</body>
+</html>

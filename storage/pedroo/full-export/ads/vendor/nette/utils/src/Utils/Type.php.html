@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/nette/utils/src/Utils/Type.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/**
+ * This file is part of the Nette Framework (https://nette.org)
+ * Copyright (c) 2004 David Grudl (https://davidgrudl.com)
+ */
+
+declare(strict_types=1);
+
+namespace Nette\Utils;
+
+use Nette;
+use function array_map, array_search, array_splice, count, explode, implode, is_a, is_resource, is_string, strcasecmp, strtolower, substr, trim;
+
+
+/**
+ * PHP type reflection.
+ */
+final readonly class Type
+{
+	/** @var array&lt;int, string|self&gt; */
+	private array $types;
+	private bool $simple;
+	private string $kind; // | &amp;
+
+
+	/**
+	 * Creates a Type object based on reflection. Resolves self, static and parent to the actual class name.
+	 * If the subject has no type, it returns null.
+	 */
+	public static function fromReflection(
+		\ReflectionFunctionAbstract|\ReflectionParameter|\ReflectionProperty $reflection,
+	): ?self
+	{
+		$type = $reflection instanceof \ReflectionFunctionAbstract
+			? $reflection-&gt;getReturnType() ?? ($reflection instanceof \ReflectionMethod ? $reflection-&gt;getTentativeReturnType() : null)
+			: $reflection-&gt;getType();
+
+		return $type ? self::fromReflectionType($type, $reflection, asObject: true) : null;
+	}
+
+
+	private static function fromReflectionType(\ReflectionType $type, $of, bool $asObject): self|string
+	{
+		if ($type instanceof \ReflectionNamedType) {
+			$name = self::resolve($type-&gt;getName(), $of);
+			return $asObject
+				? new self($type-&gt;allowsNull() &amp;&amp; $name !== &#039;mixed&#039; ? [$name, &#039;null&#039;] : [$name])
+				: $name;
+
+		} elseif ($type instanceof \ReflectionUnionType || $type instanceof \ReflectionIntersectionType) {
+			return new self(
+				array_map(fn($t) =&gt; self::fromReflectionType($t, $of, asObject: false), $type-&gt;getTypes()),
+				$type instanceof \ReflectionUnionType ? &#039;|&#039; : &#039;&amp;&#039;,
+			);
+
+		} else {
+			throw new Nette\InvalidStateException(&#039;Unexpected type of &#039; . Reflection::toString($of));
+		}
+	}
+
+
+	/**
+	 * Creates the Type object according to the text notation.
+	 */
+	public static function fromString(string $type): self
+	{
+		if (!Validators::isTypeDeclaration($type)) {
+			throw new Nette\InvalidArgumentException(&quot;Invalid type &#039;$type&#039;.&quot;);
+		}
+
+		if ($type[0] === &#039;?&#039;) {
+			return new self([substr($type, 1), &#039;null&#039;]);
+		}
+
+		$unions = [];
+		foreach (explode(&#039;|&#039;, $type) as $part) {
+			$part = explode(&#039;&amp;&#039;, trim($part, &#039;()&#039;));
+			$unions[] = count($part) === 1 ? $part[0] : new self($part, &#039;&amp;&#039;);
+		}
+
+		return count($unions) === 1 &amp;&amp; $unions[0] instanceof self
+			? $unions[0]
+			: new self($unions);
+	}
+
+
+	/**
+	 * Creates a Type object based on the actual type of value.
+	 */
+	public static function fromValue(mixed $value): self
+	{
+		$type = get_debug_type($value);
+		if (is_resource($value)) {
+			$type = &#039;mixed&#039;;
+		} elseif (str_ends_with($type, &#039;@anonymous&#039;)) {
+			$parent = substr($type, 0, -10);
+			$type = $parent === &#039;class&#039; ? &#039;object&#039; : $parent;
+		}
+
+		return new self([$type]);
+	}
+
+
+	/**
+	 * Resolves &#039;self&#039;, &#039;static&#039; and &#039;parent&#039; to the actual class name.
+	 */
+	public static function resolve(
+		string $type,
+		\ReflectionFunctionAbstract|\ReflectionParameter|\ReflectionProperty $of,
+	): string
+	{
+		$lower = strtolower($type);
+		if ($of instanceof \ReflectionFunction) {
+			return $type;
+		} elseif ($lower === &#039;self&#039;) {
+			return $of-&gt;getDeclaringClass()-&gt;name;
+		} elseif ($lower === &#039;static&#039;) {
+			return ($of instanceof ReflectionMethod ? $of-&gt;getOriginalClass() : $of-&gt;getDeclaringClass())-&gt;name;
+		} elseif ($lower === &#039;parent&#039; &amp;&amp; $of-&gt;getDeclaringClass()-&gt;getParentClass()) {
+			return $of-&gt;getDeclaringClass()-&gt;getParentClass()-&gt;name;
+		} else {
+			return $type;
+		}
+	}
+
+
+	private function __construct(array $types, string $kind = &#039;|&#039;)
+	{
+		$o = array_search(&#039;null&#039;, $types, strict: true);
+		if ($o !== false) { // null as last
+			array_splice($types, $o, 1);
+			$types[] = &#039;null&#039;;
+		}
+
+		$this-&gt;types = $types;
+		$this-&gt;simple = is_string($types[0]) &amp;&amp; ($types[1] ?? &#039;null&#039;) === &#039;null&#039;;
+		$this-&gt;kind = count($types) &gt; 1 ? $kind : &#039;&#039;;
+	}
+
+
+	public function __toString(): string
+	{
+		$multi = count($this-&gt;types) &gt; 1;
+		if ($this-&gt;simple) {
+			return ($multi ? &#039;?&#039; : &#039;&#039;) . $this-&gt;types[0];
+		}
+
+		$res = [];
+		foreach ($this-&gt;types as $type) {
+			$res[] = $type instanceof self &amp;&amp; $multi ? &quot;($type)&quot; : $type;
+		}
+		return implode($this-&gt;kind, $res);
+	}
+
+
+	/**
+	 * Returns a type that accepts both the current type and the given type.
+	 */
+	public function with(string|self $type): self
+	{
+		$type = is_string($type) ? self::fromString($type) : $type;
+		return match (true) {
+			$this-&gt;allows($type) =&gt; $this,
+			$type-&gt;allows($this) =&gt; $type,
+			default =&gt; new self(array_unique(
+				array_merge($this-&gt;isIntersection() ? [$this] : $this-&gt;types, $type-&gt;isIntersection() ? [$type] : $type-&gt;types),
+				SORT_REGULAR,
+			), &#039;|&#039;),
+		};
+	}
+
+
+	/**
+	 * Returns the array of subtypes that make up the compound type as strings.
+	 * @return array&lt;int, string|string[]&gt;
+	 */
+	public function getNames(): array
+	{
+		return array_map(fn($t) =&gt; $t instanceof self ? $t-&gt;getNames() : $t, $this-&gt;types);
+	}
+
+
+	/**
+	 * Returns the array of subtypes that make up the compound type as Type objects:
+	 * @return self[]
+	 */
+	public function getTypes(): array
+	{
+		return array_map(fn($t) =&gt; $t instanceof self ? $t : new self([$t]), $this-&gt;types);
+	}
+
+
+	/**
+	 * Returns the type name for simple types, otherwise null.
+	 */
+	public function getSingleName(): ?string
+	{
+		return $this-&gt;simple
+			? $this-&gt;types[0]
+			: null;
+	}
+
+
+	/**
+	 * Returns true whether it is a union type.
+	 */
+	public function isUnion(): bool
+	{
+		return $this-&gt;kind === &#039;|&#039;;
+	}
+
+
+	/**
+	 * Returns true whether it is an intersection type.
+	 */
+	public function isIntersection(): bool
+	{
+		return $this-&gt;kind === &#039;&amp;&#039;;
+	}
+
+
+	/**
+	 * Returns true whether it is a simple type. Single nullable types are also considered to be simple types.
+	 */
+	public function isSimple(): bool
+	{
+		return $this-&gt;simple;
+	}
+
+
+	#[\Deprecated(&#039;use isSimple()&#039;)]
+	public function isSingle(): bool
+	{
+		return $this-&gt;simple;
+	}
+
+
+	/**
+	 * Returns true whether the type is both a simple and a PHP built-in type.
+	 */
+	public function isBuiltin(): bool
+	{
+		return $this-&gt;simple &amp;&amp; Validators::isBuiltinType($this-&gt;types[0]);
+	}
+
+
+	/**
+	 * Returns true whether the type is both a simple and a class name.
+	 */
+	public function isClass(): bool
+	{
+		return $this-&gt;simple &amp;&amp; !Validators::isBuiltinType($this-&gt;types[0]);
+	}
+
+
+	/**
+	 * Determines if type is special class name self/parent/static.
+	 */
+	public function isClassKeyword(): bool
+	{
+		return $this-&gt;simple &amp;&amp; Validators::isClassKeyword($this-&gt;types[0]);
+	}
+
+
+	/**
+	 * Verifies type compatibility. For example, it checks if a value of a certain type could be passed as a parameter.
+	 */
+	public function allows(string|self $type): bool
+	{
+		if ($this-&gt;types === [&#039;mixed&#039;]) {
+			return true;
+		}
+
+		$type = is_string($type) ? self::fromString($type) : $type;
+		return $type-&gt;isUnion()
+			? Arrays::every($type-&gt;types, fn($t) =&gt; $this-&gt;allowsAny($t instanceof self ? $t-&gt;types : [$t]))
+			: $this-&gt;allowsAny($type-&gt;types);
+	}
+
+
+	private function allowsAny(array $givenTypes): bool
+	{
+		return $this-&gt;isUnion()
+			? Arrays::some($this-&gt;types, fn($t) =&gt; $this-&gt;allowsAll($t instanceof self ? $t-&gt;types : [$t], $givenTypes))
+			: $this-&gt;allowsAll($this-&gt;types, $givenTypes);
+	}
+
+
+	private function allowsAll(array $ourTypes, array $givenTypes): bool
+	{
+		return Arrays::every(
+			$ourTypes,
+			fn($ourType) =&gt; Arrays::some(
+				$givenTypes,
+				fn($givenType) =&gt; Validators::isBuiltinType($ourType)
+					? strcasecmp($ourType, $givenType) === 0
+					: is_a($givenType, $ourType, allow_string: true),
+			),
+		);
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/nette/utils/src/Utils/Validators.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/nikic -->
+
+</body>
+</html>

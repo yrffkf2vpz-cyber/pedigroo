@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/ModelInspector.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Database\Eloquent;
+
+use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Support\Collection as BaseCollection;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Str;
+use ReflectionClass;
+use ReflectionMethod;
+use ReflectionNamedType;
+use SplFileObject;
+
+use function Illuminate\Support\enum_value;
+
+class ModelInspector
+{
+    /**
+     * The methods that can be called in a model to indicate a relation.
+     *
+     * @var list&lt;string&gt;
+     */
+    protected $relationMethods = [
+        &#039;hasMany&#039;,
+        &#039;hasManyThrough&#039;,
+        &#039;hasOneThrough&#039;,
+        &#039;belongsToMany&#039;,
+        &#039;hasOne&#039;,
+        &#039;belongsTo&#039;,
+        &#039;morphOne&#039;,
+        &#039;morphTo&#039;,
+        &#039;morphMany&#039;,
+        &#039;morphToMany&#039;,
+        &#039;morphedByMany&#039;,
+    ];
+
+    /**
+     * Create a new model inspector instance.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app  The Laravel application instance.
+     */
+    public function __construct(protected Application $app)
+    {
+    }
+
+    /**
+     * Extract model details for the given model.
+     *
+     * @param  class-string&lt;\Illuminate\Database\Eloquent\Model&gt;|string  $model
+     * @param  string|null  $connection
+     * @return array{&quot;class&quot;: class-string&lt;\Illuminate\Database\Eloquent\Model&gt;, database: string, table: string, policy: class-string|null, attributes: \Illuminate\Support\Collection, relations: \Illuminate\Support\Collection, events: \Illuminate\Support\Collection, observers: \Illuminate\Support\Collection, collection: class-string&lt;\Illuminate\Database\Eloquent\Collection&lt;\Illuminate\Database\Eloquent\Model&gt;&gt;, builder: class-string&lt;\Illuminate\Database\Eloquent\Builder&lt;\Illuminate\Database\Eloquent\Model&gt;&gt;, &quot;resource&quot;: class-string&lt;\Illuminate\Http\Resources\Json\JsonResource&gt;|null}
+     *
+     * @throws \Illuminate\Contracts\Container\BindingResolutionException
+     */
+    public function inspect($model, $connection = null)
+    {
+        $class = $this-&gt;qualifyModel($model);
+
+        /** @var \Illuminate\Database\Eloquent\Model $model */
+        $model = $this-&gt;app-&gt;make($class);
+
+        if ($connection !== null) {
+            $model-&gt;setConnection($connection);
+        }
+
+        return [
+            &#039;class&#039; =&gt; get_class($model),
+            &#039;database&#039; =&gt; $model-&gt;getConnection()-&gt;getName(),
+            &#039;table&#039; =&gt; $model-&gt;getConnection()-&gt;getTablePrefix().$model-&gt;getTable(),
+            &#039;policy&#039; =&gt; $this-&gt;getPolicy($model),
+            &#039;attributes&#039; =&gt; $this-&gt;getAttributes($model),
+            &#039;relations&#039; =&gt; $this-&gt;getRelations($model),
+            &#039;events&#039; =&gt; $this-&gt;getEvents($model),
+            &#039;observers&#039; =&gt; $this-&gt;getObservers($model),
+            &#039;collection&#039; =&gt; $this-&gt;getCollectedBy($model),
+            &#039;builder&#039; =&gt; $this-&gt;getBuilder($model),
+            &#039;resource&#039; =&gt; $this-&gt;getResource($model),
+        ];
+    }
+
+    /**
+     * Get the column attributes for the given model.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return \Illuminate\Support\Collection&lt;int, array&lt;string, mixed&gt;&gt;
+     */
+    protected function getAttributes($model)
+    {
+        $connection = $model-&gt;getConnection();
+        $schema = $connection-&gt;getSchemaBuilder();
+        $table = $model-&gt;getTable();
+        $columns = $schema-&gt;getColumns($table);
+        $indexes = $schema-&gt;getIndexes($table);
+
+        return (new BaseCollection($columns))
+            -&gt;map(fn ($column) =&gt; [
+                &#039;name&#039; =&gt; $column[&#039;name&#039;],
+                &#039;type&#039; =&gt; $column[&#039;type&#039;],
+                &#039;increments&#039; =&gt; $column[&#039;auto_increment&#039;],
+                &#039;nullable&#039; =&gt; $column[&#039;nullable&#039;],
+                &#039;default&#039; =&gt; $this-&gt;getColumnDefault($column, $model),
+                &#039;unique&#039; =&gt; $this-&gt;columnIsUnique($column[&#039;name&#039;], $indexes),
+                &#039;fillable&#039; =&gt; $model-&gt;isFillable($column[&#039;name&#039;]),
+                &#039;hidden&#039; =&gt; $this-&gt;attributeIsHidden($column[&#039;name&#039;], $model),
+                &#039;appended&#039; =&gt; null,
+                &#039;cast&#039; =&gt; $this-&gt;getCastType($column[&#039;name&#039;], $model),
+            ])
+            -&gt;merge($this-&gt;getVirtualAttributes($model, $columns));
+    }
+
+    /**
+     * Get the virtual (non-column) attributes for the given model.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @param  array  $columns
+     * @return \Illuminate\Support\Collection
+     */
+    protected function getVirtualAttributes($model, $columns)
+    {
+        $class = new ReflectionClass($model);
+
+        return (new BaseCollection($class-&gt;getMethods()))
+            -&gt;reject(
+                fn (ReflectionMethod $method) =&gt; $method-&gt;isStatic()
+                    || $method-&gt;isAbstract()
+                    || $method-&gt;getDeclaringClass()-&gt;getName() === Model::class
+            )
+            -&gt;mapWithKeys(function (ReflectionMethod $method) use ($model) {
+                if (preg_match(&#039;/^get(.+)Attribute$/&#039;, $method-&gt;getName(), $matches) === 1) {
+                    return [Str::snake($matches[1]) =&gt; &#039;accessor&#039;];
+                } elseif ($model-&gt;hasAttributeMutator($method-&gt;getName())) {
+                    return [Str::snake($method-&gt;getName()) =&gt; &#039;attribute&#039;];
+                } else {
+                    return [];
+                }
+            })
+            -&gt;reject(fn ($cast, $name) =&gt; (new BaseCollection($columns))-&gt;contains(&#039;name&#039;, $name))
+            -&gt;map(fn ($cast, $name) =&gt; [
+                &#039;name&#039; =&gt; $name,
+                &#039;type&#039; =&gt; null,
+                &#039;increments&#039; =&gt; false,
+                &#039;nullable&#039; =&gt; null,
+                &#039;default&#039; =&gt; null,
+                &#039;unique&#039; =&gt; null,
+                &#039;fillable&#039; =&gt; $model-&gt;isFillable($name),
+                &#039;hidden&#039; =&gt; $this-&gt;attributeIsHidden($name, $model),
+                &#039;appended&#039; =&gt; $model-&gt;hasAppended($name),
+                &#039;cast&#039; =&gt; $cast,
+            ])
+            -&gt;values();
+    }
+
+    /**
+     * Get the relations from the given model.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return \Illuminate\Support\Collection
+     */
+    protected function getRelations($model)
+    {
+        return (new BaseCollection(get_class_methods($model)))
+            -&gt;map(fn ($method) =&gt; new ReflectionMethod($model, $method))
+            -&gt;reject(
+                fn (ReflectionMethod $method) =&gt; $method-&gt;isStatic()
+                    || $method-&gt;isAbstract()
+                    || $method-&gt;getDeclaringClass()-&gt;getName() === Model::class
+                    || $method-&gt;getNumberOfParameters() &gt; 0
+            )
+            -&gt;filter(function (ReflectionMethod $method) {
+                if ($method-&gt;getReturnType() instanceof ReflectionNamedType
+                    &amp;&amp; is_subclass_of($method-&gt;getReturnType()-&gt;getName(), Relation::class)) {
+                    return true;
+                }
+
+                $file = new SplFileObject($method-&gt;getFileName());
+                $file-&gt;seek($method-&gt;getStartLine() - 1);
+                $code = &#039;&#039;;
+                while ($file-&gt;key() &lt; $method-&gt;getEndLine()) {
+                    $code .= trim($file-&gt;current());
+                    $file-&gt;next();
+                }
+
+                return (new BaseCollection($this-&gt;relationMethods))
+                    -&gt;contains(fn ($relationMethod) =&gt; str_contains($code, &#039;$this-&gt;&#039;.$relationMethod.&#039;(&#039;));
+            })
+            -&gt;map(function (ReflectionMethod $method) use ($model) {
+                $relation = $method-&gt;invoke($model);
+
+                if (! $relation instanceof Relation) {
+                    return null;
+                }
+
+                return [
+                    &#039;name&#039; =&gt; $method-&gt;getName(),
+                    &#039;type&#039; =&gt; Str::afterLast(get_class($relation), &#039;\\&#039;),
+                    &#039;related&#039; =&gt; get_class($relation-&gt;getRelated()),
+                ];
+            })
+            -&gt;filter()
+            -&gt;values();
+    }
+
+    /**
+     * Get the first policy associated with this model.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return string|null
+     */
+    protected function getPolicy($model)
+    {
+        $policy = Gate::getPolicyFor($model::class);
+
+        return $policy ? $policy::class : null;
+    }
+
+    /**
+     * Get the events that the model dispatches.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return \Illuminate\Support\Collection
+     */
+    protected function getEvents($model)
+    {
+        return (new BaseCollection($model-&gt;dispatchesEvents()))
+            -&gt;map(fn (string $class, string $event) =&gt; [
+                &#039;event&#039; =&gt; $event,
+                &#039;class&#039; =&gt; $class,
+            ])-&gt;values();
+    }
+
+    /**
+     * Get the observers watching this model.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return \Illuminate\Support\Collection
+     *
+     * @throws \Illuminate\Contracts\Container\BindingResolutionException
+     */
+    protected function getObservers($model)
+    {
+        $listeners = $this-&gt;app-&gt;make(&#039;events&#039;)-&gt;getRawListeners();
+
+        // Get the Eloquent observers for this model...
+        $listeners = array_filter($listeners, function ($v, $key) use ($model) {
+            return Str::startsWith($key, &#039;eloquent.&#039;) &amp;&amp; Str::endsWith($key, $model::class);
+        }, ARRAY_FILTER_USE_BOTH);
+
+        // Format listeners Eloquent verb =&gt; Observer methods...
+        $extractVerb = function ($key) {
+            preg_match(&#039;/eloquent.([a-zA-Z]+)\: /&#039;, $key, $matches);
+
+            return $matches[1] ?? &#039;?&#039;;
+        };
+
+        $formatted = [];
+
+        foreach ($listeners as $key =&gt; $observerMethods) {
+            $formatted[] = [
+                &#039;event&#039; =&gt; $extractVerb($key),
+                &#039;observer&#039; =&gt; array_map(fn ($obs) =&gt; is_string($obs) ? $obs : &#039;Closure&#039;, $observerMethods),
+            ];
+        }
+
+        return new BaseCollection($formatted);
+    }
+
+    /**
+     * Get the collection class being used by the model.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return class-string&lt;\Illuminate\Database\Eloquent\Collection&gt;
+     */
+    protected function getCollectedBy($model)
+    {
+        return $model-&gt;newCollection()::class;
+    }
+
+    /**
+     * Get the builder class being used by the model.
+     *
+     * @template TModel of \Illuminate\Database\Eloquent\Model
+     *
+     * @param  TModel  $model
+     * @return class-string&lt;\Illuminate\Database\Eloquent\Builder&lt;TModel&gt;&gt;
+     */
+    protected function getBuilder($model)
+    {
+        return $model-&gt;newQuery()::class;
+    }
+
+    /**
+     * Get the class used for JSON response transforming.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return \Illuminate\Http\Resources\Json\JsonResource|null
+     */
+    protected function getResource($model)
+    {
+        return rescue(static fn () =&gt; $model-&gt;toResource()::class, null, false);
+    }
+
+    /**
+     * Qualify the given model class base name.
+     *
+     * @param  string  $model
+     * @return class-string&lt;\Illuminate\Database\Eloquent\Model&gt;
+     *
+     * @see \Illuminate\Console\GeneratorCommand
+     */
+    protected function qualifyModel(string $model)
+    {
+        if (str_contains($model, &#039;\\&#039;) &amp;&amp; class_exists($model)) {
+            return $model;
+        }
+
+        $model = ltrim($model, &#039;\\/&#039;);
+
+        $model = str_replace(&#039;/&#039;, &#039;\\&#039;, $model);
+
+        $rootNamespace = $this-&gt;app-&gt;getNamespace();
+
+        if (Str::startsWith($model, $rootNamespace)) {
+            return $model;
+        }
+
+        return is_dir(app_path(&#039;Models&#039;))
+            ? $rootNamespace.&#039;Models\\&#039;.$model
+            : $rootNamespace.$model;
+    }
+
+    /**
+     * Get the cast type for the given column.
+     *
+     * @param  string  $column
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return string|null
+     */
+    protected function getCastType($column, $model)
+    {
+        if ($model-&gt;hasGetMutator($column) || $model-&gt;hasSetMutator($column)) {
+            return &#039;accessor&#039;;
+        }
+
+        if ($model-&gt;hasAttributeMutator($column)) {
+            return &#039;attribute&#039;;
+        }
+
+        return $this-&gt;getCastsWithDates($model)-&gt;get($column) ?? null;
+    }
+
+    /**
+     * Get the model casts, including any date casts.
+     *
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return \Illuminate\Support\Collection
+     */
+    protected function getCastsWithDates($model)
+    {
+        return (new BaseCollection($model-&gt;getDates()))
+            -&gt;filter()
+            -&gt;flip()
+            -&gt;map(fn () =&gt; &#039;datetime&#039;)
+            -&gt;merge($model-&gt;getCasts());
+    }
+
+    /**
+     * Determine if the given attribute is hidden.
+     *
+     * @param  string  $attribute
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return bool
+     */
+    protected function attributeIsHidden($attribute, $model)
+    {
+        if (count($model-&gt;getHidden()) &gt; 0) {
+            return in_array($attribute, $model-&gt;getHidden());
+        }
+
+        if (count($model-&gt;getVisible()) &gt; 0) {
+            return ! in_array($attribute, $model-&gt;getVisible());
+        }
+
+        return false;
+    }
+
+    /**
+     * Get the default value for the given column.
+     *
+     * @param  array&lt;string, mixed&gt;  $column
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return mixed
+     */
+    protected function getColumnDefault($column, $model)
+    {
+        $attributeDefault = $model-&gt;getAttributes()[$column[&#039;name&#039;]] ?? null;
+
+        return enum_value($attributeDefault) ?? $column[&#039;default&#039;];
+    }
+
+    /**
+     * Determine if the given attribute is unique.
+     *
+     * @param  string  $column
+     * @param  array  $indexes
+     * @return bool
+     */
+    protected function columnIsUnique($column, $indexes)
+    {
+        return (new BaseCollection($indexes))-&gt;contains(
+            fn ($index) =&gt; count($index[&#039;columns&#039;]) === 1 &amp;&amp; $index[&#039;columns&#039;][0] === $column &amp;&amp; $index[&#039;unique&#039;]
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/ModelNotFoundException.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Attributes -->
+
+</body>
+</html>

@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/zbateson/stream-decorators/src/UUStream.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/**
+ * This file is part of the ZBateson\StreamDecorators project.
+ *
+ * @license http://opensource.org/licenses/bsd-license.php BSD
+ */
+
+namespace ZBateson\StreamDecorators;
+
+use GuzzleHttp\Psr7\BufferStream;
+use GuzzleHttp\Psr7\StreamDecoratorTrait;
+use Psr\Http\Message\StreamInterface;
+use RuntimeException;
+
+/**
+ * GuzzleHttp\Psr7 stream decoder extension for UU-Encoded streams.
+ *
+ * The size of the underlying stream and the position of bytes can&#039;t be
+ * determined because the number of encoded bytes is indeterminate without
+ * reading the entire stream.
+ *
+ * @author Zaahid Bateson
+ */
+class UUStream implements StreamInterface
+{
+    use StreamDecoratorTrait;
+
+    /**
+     * @var string name of the UUEncoded file
+     */
+    protected $filename = null;
+
+    /**
+     * @var BufferStream of read and decoded bytes
+     */
+    private $buffer;
+
+    /**
+     * @var string remainder of write operation if the bytes didn&#039;t align to 3
+     *      bytes
+     */
+    private $remainder = &#039;&#039;;
+
+    /**
+     * @var int read/write position
+     */
+    private $position = 0;
+
+    /**
+     * @var bool set to true when &#039;write&#039; is called
+     */
+    private $isWriting = false;
+
+    /**
+     * @var StreamInterface $stream
+     */
+    private $stream;
+
+    /**
+     * @param StreamInterface $stream Stream to decorate
+     * @param string $filename optional file name
+     */
+    public function __construct(StreamInterface $stream, ?string $filename = null)
+    {
+        $this-&gt;stream = $stream;
+        $this-&gt;filename = $filename;
+        $this-&gt;buffer = new BufferStream();
+    }
+
+    /**
+     * Overridden to return the position in the target encoding.
+     */
+    public function tell() : int
+    {
+        return $this-&gt;position;
+    }
+
+    /**
+     * Returns null, getSize isn&#039;t supported
+     *
+     * @return null
+     */
+    public function getSize() : ?int
+    {
+        return null;
+    }
+
+    /**
+     * Not supported.
+     *
+     * @param int $offset
+     * @param int $whence
+     * @throws RuntimeException
+     */
+    public function seek($offset, $whence = SEEK_SET) : void
+    {
+        throw new RuntimeException(&#039;Cannot seek a UUStream&#039;);
+    }
+
+    /**
+     * Overridden to return false
+     */
+    public function isSeekable() : bool
+    {
+        return false;
+    }
+
+    /**
+     * Finds the next end-of-line character to ensure a line isn&#039;t broken up
+     * while buffering.
+     */
+    private function readToEndOfLine(int $length) : string
+    {
+        $str = $this-&gt;stream-&gt;read($length);
+        if ($str === &#039;&#039;) {
+            return $str;
+        }
+        while (\substr($str, -1) !== &quot;\n&quot;) {
+            $chr = $this-&gt;stream-&gt;read(1);
+            if ($chr === &#039;&#039;) {
+                break;
+            }
+            $str .= $chr;
+        }
+        return $str;
+    }
+
+    /**
+     * Removes invalid characters from a uuencoded string, and &#039;BEGIN&#039; and &#039;END&#039;
+     * line headers and footers from the passed string before returning it.
+     */
+    private function filterAndDecode(string $str) : string
+    {
+        $ret = \str_replace(&quot;\r&quot;, &#039;&#039;, $str);
+        $ret = \preg_replace(&#039;/[^\x21-\xf5`\n]/&#039;, &#039;`&#039;, $ret);
+        if ($this-&gt;position === 0) {
+            $matches = [];
+            if (\preg_match(&#039;/^\s*begin\s+[^\s+]\s+([^\r\n]+)\s*$/im&#039;, $ret, $matches)) {
+                $this-&gt;filename = $matches[1];
+            }
+            $ret = \preg_replace(&#039;/^\s*begin[^\r\n]+\s*$/im&#039;, &#039;&#039;, $ret);
+        } else {
+            $ret = \preg_replace(&#039;/^\s*end\s*$/im&#039;, &#039;&#039;, $ret);
+        }
+        return \convert_uudecode(\trim($ret));
+    }
+
+    /**
+     * Buffers bytes into $this-&gt;buffer, removing uuencoding headers and footers
+     * and decoding them.
+     */
+    private function fillBuffer(int $length) : void
+    {
+        // 5040 = 63 * 80, seems to be good balance for buffering in benchmarks
+        // testing with a simple &#039;if ($length &lt; x)&#039; and calculating a better
+        // size reduces speeds by up to 4x
+        while ($this-&gt;buffer-&gt;getSize() &lt; $length) {
+            $read = $this-&gt;readToEndOfLine(5040);
+            if ($read === &#039;&#039;) {
+                break;
+            }
+            $this-&gt;buffer-&gt;write($this-&gt;filterAndDecode($read));
+        }
+    }
+
+    /**
+     * Returns true if the end of stream has been reached.
+     */
+    public function eof() : bool
+    {
+        return ($this-&gt;buffer-&gt;eof() &amp;&amp; $this-&gt;stream-&gt;eof());
+    }
+
+    /**
+     * Attempts to read $length bytes after decoding them, and returns them.
+     *
+     * @param int $length
+     */
+    public function read($length) : string
+    {
+        // let Guzzle decide what to do.
+        if ($length &lt;= 0 || $this-&gt;eof()) {
+            return $this-&gt;stream-&gt;read($length);
+        }
+        $this-&gt;fillBuffer($length);
+        $read = $this-&gt;buffer-&gt;read($length);
+        $this-&gt;position += \strlen($read);
+        return $read;
+    }
+
+    /**
+     * Writes the &#039;begin&#039; UU header line.
+     */
+    private function writeUUHeader() : void
+    {
+        $filename = (empty($this-&gt;filename)) ? &#039;null&#039; : $this-&gt;filename;
+        $this-&gt;stream-&gt;write(&quot;begin 666 $filename&quot;);
+    }
+
+    /**
+     * Writes the &#039;`&#039; and &#039;end&#039; UU footer lines.
+     */
+    private function writeUUFooter() : void
+    {
+        $this-&gt;stream-&gt;write(&quot;\r\n`\r\nend\r\n&quot;);
+    }
+
+    /**
+     * Writes the passed bytes to the underlying stream after encoding them.
+     */
+    private function writeEncoded(string $bytes) : void
+    {
+        $encoded = \preg_replace(&#039;/\r\n|\r|\n/&#039;, &quot;\r\n&quot;, \rtrim(\convert_uuencode($bytes)));
+        // removes ending &#039;`&#039; line
+        $this-&gt;stream-&gt;write(&quot;\r\n&quot; . \rtrim(\substr($encoded, 0, -1)));
+    }
+
+    /**
+     * Prepends any existing remainder to the passed string, then checks if the
+     * string fits into a uuencoded line, and removes and keeps any remainder
+     * from the string to write.  Full lines ready for writing are returned.
+     */
+    private function handleRemainder(string $string) : string
+    {
+        $write = $this-&gt;remainder . $string;
+        $nRem = \strlen($write) % 45;
+        $this-&gt;remainder = &#039;&#039;;
+        if ($nRem !== 0) {
+            $this-&gt;remainder = \substr($write, -$nRem);
+            $write = \substr($write, 0, -$nRem);
+        }
+        return $write;
+    }
+
+    /**
+     * Writes the passed string to the underlying stream after encoding it.
+     *
+     * Note that reading and writing to the same stream without rewinding is not
+     * supported.
+     *
+     * Also note that some bytes may not be written until close or detach are
+     * called.  This happens if written data doesn&#039;t align to a complete
+     * uuencoded &#039;line&#039; of 45 bytes.  In addition, the UU footer is only written
+     * when closing or detaching as well.
+     *
+     * @param string $string
+     * @return int the number of bytes written
+     */
+    public function write($string) : int
+    {
+        $this-&gt;isWriting = true;
+        if ($this-&gt;position === 0) {
+            $this-&gt;writeUUHeader();
+        }
+        $write = $this-&gt;handleRemainder($string);
+        if ($write !== &#039;&#039;) {
+            $this-&gt;writeEncoded($write);
+        }
+        $written = \strlen($string);
+        $this-&gt;position += $written;
+        return $written;
+    }
+
+    /**
+     * Returns the filename set in the UUEncoded header (or null)
+     */
+    public function getFilename() : string
+    {
+        return $this-&gt;filename;
+    }
+
+    /**
+     * Sets the UUEncoded header file name written in the &#039;begin&#039; header line.
+     */
+    public function setFilename(string $filename) : void
+    {
+        $this-&gt;filename = $filename;
+    }
+
+    /**
+     * Writes out any remaining bytes and the UU footer.
+     */
+    private function beforeClose() : void
+    {
+        if (!$this-&gt;isWriting) {
+            return;
+        }
+        if ($this-&gt;remainder !== &#039;&#039;) {
+            $this-&gt;writeEncoded($this-&gt;remainder);
+        }
+        $this-&gt;remainder = &#039;&#039;;
+        $this-&gt;isWriting = false;
+        $this-&gt;writeUUFooter();
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function close() : void
+    {
+        $this-&gt;beforeClose();
+        $this-&gt;stream-&gt;close();
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function detach()
+    {
+        $this-&gt;beforeClose();
+        $this-&gt;stream-&gt;detach();
+
+        return null;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/webpack.mix.combine.js -->
+<!-- PEDROO_NEXT_DIR: /app -->
+
+</body>
+</html>

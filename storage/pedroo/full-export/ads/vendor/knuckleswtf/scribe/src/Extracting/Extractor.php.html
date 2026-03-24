@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/knuckleswtf/scribe/src/Extracting/Extractor.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Knuckles\Scribe\Extracting;
+
+use Knuckles\Camel\Extraction\ExtractedEndpointData;
+use Knuckles\Camel\Extraction\Metadata;
+use Knuckles\Camel\Extraction\Parameter;
+use Faker\Factory;
+use Illuminate\Http\Testing\File;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Routing\Route;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Knuckles\Camel\Extraction\ResponseCollection;
+use Knuckles\Camel\Extraction\ResponseField;
+use Knuckles\Camel\Output\OutputEndpointData;
+use Knuckles\Scribe\Extracting\Strategies\StaticData;
+use Knuckles\Scribe\Tools\ConsoleOutputUtils as c;
+use Knuckles\Scribe\Tools\DocumentationConfig;
+use Knuckles\Scribe\Tools\RoutePatternMatcher;
+
+class Extractor
+{
+    private DocumentationConfig $config;
+
+    use ParamHelpers;
+
+    private static ?Route $routeBeingProcessed = null;
+
+    public function __construct(?DocumentationConfig $config = null)
+    {
+        // If no config is injected, pull from global
+        $this-&gt;config = $config ?: new DocumentationConfig(config(&#039;scribe&#039;));
+    }
+
+    /**
+     * External interface that allows users to know what route is currently being processed
+     */
+    public static function getRouteBeingProcessed(): ?Route
+    {
+        return self::$routeBeingProcessed;
+    }
+
+    /**
+     * @param Route $route
+     * @param array $routeRules Rules to apply when generating documentation for this route. Deprecated. Use strategy config instead.
+     *
+     * @return ExtractedEndpointData
+     *
+     */
+    public function processRoute(Route $route, array $routeRules = []): ExtractedEndpointData
+    {
+        self::$routeBeingProcessed = $route;
+
+        $endpointData = ExtractedEndpointData::fromRoute($route);
+
+        $inheritedDocsOverrides = [];
+        if ($endpointData-&gt;controller-&gt;hasMethod(&#039;inheritedDocsOverrides&#039;)) {
+            $inheritedDocsOverrides = call_user_func([$endpointData-&gt;controller-&gt;getName(), &#039;inheritedDocsOverrides&#039;]);
+            $inheritedDocsOverrides = $inheritedDocsOverrides[$endpointData-&gt;method-&gt;getName()] ?? [];
+        }
+
+        $this-&gt;fetchMetadata($endpointData, $routeRules);
+        $this-&gt;mergeInheritedMethodsData(&#039;metadata&#039;, $endpointData, $inheritedDocsOverrides);
+
+        $this-&gt;fetchUrlParameters($endpointData, $routeRules);
+        $this-&gt;mergeInheritedMethodsData(&#039;urlParameters&#039;, $endpointData, $inheritedDocsOverrides);
+        $endpointData-&gt;cleanUrlParameters = self::cleanParams($endpointData-&gt;urlParameters);
+
+        $this-&gt;addAuthField($endpointData);
+
+        $this-&gt;fetchQueryParameters($endpointData, $routeRules);
+        $this-&gt;mergeInheritedMethodsData(&#039;queryParameters&#039;, $endpointData, $inheritedDocsOverrides);
+        $endpointData-&gt;cleanQueryParameters = self::cleanParams($endpointData-&gt;queryParameters);
+
+        $this-&gt;fetchRequestHeaders($endpointData, $routeRules);
+        $this-&gt;mergeInheritedMethodsData(&#039;headers&#039;, $endpointData, $inheritedDocsOverrides);
+
+        $this-&gt;fetchBodyParameters($endpointData, $routeRules);
+        $endpointData-&gt;cleanBodyParameters = self::cleanParams($endpointData-&gt;bodyParameters);
+        $this-&gt;mergeInheritedMethodsData(&#039;bodyParameters&#039;, $endpointData, $inheritedDocsOverrides);
+
+        if (count($endpointData-&gt;cleanBodyParameters) &amp;&amp; !isset($endpointData-&gt;headers[&#039;Content-Type&#039;])) {
+            // Set content type if the user forgot to set it
+            $endpointData-&gt;headers[&#039;Content-Type&#039;] = &#039;application/json&#039;;
+        }
+        // We need to do all this so response calls can work correctly,
+        // even though they&#039;re only needed for output
+        // Note that this
+        [$files, $regularParameters] = OutputEndpointData::splitIntoFileAndRegularParameters($endpointData-&gt;cleanBodyParameters);
+        if (count($files)) {
+            $endpointData-&gt;headers[&#039;Content-Type&#039;] = &#039;multipart/form-data&#039;;
+        }
+        $endpointData-&gt;fileParameters = $files;
+        $endpointData-&gt;cleanBodyParameters = $regularParameters;
+
+        $this-&gt;fetchResponses($endpointData, $routeRules);
+        $this-&gt;mergeInheritedMethodsData(&#039;responses&#039;, $endpointData, $inheritedDocsOverrides);
+
+        $this-&gt;fetchResponseFields($endpointData, $routeRules);
+        $this-&gt;mergeInheritedMethodsData(&#039;responseFields&#039;, $endpointData, $inheritedDocsOverrides);
+
+        self::$routeBeingProcessed = null;
+
+        return $endpointData;
+    }
+
+    protected function fetchMetadata(ExtractedEndpointData $endpointData, array $rulesToApply): void
+    {
+        $endpointData-&gt;metadata = new Metadata([
+            &#039;groupName&#039; =&gt; $this-&gt;config-&gt;get(&#039;groups.default&#039;, &#039;&#039;),
+            &quot;authenticated&quot; =&gt; $this-&gt;config-&gt;get(&quot;auth.default&quot;, false),
+        ]);
+
+        $this-&gt;iterateThroughStrategies(&#039;metadata&#039;, $endpointData, $rulesToApply, function ($results) use ($endpointData) {
+            foreach ($results as $key =&gt; $item) {
+                $hadPreviousValue = !is_null($endpointData-&gt;metadata-&gt;$key);
+                $noNewValueSet = is_null($item) || $item === &quot;&quot;;
+                if ($hadPreviousValue &amp;&amp; $noNewValueSet) {
+                    continue;
+                }
+                $endpointData-&gt;metadata-&gt;$key = $item;
+            }
+        });
+    }
+
+    protected function fetchUrlParameters(ExtractedEndpointData $endpointData, array $rulesToApply): void
+    {
+        $this-&gt;iterateThroughStrategies(&#039;urlParameters&#039;, $endpointData, $rulesToApply, function ($results) use ($endpointData) {
+            foreach ($results as $key =&gt; $item) {
+                if (empty($item[&#039;name&#039;])) {
+                    $item[&#039;name&#039;] = $key;
+                }
+                $endpointData-&gt;urlParameters[$key] = Parameter::create($item, $endpointData-&gt;urlParameters[$key] ?? []);
+            }
+        });
+    }
+
+    protected function fetchQueryParameters(ExtractedEndpointData $endpointData, array $rulesToApply): void
+    {
+        $this-&gt;iterateThroughStrategies(&#039;queryParameters&#039;, $endpointData, $rulesToApply, function ($results) use ($endpointData) {
+            foreach ($results as $key =&gt; $item) {
+                if (empty($item[&#039;name&#039;])) {
+                    $item[&#039;name&#039;] = $key;
+                }
+                $endpointData-&gt;queryParameters[$key] = Parameter::create($item, $endpointData-&gt;queryParameters[$key] ?? []);
+            }
+        });
+    }
+
+    protected function fetchBodyParameters(ExtractedEndpointData $endpointData, array $rulesToApply): void
+    {
+        $this-&gt;iterateThroughStrategies(&#039;bodyParameters&#039;, $endpointData, $rulesToApply, function ($results) use ($endpointData) {
+            foreach ($results as $key =&gt; $item) {
+                if (empty($item[&#039;name&#039;])) {
+                    $item[&#039;name&#039;] = $key;
+                }
+                $endpointData-&gt;bodyParameters[$key] = Parameter::create($item, $endpointData-&gt;bodyParameters[$key] ?? []);
+            }
+        });
+    }
+
+    protected function fetchResponses(ExtractedEndpointData $endpointData, array $rulesToApply): void
+    {
+        $this-&gt;iterateThroughStrategies(&#039;responses&#039;, $endpointData, $rulesToApply, function ($results) use ($endpointData) {
+            // Responses from different strategies are all added, not overwritten
+            $endpointData-&gt;responses-&gt;concat($results);
+        });
+        // Ensure 200 responses come first
+        $endpointData-&gt;responses = new ResponseCollection($endpointData-&gt;responses-&gt;sortBy(&#039;status&#039;)-&gt;values());
+    }
+
+    protected function fetchResponseFields(ExtractedEndpointData $endpointData, array $rulesToApply): void
+    {
+        $this-&gt;iterateThroughStrategies(&#039;responseFields&#039;, $endpointData, $rulesToApply, function ($results) use ($endpointData) {
+            foreach ($results as $key =&gt; $item) {
+                $endpointData-&gt;responseFields[$key] = Parameter::create($item, $endpointData-&gt;responseFields[$key] ?? []);
+            }
+        });
+    }
+
+    protected function fetchRequestHeaders(ExtractedEndpointData $endpointData, array $rulesToApply): void
+    {
+        $this-&gt;iterateThroughStrategies(&#039;headers&#039;, $endpointData, $rulesToApply, function ($results) use ($endpointData) {
+            foreach ($results as $key =&gt; $item) {
+                if ($item) {
+                    $endpointData-&gt;headers[$key] = $item;
+                }
+            }
+        });
+    }
+
+    /**
+     * Iterate through all defined strategies for this stage.
+     * A strategy may return an array of attributes
+     * to be added to that stage data, or it may modify the stage data directly.
+     *
+     * @param string $stage
+     * @param ExtractedEndpointData $endpointData
+     * @param array $rulesToApply Deprecated. Use strategy config instead.
+     * @param callable $handler Function to run after each strategy returns its results (an array).
+     *
+     */
+    protected function iterateThroughStrategies(
+        string $stage, ExtractedEndpointData $endpointData, array $rulesToApply, callable $handler
+    ): void
+    {
+        $strategies = $this-&gt;config-&gt;get(&quot;strategies.$stage&quot;, []);
+
+        foreach ($strategies as $strategyClassOrTuple) {
+            if (is_array($strategyClassOrTuple)) {
+                [$strategyClass, &amp;$settings] = $strategyClassOrTuple;
+                if ($strategyClass == &#039;override&#039;) {
+                    c::warn(&quot;The &#039;override&#039; strategy was renamed to &#039;static_data&#039;, and will stop working in the future. Please replace &#039;override&#039; in your config file with &#039;static_data&#039;.&quot;);
+                    $strategyClass = &#039;static_data&#039;;
+                }
+                if ($strategyClass == &#039;static_data&#039;) {
+                    $strategyClass = StaticData::class;
+                    // Static data can be short: [&#039;static_data&#039;, [&#039;key&#039; =&gt; &#039;value&#039;]],
+                    // or extended [&#039;static_data&#039;, [&#039;data&#039; =&gt; [&#039;key&#039; =&gt; &#039;value&#039;], &#039;only&#039; =&gt; [&#039;GET *&#039;], &#039;except&#039; =&gt; []]],
+                    $settingsFormat = array_key_exists(&#039;data&#039;, $settings) ? &#039;extended&#039; : &#039;short&#039;;
+                    $settings = match($settingsFormat) {
+                        &#039;extended&#039; =&gt; $settings,
+                        &#039;short&#039; =&gt; [&#039;data&#039; =&gt; $settings],
+                    };
+                }
+            } else {
+                $strategyClass = $strategyClassOrTuple;
+                $settings = [];
+            }
+
+            $routesToExclude = Arr::wrap($settings[&quot;except&quot;] ?? []);
+            $routesToInclude = Arr::wrap($settings[&quot;only&quot;] ?? []);
+
+            if ($this-&gt;shouldSkipRoute($endpointData-&gt;route, $routesToExclude, $routesToInclude)) {
+                continue;
+            }
+
+            $strategy = new $strategyClass($this-&gt;config);
+            $results = $strategy($endpointData, $settings);
+            if (is_array($results)) {
+                $handler($results);
+            }
+        }
+    }
+
+    public function shouldSkipRoute($route, array $routesToExclude, array $routesToInclude): bool
+    {
+        if (!empty($routesToExclude) &amp;&amp; RoutePatternMatcher::matches($route, $routesToExclude)) {
+            return true;
+        } elseif (!empty($routesToInclude) &amp;&amp; !RoutePatternMatcher::matches($route, $routesToInclude)) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * This method prepares and simplifies request parameters for use in example requests and response calls.
+     * It takes in an array with rich details about a parameter eg
+     *   [&#039;age&#039; =&gt; new Parameter([
+     *     &#039;description&#039; =&gt; &#039;The age&#039;,
+     *     &#039;example&#039; =&gt; 12,
+     *     &#039;required&#039; =&gt; false,
+     *   ])]
+     * And transforms them into key-example pairs : [&#039;age&#039; =&gt; 12]
+     * It also filters out parameters which have null values and have &#039;required&#039; as false.
+     * It converts all file params that have string examples to actual files (instances of UploadedFile).
+     *
+     * @param array&lt;string,Parameter&gt; $parameters
+     *
+     * @return array
+     */
+    public static function cleanParams(array $parameters): array
+    {
+        $cleanParameters = [];
+
+        /**
+         * @var string $paramName
+         * @var Parameter $details
+         */
+        foreach ($parameters as $paramName =&gt; $details) {
+
+            // Remove params which have no intentional examples and are optional.
+            if (!$details-&gt;exampleWasSpecified) {
+                if (is_null($details-&gt;example) &amp;&amp; $details-&gt;required === false) {
+                    continue;
+                }
+            }
+
+            if ($details-&gt;type === &#039;file&#039;) {
+                if (is_string($details-&gt;example)) {
+                    $details-&gt;example = self::convertStringValueToUploadedFileInstance($details-&gt;example);
+                } else if (is_null($details-&gt;example)) {
+                    $details-&gt;example = (new self)-&gt;generateDummyValue($details-&gt;type);
+                }
+            }
+
+            if (Str::startsWith($paramName, &#039;[].&#039;)) { // Entire body is an array
+                if (empty($parameters[&quot;[]&quot;])) { // Make sure there&#039;s a parent
+                    $cleanParameters[&quot;[]&quot;] = [[], []];
+                    $parameters[&quot;[]&quot;] = new Parameter([
+                        &quot;name&quot; =&gt; &quot;[]&quot;,
+                        &quot;type&quot; =&gt; &quot;object[]&quot;,
+                        &quot;description&quot; =&gt; &quot;&quot;,
+                        &quot;required&quot; =&gt; true,
+                        &quot;example&quot; =&gt; [$paramName =&gt; $details-&gt;example],
+                    ]);
+                }
+            }
+
+            if (Str::contains($paramName, &#039;.&#039;)) { // Object field (or array of objects)
+                self::setObject($cleanParameters, $paramName, $details-&gt;example, $parameters, $details-&gt;required);
+            } else {
+                $cleanParameters[$paramName] = $details-&gt;example;
+            }
+        }
+
+        // Finally, if the body is an array, flatten it.
+        if (isset($cleanParameters[&#039;[]&#039;])) {
+            $cleanParameters = $cleanParameters[&#039;[]&#039;];
+        }
+
+        return $cleanParameters;
+    }
+
+    public static function setObject(array &amp;$results, string $path, $value, array $source, bool $isRequired)
+    {
+        $parts = explode(&#039;.&#039;, $path);
+
+        array_pop($parts); // Get rid of the field name
+
+        $baseName = join(&#039;.&#039;, $parts);
+        // For array fields, the type should be indicated in the source object by now;
+        // eg test.items[] would actually be described as name: test.items, type: object[]
+        // So we get rid of that ending []
+        // For other fields (eg test.items[].name), it remains as-is
+        $baseNameInOriginalParams = $baseName;
+        while (Str::endsWith($baseNameInOriginalParams, &#039;[]&#039;)) {
+            $baseNameInOriginalParams = substr($baseNameInOriginalParams, 0, -2);
+        }
+        // When the body is an array, param names will be  &quot;[].paramname&quot;,
+        // so $baseNameInOriginalParams here will be empty
+        if (Str::startsWith($path, &#039;[].&#039;)) {
+            $baseNameInOriginalParams = &#039;[]&#039;;
+        }
+
+        if (Arr::has($source, $baseNameInOriginalParams)) {
+            /** @var Parameter $parentData */
+            $parentData = Arr::get($source, $baseNameInOriginalParams);
+            // Path we use for data_set
+            $dotPath = str_replace(&#039;[]&#039;, &#039;.0&#039;, $path);
+
+            // Don&#039;t overwrite parent if there&#039;s already data there
+
+            if ($parentData-&gt;type === &#039;object&#039;) {
+                $parentPath = explode(&#039;.&#039;, $dotPath);
+                $property = array_pop($parentPath);
+                $parentPath = implode(&#039;.&#039;, $parentPath);
+
+                $exampleFromParent = Arr::get($results, $dotPath) ?? $parentData-&gt;example[$property] ?? null;
+                if (empty($exampleFromParent)) {
+                    Arr::set($results, $dotPath, $value);
+                }
+            } else if ($parentData-&gt;type === &#039;object[]&#039;) {
+                // When the body is an array, param names will be  &quot;[].paramname&quot;, so dot paths won&#039;t work correctly with &quot;[]&quot;
+                if (Str::startsWith($path, &#039;[].&#039;)) {
+                    $valueDotPath = substr($dotPath, 3); // Remove initial &#039;.0.&#039;
+                    if (isset($results[&#039;[]&#039;][0]) &amp;&amp; !Arr::has($results[&#039;[]&#039;][0], $valueDotPath)) {
+                        Arr::set($results[&#039;[]&#039;][0], $valueDotPath, $value);
+                    }
+                } else {
+                    $parentPath = explode(&#039;.&#039;, $dotPath);
+                    $index = (int)array_pop($parentPath);
+                    $parentPath = implode(&#039;.&#039;, $parentPath);
+
+                    $exampleFromParent = Arr::get($results, $dotPath) ?? $parentData-&gt;example[$index] ?? null;
+                    if (empty($exampleFromParent)) {
+                        Arr::set($results, $dotPath, $value);
+                    }
+                }
+            }
+        }
+    }
+
+    public function addAuthField(ExtractedEndpointData $endpointData): void
+    {
+        $isApiAuthed = $this-&gt;config-&gt;get(&#039;auth.enabled&#039;, false);
+        if (!$isApiAuthed || !$endpointData-&gt;metadata-&gt;authenticated) {
+            return;
+        }
+
+        $strategy = $this-&gt;config-&gt;get(&#039;auth.in&#039;);
+        $parameterName = $this-&gt;config-&gt;get(&#039;auth.name&#039;);
+
+        $faker = Factory::create();
+        if ($seed = $this-&gt;config-&gt;get(&#039;examples.faker_seed&#039;)) {
+            $faker-&gt;seed($seed);
+        }
+        $token = $faker-&gt;shuffleString(&#039;abcdefghkvaZVDPE1864563&#039;);
+        $valueToUse = $this-&gt;config-&gt;get(&#039;auth.use_value&#039;);
+        $valueToDisplay = $this-&gt;config-&gt;get(&#039;auth.placeholder&#039;);
+
+        switch ($strategy) {
+            case &#039;query&#039;:
+            case &#039;query_or_body&#039;:
+                $endpointData-&gt;auth = [&quot;queryParameters&quot;, $parameterName, $valueToUse ?: $token];
+                $endpointData-&gt;queryParameters[$parameterName] = new Parameter([
+                    &#039;name&#039; =&gt; $parameterName,
+                    &#039;type&#039; =&gt; &#039;string&#039;,
+                    &#039;example&#039; =&gt; $valueToDisplay ?: $token,
+                    &#039;description&#039; =&gt; &#039;Authentication key.&#039;,
+                    &#039;required&#039; =&gt; true,
+                ]);
+                return;
+            case &#039;body&#039;:
+                $endpointData-&gt;auth = [&quot;bodyParameters&quot;, $parameterName, $valueToUse ?: $token];
+                $endpointData-&gt;bodyParameters[$parameterName] = new Parameter([
+                    &#039;name&#039; =&gt; $parameterName,
+                    &#039;type&#039; =&gt; &#039;string&#039;,
+                    &#039;example&#039; =&gt; $valueToDisplay ?: $token,
+                    &#039;description&#039; =&gt; &#039;Authentication key.&#039;,
+                    &#039;required&#039; =&gt; true,
+                ]);
+                return;
+            case &#039;bearer&#039;:
+                $endpointData-&gt;auth = [&quot;headers&quot;, &quot;Authorization&quot;, &quot;Bearer &quot; . ($valueToUse ?: $token)];
+                $endpointData-&gt;headers[&#039;Authorization&#039;] = &quot;Bearer &quot; . ($valueToDisplay ?: $token);
+                return;
+            case &#039;basic&#039;:
+                $endpointData-&gt;auth = [&quot;headers&quot;, &quot;Authorization&quot;, &quot;Basic &quot; . ($valueToUse ?: base64_encode($token))];
+                $endpointData-&gt;headers[&#039;Authorization&#039;] = &quot;Basic &quot; . ($valueToDisplay ?: base64_encode($token));
+                return;
+            case &#039;header&#039;:
+                $endpointData-&gt;auth = [&quot;headers&quot;, $parameterName, $valueToUse ?: $token];
+                $endpointData-&gt;headers[$parameterName] = $valueToDisplay ?: $token;
+                return;
+        }
+    }
+
+    protected static function convertStringValueToUploadedFileInstance(string $filePath): UploadedFile
+    {
+        $fileName = basename($filePath);
+        return new File($fileName, fopen($filePath, &#039;r&#039;));
+    }
+
+    protected function mergeInheritedMethodsData(string $stage, ExtractedEndpointData $endpointData, array $inheritedDocsOverrides = []): void
+    {
+        $overrides = $inheritedDocsOverrides[$stage] ?? [];
+        $normalizeParamData = fn($data, $key) =&gt; array_merge($data, [&quot;name&quot; =&gt; $key]);
+        if (is_array($overrides)) {
+            foreach ($overrides as $key =&gt; $item) {
+                switch ($stage) {
+                    case &quot;responses&quot;:
+                        $endpointData-&gt;responses-&gt;concat($overrides);
+                        $endpointData-&gt;responses-&gt;sortBy(&#039;status&#039;);
+                        break;
+                    case &quot;urlParameters&quot;:
+                    case &quot;bodyParameters&quot;:
+                    case &quot;queryParameters&quot;:
+                        $endpointData-&gt;$stage[$key] = Parameter::make($normalizeParamData($item, $key));
+                        break;
+                    case &quot;responseFields&quot;:
+                        $endpointData-&gt;$stage[$key] = ResponseField::make($normalizeParamData($item, $key));
+                        break;
+                    default:
+                        $endpointData-&gt;$stage[$key] = $item;
+                }
+            }
+        } else if (is_callable($overrides)) {
+            $results = $overrides($endpointData);
+
+            $endpointData-&gt;$stage = match ($stage) {
+                &quot;responses&quot; =&gt; ResponseCollection::make($results),
+                &quot;urlParameters&quot;, &quot;bodyParameters&quot;, &quot;queryParameters&quot; =&gt; collect($results)-&gt;map(fn($param, $name) =&gt; Parameter::make($normalizeParamData($param, $name)))-&gt;all(),
+                &quot;responseFields&quot; =&gt; collect($results)-&gt;map(fn($field, $name) =&gt; ResponseField::make($normalizeParamData($field, $name)))-&gt;all(),
+                default =&gt; $results,
+            };
+        }
+    }
+
+    public static function transformOldRouteRulesIntoNewSettings($stage, $rulesToApply, $strategyName, $strategySettings = [])
+    {
+        if ($stage == &#039;responses&#039; &amp;&amp; Str::is(&#039;*ResponseCalls*&#039;, $strategyName) &amp;&amp;!empty($rulesToApply[&#039;response_calls&#039;])) {
+            // Transform `methods` to `only`
+            $strategySettings = [];
+
+            if (isset($rulesToApply[&#039;response_calls&#039;][&#039;methods&#039;])) {
+                if(empty($rulesToApply[&#039;response_calls&#039;][&#039;methods&#039;])) {
+                    // This means all routes are forbidden
+                    $strategySettings[&#039;except&#039;] = [&quot;*&quot;];
+                } else {
+                    $strategySettings[&#039;only&#039;] = array_map(
+                        fn($method) =&gt; &quot;$method *&quot;,
+                        $rulesToApply[&#039;response_calls&#039;][&#039;methods&#039;]
+                    );
+                }
+            }
+
+            // Copy all other keys over as is
+            foreach (array_keys($rulesToApply[&#039;response_calls&#039;]) as $key) {
+                if ($key == &#039;methods&#039;) continue;
+                $strategySettings[$key] = $rulesToApply[&#039;response_calls&#039;][$key];
+            }
+        }
+
+        return $strategySettings;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/knuckleswtf/scribe/src/Extracting/FindsFormRequestForMethod.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/knuckleswtf/scribe/src/Extracting/Shared -->
+
+</body>
+</html>

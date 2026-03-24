@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/php-di/php-di/src/Definition/Resolver/ObjectCreator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace DI\Definition\Resolver;
+
+use DI\Definition\Definition;
+use DI\Definition\Exception\InvalidDefinition;
+use DI\Definition\ObjectDefinition;
+use DI\Definition\ObjectDefinition\PropertyInjection;
+use DI\DependencyException;
+use DI\Proxy\ProxyFactoryInterface;
+use Exception;
+use Psr\Container\NotFoundExceptionInterface;
+use ReflectionClass;
+use ReflectionProperty;
+
+/**
+ * Create objects based on an object definition.
+ *
+ * @template-implements DefinitionResolver&lt;ObjectDefinition&gt;
+ *
+ * @since 4.0
+ * @author Matthieu Napoli &lt;matthieu@mnapoli.fr&gt;
+ */
+class ObjectCreator implements DefinitionResolver
+{
+    private ParameterResolver $parameterResolver;
+
+    /**
+     * @param DefinitionResolver    $definitionResolver Used to resolve nested definitions.
+     * @param ProxyFactoryInterface $proxyFactory       Used to create proxies for lazy injections.
+     */
+    public function __construct(
+        private DefinitionResolver $definitionResolver,
+        private ProxyFactoryInterface $proxyFactory,
+    ) {
+        $this-&gt;parameterResolver = new ParameterResolver($definitionResolver);
+    }
+
+    /**
+     * Resolve a class definition to a value.
+     *
+     * This will create a new instance of the class using the injections points defined.
+     *
+     * @param ObjectDefinition $definition
+     */
+    public function resolve(Definition $definition, array $parameters = []) : ?object
+    {
+        // Lazy?
+        if ($definition-&gt;isLazy()) {
+            return $this-&gt;createProxy($definition, $parameters);
+        }
+
+        return $this-&gt;createInstance($definition, $parameters);
+    }
+
+    /**
+     * The definition is not resolvable if the class is not instantiable (interface or abstract)
+     * or if the class doesn&#039;t exist.
+     *
+     * @param ObjectDefinition $definition
+     */
+    public function isResolvable(Definition $definition, array $parameters = []) : bool
+    {
+        return $definition-&gt;isInstantiable();
+    }
+
+    /**
+     * Returns a proxy instance.
+     */
+    private function createProxy(ObjectDefinition $definition, array $parameters) : object
+    {
+        /** @var class-string $className */
+        $className = $definition-&gt;getClassName();
+
+        return $this-&gt;proxyFactory-&gt;createProxy(
+            $className,
+            function () use ($definition, $parameters) {
+                return $this-&gt;createInstance($definition, $parameters);
+            }
+        );
+    }
+
+    /**
+     * Creates an instance of the class and injects dependencies..
+     *
+     * @param array $parameters Optional parameters to use to create the instance.
+     *
+     * @throws DependencyException
+     * @throws InvalidDefinition
+     */
+    private function createInstance(ObjectDefinition $definition, array $parameters) : object
+    {
+        // Check that the class is instantiable
+        if (! $definition-&gt;isInstantiable()) {
+            // Check that the class exists
+            if (! $definition-&gt;classExists()) {
+                throw InvalidDefinition::create($definition, sprintf(
+                    &#039;Entry &quot;%s&quot; cannot be resolved: the class doesn\&#039;t exist&#039;,
+                    $definition-&gt;getName()
+                ));
+            }
+
+            throw InvalidDefinition::create($definition, sprintf(
+                &#039;Entry &quot;%s&quot; cannot be resolved: the class is not instantiable&#039;,
+                $definition-&gt;getName()
+            ));
+        }
+
+        /** @psalm-var class-string $classname */
+        $classname = $definition-&gt;getClassName();
+        $classReflection = new ReflectionClass($classname);
+
+        $constructorInjection = $definition-&gt;getConstructorInjection();
+
+        /** @psalm-suppress InvalidCatch */
+        try {
+            $args = $this-&gt;parameterResolver-&gt;resolveParameters(
+                $constructorInjection,
+                $classReflection-&gt;getConstructor(),
+                $parameters
+            );
+
+            $object = new $classname(...$args);
+
+            $this-&gt;injectMethodsAndProperties($object, $definition);
+        } catch (NotFoundExceptionInterface $e) {
+            throw new DependencyException(sprintf(
+                &#039;Error while injecting dependencies into %s: %s&#039;,
+                $classReflection-&gt;getName(),
+                $e-&gt;getMessage()
+            ), 0, $e);
+        } catch (InvalidDefinition $e) {
+            throw InvalidDefinition::create($definition, sprintf(
+                &#039;Entry &quot;%s&quot; cannot be resolved: %s&#039;,
+                $definition-&gt;getName(),
+                $e-&gt;getMessage()
+            ));
+        }
+
+        return $object;
+    }
+
+    protected function injectMethodsAndProperties(object $object, ObjectDefinition $objectDefinition) : void
+    {
+        // Property injections
+        foreach ($objectDefinition-&gt;getPropertyInjections() as $propertyInjection) {
+            $this-&gt;injectProperty($object, $propertyInjection);
+        }
+
+        // Method injections
+        foreach ($objectDefinition-&gt;getMethodInjections() as $methodInjection) {
+            $methodReflection = new \ReflectionMethod($object, $methodInjection-&gt;getMethodName());
+            $args = $this-&gt;parameterResolver-&gt;resolveParameters($methodInjection, $methodReflection);
+
+            $methodReflection-&gt;invokeArgs($object, $args);
+        }
+    }
+
+    /**
+     * Inject dependencies into properties.
+     *
+     * @param object            $object            Object to inject dependencies into
+     * @param PropertyInjection $propertyInjection Property injection definition
+     *
+     * @throws DependencyException
+     */
+    private function injectProperty(object $object, PropertyInjection $propertyInjection) : void
+    {
+        $propertyName = $propertyInjection-&gt;getPropertyName();
+
+        $value = $propertyInjection-&gt;getValue();
+
+        if ($value instanceof Definition) {
+            try {
+                $value = $this-&gt;definitionResolver-&gt;resolve($value);
+            } catch (DependencyException $e) {
+                throw $e;
+            } catch (Exception $e) {
+                throw new DependencyException(sprintf(
+                    &#039;Error while injecting in %s::%s. %s&#039;,
+                    $object::class,
+                    $propertyName,
+                    $e-&gt;getMessage()
+                ), 0, $e);
+            }
+        }
+
+        self::setPrivatePropertyValue($propertyInjection-&gt;getClassName(), $object, $propertyName, $value);
+    }
+
+    public static function setPrivatePropertyValue(?string $className, $object, string $propertyName, mixed $propertyValue) : void
+    {
+        $className = $className ?: $object::class;
+
+        $property = new ReflectionProperty($className, $propertyName);
+        if (! $property-&gt;isPublic() &amp;&amp; \PHP_VERSION_ID &lt; 80100) {
+            $property-&gt;setAccessible(true);
+        }
+        $property-&gt;setValue($object, $propertyValue);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/php-di/php-di/src/Definition/Resolver/ParameterResolver.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/php-di/php-di/src/Definition/Source -->
+
+</body>
+</html>

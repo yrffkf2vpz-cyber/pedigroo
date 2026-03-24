@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/var-exporter/Internal/Hydrator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\VarExporter\Internal;
+
+use Symfony\Component\VarExporter\Exception\ClassNotFoundException;
+
+/**
+ * @author Nicolas Grekas &lt;p@tchwork.com&gt;
+ *
+ * @internal
+ */
+class Hydrator
+{
+    public const PROPERTY_HAS_HOOKS = 1;
+    public const PROPERTY_NOT_BY_REF = 2;
+
+    public static array $hydrators = [];
+    public static array $simpleHydrators = [];
+    public static array $propertyScopes = [];
+
+    public function __construct(
+        public readonly Registry $registry,
+        public readonly ?Values $values,
+        public readonly array $properties,
+        public readonly mixed $value,
+        public readonly array $wakeups,
+    ) {
+    }
+
+    public static function hydrate($objects, $values, $properties, $value, $wakeups)
+    {
+        foreach ($properties as $class =&gt; $vars) {
+            (self::$hydrators[$class] ??= self::getHydrator($class))($vars, $objects);
+        }
+        foreach ($wakeups as $k =&gt; $v) {
+            if (\is_array($v)) {
+                $objects[-$k]-&gt;__unserialize($v);
+            } else {
+                $objects[$v]-&gt;__wakeup();
+            }
+        }
+
+        return $value;
+    }
+
+    public static function getHydrator($class)
+    {
+        $baseHydrator = self::$hydrators[&#039;stdClass&#039;] ??= static function ($properties, $objects) {
+            foreach ($properties as $name =&gt; $values) {
+                foreach ($values as $i =&gt; $v) {
+                    $objects[$i]-&gt;$name = $v;
+                }
+            }
+        };
+
+        switch ($class) {
+            case &#039;stdClass&#039;:
+                return $baseHydrator;
+
+            case &#039;ErrorException&#039;:
+                return $baseHydrator-&gt;bindTo(null, new class extends \ErrorException {
+                });
+
+            case &#039;TypeError&#039;:
+                return $baseHydrator-&gt;bindTo(null, new class extends \Error {
+                });
+
+            case &#039;SplObjectStorage&#039;:
+                return static function ($properties, $objects) {
+                    foreach ($properties as $name =&gt; $values) {
+                        if (&quot;\0&quot; === $name) {
+                            foreach ($values as $i =&gt; $v) {
+                                for ($j = 0; $j &lt; \count($v); ++$j) {
+                                    $objects[$i][$v[$j]] = $v[++$j];
+                                }
+                            }
+                            continue;
+                        }
+                        foreach ($values as $i =&gt; $v) {
+                            $objects[$i]-&gt;$name = $v;
+                        }
+                    }
+                };
+        }
+
+        if (!class_exists($class) &amp;&amp; !interface_exists($class, false) &amp;&amp; !trait_exists($class, false)) {
+            throw new ClassNotFoundException($class);
+        }
+        $classReflector = new \ReflectionClass($class);
+
+        switch ($class) {
+            case &#039;ArrayIterator&#039;:
+            case &#039;ArrayObject&#039;:
+                $constructor = $classReflector-&gt;getConstructor()-&gt;invokeArgs(...);
+
+                return static function ($properties, $objects) use ($constructor) {
+                    foreach ($properties as $name =&gt; $values) {
+                        if (&quot;\0&quot; !== $name) {
+                            foreach ($values as $i =&gt; $v) {
+                                $objects[$i]-&gt;$name = $v;
+                            }
+                        }
+                    }
+                    foreach ($properties[&quot;\0&quot;] ?? [] as $i =&gt; $v) {
+                        $constructor($objects[$i], $v);
+                    }
+                };
+        }
+
+        if (!$classReflector-&gt;isInternal()) {
+            return $baseHydrator-&gt;bindTo(null, $class);
+        }
+
+        if ($classReflector-&gt;name !== $class) {
+            return self::$hydrators[$classReflector-&gt;name] ??= self::getHydrator($classReflector-&gt;name);
+        }
+
+        $propertySetters = [];
+        foreach ($classReflector-&gt;getProperties() as $propertyReflector) {
+            if (!$propertyReflector-&gt;isStatic()) {
+                $propertySetters[$propertyReflector-&gt;name] = $propertyReflector-&gt;setValue(...);
+            }
+        }
+
+        if (!$propertySetters) {
+            return $baseHydrator;
+        }
+
+        return static function ($properties, $objects) use ($propertySetters) {
+            foreach ($properties as $name =&gt; $values) {
+                if ($setValue = $propertySetters[$name] ?? null) {
+                    foreach ($values as $i =&gt; $v) {
+                        $setValue($objects[$i], $v);
+                    }
+                    continue;
+                }
+                foreach ($values as $i =&gt; $v) {
+                    $objects[$i]-&gt;$name = $v;
+                }
+            }
+        };
+    }
+
+    public static function getSimpleHydrator($class)
+    {
+        $baseHydrator = self::$simpleHydrators[&#039;stdClass&#039;] ??= (function ($properties, $object) {
+            $notByRef = (array) $this;
+
+            foreach ($properties as $name =&gt; &amp;$value) {
+                if (!$noRef = $notByRef[$name] ?? false) {
+                    $object-&gt;$name = $value;
+                    $object-&gt;$name = &amp;$value;
+                } elseif (true !== $noRef) {
+                    $noRef($object, $value);
+                } else {
+                    $object-&gt;$name = $value;
+                }
+            }
+        })-&gt;bindTo(new \stdClass());
+
+        switch ($class) {
+            case &#039;stdClass&#039;:
+                return $baseHydrator;
+
+            case &#039;ErrorException&#039;:
+                return $baseHydrator-&gt;bindTo(new \stdClass(), new class extends \ErrorException {
+                });
+
+            case &#039;TypeError&#039;:
+                return $baseHydrator-&gt;bindTo(new \stdClass(), new class extends \Error {
+                });
+
+            case &#039;SplObjectStorage&#039;:
+                return static function ($properties, $object) {
+                    foreach ($properties as $name =&gt; &amp;$value) {
+                        if (&quot;\0&quot; !== $name) {
+                            $object-&gt;$name = $value;
+                            $object-&gt;$name = &amp;$value;
+                            continue;
+                        }
+                        for ($i = 0; $i &lt; \count($value); ++$i) {
+                            $object[$value[$i]] = $value[++$i];
+                        }
+                    }
+                };
+        }
+
+        if (!class_exists($class) &amp;&amp; !interface_exists($class, false) &amp;&amp; !trait_exists($class, false)) {
+            throw new ClassNotFoundException($class);
+        }
+        $classReflector = new \ReflectionClass($class);
+
+        switch ($class) {
+            case &#039;ArrayIterator&#039;:
+            case &#039;ArrayObject&#039;:
+                $constructor = $classReflector-&gt;getConstructor()-&gt;invokeArgs(...);
+
+                return static function ($properties, $object) use ($constructor) {
+                    foreach ($properties as $name =&gt; &amp;$value) {
+                        if (&quot;\0&quot; === $name) {
+                            $constructor($object, $value);
+                        } else {
+                            $object-&gt;$name = $value;
+                            $object-&gt;$name = &amp;$value;
+                        }
+                    }
+                };
+        }
+
+        if (!$classReflector-&gt;isInternal()) {
+            $notByRef = new \stdClass();
+            foreach ($classReflector-&gt;getProperties() as $propertyReflector) {
+                if ($propertyReflector-&gt;isStatic()) {
+                    continue;
+                }
+                if (\PHP_VERSION_ID &gt;= 80400 &amp;&amp; !$propertyReflector-&gt;isAbstract() &amp;&amp; $propertyReflector-&gt;getHooks()) {
+                    $notByRef-&gt;{$propertyReflector-&gt;name} = $propertyReflector-&gt;setRawValue(...);
+                } elseif ($propertyReflector-&gt;isReadOnly()) {
+                    $notByRef-&gt;{$propertyReflector-&gt;name} = true;
+                }
+            }
+
+            return $baseHydrator-&gt;bindTo($notByRef, $class);
+        }
+
+        if ($classReflector-&gt;name !== $class) {
+            return self::$simpleHydrators[$classReflector-&gt;name] ??= self::getSimpleHydrator($classReflector-&gt;name);
+        }
+
+        $propertySetters = [];
+        foreach ($classReflector-&gt;getProperties() as $propertyReflector) {
+            if (!$propertyReflector-&gt;isStatic()) {
+                $propertySetters[$propertyReflector-&gt;name] = $propertyReflector-&gt;setValue(...);
+            }
+        }
+
+        if (!$propertySetters) {
+            return $baseHydrator;
+        }
+
+        return static function ($properties, $object) use ($propertySetters) {
+            foreach ($properties as $name =&gt; &amp;$value) {
+                if ($setValue = $propertySetters[$name] ?? null) {
+                    $setValue($object, $value);
+                } else {
+                    $object-&gt;$name = $value;
+                    $object-&gt;$name = &amp;$value;
+                }
+            }
+        };
+    }
+
+    public static function getPropertyScopes($class): array
+    {
+        $propertyScopes = [];
+        $r = new \ReflectionClass($class);
+
+        foreach ($r-&gt;getProperties() as $property) {
+            $flags = $property-&gt;getModifiers();
+
+            if (\ReflectionProperty::IS_STATIC &amp; $flags) {
+                continue;
+            }
+            $name = $property-&gt;name;
+            $access = ($flags &lt;&lt; 2) | ($flags &amp; \ReflectionProperty::IS_READONLY ? self::PROPERTY_NOT_BY_REF : 0);
+
+            if (\PHP_VERSION_ID &gt;= 80400 &amp;&amp; !$property-&gt;isAbstract() &amp;&amp; $h = $property-&gt;getHooks()) {
+                $access |= self::PROPERTY_HAS_HOOKS | (isset($h[&#039;get&#039;]) &amp;&amp; !$h[&#039;get&#039;]-&gt;returnsReference() ? self::PROPERTY_NOT_BY_REF : 0);
+            }
+
+            if (\ReflectionProperty::IS_PRIVATE &amp; $flags) {
+                $propertyScopes[&quot;\0$class\0$name&quot;] = $propertyScopes[$name] = [$class, $name, null, $access, $property];
+
+                continue;
+            }
+
+            $propertyScopes[$name] = [$class, $name, null, $access, $property];
+
+            if ($flags &amp; (\PHP_VERSION_ID &gt;= 80400 ? \ReflectionProperty::IS_PRIVATE_SET : \ReflectionProperty::IS_READONLY)) {
+                $propertyScopes[$name][2] = $property-&gt;class;
+            }
+
+            if (\ReflectionProperty::IS_PROTECTED &amp; $flags) {
+                $propertyScopes[&quot;\0*\0$name&quot;] = $propertyScopes[$name];
+            }
+        }
+
+        while ($r = $r-&gt;getParentClass()) {
+            $class = $r-&gt;name;
+
+            foreach ($r-&gt;getProperties(\ReflectionProperty::IS_PRIVATE) as $property) {
+                $flags = $property-&gt;getModifiers();
+
+                if (\ReflectionProperty::IS_STATIC &amp; $flags) {
+                    continue;
+                }
+                $name = $property-&gt;name;
+                $access = ($flags &lt;&lt; 2) | ($flags &amp; \ReflectionProperty::IS_READONLY ? self::PROPERTY_NOT_BY_REF : 0);
+
+                if (\PHP_VERSION_ID &gt;= 80400 &amp;&amp; $h = $property-&gt;getHooks()) {
+                    $access |= self::PROPERTY_HAS_HOOKS | (isset($h[&#039;get&#039;]) &amp;&amp; !$h[&#039;get&#039;]-&gt;returnsReference() ? self::PROPERTY_NOT_BY_REF : 0);
+                }
+
+                $propertyScopes[&quot;\0$class\0$name&quot;] = [$class, $name, null, $access, $property];
+                $propertyScopes[$name] ??= $propertyScopes[&quot;\0$class\0$name&quot;];
+            }
+        }
+
+        return $propertyScopes;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/var-exporter/Internal/LazyDecoratorTrait.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/yaml -->
+
+</body>
+</html>

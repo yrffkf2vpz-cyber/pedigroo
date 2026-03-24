@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/spatie/laravel-ignition/src/IgnitionServiceProvider.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Spatie\LaravelIgnition;
+
+use Exception;
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Foundation\Application;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\ServiceProvider;
+use Illuminate\View\ViewException;
+use Laravel\Octane\Events\RequestReceived;
+use Laravel\Octane\Events\RequestTerminated;
+use Laravel\Octane\Events\TaskReceived;
+use Laravel\Octane\Events\TickReceived;
+use Monolog\Level;
+use Monolog\Logger;
+use Spatie\ErrorSolutions\Contracts\SolutionProviderRepository as SolutionProviderRepositoryContract;
+use Spatie\ErrorSolutions\SolutionProviderRepository;
+use Spatie\FlareClient\Flare;
+use Spatie\FlareClient\FlareMiddleware\AddSolutions;
+use Spatie\Ignition\Config\FileConfigManager;
+use Spatie\Ignition\Config\IgnitionConfig;
+use Spatie\Ignition\Contracts\ConfigManager;
+use Spatie\Ignition\Ignition;
+use Spatie\LaravelIgnition\Commands\SolutionMakeCommand;
+use Spatie\LaravelIgnition\Commands\SolutionProviderMakeCommand;
+use Spatie\LaravelIgnition\Commands\TestCommand;
+use Spatie\LaravelIgnition\ContextProviders\LaravelContextProviderDetector;
+use Spatie\LaravelIgnition\Exceptions\InvalidConfig;
+use Spatie\LaravelIgnition\FlareMiddleware\AddJobs;
+use Spatie\LaravelIgnition\FlareMiddleware\AddLogs;
+use Spatie\LaravelIgnition\FlareMiddleware\AddQueries;
+use Spatie\LaravelIgnition\Recorders\DumpRecorder\DumpRecorder;
+use Spatie\LaravelIgnition\Recorders\JobRecorder\JobRecorder;
+use Spatie\LaravelIgnition\Recorders\LogRecorder\LogRecorder;
+use Spatie\LaravelIgnition\Recorders\QueryRecorder\QueryRecorder;
+use Spatie\LaravelIgnition\Renderers\IgnitionExceptionRenderer;
+use Spatie\LaravelIgnition\Support\FlareLogHandler;
+use Spatie\LaravelIgnition\Support\SentReports;
+use Spatie\LaravelIgnition\Views\ViewExceptionMapper;
+
+class IgnitionServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this-&gt;registerConfig();
+        $this-&gt;registerFlare();
+        $this-&gt;registerIgnition();
+        $this-&gt;registerRenderer();
+        $this-&gt;registerRecorders();
+        $this-&gt;registerLogHandler();
+    }
+
+    public function boot()
+    {
+        if ($this-&gt;app-&gt;runningInConsole()) {
+            $this-&gt;registerCommands();
+            $this-&gt;publishConfigs();
+        }
+
+        $this-&gt;registerRoutes();
+        $this-&gt;configureTinker();
+        $this-&gt;configureOctane();
+        $this-&gt;registerViewExceptionMapper();
+        $this-&gt;startRecorders();
+        $this-&gt;configureQueue();
+    }
+
+    protected function registerConfig(): void
+    {
+        $this-&gt;mergeConfigFrom(__DIR__ . &#039;/../config/flare.php&#039;, &#039;flare&#039;);
+        $this-&gt;mergeConfigFrom(__DIR__ . &#039;/../config/ignition.php&#039;, &#039;ignition&#039;);
+    }
+
+    protected function registerCommands(): void
+    {
+        if ($this-&gt;app[&#039;config&#039;]-&gt;get(&#039;flare.key&#039;)) {
+            $this-&gt;commands([
+                TestCommand::class,
+            ]);
+        }
+
+        if ($this-&gt;app[&#039;config&#039;]-&gt;get(&#039;ignition.register_commands&#039;)) {
+            $this-&gt;commands([
+                SolutionMakeCommand::class,
+                SolutionProviderMakeCommand::class,
+            ]);
+        }
+    }
+
+    protected function publishConfigs(): void
+    {
+        $this-&gt;publishes([
+            __DIR__ . &#039;/../config/ignition.php&#039; =&gt; config_path(&#039;ignition.php&#039;),
+        ], &#039;ignition-config&#039;);
+
+        $this-&gt;publishes([
+            __DIR__ . &#039;/../config/flare.php&#039; =&gt; config_path(&#039;flare.php&#039;),
+        ], &#039;flare-config&#039;);
+    }
+
+    protected function registerRenderer(): void
+    {
+        $this-&gt;app-&gt;bind(
+            &#039;Illuminate\Contracts\Foundation\ExceptionRenderer&#039;,
+            fn (Application $app) =&gt; $app-&gt;make(IgnitionExceptionRenderer::class)
+        );
+    }
+
+    protected function registerFlare(): void
+    {
+        $this-&gt;app-&gt;singleton(Flare::class, function () {
+            return Flare::make()
+                -&gt;setApiToken(config(&#039;flare.key&#039;) ?? &#039;&#039;)
+                -&gt;setBaseUrl(config(&#039;flare.base_url&#039;, &#039;https://flareapp.io/api&#039;))
+                -&gt;applicationPath(base_path())
+                -&gt;setStage(app()-&gt;environment())
+                -&gt;setContextProviderDetector(new LaravelContextProviderDetector())
+                -&gt;registerMiddleware($this-&gt;getFlareMiddleware())
+                -&gt;registerMiddleware(new AddSolutions(new SolutionProviderRepository($this-&gt;getSolutionProviders())))
+                -&gt;argumentReducers(config(&#039;ignition.argument_reducers&#039;, []))
+                -&gt;withStackFrameArguments(config(&#039;ignition.with_stack_frame_arguments&#039;, true));
+        });
+
+        $this-&gt;app-&gt;singleton(SentReports::class);
+    }
+
+    protected function registerIgnition(): void
+    {
+        $this-&gt;app-&gt;singleton(
+            ConfigManager::class,
+            fn () =&gt; new FileConfigManager(config(&#039;ignition.settings_file_path&#039;, &#039;&#039;))
+        );
+
+        $ignitionConfig = (new IgnitionConfig())
+            -&gt;merge(config(&#039;ignition&#039;, []))
+            -&gt;loadConfigFile();
+
+        $solutionProviders = $this-&gt;getSolutionProviders();
+        $solutionProviderRepository = new SolutionProviderRepository($solutionProviders);
+
+        $this-&gt;app-&gt;singleton(IgnitionConfig::class, fn () =&gt; $ignitionConfig);
+
+        $this-&gt;app-&gt;singleton(SolutionProviderRepositoryContract::class, fn () =&gt; $solutionProviderRepository);
+
+        $this-&gt;app-&gt;singleton(
+            Ignition::class,
+            fn () =&gt; (new Ignition($this-&gt;app-&gt;make(Flare::class)))-&gt;applicationPath(base_path())
+        );
+    }
+
+    protected function registerRecorders(): void
+    {
+        $this-&gt;app-&gt;singleton(DumpRecorder::class);
+
+        $this-&gt;app-&gt;singleton(LogRecorder::class, function (Application $app): LogRecorder {
+            return new LogRecorder(
+                $app,
+                config()-&gt;get(&#039;flare.flare_middleware.&#039; . AddLogs::class . &#039;.maximum_number_of_collected_logs&#039;)
+            );
+        });
+
+        $this-&gt;app-&gt;singleton(
+            QueryRecorder::class,
+            function (Application $app): QueryRecorder {
+                return new QueryRecorder(
+                    $app,
+                    config(&#039;flare.flare_middleware.&#039; . AddQueries::class . &#039;.report_query_bindings&#039;, true),
+                    config(&#039;flare.flare_middleware.&#039; . AddQueries::class . &#039;.maximum_number_of_collected_queries&#039;, 200)
+                );
+            }
+        );
+
+        $this-&gt;app-&gt;singleton(JobRecorder::class, function (Application $app): JobRecorder {
+            return new JobRecorder(
+                $app,
+                config(&#039;flare.flare_middleware.&#039; . AddJobs::class . &#039;.max_chained_job_reporting_depth&#039;, 5)
+            );
+        });
+    }
+
+    public function configureTinker(): void
+    {
+        if ($this-&gt;app-&gt;runningInConsole()) {
+            if (isset($_SERVER[&#039;argv&#039;]) &amp;&amp; [&#039;artisan&#039;, &#039;tinker&#039;] === $_SERVER[&#039;argv&#039;]) {
+                app(Flare::class)-&gt;sendReportsImmediately();
+            }
+        }
+    }
+
+    protected function configureOctane(): void
+    {
+        if (isset($_SERVER[&#039;LARAVEL_OCTANE&#039;])) {
+            $this-&gt;setupOctane();
+        }
+    }
+
+    protected function registerViewExceptionMapper(): void
+    {
+        $handler = $this-&gt;app-&gt;make(ExceptionHandler::class);
+
+        if (! method_exists($handler, &#039;map&#039;)) {
+            return;
+        }
+
+        $handler-&gt;map(function (ViewException $viewException) {
+            return $this-&gt;app-&gt;make(ViewExceptionMapper::class)-&gt;map($viewException);
+        });
+    }
+
+    protected function registerRoutes(): void
+    {
+        $this-&gt;loadRoutesFrom(realpath(__DIR__ . &#039;/ignition-routes.php&#039;));
+    }
+
+    protected function registerLogHandler(): void
+    {
+        $this-&gt;app-&gt;singleton(&#039;flare.logger&#039;, function ($app) {
+            $handler = new FlareLogHandler(
+                $app-&gt;make(Flare::class),
+                $app-&gt;make(SentReports::class),
+            );
+
+            $logLevelString = config(&#039;logging.channels.flare.level&#039;, &#039;error&#039;);
+
+            $logLevel = $this-&gt;getLogLevel($logLevelString);
+
+            $handler-&gt;setMinimumReportLogLevel($logLevel);
+
+            return tap(
+                new Logger(&#039;Flare&#039;),
+                fn (Logger $logger) =&gt; $logger-&gt;pushHandler($handler)
+            );
+        });
+
+        Log::extend(&#039;flare&#039;, fn ($app) =&gt; $app[&#039;flare.logger&#039;]);
+    }
+
+    protected function startRecorders(): void
+    {
+        foreach ($this-&gt;app-&gt;config[&#039;ignition.recorders&#039;] ?? [] as $recorder) {
+            $this-&gt;app-&gt;make($recorder)-&gt;start();
+        }
+    }
+
+    protected function configureQueue(): void
+    {
+        if (! $this-&gt;app-&gt;bound(&#039;queue&#039;)) {
+            return;
+        }
+
+        $queue = $this-&gt;app-&gt;get(&#039;queue&#039;);
+
+        // Reset before executing a queue job to make sure the job&#039;s log/query/dump recorders are empty.
+        // When using a sync queue this also reports the queued reports from previous exceptions.
+        $queue-&gt;before(function () {
+            $this-&gt;resetFlareAndLaravelIgnition();
+            app(Flare::class)-&gt;sendReportsImmediately();
+        });
+
+        // Send queued reports (and reset) after executing a queue job.
+        $queue-&gt;after(function () {
+            $this-&gt;resetFlareAndLaravelIgnition();
+        });
+
+        // Note: the $queue-&gt;looping() event can&#039;t be used because it&#039;s not triggered on Vapor
+    }
+
+    protected function getLogLevel(string $logLevelString): int
+    {
+        try {
+            $logLevel = Level::fromName($logLevelString);
+        } catch (Exception $exception) {
+            $logLevel = null;
+        }
+
+        if (! $logLevel) {
+            throw InvalidConfig::invalidLogLevel($logLevelString);
+        }
+
+        return $logLevel-&gt;value;
+    }
+
+    protected function getFlareMiddleware(): array
+    {
+        return collect(config(&#039;flare.flare_middleware&#039;))
+            -&gt;map(function ($value, $key) {
+                if (is_string($key)) {
+                    $middlewareClass = $key;
+                    $parameters = $value ?? [];
+                } else {
+                    $middlewareClass = $value;
+                    $parameters = [];
+                }
+
+                return new $middlewareClass(...array_values($parameters));
+            })
+            -&gt;values()
+            -&gt;toArray();
+    }
+
+    protected function getSolutionProviders(): array
+    {
+        return collect(config(&#039;ignition.solution_providers&#039;))
+            -&gt;reject(
+                fn (string $class) =&gt; in_array($class, config(&#039;ignition.ignored_solution_providers&#039;))
+            )
+            -&gt;toArray();
+    }
+
+    protected function setupOctane(): void
+    {
+        $this-&gt;app[&#039;events&#039;]-&gt;listen(RequestReceived::class, function () {
+            $this-&gt;resetFlareAndLaravelIgnition();
+        });
+
+        $this-&gt;app[&#039;events&#039;]-&gt;listen(TaskReceived::class, function () {
+            $this-&gt;resetFlareAndLaravelIgnition();
+        });
+
+        $this-&gt;app[&#039;events&#039;]-&gt;listen(TickReceived::class, function () {
+            $this-&gt;resetFlareAndLaravelIgnition();
+        });
+
+        $this-&gt;app[&#039;events&#039;]-&gt;listen(RequestTerminated::class, function () {
+            $this-&gt;resetFlareAndLaravelIgnition();
+        });
+    }
+
+    protected function resetFlareAndLaravelIgnition(): void
+    {
+        $this-&gt;app-&gt;get(SentReports::class)-&gt;clear();
+        $this-&gt;app-&gt;get(Ignition::class)-&gt;reset();
+
+        if (config(&#039;flare.flare_middleware.&#039; . AddLogs::class)) {
+            $this-&gt;app-&gt;make(LogRecorder::class)-&gt;reset();
+        }
+
+        if (config(&#039;flare.flare_middleware.&#039; . AddQueries::class)) {
+            $this-&gt;app-&gt;make(QueryRecorder::class)-&gt;reset();
+        }
+
+        if (config(&#039;flare.flare_middleware.&#039; . AddJobs::class)) {
+            $this-&gt;app-&gt;make(JobRecorder::class)-&gt;reset();
+        }
+
+        $this-&gt;app-&gt;make(DumpRecorder::class)-&gt;reset();
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/spatie/laravel-ignition/src/Recorders/DumpRecorder/Dump.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/spatie/laravel-ignition/src/ArgumentReducers -->
+
+</body>
+</html>

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/predis/predis/src/Cluster/Distributor/HashRing.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Predis package.
+ *
+ * (c) 2009-2020 Daniele Alessandri
+ * (c) 2021-2025 Till Krüss
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Predis\Cluster\Distributor;
+
+use Predis\Cluster\Hash\HashGeneratorInterface;
+
+/**
+ * This class implements an hashring-based distributor that uses the same
+ * algorithm of memcache to distribute keys in a cluster using client-side
+ * sharding.
+ * @author Lorenzo Castelli &lt;lcastelli@gmail.com&gt;
+ */
+class HashRing implements DistributorInterface, HashGeneratorInterface
+{
+    public const DEFAULT_REPLICAS = 128;
+    public const DEFAULT_WEIGHT = 100;
+
+    private $ring;
+    private $ringKeys;
+    private $ringKeysCount;
+    private $replicas;
+    private $nodeHashCallback;
+    private $nodes = [];
+
+    /**
+     * @param int   $replicas         Number of replicas in the ring.
+     * @param mixed $nodeHashCallback Callback returning a string used to calculate the hash of nodes.
+     */
+    public function __construct($replicas = self::DEFAULT_REPLICAS, $nodeHashCallback = null)
+    {
+        $this-&gt;replicas = $replicas;
+        $this-&gt;nodeHashCallback = $nodeHashCallback;
+    }
+
+    /**
+     * Adds a node to the ring with an optional weight.
+     *
+     * @param mixed $node   Node object.
+     * @param int   $weight Weight for the node.
+     */
+    public function add($node, $weight = null)
+    {
+        // In case of collisions in the hashes of the nodes, the node added
+        // last wins, thus the order in which nodes are added is significant.
+        $this-&gt;nodes[] = [
+            &#039;object&#039; =&gt; $node,
+            &#039;weight&#039; =&gt; (int) $weight ?: $this::DEFAULT_WEIGHT,
+        ];
+
+        $this-&gt;reset();
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function remove($node)
+    {
+        // A node is removed by resetting the ring so that it&#039;s recreated from
+        // scratch, in order to reassign possible hashes with collisions to the
+        // right node according to the order in which they were added in the
+        // first place.
+        for ($i = 0; $i &lt; count($this-&gt;nodes); ++$i) {
+            if ($this-&gt;nodes[$i][&#039;object&#039;] === $node) {
+                array_splice($this-&gt;nodes, $i, 1);
+                $this-&gt;reset();
+
+                break;
+            }
+        }
+    }
+
+    /**
+     * Resets the distributor.
+     */
+    private function reset()
+    {
+        unset(
+            $this-&gt;ring,
+            $this-&gt;ringKeys,
+            $this-&gt;ringKeysCount
+        );
+    }
+
+    /**
+     * Returns the initialization status of the distributor.
+     *
+     * @return bool
+     */
+    private function isInitialized()
+    {
+        return isset($this-&gt;ringKeys);
+    }
+
+    /**
+     * Calculates the total weight of all the nodes in the distributor.
+     *
+     * @return int
+     */
+    private function computeTotalWeight()
+    {
+        $totalWeight = 0;
+
+        foreach ($this-&gt;nodes as $node) {
+            $totalWeight += $node[&#039;weight&#039;];
+        }
+
+        return $totalWeight;
+    }
+
+    /**
+     * Initializes the distributor.
+     */
+    private function initialize()
+    {
+        if ($this-&gt;isInitialized()) {
+            return;
+        }
+
+        if (!$this-&gt;nodes) {
+            throw new EmptyRingException(&#039;Cannot initialize an empty hashring.&#039;);
+        }
+
+        $this-&gt;ring = [];
+        $totalWeight = $this-&gt;computeTotalWeight();
+        $nodesCount = count($this-&gt;nodes);
+
+        foreach ($this-&gt;nodes as $node) {
+            $weightRatio = $node[&#039;weight&#039;] / $totalWeight;
+            $this-&gt;addNodeToRing($this-&gt;ring, $node, $nodesCount, $this-&gt;replicas, $weightRatio);
+        }
+
+        ksort($this-&gt;ring, SORT_NUMERIC);
+        $this-&gt;ringKeys = array_keys($this-&gt;ring);
+        $this-&gt;ringKeysCount = count($this-&gt;ringKeys);
+    }
+
+    /**
+     * Implements the logic needed to add a node to the hashring.
+     *
+     * @param array $ring        Source hashring.
+     * @param mixed $node        Node object to be added.
+     * @param int   $totalNodes  Total number of nodes.
+     * @param int   $replicas    Number of replicas in the ring.
+     * @param float $weightRatio Weight ratio for the node.
+     */
+    protected function addNodeToRing(&amp;$ring, $node, $totalNodes, $replicas, $weightRatio)
+    {
+        $nodeObject = $node[&#039;object&#039;];
+        $nodeHash = $this-&gt;getNodeHash($nodeObject);
+        $replicas = (int) round($weightRatio * $totalNodes * $replicas);
+
+        for ($i = 0; $i &lt; $replicas; ++$i) {
+            $key = $this-&gt;hash(&quot;$nodeHash:$i&quot;);
+            $ring[$key] = $nodeObject;
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function getNodeHash($nodeObject)
+    {
+        if (!isset($this-&gt;nodeHashCallback)) {
+            return (string) $nodeObject;
+        }
+
+        return call_user_func($this-&gt;nodeHashCallback, $nodeObject);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function hash($value)
+    {
+        return crc32($value);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getByHash($hash)
+    {
+        return $this-&gt;ring[$this-&gt;getSlot($hash)];
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getBySlot($slot)
+    {
+        $this-&gt;initialize();
+
+        if (isset($this-&gt;ring[$slot])) {
+            return $this-&gt;ring[$slot];
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getSlot($hash)
+    {
+        $this-&gt;initialize();
+
+        $ringKeys = $this-&gt;ringKeys;
+        $upper = $this-&gt;ringKeysCount - 1;
+        $lower = 0;
+
+        while ($lower &lt;= $upper) {
+            $index = ($lower + $upper) &gt;&gt; 1;
+            $item = $ringKeys[$index];
+
+            if ($item &gt; $hash) {
+                $upper = $index - 1;
+            } elseif ($item &lt; $hash) {
+                $lower = $index + 1;
+            } else {
+                return $item;
+            }
+        }
+
+        return $ringKeys[$this-&gt;wrapAroundStrategy($upper, $lower, $this-&gt;ringKeysCount)];
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function get($value)
+    {
+        $hash = $this-&gt;hash($value);
+
+        return $this-&gt;getByHash($hash);
+    }
+
+    /**
+     * Implements a strategy to deal with wrap-around errors during binary searches.
+     *
+     * @param int $upper
+     * @param int $lower
+     * @param int $ringKeysCount
+     *
+     * @return int
+     */
+    protected function wrapAroundStrategy($upper, $lower, $ringKeysCount)
+    {
+        // Binary search for the last item in ringkeys with a value less or
+        // equal to the key. If no such item exists, return the last item.
+        return $upper &gt;= 0 ? $upper : $ringKeysCount - 1;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getHashGenerator()
+    {
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/predis/predis/src/Cluster/Distributor/KetamaRing.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/predis/predis/src/Cluster/Hash -->
+
+</body>
+</html>

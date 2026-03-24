@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpdocumentor/reflection-docblock/src/DocBlock/StandardTagFactory.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/**
+ * This file is part of phpDocumentor.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ *
+ * @link http://phpdoc.org
+ */
+
+namespace phpDocumentor\Reflection\DocBlock;
+
+use InvalidArgumentException;
+use phpDocumentor\Reflection\DocBlock\Tags\Author;
+use phpDocumentor\Reflection\DocBlock\Tags\Covers;
+use phpDocumentor\Reflection\DocBlock\Tags\Deprecated;
+use phpDocumentor\Reflection\DocBlock\Tags\Factory\Factory;
+use phpDocumentor\Reflection\DocBlock\Tags\Generic;
+use phpDocumentor\Reflection\DocBlock\Tags\InvalidTag;
+use phpDocumentor\Reflection\DocBlock\Tags\Link as LinkTag;
+use phpDocumentor\Reflection\DocBlock\Tags\Method;
+use phpDocumentor\Reflection\DocBlock\Tags\Mixin;
+use phpDocumentor\Reflection\DocBlock\Tags\Param;
+use phpDocumentor\Reflection\DocBlock\Tags\Property;
+use phpDocumentor\Reflection\DocBlock\Tags\PropertyRead;
+use phpDocumentor\Reflection\DocBlock\Tags\PropertyWrite;
+use phpDocumentor\Reflection\DocBlock\Tags\Return_;
+use phpDocumentor\Reflection\DocBlock\Tags\See as SeeTag;
+use phpDocumentor\Reflection\DocBlock\Tags\Since;
+use phpDocumentor\Reflection\DocBlock\Tags\Source;
+use phpDocumentor\Reflection\DocBlock\Tags\TemplateCovariant;
+use phpDocumentor\Reflection\DocBlock\Tags\Throws;
+use phpDocumentor\Reflection\DocBlock\Tags\Uses;
+use phpDocumentor\Reflection\DocBlock\Tags\Var_;
+use phpDocumentor\Reflection\DocBlock\Tags\Version;
+use phpDocumentor\Reflection\FqsenResolver;
+use phpDocumentor\Reflection\Types\Context as TypeContext;
+use ReflectionMethod;
+use ReflectionNamedType;
+use ReflectionParameter;
+use Webmozart\Assert\Assert;
+
+use function array_key_exists;
+use function array_merge;
+use function array_slice;
+use function call_user_func_array;
+use function get_class;
+use function is_object;
+use function preg_match;
+use function sprintf;
+use function strpos;
+use function trim;
+
+/**
+ * Creates a Tag object given the contents of a tag.
+ *
+ * This Factory is capable of determining the appropriate class for a tag and instantiate it using its `create`
+ * factory method. The `create` factory method of a Tag can have a variable number of arguments; this way you can
+ * pass the dependencies that you need to construct a tag object.
+ *
+ * &gt; Important: each parameter in addition to the body variable for the `create` method must default to null, otherwise
+ * &gt; it violates the constraint with the interface; it is recommended to use the {@see Assert::notNull()} method to
+ * &gt; verify that a dependency is actually passed.
+ *
+ * This Factory also features a Service Locator component that is used to pass the right dependencies to the
+ * `create` method of a tag; each dependency should be registered as a service or as a parameter.
+ *
+ * When you want to use a Tag of your own with custom handling you need to call the `registerTagHandler` method, pass
+ * the name of the tag and a Fully Qualified Class Name pointing to a class that implements the Tag interface.
+ */
+final class StandardTagFactory implements TagFactory
+{
+    /** PCRE regular expression matching a tag name. */
+    public const REGEX_TAGNAME = &#039;[\w\-\_\\\\:]+&#039;;
+
+    /**
+     * @var array&lt;class-string&lt;Tag&gt;|Factory&gt; An array with a tag as a key, and an
+     *                               FQCN to a class that handles it as an array value.
+     */
+    private array $tagHandlerMappings = [
+        &#039;author&#039;             =&gt; Author::class,
+        &#039;covers&#039;             =&gt; Covers::class,
+        &#039;deprecated&#039;         =&gt; Deprecated::class,
+        // &#039;example&#039;         =&gt; &#039;\phpDocumentor\Reflection\DocBlock\Tags\Example&#039;,
+        &#039;link&#039;               =&gt; LinkTag::class,
+        &#039;mixin&#039;              =&gt; Mixin::class,
+        &#039;method&#039;             =&gt; Method::class,
+        &#039;param&#039;              =&gt; Param::class,
+        &#039;property-read&#039;      =&gt; PropertyRead::class,
+        &#039;property&#039;           =&gt; Property::class,
+        &#039;property-write&#039;     =&gt; PropertyWrite::class,
+        &#039;return&#039;             =&gt; Return_::class,
+        &#039;see&#039;                =&gt; SeeTag::class,
+        &#039;since&#039;              =&gt; Since::class,
+        &#039;source&#039;             =&gt; Source::class,
+        &#039;template-covariant&#039; =&gt; TemplateCovariant::class,
+        &#039;throw&#039;              =&gt; Throws::class,
+        &#039;throws&#039;             =&gt; Throws::class,
+        &#039;uses&#039;               =&gt; Uses::class,
+        &#039;var&#039;                =&gt; Var_::class,
+        &#039;version&#039;            =&gt; Version::class,
+    ];
+
+    /**
+     * @var array&lt;class-string&lt;Tag&gt;&gt; An array with an annotation as a key, and an
+     *      FQCN to a class that handles it as an array value.
+     */
+    private array $annotationMappings = [];
+
+    /**
+     * @var ReflectionParameter[][] a lazy-loading cache containing parameters
+     *      for each tagHandler that has been used.
+     */
+    private array $tagHandlerParameterCache = [];
+
+    private FqsenResolver $fqsenResolver;
+
+    /**
+     * @var mixed[] an array representing a simple Service Locator where we can store parameters and
+     *     services that can be inserted into the Factory Methods of Tag Handlers.
+     */
+    private array $serviceLocator = [];
+
+    /**
+     * Initialize this tag factory with the means to resolve an FQSEN and optionally a list of tag handlers.
+     *
+     * If no tag handlers are provided than the default list in the {@see self::$tagHandlerMappings} property
+     * is used.
+     *
+     * @see self::registerTagHandler() to add a new tag handler to the existing default list.
+     *
+     * @param array&lt;class-string&lt;Tag&gt;&gt; $tagHandlers
+     */
+    public function __construct(FqsenResolver $fqsenResolver, ?array $tagHandlers = null)
+    {
+        $this-&gt;fqsenResolver = $fqsenResolver;
+        if ($tagHandlers !== null) {
+            $this-&gt;tagHandlerMappings = $tagHandlers;
+        }
+
+        $this-&gt;addService($fqsenResolver, FqsenResolver::class);
+    }
+
+    public function create(string $tagLine, ?TypeContext $context = null): Tag
+    {
+        if (!$context) {
+            $context = new TypeContext(&#039;&#039;);
+        }
+
+        [$tagName, $tagBody] = $this-&gt;extractTagParts($tagLine);
+
+        return $this-&gt;createTag(trim($tagBody), $tagName, $context);
+    }
+
+    /**
+     * @param mixed $value
+     */
+    public function addParameter(string $name, $value): void
+    {
+        $this-&gt;serviceLocator[$name] = $value;
+    }
+
+    public function addService(object $service, ?string $alias = null): void
+    {
+        $this-&gt;serviceLocator[$alias ?? get_class($service)] = $service;
+    }
+
+    /** {@inheritDoc} */
+    public function registerTagHandler(string $tagName, $handler): void
+    {
+        Assert::stringNotEmpty($tagName);
+        if (strpos($tagName, &#039;\\&#039;) !== false &amp;&amp; $tagName[0] !== &#039;\\&#039;) {
+            throw new InvalidArgumentException(
+                &#039;A namespaced tag must have a leading backslash as it must be fully qualified&#039;
+            );
+        }
+
+        if (is_object($handler)) {
+            Assert::isInstanceOf($handler, Factory::class);
+            $this-&gt;tagHandlerMappings[$tagName] = $handler;
+
+            return;
+        }
+
+        Assert::classExists($handler);
+        Assert::implementsInterface($handler, Tag::class);
+        $this-&gt;tagHandlerMappings[$tagName] = $handler;
+    }
+
+    /**
+     * Extracts all components for a tag.
+     *
+     * @return string[]
+     */
+    private function extractTagParts(string $tagLine): array
+    {
+        $matches = [];
+        if (!preg_match(&#039;/^@(&#039; . self::REGEX_TAGNAME . &#039;)((?:[\s\(\{])\s*([^\s].*)|$)/us&#039;, $tagLine, $matches)) {
+            throw new InvalidArgumentException(
+                &#039;The tag &quot;&#039; . $tagLine . &#039;&quot; does not seem to be wellformed, please check it for errors&#039;
+            );
+        }
+
+        return array_slice($matches, 1);
+    }
+
+    /**
+     * Creates a new tag object with the given name and body or returns null if the tag name was recognized but the
+     * body was invalid.
+     */
+    private function createTag(string $body, string $name, TypeContext $context): Tag
+    {
+        $handlerClassName = $this-&gt;findHandlerClassName($name, $context);
+        $arguments        = $this-&gt;getArgumentsForParametersFromWiring(
+            $this-&gt;fetchParametersForHandlerFactoryMethod($handlerClassName),
+            $this-&gt;getServiceLocatorWithDynamicParameters($context, $name, $body)
+        );
+
+        if (array_key_exists(&#039;tagLine&#039;, $arguments)) {
+            $arguments[&#039;tagLine&#039;] = sprintf(&#039;@%s %s&#039;, $name, $body);
+        }
+
+        try {
+            $callable = [$handlerClassName, &#039;create&#039;];
+            Assert::isCallable($callable);
+            /** @phpstan-var callable(string): ?Tag $callable */
+            $tag = call_user_func_array($callable, $arguments);
+
+            return $tag ?? InvalidTag::create($body, $name);
+        } catch (InvalidArgumentException $e) {
+            return InvalidTag::create($body, $name)-&gt;withError($e);
+        }
+    }
+
+    /**
+     * Determines the Fully Qualified Class Name of the Factory or Tag (containing a Factory Method `create`).
+     *
+     * @return class-string&lt;Tag&gt;|Factory
+     */
+    private function findHandlerClassName(string $tagName, TypeContext $context)
+    {
+        $handlerClassName = Generic::class;
+        if (isset($this-&gt;tagHandlerMappings[$tagName])) {
+            $handlerClassName = $this-&gt;tagHandlerMappings[$tagName];
+        } elseif ($this-&gt;isAnnotation($tagName)) {
+            // TODO: Annotation support is planned for a later stage and as such is disabled for now
+            $tagName = (string) $this-&gt;fqsenResolver-&gt;resolve($tagName, $context);
+            if (isset($this-&gt;annotationMappings[$tagName])) {
+                $handlerClassName = $this-&gt;annotationMappings[$tagName];
+            }
+        }
+
+        return $handlerClassName;
+    }
+
+    /**
+     * Retrieves the arguments that need to be passed to the Factory Method with the given Parameters.
+     *
+     * @param ReflectionParameter[] $parameters
+     * @param mixed[]               $locator
+     *
+     * @return mixed[] A series of values that can be passed to the Factory Method of the tag whose parameters
+     *     is provided with this method.
+     */
+    private function getArgumentsForParametersFromWiring(array $parameters, array $locator): array
+    {
+        $arguments = [];
+        foreach ($parameters as $parameter) {
+            $type     = $parameter-&gt;getType();
+            $typeHint = null;
+            if ($type instanceof ReflectionNamedType) {
+                $typeHint = $type-&gt;getName();
+                if ($typeHint === &#039;self&#039;) {
+                    $declaringClass = $parameter-&gt;getDeclaringClass();
+                    if ($declaringClass !== null) {
+                        $typeHint = $declaringClass-&gt;getName();
+                    }
+                }
+            }
+
+            $parameterName = $parameter-&gt;getName();
+            if (isset($locator[$typeHint ?? &#039;&#039;])) {
+                $arguments[$parameterName] = $locator[$typeHint ?? &#039;&#039;];
+                continue;
+            }
+
+            if (isset($locator[$parameterName])) {
+                $arguments[$parameterName] = $locator[$parameterName];
+                continue;
+            }
+
+            $arguments[$parameterName] = null;
+        }
+
+        return $arguments;
+    }
+
+    /**
+     * Retrieves a series of ReflectionParameter objects for the static &#039;create&#039; method of the given
+     * tag handler class name.
+     *
+     * @param class-string|Factory $handler
+     *
+     * @return ReflectionParameter[]
+     */
+    private function fetchParametersForHandlerFactoryMethod($handler): array
+    {
+        $handlerClassName = is_object($handler) ? get_class($handler) : $handler;
+
+        if (!isset($this-&gt;tagHandlerParameterCache[$handlerClassName])) {
+            $methodReflection                                  = new ReflectionMethod($handlerClassName, &#039;create&#039;);
+            $this-&gt;tagHandlerParameterCache[$handlerClassName] = $methodReflection-&gt;getParameters();
+        }
+
+        return $this-&gt;tagHandlerParameterCache[$handlerClassName];
+    }
+
+    /**
+     * Returns a copy of this class&#039; Service Locator with added dynamic parameters,
+     * such as the tag&#039;s name, body and Context.
+     *
+     * @param TypeContext $context The Context (namespace and aliases) that may be
+     *  passed and is used to resolve FQSENs.
+     * @param string      $tagName The name of the tag that may be
+     *  passed onto the factory method of the Tag class.
+     * @param string      $tagBody The body of the tag that may be
+     *  passed onto the factory method of the Tag class.
+     *
+     * @return mixed[]
+     */
+    private function getServiceLocatorWithDynamicParameters(
+        TypeContext $context,
+        string $tagName,
+        string $tagBody
+    ): array {
+        return array_merge(
+            $this-&gt;serviceLocator,
+            [
+                &#039;name&#039; =&gt; $tagName,
+                &#039;body&#039; =&gt; $tagBody,
+                TypeContext::class =&gt; $context,
+            ]
+        );
+    }
+
+    /**
+     * Returns whether the given tag belongs to an annotation.
+     *
+     * @todo this method should be populated once we implement Annotation notation support.
+     */
+    private function isAnnotation(string $tagContent): bool
+    {
+        // 1. Contains a namespace separator
+        // 2. Contains parenthesis
+        // 3. Is present in a list of known annotations (make the algorithm smart by first checking is the last part
+        //    of the annotation class name matches the found tag name
+
+        return false;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpdocumentor/reflection-docblock/src/DocBlock/Tag.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpdocumentor/reflection-docblock/src/DocBlock/Tags -->
+
+</body>
+</html>

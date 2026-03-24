@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Http/Resources/JsonApi/Concerns/ResolvesJsonApiElements.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Http\Resources\JsonApi\Concerns;
+
+use Generator;
+use Illuminate\Contracts\Support\Arrayable;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\Concerns\AsPivot;
+use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Http\Resources\Json\JsonResource;
+use Illuminate\Http\Resources\JsonApi\Exceptions\ResourceIdentificationException;
+use Illuminate\Http\Resources\JsonApi\JsonApiRequest;
+use Illuminate\Http\Resources\JsonApi\JsonApiResource;
+use Illuminate\Http\Resources\JsonApi\RelationResolver;
+use Illuminate\Http\Resources\MissingValue;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\LazyCollection;
+use Illuminate\Support\Str;
+use JsonSerializable;
+use WeakMap;
+
+trait ResolvesJsonApiElements
+{
+    /**
+     * Determine whether resources respect inclusions and fields from the request.
+     */
+    protected bool $usesRequestQueryString = true;
+
+    /**
+     * Determine whether included relationship for the resource from eager loaded relationship.
+     */
+    protected bool $includesPreviouslyLoadedRelationships = false;
+
+    /**
+     * Cached loaded relationships map.
+     *
+     * @var array&lt;int, array{0: \Illuminate\Http\Resources\JsonApi\JsonApiResource, 1: string, 2: string, 3: bool}|null
+     */
+    public $loadedRelationshipsMap;
+
+    /**
+     * Cached loaded relationships identifers.
+     */
+    protected array $loadedRelationshipIdentifiers = [];
+
+    /**
+     * The maximum relationship depth.
+     */
+    public static int $maxRelationshipDepth = 5;
+
+    /**
+     * Specify the maximum relationship depth.
+     */
+    public static function maxRelationshipDepth(int $depth): void
+    {
+        static::$maxRelationshipDepth = max(0, $depth);
+    }
+
+    /**
+     * Resolves `data` for the resource.
+     */
+    protected function resolveResourceObject(JsonApiRequest $request): array
+    {
+        $resourceType = $this-&gt;resolveResourceType($request);
+
+        return [
+            &#039;id&#039; =&gt; $this-&gt;resolveResourceIdentifier($request),
+            &#039;type&#039; =&gt; $resourceType,
+            ...(new Collection([
+                &#039;attributes&#039; =&gt; $this-&gt;resolveResourceAttributes($request, $resourceType),
+                &#039;relationships&#039; =&gt; $this-&gt;resolveResourceRelationshipIdentifiers($request),
+                &#039;links&#039; =&gt; $this-&gt;resolveResourceLinks($request),
+                &#039;meta&#039; =&gt; $this-&gt;resolveResourceMetaInformation($request),
+            ]))-&gt;filter()-&gt;map(fn ($value) =&gt; (object) $value),
+        ];
+    }
+
+    /**
+     * Resolve the resource&#039;s identifier.
+     *
+     * @return string|int
+     *
+     * @throws ResourceIdentificationException
+     */
+    public function resolveResourceIdentifier(JsonApiRequest $request): string
+    {
+        if (! is_null($resourceId = $this-&gt;toId($request))) {
+            return $resourceId;
+        }
+
+        if (! ($this-&gt;resource instanceof Model || method_exists($this-&gt;resource, &#039;getKey&#039;))) {
+            throw ResourceIdentificationException::attemptingToDetermineIdFor($this);
+        }
+
+        return (string) $this-&gt;resource-&gt;getKey();
+    }
+
+    /**
+     * Resolve the resource&#039;s type.
+     *
+     *
+     * @throws ResourceIdentificationException
+     */
+    public function resolveResourceType(JsonApiRequest $request): string
+    {
+        if (! is_null($resourceType = $this-&gt;toType($request))) {
+            return $resourceType;
+        }
+
+        if (static::class !== JsonApiResource::class) {
+            return Str::of(static::class)-&gt;classBasename()-&gt;basename(&#039;Resource&#039;)-&gt;snake()-&gt;pluralStudly();
+        }
+
+        if (! $this-&gt;resource instanceof Model) {
+            throw ResourceIdentificationException::attemptingToDetermineTypeFor($this);
+        }
+
+        $modelClassName = $this-&gt;resource::class;
+
+        $morphMap = Relation::getMorphAlias($modelClassName);
+
+        return Str::of(
+            $morphMap !== $modelClassName ? $morphMap : class_basename($modelClassName)
+        )-&gt;snake()-&gt;pluralStudly();
+    }
+
+    /**
+     * Resolve the resource&#039;s attributes.
+     *
+     *
+     * @throws \RuntimeException
+     */
+    protected function resolveResourceAttributes(JsonApiRequest $request, string $resourceType): array
+    {
+        $data = $this-&gt;toAttributes($request);
+
+        if ($data instanceof Arrayable) {
+            $data = $data-&gt;toArray();
+        } elseif ($data instanceof JsonSerializable) {
+            $data = $data-&gt;jsonSerialize();
+        }
+
+        $sparseFieldset = match ($this-&gt;usesRequestQueryString) {
+            true =&gt; $request-&gt;sparseFields($resourceType),
+            default =&gt; [],
+        };
+
+        $data = (new Collection($data))
+            -&gt;mapWithKeys(fn ($value, $key) =&gt; is_int($key) ? [$value =&gt; $this-&gt;resource-&gt;{$value}] : [$key =&gt; $value])
+            -&gt;when(! empty($sparseFieldset), fn ($attributes) =&gt; $attributes-&gt;only($sparseFieldset))
+            -&gt;transform(fn ($value) =&gt; value($value, $request))
+            -&gt;all();
+
+        return $this-&gt;filter($data);
+    }
+
+    /**
+     * Resolves `relationships` for the resource&#039;s data object.
+     *
+     * @return array
+     *
+     * @throws \RuntimeException
+     */
+    protected function resolveResourceRelationshipIdentifiers(JsonApiRequest $request): array
+    {
+        if (! $this-&gt;resource instanceof Model) {
+            return [];
+        }
+
+        $this-&gt;compileResourceRelationships($request);
+
+        return [
+            ...(new Collection($this-&gt;filter($this-&gt;loadedRelationshipIdentifiers)))
+                -&gt;map(function ($relation) {
+                    return ! is_null($relation) ? $relation : [&#039;data&#039; =&gt; null];
+                })-&gt;all(),
+        ];
+    }
+
+    /**
+     * Compile resource relationships.
+     */
+    protected function compileResourceRelationships(JsonApiRequest $request): void
+    {
+        if (! is_null($this-&gt;loadedRelationshipsMap)) {
+            return;
+        }
+
+        $sparseIncluded = match (true) {
+            $this-&gt;includesPreviouslyLoadedRelationships =&gt; array_keys($this-&gt;resource-&gt;getRelations()),
+            default =&gt; $request-&gt;sparseIncluded(),
+        };
+
+        $resourceRelationships = (new Collection($this-&gt;toRelationships($request)))
+            -&gt;transform(fn ($value, $key) =&gt; is_int($key) ? new RelationResolver($value) : new RelationResolver($key, $value))
+            -&gt;mapWithKeys(fn ($relationResolver) =&gt; [$relationResolver-&gt;relationName =&gt; $relationResolver])
+            -&gt;filter(fn ($value, $key) =&gt; in_array($key, $sparseIncluded));
+
+        $resourceRelationshipKeys = $resourceRelationships-&gt;keys();
+
+        $this-&gt;resource-&gt;loadMissing($resourceRelationshipKeys-&gt;all() ?? []);
+
+        $this-&gt;loadedRelationshipsMap = [];
+
+        $this-&gt;loadedRelationshipIdentifiers = (new LazyCollection(function () use ($request, $resourceRelationships) {
+            foreach ($resourceRelationships as $relationName =&gt; $relationResolver) {
+                $relatedModels = $relationResolver-&gt;handle($this-&gt;resource);
+                $relatedResourceClass = $relationResolver-&gt;resourceClass();
+
+                if (! is_null($relatedModels) &amp;&amp; $this-&gt;includesPreviouslyLoadedRelationships === false) {
+                    if (! empty($relations = $request-&gt;sparseIncluded($relationName))) {
+                        $relatedModels-&gt;loadMissing($relations);
+                    }
+                }
+
+                yield from $this-&gt;compileResourceRelationshipUsingResolver(
+                    $request,
+                    $this-&gt;resource,
+                    $relationResolver,
+                    $relatedModels,
+                );
+            }
+        }))-&gt;all();
+    }
+
+    /**
+     * Compile resource relations.
+     */
+    protected function compileResourceRelationshipUsingResolver(
+        JsonApiRequest $request,
+        mixed $resource,
+        RelationResolver $relationResolver,
+        Collection|Model|null $relatedModels
+    ): Generator {
+        $relationName = $relationResolver-&gt;relationName;
+        $resourceClass = $relationResolver-&gt;resourceClass();
+
+        // Relationship is a collection of models...
+        if ($relatedModels instanceof Collection) {
+            $relatedModels = $relatedModels-&gt;values();
+
+            if ($relatedModels-&gt;isEmpty()) {
+                yield $relationName =&gt; [&#039;data&#039; =&gt; $relatedModels];
+
+                return;
+            }
+
+            $relationship = $resource-&gt;{$relationName}();
+
+            $isUnique = ! $relationship instanceof BelongsToMany;
+
+            yield $relationName =&gt; [&#039;data&#039; =&gt; $relatedModels-&gt;map(function ($relatedModel) use ($request, $resourceClass, $isUnique) {
+                $relatedResource = rescue(fn () =&gt; $relatedModel-&gt;toResource($resourceClass), new JsonApiResource($relatedModel));
+
+                return transform(
+                    [$relatedResource-&gt;resolveResourceType($request), $relatedResource-&gt;resolveResourceIdentifier($request)],
+                    function ($uniqueKey) use ($request, $relatedModel, $relatedResource, $isUnique) {
+                        $this-&gt;loadedRelationshipsMap[] = [$relatedResource, ...$uniqueKey, $isUnique];
+
+                        $this-&gt;compileIncludedNestedRelationshipsMap($request, $relatedModel, $relatedResource);
+
+                        return [
+                            &#039;id&#039; =&gt; $uniqueKey[1],
+                            &#039;type&#039; =&gt; $uniqueKey[0],
+                        ];
+                    }
+                );
+            })-&gt;all()];
+
+            return;
+        }
+
+        // Relationship is a single model...
+        $relatedModel = $relatedModels;
+
+        if (is_null($relatedModel)) {
+            yield $relationName =&gt; null;
+
+            return;
+        } elseif ($relatedModel instanceof Pivot ||
+            in_array(AsPivot::class, class_uses_recursive($relatedModel), true)) {
+            yield $relationName =&gt; new MissingValue;
+
+            return;
+        }
+
+        $relatedResource = rescue(fn () =&gt; $relatedModel-&gt;toResource($resourceClass), new JsonApiResource($relatedModel));
+
+        yield $relationName =&gt; [&#039;data&#039; =&gt; transform(
+            [$relatedResource-&gt;resolveResourceType($request), $relatedResource-&gt;resolveResourceIdentifier($request)],
+            function ($uniqueKey) use ($relatedModel, $relatedResource, $request) {
+                $this-&gt;loadedRelationshipsMap[] = [$relatedResource, ...$uniqueKey, true];
+
+                $this-&gt;compileIncludedNestedRelationshipsMap($request, $relatedModel, $relatedResource);
+
+                return [
+                    &#039;id&#039; =&gt; $uniqueKey[1],
+                    &#039;type&#039; =&gt; $uniqueKey[0],
+                ];
+            }
+        )];
+    }
+
+    /**
+     * Compile included relationships map.
+     */
+    protected function compileIncludedNestedRelationshipsMap(JsonApiRequest $request, Model $relation, JsonApiResource $resource): void
+    {
+        (new Collection($resource-&gt;toRelationships($request)))
+            -&gt;transform(fn ($value, $key) =&gt; is_int($key) ? new RelationResolver($value) : new RelationResolver($key, $value))
+            -&gt;mapWithKeys(fn ($relationResolver) =&gt; [$relationResolver-&gt;relationName =&gt; $relationResolver])
+            -&gt;filter(fn ($value, $key) =&gt; in_array($key, array_keys($relation-&gt;getRelations())))
+            -&gt;each(function ($relationResolver, $key) use ($relation, $request) {
+                $this-&gt;compileResourceRelationshipUsingResolver($request, $relation, $relationResolver, $relation-&gt;getRelation($key));
+            });
+    }
+
+    /**
+     * Resolves `included` for the resource.
+     */
+    public function resolveIncludedResourceObjects(JsonApiRequest $request): Collection
+    {
+        if (! $this-&gt;resource instanceof Model) {
+            return new Collection;
+        }
+
+        $this-&gt;compileResourceRelationships($request);
+
+        $relations = new Collection;
+        $index = 0;
+
+        // Track visited objects by instance + type to prevent infinite loops from circular
+        // references created by &quot;chaperone()&quot;. We use object instances rather than type
+        // and ID for any possible cases like BelongsToMany with different pivot data.
+        // We&#039;ll track types to allow the same models with different resource types.
+        $visitedObjects = new WeakMap;
+
+        $visitedObjects[$this-&gt;resource] = [
+            $this-&gt;resolveResourceType($request) =&gt; true,
+        ];
+
+        while ($index &lt; count($this-&gt;loadedRelationshipsMap)) {
+            [$resourceInstance, $type, $id, $isUnique] = $this-&gt;loadedRelationshipsMap[$index];
+
+            $underlyingResource = $resourceInstance-&gt;resource;
+
+            if (is_object($underlyingResource)) {
+                if (isset($visitedObjects[$underlyingResource][$type])) {
+                    $index++;
+                    continue;
+                }
+
+                $visitedObjects[$underlyingResource] ??= [];
+                $visitedObjects[$underlyingResource][$type] = true;
+            }
+
+            if (! $resourceInstance instanceof JsonApiResource &amp;&amp;
+                $resourceInstance instanceof JsonResource) {
+                $resourceInstance = new JsonApiResource($resourceInstance-&gt;resource);
+            }
+
+            $relationsData = $resourceInstance
+                -&gt;includePreviouslyLoadedRelationships()
+                -&gt;resolve($request);
+
+            array_push($this-&gt;loadedRelationshipsMap, ...($resourceInstance-&gt;loadedRelationshipsMap ?? []));
+
+            $relations-&gt;push(array_filter([
+                &#039;id&#039; =&gt; $id,
+                &#039;type&#039; =&gt; $type,
+                &#039;_uniqueKey&#039; =&gt; implode(&#039;:&#039;, $isUnique === true ? [$id, $type] : [$id, $type, (string) Str::random()]),
+                &#039;attributes&#039; =&gt; Arr::get($relationsData, &#039;data.attributes&#039;),
+                &#039;relationships&#039; =&gt; Arr::get($relationsData, &#039;data.relationships&#039;),
+                &#039;links&#039; =&gt; Arr::get($relationsData, &#039;data.links&#039;),
+                &#039;meta&#039; =&gt; Arr::get($relationsData, &#039;data.meta&#039;),
+            ]));
+
+            $index++;
+        }
+
+        return $relations;
+    }
+
+    /**
+     * Resolve the links for the resource.
+     *
+     * @return array&lt;string, mixed&gt;
+     */
+    protected function resolveResourceLinks(JsonApiRequest $request): array
+    {
+        return $this-&gt;toLinks($request);
+    }
+
+    /**
+     * Resolve the meta information for the resource.
+     *
+     * @return array&lt;string, mixed&gt;
+     */
+    protected function resolveResourceMetaInformation(JsonApiRequest $request): array
+    {
+        return $this-&gt;toMeta($request);
+    }
+
+    /**
+     * Indicate that relationship loading should respect the request&#039;s &quot;includes&quot; query string.
+     *
+     * @return $this
+     */
+    public function respectFieldsAndIncludesInQueryString(bool $value = true)
+    {
+        $this-&gt;usesRequestQueryString = $value;
+
+        return $this;
+    }
+
+    /**
+     * Indicate that relationship loading should not rely on the request&#039;s &quot;includes&quot; query string.
+     *
+     * @return $this
+     */
+    public function ignoreFieldsAndIncludesInQueryString()
+    {
+        return $this-&gt;respectFieldsAndIncludesInQueryString(false);
+    }
+
+    /**
+     * Determine relationship should include loaded relationships.
+     *
+     * @return $this
+     */
+    public function includePreviouslyLoadedRelationships()
+    {
+        $this-&gt;includesPreviouslyLoadedRelationships = true;
+
+        return $this;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Http/Resources/JsonApi/Concerns/ResolvesJsonApiRequest.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Http/Resources/JsonApi/Exceptions -->
+
+</body>
+</html>

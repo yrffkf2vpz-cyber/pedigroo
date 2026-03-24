@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/app/Services/Ingest/IngestService.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace App\Services\Ingest;
+
+use App\Services\Normalizers\NormalizeDogService;
+use App\Models\Ingest\PdfImport;
+use App\Jobs\ProcessPdfImportJob;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use Carbon\Carbon;
+
+class IngestService
+{
+    protected NormalizeDogService $normalizer;
+
+    public function __construct(NormalizeDogService $normalizer)
+    {
+        $this-&gt;normalizer = $normalizer;
+    }
+
+    /**
+     * PDF felismerés + letöltés + ingest indítás
+     */
+    public function ingestUrl(string $url, string $source): void
+    {
+        // 1) PDF felismerés
+        if ($this-&gt;isPdfLink($url)) {
+            $path = $this-&gt;downloadPdf($url, $source);
+            $type = $this-&gt;detectPdfType($url, $source);
+
+            $this-&gt;createPdfImportRecord($path, $type, $source);
+            return;
+        }
+
+        // 2) HTML → scraper (ha van)
+        // Ha nincs scraper modulod, ezt később bővítjük.
+    }
+
+    private function isPdfLink(string $url): bool
+    {
+        return str_ends_with(strtolower($url), &#039;.pdf&#039;);
+    }
+
+    private function downloadPdf(string $url, string $source): string
+    {
+        $contents = file_get_contents($url);
+
+        $filename = basename(parse_url($url, PHP_URL_PATH));
+        $path = &quot;ingest/pdf/&quot; . date(&#039;Y/m&#039;) . &quot;/{$source}/{$filename}&quot;;
+
+        Storage::put($path, $contents);
+
+        return $path;
+    }
+
+    private function detectPdfType(string $url, string $source): string
+    {
+        $lower = strtolower($url);
+
+        if (str_contains($lower, &#039;hd&#039;) || str_contains($lower, &#039;ed&#039;) || str_contains($lower, &#039;health&#039;)) {
+            return &#039;health&#039;;
+        }
+
+        if (str_contains($lower, &#039;show&#039;) || str_contains($lower, &#039;result&#039;) || str_contains($lower, &#039;kiállítás&#039;)) {
+            return &#039;event&#039;;
+        }
+
+        if (str_contains($lower, &#039;pedigree&#039;) || str_contains($lower, &#039;származás&#039;) || str_contains($lower, &#039;rodokmen&#039;)) {
+            return &#039;pedigree&#039;;
+        }
+
+        return &#039;event&#039;;
+    }
+
+    private function createPdfImportRecord(string $path, string $type, string $source): void
+    {
+        $import = PdfImport::create([
+            &#039;user_id&#039;   =&gt; null,
+            &#039;type&#039;      =&gt; $type,
+            &#039;source&#039;    =&gt; $source,
+            &#039;file_path&#039; =&gt; $path,
+            &#039;status&#039;    =&gt; &#039;pending&#039;,
+            &#039;stats&#039;     =&gt; null,
+            &#039;log&#039;       =&gt; [],
+        ]);
+
+        ProcessPdfImportJob::dispatch($import-&gt;id);
+    }
+
+    /**
+     * A meglévő kutya-ingest változatlan marad
+     */
+    public function ingestDog(array $raw)
+    {
+        return DB::transaction(function () use ($raw) {
+
+            // 1) Normalizálás
+            $normalized = $this-&gt;normalizer-&gt;normalize($raw);
+
+            // 2) Mentés a pedroo_dogs táblába
+            $dogId = DB::table(&#039;pedroo_dogs&#039;)-&gt;insertGetId([
+                &#039;source_dog_id&#039;   =&gt; $raw[&#039;source_id&#039;] ?? null,
+                &#039;source_name&#039;     =&gt; $raw[&#039;raw_name&#039;] ?? null,
+                &#039;source_reg_no&#039;   =&gt; $raw[&#039;raw_reg_no&#039;] ?? null,
+                &#039;source_fci_no&#039;   =&gt; $raw[&#039;raw_fci_no&#039;] ?? null,
+
+                &#039;real_name&#039;       =&gt; $normalized[&#039;real_name&#039;],
+                &#039;real_prefix&#039;     =&gt; $normalized[&#039;real_prefix&#039;],
+                &#039;real_firstname&#039;  =&gt; $normalized[&#039;real_firstname&#039;],
+                &#039;real_lastname&#039;   =&gt; $normalized[&#039;real_lastname&#039;],
+                &#039;real_dob&#039;        =&gt; $raw[&#039;raw_dob&#039;] ?? null,
+                &#039;real_sex&#039;        =&gt; $raw[&#039;raw_sex&#039;] ?? null,
+                &#039;real_color&#039;      =&gt; $normalized[&#039;real_color&#039;],
+                &#039;real_breed&#039;      =&gt; $raw[&#039;raw_breed&#039;] ?? null,
+                &#039;real_origin_country&#039;   =&gt; $normalized[&#039;origin_country&#039;] ?? null,
+                &#039;real_standing_country&#039; =&gt; $normalized[&#039;standing_country&#039;] ?? null,
+                &#039;real_breeder&#039;    =&gt; $raw[&#039;raw_breeder&#039;] ?? null,
+                &#039;real_owner&#039;      =&gt; $raw[&#039;raw_owner&#039;] ?? null,
+                &#039;real_kennel&#039;     =&gt; $raw[&#039;raw_kennel&#039;] ?? null,
+
+                &#039;found_on&#039;        =&gt; $raw[&#039;found_on&#039;] ?? null,
+                &#039;confidence&#039;      =&gt; $normalized[&#039;confidence&#039;],
+            ]);
+
+            // 3) Szülők mentése
+            if (!empty($raw[&#039;parents&#039;])) {
+                foreach ($raw[&#039;parents&#039;] as $relation =&gt; $parentName) {
+                    if (!$parentName) continue;
+
+                    DB::table(&#039;pedroo_parents&#039;)-&gt;insert([
+                        &#039;child_name&#039; =&gt; $normalized[&#039;real_name&#039;],
+                        &#039;parent_name&#039;=&gt; $parentName,
+                        &#039;relation&#039;   =&gt; $relation,
+                        &#039;created_at&#039; =&gt; Carbon::now(),
+                        &#039;updated_at&#039; =&gt; Carbon::now(),
+                    ]);
+                }
+            }
+
+            // 4) Gyerekek mentése
+            if (!empty($raw[&#039;children&#039;])) {
+                foreach ($raw[&#039;children&#039;] as $childName) {
+                    DB::table(&#039;pedroo_children&#039;)-&gt;insert([
+                        &#039;parent_name&#039;=&gt; $normalized[&#039;real_name&#039;],
+                        &#039;child_name&#039; =&gt; $childName,
+                        &#039;created_at&#039; =&gt; Carbon::now(),
+                        &#039;updated_at&#039; =&gt; Carbon::now(),
+                    ]);
+                }
+            }
+
+            // 5) Eredmények mentése
+            if (!empty($raw[&#039;results&#039;])) {
+                foreach ($raw[&#039;results&#039;] as $result) {
+                    DB::table(&#039;dog_event_results&#039;)-&gt;insert([
+                        &#039;dog_name&#039;      =&gt; $normalized[&#039;real_name&#039;],
+                        &#039;show_id&#039;       =&gt; $result[&#039;show_id&#039;] ?? null,
+                        &#039;show_result_id&#039;=&gt; $result[&#039;result_id&#039;] ?? null,
+                        &#039;created_at&#039;    =&gt; Carbon::now(),
+                        &#039;updated_at&#039;    =&gt; Carbon::now(),
+                    ]);
+                }
+            }
+
+            return $dogId;
+        });
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /app/Services/Ingest/Pdf/PdfNormalizerFactory.php -->
+<!-- PEDROO_NEXT_DIR: /app/Services/Ingest/Pdf -->
+
+</body>
+</html>

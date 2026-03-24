@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/symfony/process/Pipes/AbstractPipes.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\Process\Pipes;
+
+use Symfony\Component\Process\Exception\InvalidArgumentException;
+
+/**
+ * @author Romain Neutron &lt;imprec@gmail.com&gt;
+ *
+ * @internal
+ */
+abstract class AbstractPipes implements PipesInterface
+{
+    public array $pipes = [];
+
+    private string $inputBuffer = &#039;&#039;;
+    /** @var resource|string|\Iterator */
+    private $input;
+    private bool $blocked = true;
+    private ?string $lastError = null;
+
+    /**
+     * @param resource|string|\Iterator $input
+     */
+    public function __construct($input)
+    {
+        if (\is_resource($input) || $input instanceof \Iterator) {
+            $this-&gt;input = $input;
+        } else {
+            $this-&gt;inputBuffer = (string) $input;
+        }
+    }
+
+    public function close(): void
+    {
+        foreach ($this-&gt;pipes as $pipe) {
+            if (\is_resource($pipe)) {
+                fclose($pipe);
+            }
+        }
+        $this-&gt;pipes = [];
+    }
+
+    /**
+     * Returns true if a system call has been interrupted.
+     *
+     * stream_select() returns false when the `select` system call is interrupted by an incoming signal.
+     */
+    protected function hasSystemCallBeenInterrupted(): bool
+    {
+        $lastError = $this-&gt;lastError;
+        $this-&gt;lastError = null;
+
+        if (null === $lastError) {
+            return false;
+        }
+
+        if (false !== stripos($lastError, &#039;interrupted system call&#039;)) {
+            return true;
+        }
+
+        // on applications with a different locale than english, the message above is not found because
+        // it&#039;s translated. So we also check for the SOCKET_EINTR constant which is defined under
+        // Windows and UNIX-like platforms (if available on the platform).
+        return \defined(&#039;SOCKET_EINTR&#039;) &amp;&amp; str_starts_with($lastError, &#039;stream_select(): Unable to select [&#039;.\SOCKET_EINTR.&#039;]&#039;);
+    }
+
+    /**
+     * Unblocks streams.
+     */
+    protected function unblock(): void
+    {
+        if (!$this-&gt;blocked) {
+            return;
+        }
+
+        foreach ($this-&gt;pipes as $pipe) {
+            stream_set_blocking($pipe, false);
+        }
+        if (\is_resource($this-&gt;input)) {
+            stream_set_blocking($this-&gt;input, false);
+        }
+
+        $this-&gt;blocked = false;
+    }
+
+    /**
+     * Writes input to stdin.
+     *
+     * @throws InvalidArgumentException When an input iterator yields a non supported value
+     */
+    protected function write(): ?array
+    {
+        if (!isset($this-&gt;pipes[0])) {
+            return null;
+        }
+        $input = $this-&gt;input;
+
+        if ($input instanceof \Iterator) {
+            if (!$input-&gt;valid()) {
+                $input = null;
+            } elseif (\is_resource($input = $input-&gt;current())) {
+                stream_set_blocking($input, false);
+            } elseif (!isset($this-&gt;inputBuffer[0])) {
+                if (!\is_string($input)) {
+                    if (!\is_scalar($input)) {
+                        throw new InvalidArgumentException(\sprintf(&#039;&quot;%s&quot; yielded a value of type &quot;%s&quot;, but only scalars and stream resources are supported.&#039;, get_debug_type($this-&gt;input), get_debug_type($input)));
+                    }
+                    $input = (string) $input;
+                }
+                $this-&gt;inputBuffer = $input;
+                $this-&gt;input-&gt;next();
+                $input = null;
+            } else {
+                $input = null;
+            }
+        }
+
+        $r = $e = [];
+        $w = [$this-&gt;pipes[0]];
+
+        // let&#039;s have a look if something changed in streams
+        if (false === @stream_select($r, $w, $e, 0, 0)) {
+            return null;
+        }
+
+        foreach ($w as $stdin) {
+            if (isset($this-&gt;inputBuffer[0])) {
+                if (false === $written = @fwrite($stdin, $this-&gt;inputBuffer)) {
+                    return $this-&gt;closeBrokenInputPipe();
+                }
+                $this-&gt;inputBuffer = substr($this-&gt;inputBuffer, $written);
+                if (isset($this-&gt;inputBuffer[0]) &amp;&amp; isset($this-&gt;pipes[0])) {
+                    return [$this-&gt;pipes[0]];
+                }
+            }
+
+            if ($input) {
+                while (true) {
+                    $data = fread($input, self::CHUNK_SIZE);
+                    if (!isset($data[0])) {
+                        break;
+                    }
+                    if (false === $written = @fwrite($stdin, $data)) {
+                        return $this-&gt;closeBrokenInputPipe();
+                    }
+                    $data = substr($data, $written);
+                    if (isset($data[0])) {
+                        $this-&gt;inputBuffer = $data;
+
+                        return isset($this-&gt;pipes[0]) ? [$this-&gt;pipes[0]] : null;
+                    }
+                }
+                if (feof($input)) {
+                    if ($this-&gt;input instanceof \Iterator) {
+                        $this-&gt;input-&gt;next();
+                    } else {
+                        $this-&gt;input = null;
+                    }
+                }
+            }
+        }
+
+        // no input to read on resource, buffer is empty
+        if (!isset($this-&gt;inputBuffer[0]) &amp;&amp; !($this-&gt;input instanceof \Iterator ? $this-&gt;input-&gt;valid() : $this-&gt;input)) {
+            $this-&gt;input = null;
+            fclose($this-&gt;pipes[0]);
+            unset($this-&gt;pipes[0]);
+        } elseif (!$w) {
+            return [$this-&gt;pipes[0]];
+        }
+
+        return null;
+    }
+
+    private function closeBrokenInputPipe(): void
+    {
+        $this-&gt;lastError = error_get_last()[&#039;message&#039;] ?? null;
+        if (\is_resource($this-&gt;pipes[0] ?? null)) {
+            fclose($this-&gt;pipes[0]);
+        }
+        unset($this-&gt;pipes[0]);
+
+        $this-&gt;input = null;
+        $this-&gt;inputBuffer = &#039;&#039;;
+    }
+
+    /**
+     * @internal
+     */
+    public function handleError(int $type, string $msg): void
+    {
+        $this-&gt;lastError = $msg;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/symfony/process/Pipes/PipesInterface.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/symfony/routing -->
+
+</body>
+</html>

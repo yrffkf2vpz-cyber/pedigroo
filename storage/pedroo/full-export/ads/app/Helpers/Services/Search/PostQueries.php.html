@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Helpers/Services/Search/PostQueries.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Helpers\Services\Search;
+
+use App\Enums\PostType;
+use App\Helpers\Common\DBUtils;
+use App\Helpers\Common\PaginationHelper;
+use App\Helpers\Services\Search\Traits\Filters;
+use App\Helpers\Services\Search\Traits\GroupBy;
+use App\Helpers\Services\Search\Traits\Having;
+use App\Helpers\Services\Search\Traits\OrderBy;
+use App\Helpers\Services\Search\Traits\Relations;
+use App\Helpers\Services\Search\Traits\Select;
+use App\Http\Resources\EntityCollection;
+use App\Http\Resources\PostResource;
+use App\Jobs\GeneratePostCollectionMainImageThumbsJob;
+use App\Models\Post;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\DB;
+use Throwable;
+
+class PostQueries
+{
+	use Select, Relations, Filters, GroupBy, Having, OrderBy;
+	
+	private static bool $dbModeStrict = false;
+	protected static int $cacheExpiration = 300; // 5mn (60s * 5)
+	
+	public mixed $country;
+	public mixed $lang;
+	
+	// Default Inputs (op, perPage, cacheExpiration &amp; orderBy)
+	// These inputs need to have a default value
+	protected array $input = [];
+	
+	// Pre-Search Objects
+	private array $preSearch;
+	public mixed $cat = null;
+	public mixed $city = null;
+	public mixed $citiesIds = [];
+	public mixed $admin = null;
+	
+	// Default Columns Selected
+	protected array $select = [];
+	protected array $groupBy = [];
+	protected array $having = [];
+	protected array $orderBy = [];
+	
+	protected Builder $posts;
+	protected string $postsTable;
+	
+	// &#039;queryStringKey&#039; =&gt; [&#039;name&#039; =&gt; &#039;column&#039;, &#039;order&#039; =&gt; &#039;direction&#039;]
+	public array $orderByParametersFields = [];
+	
+	/**
+	 * PostQueries constructor.
+	 *
+	 * @param array $input
+	 * @param array $preSearch
+	 */
+	public function __construct(array $input = [], array $preSearch = [])
+	{
+		self::$dbModeStrict = config(&#039;database.connections.&#039; . config(&#039;database.default&#039;) . &#039;.strict&#039;);
+		
+		// Input
+		$this-&gt;input = $this-&gt;bindValidValuesForInput($input);
+		
+		// Pre-Search (category, city or admin. division)
+		$this-&gt;cat = !empty($preSearch[&#039;cat&#039;]) ? $preSearch[&#039;cat&#039;] : null;
+		$this-&gt;city = !empty($preSearch[&#039;city&#039;]) ? $preSearch[&#039;city&#039;] : null;
+		$this-&gt;citiesIds = !empty($preSearch[&#039;citiesIds&#039;]) ? $preSearch[&#039;citiesIds&#039;] : [];
+		$this-&gt;admin = !empty($preSearch[&#039;admin&#039;]) ? $preSearch[&#039;admin&#039;] : null;
+		
+		// Save preSearch
+		$this-&gt;preSearch = $preSearch;
+		
+		// Init. Builder
+		$this-&gt;posts = Post::query();
+		$this-&gt;postsTable = (new Post())-&gt;getTable();
+		
+		// Add Default Select Columns
+		$this-&gt;setSelect();
+		
+		// Relations
+		$this-&gt;setRelations();
+	}
+	
+	/**
+	 * Get the results
+	 *
+	 * @return array
+	 */
+	public function fetch(): array
+	{
+		// Apply Requested Filters
+		$this-&gt;applyFilters();
+		
+		// Apply Aggregation &amp; Reorder Statements
+		$this-&gt;applyGroupBy();
+		$this-&gt;applyHaving();
+		$this-&gt;applyOrderBy();
+		
+		$isListingTypeShowingEnabled = (config(&#039;settings.listing_form.show_listing_type&#039;) == &#039;1&#039;);
+		
+		// Get Count PostTypes Results
+		$count = $isListingTypeShowingEnabled ? $this-&gt;countFetch() : [];
+		
+		// Get Results
+		$perPage = $this-&gt;input[&#039;perPage&#039;] ?? null;
+		$posts = $this-&gt;posts-&gt;paginate((int)$perPage);
+		$posts = PaginationHelper::adjustSides($posts);
+		
+		// Generate listings images thumbnails
+		GeneratePostCollectionMainImageThumbsJob::dispatch($posts);
+		
+		// Remove Distance from Request
+		$this-&gt;input = $this-&gt;removeDistanceFromRequest($this-&gt;input);
+		
+		// If the request is made from the app&#039;s Web environment,
+		// use the Web URL as the pagination&#039;s base URL
+		$posts = setPaginationBaseUrl($posts);
+		
+		// Append request queries in the pagination links
+		$query = request()-&gt;query();
+		$query = collect($query)-&gt;map(fn ($item) =&gt; (is_null($item) ? &#039;&#039; : $item))-&gt;toArray();
+		$posts-&gt;appends($query);
+		
+		// Get Count Results
+		$totalCountId = 0;
+		$count[$totalCountId] = $posts-&gt;total();
+		if ($isListingTypeShowingEnabled) {
+			$postTypeId = $this-&gt;input[&#039;type&#039;] ?? null;
+			if (!empty($postTypeId) &amp;&amp; isset($count[$postTypeId])) {
+				$total = 0;
+				foreach ($count as $typeId =&gt; $countItems) {
+					if ($typeId != $totalCountId) {
+						$total += $countItems;
+					}
+				}
+				$count[$totalCountId] = $total;
+			}
+		}
+		
+		// Wrap the listings for API calls
+		$postsCollection = new EntityCollection(PostResource::class, $posts, $this-&gt;input);
+		$message = ($posts-&gt;count() &lt;= 0) ? trans(&#039;global.no_posts_found&#039;) : null;
+		$postsResult = $postsCollection-&gt;toResponse(request())-&gt;getData(true);
+		
+		// Retrieve user identifiers values
+		$userId = $this-&gt;input[&#039;userId&#039;] ?? null;
+		$username = $this-&gt;input[&#039;username&#039;] ?? null;
+		$searchBasedOnUser = (!empty($userId) || !empty($username));
+		
+		// Add &#039;user&#039; object in preSearch (If available)
+		$this-&gt;preSearch[&#039;user&#039;] = null;
+		if ($searchBasedOnUser) {
+			$this-&gt;preSearch[&#039;user&#039;] = data_get($postsResult, &#039;data.0.user&#039;);
+		}
+		
+		$this-&gt;preSearch[&#039;tag&#039;] = $this-&gt;input[&#039;tag&#039;] ?? null;
+		
+		$this-&gt;preSearch[&#039;distance&#039;] = [
+			&#039;default&#039; =&gt; self::$defaultDistance,
+			&#039;current&#039; =&gt; self::$distance,
+			&#039;max&#039;     =&gt; self::$maxDistance,
+		];
+		
+		// Results Data
+		return [
+			&#039;message&#039;   =&gt; $message,
+			&#039;count&#039;     =&gt; $count,
+			&#039;posts&#039;     =&gt; $postsResult,
+			&#039;distance&#039;  =&gt; self::$distance,
+			&#039;preSearch&#039; =&gt; $this-&gt;preSearch,
+			&#039;tags&#039;      =&gt; $this-&gt;getPostsTags($posts),
+		];
+	}
+	
+	/**
+	 * Count the results
+	 *
+	 * @return array
+	 */
+	private function countFetch(): array
+	{
+		$count = [];
+		
+		$postTypes = PostType::all();
+		if (empty($postTypes)) {
+			return $count;
+		}
+		
+		// Count entries by post type
+		$pattern = &#039;/`post_type_id`\s*=\s*[\d\&#039;]+\s+/ui&#039;;
+		foreach ($postTypes as $postType) {
+			$postTypeId = data_get($postType, &#039;id&#039;);
+			$iPosts = clone $this-&gt;posts;
+			
+			$sql = DBUtils::getRealSql($iPosts-&gt;toSql(), $iPosts-&gt;getBindings());
+			
+			if (preg_match($pattern, $sql)) {
+				$sql = preg_replace($pattern, &#039;`post_type_id` = &#039; . $postTypeId . &#039; &#039;, $sql);
+			} else {
+				$iPosts-&gt;where(&#039;post_type_id&#039;, $postTypeId);
+				$sql = DBUtils::getRealSql($iPosts-&gt;toSql(), $iPosts-&gt;getBindings());
+			}
+			
+			try {
+				$sql = &#039;SELECT COUNT(*) AS total FROM (&#039; . $sql . &#039;) AS x&#039;;
+				$result = DB::select($sql);
+			} catch (Throwable $e) {
+				// dd($e-&gt;getMessage()); // Debug!
+				$result = null;
+			}
+			
+			$count[$postTypeId] = isset($result[0]) ? (int)$result[0]-&gt;total : 0;
+		}
+		
+		return $count;
+	}
+	
+	/**
+	 * Get found listings&#039; tags (per page)
+	 *
+	 * @param $posts
+	 * @return array|string|null
+	 */
+	private function getPostsTags($posts): array|string|null
+	{
+		$isListingsTagsShowingEnabled = (config(&#039;settings.listings_list.show_listings_tags&#039;) == &#039;1&#039;);
+		
+		if (!$isListingsTagsShowingEnabled) {
+			return null;
+		}
+		
+		if ($posts-&gt;count() &gt; 0) {
+			$tags = [];
+			foreach ($posts as $post) {
+				if (!empty($post-&gt;tags)) {
+					$tags = array_merge($tags, $post-&gt;tags);
+				}
+			}
+			
+			return tagCleaner($tags);
+		}
+		
+		return null;
+	}
+	
+	/**
+	 * Bind valid values for the input&#039;s elements
+	 *
+	 * @param array $array
+	 * @return array
+	 */
+	private function bindValidValuesForInput(array $array = []): array
+	{
+		// cacheExpiration
+		$cacheExpiration = $array[&#039;cacheExpiration&#039;] ?? null;
+		$cacheExpirationIsValid = !empty($cacheExpiration) &amp;&amp; is_numeric($cacheExpiration);
+		if (!$cacheExpirationIsValid) {
+			$array[&#039;cacheExpiration&#039;] = getGlobalCacheTtl();
+		}
+		
+		// op (operation)
+		$array[&#039;op&#039;] = $array[&#039;op&#039;] ?? &#039;default&#039;;
+		
+		// perPage
+		$perPage = $array[&#039;perPage&#039;] ?? null;
+		$array[&#039;perPage&#039;] = getNumberOfItemsPerPage(&#039;posts&#039;, $perPage);
+		
+		// orderBy
+		// Avoid to set an arbitrary orderBy value (set value to null instead)
+		// $orderBy = $array[&#039;orderBy&#039;] ?? null;
+		// $array[&#039;orderBy&#039;] = !empty($orderBy) ? $orderBy : null;
+		
+		return $array;
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Helpers/Services/Search/Traits/Filters.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Helpers/Services/Search/Traits -->
+
+</body>
+</html>

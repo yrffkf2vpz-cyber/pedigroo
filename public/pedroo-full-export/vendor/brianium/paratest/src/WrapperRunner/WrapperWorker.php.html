@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/brianium/paratest/src/WrapperRunner/WrapperWorker.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace ParaTest\WrapperRunner;
+
+use ParaTest\Options;
+use SplFileInfo;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Process\InputStream;
+use Symfony\Component\Process\Process;
+use Throwable;
+
+use function array_map;
+use function assert;
+use function clearstatcache;
+use function file_get_contents;
+use function filesize;
+use function implode;
+use function is_array;
+use function is_string;
+use function serialize;
+use function sprintf;
+use function touch;
+use function uniqid;
+
+use const DIRECTORY_SEPARATOR;
+
+/** @internal */
+final class WrapperWorker
+{
+    public const string COMMAND_EXIT = &quot;EXIT\n&quot;;
+
+    public readonly SplFileInfo $statusFile;
+    public readonly SplFileInfo $progressFile;
+    public readonly SplFileInfo $unexpectedOutputFile;
+    public readonly SplFileInfo $testResultFile;
+    public readonly SplFileInfo $resultCacheFile;
+    public readonly SplFileInfo $junitFile;
+    public readonly SplFileInfo $coverageFile;
+    public readonly SplFileInfo $teamcityFile;
+    public readonly SplFileInfo $testdoxFile;
+
+    private ?string $currentlyExecuting = null;
+    private Process $process;
+    private int $inExecution = 0;
+    private InputStream $input;
+    private int $exitCode = -1;
+
+    /** @param non-empty-string[] $parameters */
+    public function __construct(
+        private readonly OutputInterface $output,
+        private readonly Options $options,
+        array $parameters,
+        private readonly int $token
+    ) {
+        $commonTmpFilePath = sprintf(
+            &#039;%s%sworker_%02s_stdout_%s_&#039;,
+            $options-&gt;tmpDir,
+            DIRECTORY_SEPARATOR,
+            $token,
+            uniqid(),
+        );
+        $this-&gt;statusFile  = new SplFileInfo($commonTmpFilePath . &#039;status&#039;);
+        touch($this-&gt;statusFile-&gt;getPathname());
+        $this-&gt;progressFile = new SplFileInfo($commonTmpFilePath . &#039;progress&#039;);
+        touch($this-&gt;progressFile-&gt;getPathname());
+        $this-&gt;unexpectedOutputFile = new SplFileInfo($commonTmpFilePath . &#039;unexpected_output&#039;);
+        touch($this-&gt;unexpectedOutputFile-&gt;getPathname());
+        $this-&gt;testResultFile = new SplFileInfo($commonTmpFilePath . &#039;test_result&#039;);
+
+        if ($this-&gt;options-&gt;configuration-&gt;cacheResult()) {
+            $this-&gt;resultCacheFile = new SplFileInfo($commonTmpFilePath . &#039;result_cache&#039;);
+        }
+
+        if ($options-&gt;configuration-&gt;hasLogfileJunit()) {
+            $this-&gt;junitFile = new SplFileInfo($commonTmpFilePath . &#039;junit&#039;);
+        }
+
+        if ($options-&gt;configuration-&gt;hasCoverageReport()) {
+            $this-&gt;coverageFile = new SplFileInfo($commonTmpFilePath . &#039;coverage&#039;);
+        }
+
+        if ($options-&gt;needsTeamcity) {
+            $this-&gt;teamcityFile = new SplFileInfo($commonTmpFilePath . &#039;teamcity&#039;);
+        }
+
+        if ($options-&gt;needsTestdox) {
+            $this-&gt;testdoxFile = new SplFileInfo($commonTmpFilePath . &#039;testdox&#039;);
+        }
+
+        $parameters[] = &#039;--status-file&#039;;
+        $parameters[] = $this-&gt;statusFile-&gt;getPathname();
+        $parameters[] = &#039;--progress-file&#039;;
+        $parameters[] = $this-&gt;progressFile-&gt;getPathname();
+        $parameters[] = &#039;--unexpected-output-file&#039;;
+        $parameters[] = $this-&gt;unexpectedOutputFile-&gt;getPathname();
+        $parameters[] = &#039;--test-result-file&#039;;
+        $parameters[] = $this-&gt;testResultFile-&gt;getPathname();
+
+        if (isset($this-&gt;resultCacheFile)) {
+            $parameters[] = &#039;--result-cache-file&#039;;
+            $parameters[] = $this-&gt;resultCacheFile-&gt;getPathname();
+        }
+
+        if (isset($this-&gt;teamcityFile)) {
+            $parameters[] = &#039;--teamcity-file&#039;;
+            $parameters[] = $this-&gt;teamcityFile-&gt;getPathname();
+        }
+
+        if (isset($this-&gt;testdoxFile)) {
+            $parameters[] = &#039;--testdox-file&#039;;
+            $parameters[] = $this-&gt;testdoxFile-&gt;getPathname();
+        }
+
+        $phpunitArguments = [$options-&gt;phpunit];
+        foreach ($options-&gt;phpunitOptions as $key =&gt; $value) {
+            if ($options-&gt;functional &amp;&amp; $key === &#039;filter&#039;) {
+                continue;
+            }
+
+            if ($value === true) {
+                $phpunitArguments[] = &quot;--{$key}&quot;;
+                continue;
+            }
+
+            if (! is_array($value)) {
+                $value = [$value];
+            }
+
+            foreach ($value as $innerValue) {
+                $phpunitArguments[] = &quot;--{$key}&quot;;
+                $phpunitArguments[] = $innerValue;
+            }
+        }
+
+        $phpunitArguments[] = &#039;--do-not-cache-result&#039;;
+        $phpunitArguments[] = &#039;--no-logging&#039;;
+        $phpunitArguments[] = &#039;--no-coverage&#039;;
+        $phpunitArguments[] = &#039;--no-output&#039;;
+        if (isset($this-&gt;junitFile)) {
+            $phpunitArguments[] = &#039;--log-junit&#039;;
+            $phpunitArguments[] = $this-&gt;junitFile-&gt;getPathname();
+        }
+
+        if (isset($this-&gt;coverageFile)) {
+            $phpunitArguments[] = &#039;--coverage-php&#039;;
+            $phpunitArguments[] = $this-&gt;coverageFile-&gt;getPathname();
+        }
+
+        $parameters[] = &#039;--phpunit-argv&#039;;
+        $parameters[] = serialize($phpunitArguments);
+
+        if ($options-&gt;verbose) {
+            $output-&gt;write(sprintf(
+                &quot;Starting process {$this-&gt;token}: %s\n&quot;,
+                implode(&#039; &#039;, array_map(&#039;\\escapeshellarg&#039;, $parameters)),
+            ));
+        }
+
+        $this-&gt;input   = new InputStream();
+        $this-&gt;process = new Process(
+            $parameters,
+            $options-&gt;cwd,
+            $options-&gt;fillEnvWithTokens($token),
+            $this-&gt;input,
+            null,
+        );
+    }
+
+    public function start(): void
+    {
+        $this-&gt;process-&gt;start();
+    }
+
+    public function getWorkerCrashedException(?Throwable $previousException = null): WorkerCrashedException
+    {
+        return WorkerCrashedException::fromProcess(
+            $this-&gt;process,
+            $this-&gt;currentlyExecuting ?? &#039;N.A.&#039;,
+            $previousException,
+        );
+    }
+
+    public function assign(string $test): void
+    {
+        assert($this-&gt;currentlyExecuting === null);
+
+        if ($this-&gt;options-&gt;verbose) {
+            $this-&gt;output-&gt;write(&quot;Process {$this-&gt;token} executing: {$test}\n&quot;);
+        }
+
+        $this-&gt;input-&gt;write($test . &quot;\n&quot;);
+        $this-&gt;currentlyExecuting = $test;
+        ++$this-&gt;inExecution;
+    }
+
+    public function reset(): void
+    {
+        $this-&gt;currentlyExecuting = null;
+    }
+
+    public function stop(): void
+    {
+        $this-&gt;input-&gt;write(self::COMMAND_EXIT);
+    }
+
+    public function isFree(): bool
+    {
+        $statusFilepath = $this-&gt;statusFile-&gt;getPathname();
+        clearstatcache(true, $statusFilepath);
+
+        $isFree = $this-&gt;inExecution === filesize($statusFilepath);
+
+        if ($isFree &amp;&amp; $this-&gt;inExecution &gt; 0) {
+            $exitCodes = file_get_contents($statusFilepath);
+            assert(is_string($exitCodes) &amp;&amp; $exitCodes !== &#039;&#039;);
+            $this-&gt;exitCode = (int) $exitCodes[-1];
+        }
+
+        return $isFree;
+    }
+
+    public function getExitCode(): int
+    {
+        return $this-&gt;exitCode;
+    }
+
+    public function isRunning(): bool
+    {
+        return $this-&gt;process-&gt;isRunning();
+    }
+
+    public function hasExecutedTests(): bool
+    {
+        return $this-&gt;inExecution &gt; 0;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/brick/math/CHANGELOG.md -->
+<!-- PEDROO_NEXT_DIR: /vendor/brick -->
+
+</body>
+</html>

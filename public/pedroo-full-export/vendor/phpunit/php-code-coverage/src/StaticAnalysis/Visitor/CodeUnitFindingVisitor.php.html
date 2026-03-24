@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpunit/php-code-coverage/src/StaticAnalysis/Visitor/CodeUnitFindingVisitor.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of phpunit/php-code-coverage.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace SebastianBergmann\CodeCoverage\StaticAnalysis;
+
+use function assert;
+use function implode;
+use function rtrim;
+use function trim;
+use PhpParser\Node;
+use PhpParser\Node\ComplexType;
+use PhpParser\Node\Identifier;
+use PhpParser\Node\IntersectionType;
+use PhpParser\Node\Name;
+use PhpParser\Node\NullableType;
+use PhpParser\Node\Stmt\Class_;
+use PhpParser\Node\Stmt\ClassMethod;
+use PhpParser\Node\Stmt\Enum_;
+use PhpParser\Node\Stmt\Function_;
+use PhpParser\Node\Stmt\Interface_;
+use PhpParser\Node\Stmt\Trait_;
+use PhpParser\Node\UnionType;
+use PhpParser\NodeTraverser;
+use PhpParser\NodeVisitorAbstract;
+use SebastianBergmann\Complexity\CyclomaticComplexityCalculatingVisitor;
+
+/**
+ * @internal This class is not covered by the backward compatibility promise for phpunit/php-code-coverage
+ */
+final class CodeUnitFindingVisitor extends NodeVisitorAbstract
+{
+    /**
+     * @var non-empty-string
+     */
+    private string $file;
+
+    /**
+     * @var array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Interface_&gt;
+     */
+    private array $interfaces = [];
+
+    /**
+     * @var array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Class_&gt;
+     */
+    private array $classes = [];
+
+    /**
+     * @var array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Trait_&gt;
+     */
+    private array $traits = [];
+
+    /**
+     * @var array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Function_&gt;
+     */
+    private array $functions = [];
+
+    /**
+     * @param non-empty-string $file
+     */
+    public function __construct(string $file)
+    {
+        $this-&gt;file = $file;
+    }
+
+    public function enterNode(Node $node): null
+    {
+        if ($node instanceof Interface_) {
+            $this-&gt;processInterface($node);
+        }
+
+        if ($node instanceof Class_) {
+            if ($node-&gt;isAnonymous()) {
+                return null;
+            }
+
+            $this-&gt;processClass($node);
+        }
+
+        if ($node instanceof Enum_) {
+            $this-&gt;processClass($node);
+        }
+
+        if ($node instanceof Trait_) {
+            $this-&gt;processTrait($node);
+        }
+
+        if (!$node instanceof Function_) {
+            return null;
+        }
+
+        $this-&gt;processFunction($node);
+
+        return null;
+    }
+
+    public function leaveNode(Node $node): null
+    {
+        if ($node instanceof Class_ &amp;&amp; $node-&gt;isAnonymous()) {
+            return null;
+        }
+
+        if (!$node instanceof Class_ &amp;&amp; !$node instanceof Trait_) {
+            return null;
+        }
+
+        $traits = [];
+
+        foreach ($node-&gt;getTraitUses() as $traitUse) {
+            foreach ($traitUse-&gt;traits as $trait) {
+                $traits[] = $trait-&gt;toString();
+            }
+        }
+
+        if ($traits === []) {
+            return null;
+        }
+
+        $this-&gt;postProcessClassOrTrait($node, $traits);
+
+        return null;
+    }
+
+    /**
+     * @return array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Interface_&gt;
+     */
+    public function interfaces(): array
+    {
+        return $this-&gt;interfaces;
+    }
+
+    /**
+     * @return array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Class_&gt;
+     */
+    public function classes(): array
+    {
+        return $this-&gt;classes;
+    }
+
+    /**
+     * @return array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Trait_&gt;
+     */
+    public function traits(): array
+    {
+        return $this-&gt;traits;
+    }
+
+    /**
+     * @return array&lt;string, \SebastianBergmann\CodeCoverage\StaticAnalysis\Function_&gt;
+     */
+    public function functions(): array
+    {
+        return $this-&gt;functions;
+    }
+
+    private function cyclomaticComplexity(ClassMethod|Function_ $node): int
+    {
+        $nodes = $node-&gt;getStmts();
+
+        if ($nodes === null) {
+            return 0;
+        }
+
+        $traverser = new NodeTraverser;
+
+        $cyclomaticComplexityCalculatingVisitor = new CyclomaticComplexityCalculatingVisitor;
+
+        $traverser-&gt;addVisitor($cyclomaticComplexityCalculatingVisitor);
+
+        /* @noinspection UnusedFunctionResultInspection */
+        $traverser-&gt;traverse($nodes);
+
+        return $cyclomaticComplexityCalculatingVisitor-&gt;cyclomaticComplexity();
+    }
+
+    private function signature(ClassMethod|Function_ $node): string
+    {
+        $signature  = ($node-&gt;returnsByRef() ? &#039;&amp;&#039; : &#039;&#039;) . $node-&gt;name-&gt;toString() . &#039;(&#039;;
+        $parameters = [];
+
+        foreach ($node-&gt;getParams() as $parameter) {
+            assert(isset($parameter-&gt;var-&gt;name));
+
+            $parameterAsString = &#039;&#039;;
+
+            if ($parameter-&gt;type !== null) {
+                $parameterAsString = $this-&gt;type($parameter-&gt;type) . &#039; &#039;;
+            }
+
+            $parameterAsString .= &#039;$&#039; . $parameter-&gt;var-&gt;name;
+
+            /* @todo Handle default values */
+
+            $parameters[] = $parameterAsString;
+        }
+
+        $signature .= implode(&#039;, &#039;, $parameters) . &#039;)&#039;;
+
+        $returnType = $node-&gt;getReturnType();
+
+        if ($returnType !== null) {
+            $signature .= &#039;: &#039; . $this-&gt;type($returnType);
+        }
+
+        return $signature;
+    }
+
+    private function type(ComplexType|Identifier|Name $type): string
+    {
+        if ($type instanceof NullableType) {
+            return &#039;?&#039; . $type-&gt;type;
+        }
+
+        if ($type instanceof UnionType) {
+            return $this-&gt;unionTypeAsString($type);
+        }
+
+        if ($type instanceof IntersectionType) {
+            return $this-&gt;intersectionTypeAsString($type);
+        }
+
+        return $type-&gt;toString();
+    }
+
+    private function visibility(ClassMethod $node): Visibility
+    {
+        if ($node-&gt;isPrivate()) {
+            return Visibility::Private;
+        }
+
+        if ($node-&gt;isProtected()) {
+            return Visibility::Protected;
+        }
+
+        return Visibility::Public;
+    }
+
+    private function processInterface(Interface_ $node): void
+    {
+        $name             = $node-&gt;name-&gt;toString();
+        $namespacedName   = $node-&gt;namespacedName-&gt;toString();
+        $parentInterfaces = [];
+
+        foreach ($node-&gt;extends as $parentInterface) {
+            $parentInterfaces[] = $parentInterface-&gt;toString();
+        }
+
+        $this-&gt;interfaces[$namespacedName] = new \SebastianBergmann\CodeCoverage\StaticAnalysis\Interface_(
+            $name,
+            $namespacedName,
+            $this-&gt;namespace($namespacedName, $name),
+            $node-&gt;getStartLine(),
+            $node-&gt;getEndLine(),
+            $parentInterfaces,
+        );
+    }
+
+    private function processClass(Class_|Enum_ $node): void
+    {
+        $name           = $node-&gt;name-&gt;toString();
+        $namespacedName = $node-&gt;namespacedName-&gt;toString();
+        $parentClass    = null;
+        $interfaces     = [];
+
+        if (!$node instanceof Enum_) {
+            if ($node-&gt;extends instanceof Name) {
+                $parentClass = $node-&gt;extends-&gt;toString();
+            }
+
+            foreach ($node-&gt;implements as $interface) {
+                $interfaces[] = $interface-&gt;toString();
+            }
+        }
+
+        $this-&gt;classes[$namespacedName] = new \SebastianBergmann\CodeCoverage\StaticAnalysis\Class_(
+            $name,
+            $namespacedName,
+            $this-&gt;namespace($namespacedName, $name),
+            $this-&gt;file,
+            $node-&gt;getStartLine(),
+            $node-&gt;getEndLine(),
+            $parentClass,
+            $interfaces,
+            [],
+            $this-&gt;processMethods($node-&gt;getMethods()),
+        );
+    }
+
+    private function processTrait(Trait_ $node): void
+    {
+        $name           = $node-&gt;name-&gt;toString();
+        $namespacedName = $node-&gt;namespacedName-&gt;toString();
+
+        $this-&gt;traits[$namespacedName] = new \SebastianBergmann\CodeCoverage\StaticAnalysis\Trait_(
+            $name,
+            $namespacedName,
+            $this-&gt;namespace($namespacedName, $name),
+            $this-&gt;file,
+            $node-&gt;getStartLine(),
+            $node-&gt;getEndLine(),
+            [],
+            $this-&gt;processMethods($node-&gt;getMethods()),
+        );
+    }
+
+    /**
+     * @param list&lt;ClassMethod&gt; $nodes
+     *
+     * @return array&lt;non-empty-string, Method&gt;
+     */
+    private function processMethods(array $nodes): array
+    {
+        $methods = [];
+
+        foreach ($nodes as $node) {
+            $methods[$node-&gt;name-&gt;toString()] = new Method(
+                $node-&gt;name-&gt;toString(),
+                $node-&gt;getStartLine(),
+                $node-&gt;getEndLine(),
+                $this-&gt;signature($node),
+                $this-&gt;visibility($node),
+                $this-&gt;cyclomaticComplexity($node),
+            );
+        }
+
+        return $methods;
+    }
+
+    private function processFunction(Function_ $node): void
+    {
+        assert(isset($node-&gt;name));
+        assert(isset($node-&gt;namespacedName));
+        assert($node-&gt;namespacedName instanceof Name);
+
+        $name           = $node-&gt;name-&gt;toString();
+        $namespacedName = $node-&gt;namespacedName-&gt;toString();
+
+        $this-&gt;functions[$namespacedName] = new \SebastianBergmann\CodeCoverage\StaticAnalysis\Function_(
+            $name,
+            $namespacedName,
+            $this-&gt;namespace($namespacedName, $name),
+            $node-&gt;getStartLine(),
+            $node-&gt;getEndLine(),
+            $this-&gt;signature($node),
+            $this-&gt;cyclomaticComplexity($node),
+        );
+    }
+
+    private function namespace(string $namespacedName, string $name): string
+    {
+        return trim(rtrim($namespacedName, $name), &#039;\\&#039;);
+    }
+
+    private function unionTypeAsString(UnionType $node): string
+    {
+        $types = [];
+
+        foreach ($node-&gt;types as $type) {
+            if ($type instanceof IntersectionType) {
+                $types[] = &#039;(&#039; . $this-&gt;intersectionTypeAsString($type) . &#039;)&#039;;
+
+                continue;
+            }
+
+            $types[] = $this-&gt;typeAsString($type);
+        }
+
+        return implode(&#039;|&#039;, $types);
+    }
+
+    private function intersectionTypeAsString(IntersectionType $node): string
+    {
+        $types = [];
+
+        foreach ($node-&gt;types as $type) {
+            $types[] = $this-&gt;typeAsString($type);
+        }
+
+        return implode(&#039;&amp;&#039;, $types);
+    }
+
+    private function typeAsString(Identifier|Name $node): string
+    {
+        if ($node instanceof Name) {
+            return $node-&gt;toCodeString();
+        }
+
+        return $node-&gt;toString();
+    }
+
+    /**
+     * @param list&lt;non-empty-string&gt; $traits
+     */
+    private function postProcessClassOrTrait(Class_|Trait_ $node, array $traits): void
+    {
+        $name = $node-&gt;namespacedName-&gt;toString();
+
+        if ($node instanceof Class_) {
+            assert(isset($this-&gt;classes[$name]));
+
+            $this-&gt;classes[$name] = new \SebastianBergmann\CodeCoverage\StaticAnalysis\Class_(
+                $this-&gt;classes[$name]-&gt;name(),
+                $this-&gt;classes[$name]-&gt;namespacedName(),
+                $this-&gt;classes[$name]-&gt;namespace(),
+                $this-&gt;classes[$name]-&gt;file(),
+                $this-&gt;classes[$name]-&gt;startLine(),
+                $this-&gt;classes[$name]-&gt;endLine(),
+                $this-&gt;classes[$name]-&gt;parentClass(),
+                $this-&gt;classes[$name]-&gt;interfaces(),
+                $traits,
+                $this-&gt;classes[$name]-&gt;methods(),
+            );
+
+            return;
+        }
+
+        assert(isset($this-&gt;traits[$name]));
+
+        $this-&gt;traits[$name] = new \SebastianBergmann\CodeCoverage\StaticAnalysis\Trait_(
+            $this-&gt;traits[$name]-&gt;name(),
+            $this-&gt;traits[$name]-&gt;namespacedName(),
+            $this-&gt;traits[$name]-&gt;namespace(),
+            $this-&gt;traits[$name]-&gt;file(),
+            $this-&gt;traits[$name]-&gt;startLine(),
+            $this-&gt;traits[$name]-&gt;endLine(),
+            $traits,
+            $this-&gt;traits[$name]-&gt;methods(),
+        );
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpunit/php-code-coverage/src/StaticAnalysis/Visitor/ExecutableLinesFindingVisitor.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpunit/php-code-coverage/src/Target -->
+
+</body>
+</html>

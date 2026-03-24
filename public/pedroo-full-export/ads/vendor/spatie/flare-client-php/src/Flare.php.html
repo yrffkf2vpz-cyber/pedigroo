@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/spatie/flare-client-php/src/Flare.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Spatie\FlareClient;
+
+use Error;
+use ErrorException;
+use Exception;
+use Illuminate\Contracts\Container\Container;
+use Illuminate\Pipeline\Pipeline;
+use Spatie\Backtrace\Arguments\ArgumentReducers;
+use Spatie\Backtrace\Arguments\Reducers\ArgumentReducer;
+use Spatie\FlareClient\Concerns\HasContext;
+use Spatie\FlareClient\Context\BaseContextProviderDetector;
+use Spatie\FlareClient\Context\ContextProviderDetector;
+use Spatie\FlareClient\Enums\MessageLevels;
+use Spatie\FlareClient\Enums\OverriddenGrouping;
+use Spatie\FlareClient\FlareMiddleware\AddEnvironmentInformation;
+use Spatie\FlareClient\FlareMiddleware\AddGlows;
+use Spatie\FlareClient\FlareMiddleware\CensorRequestBodyFields;
+use Spatie\FlareClient\FlareMiddleware\FlareMiddleware;
+use Spatie\FlareClient\FlareMiddleware\RemoveRequestIp;
+use Spatie\FlareClient\Glows\Glow;
+use Spatie\FlareClient\Glows\GlowRecorder;
+use Spatie\FlareClient\Http\Client;
+use Spatie\FlareClient\Support\PhpStackFrameArgumentsFixer;
+use Throwable;
+
+class Flare
+{
+    use HasContext;
+
+    protected Client $client;
+
+    protected Api $api;
+
+    /** @var array&lt;int, FlareMiddleware|class-string&lt;FlareMiddleware&gt;&gt; */
+    protected array $middleware = [];
+
+    protected GlowRecorder $recorder;
+
+    protected ?string $applicationPath = null;
+
+    protected ContextProviderDetector $contextDetector;
+
+    protected mixed $previousExceptionHandler = null;
+
+    /** @var null|callable */
+    protected $previousErrorHandler = null;
+
+    /** @var null|callable */
+    protected $determineVersionCallable = null;
+
+    protected ?int $reportErrorLevels = null;
+
+    /** @var null|callable */
+    protected $filterExceptionsCallable = null;
+
+    /** @var null|callable */
+    protected $filterReportsCallable = null;
+
+    protected ?string $stage = null;
+
+    protected ?string $requestId = null;
+
+    protected ?Container $container = null;
+
+    /** @var array&lt;class-string&lt;ArgumentReducer&gt;|ArgumentReducer&gt;|ArgumentReducers|null */
+    protected null|array|ArgumentReducers $argumentReducers = null;
+
+    protected bool $withStackFrameArguments = true;
+
+    /** @var array&lt;class-string, string&gt; */
+    protected array $overriddenGroupings = [];
+
+    public static function make(
+        ?string $apiKey = null,
+        ?ContextProviderDetector $contextDetector = null
+    ): self {
+        $client = new Client($apiKey);
+
+        return new self($client, $contextDetector);
+    }
+
+    public function setApiToken(string $apiToken): self
+    {
+        $this-&gt;client-&gt;setApiToken($apiToken);
+
+        return $this;
+    }
+
+    public function apiTokenSet(): bool
+    {
+        return $this-&gt;client-&gt;apiTokenSet();
+    }
+
+    public function setBaseUrl(string $baseUrl): self
+    {
+        $this-&gt;client-&gt;setBaseUrl($baseUrl);
+
+        return $this;
+    }
+
+    public function setStage(?string $stage): self
+    {
+        $this-&gt;stage = $stage;
+
+        return $this;
+    }
+
+    public function sendReportsImmediately(): self
+    {
+        $this-&gt;api-&gt;sendReportsImmediately();
+
+        return $this;
+    }
+
+    public function determineVersionUsing(callable $determineVersionCallable): self
+    {
+        $this-&gt;determineVersionCallable = $determineVersionCallable;
+
+        return $this;
+    }
+
+    public function reportErrorLevels(int $reportErrorLevels): self
+    {
+        $this-&gt;reportErrorLevels = $reportErrorLevels;
+
+        return $this;
+    }
+
+    public function filterExceptionsUsing(callable $filterExceptionsCallable): self
+    {
+        $this-&gt;filterExceptionsCallable = $filterExceptionsCallable;
+
+        return $this;
+    }
+
+    public function filterReportsUsing(callable $filterReportsCallable): self
+    {
+        $this-&gt;filterReportsCallable = $filterReportsCallable;
+
+        return $this;
+    }
+
+    /** @param array&lt;class-string&lt;ArgumentReducer&gt;|ArgumentReducer&gt;|ArgumentReducers|null $argumentReducers */
+    public function argumentReducers(null|array|ArgumentReducers $argumentReducers): self
+    {
+        $this-&gt;argumentReducers = $argumentReducers;
+
+        return $this;
+    }
+
+    public function withStackFrameArguments(
+        bool $withStackFrameArguments = true,
+        bool $forcePHPIniSetting = false,
+    ): self {
+        $this-&gt;withStackFrameArguments = $withStackFrameArguments;
+
+        if ($forcePHPIniSetting) {
+            (new PhpStackFrameArgumentsFixer())-&gt;enable();
+        }
+
+        return $this;
+    }
+
+    /**
+     * @param class-string $exceptionClass
+     */
+    public function overrideGrouping(
+        string $exceptionClass,
+        string $type = OverriddenGrouping::ExceptionMessageAndClass,
+    ): self {
+        $this-&gt;overriddenGroupings[$exceptionClass] = $type;
+
+        return $this;
+    }
+
+    public function version(): ?string
+    {
+        if (! $this-&gt;determineVersionCallable) {
+            return null;
+        }
+
+        return ($this-&gt;determineVersionCallable)();
+    }
+
+    /**
+     * @param \Spatie\FlareClient\Http\Client $client
+     * @param \Spatie\FlareClient\Context\ContextProviderDetector|null $contextDetector
+     * @param array&lt;int, FlareMiddleware&gt; $middleware
+     */
+    public function __construct(
+        Client $client,
+        ?ContextProviderDetector $contextDetector = null,
+        array $middleware = [],
+    ) {
+        $this-&gt;client = $client;
+        $this-&gt;recorder = new GlowRecorder();
+        $this-&gt;contextDetector = $contextDetector ?? new BaseContextProviderDetector();
+        $this-&gt;middleware = $middleware;
+        $this-&gt;api = new Api($this-&gt;client);
+
+        $this-&gt;registerDefaultMiddleware();
+    }
+
+    /** @return array&lt;int, FlareMiddleware|class-string&lt;FlareMiddleware&gt;&gt; */
+    public function getMiddleware(): array
+    {
+        return $this-&gt;middleware;
+    }
+
+    public function setContextProviderDetector(ContextProviderDetector $contextDetector): self
+    {
+        $this-&gt;contextDetector = $contextDetector;
+
+        return $this;
+    }
+
+    public function setContainer(Container $container): self
+    {
+        $this-&gt;container = $container;
+
+        return $this;
+    }
+
+    public function registerFlareHandlers(): self
+    {
+        $this-&gt;registerExceptionHandler();
+
+        $this-&gt;registerErrorHandler();
+
+        return $this;
+    }
+
+    public function registerExceptionHandler(): self
+    {
+        $this-&gt;previousExceptionHandler = set_exception_handler([$this, &#039;handleException&#039;]);
+
+        return $this;
+    }
+
+    public function registerErrorHandler(?int $errorLevels = null): self
+    {
+        $this-&gt;previousErrorHandler = $errorLevels
+            ? set_error_handler([$this, &#039;handleError&#039;], $errorLevels)
+            : set_error_handler([$this, &#039;handleError&#039;]);
+
+        return $this;
+    }
+
+    protected function registerDefaultMiddleware(): self
+    {
+        return $this-&gt;registerMiddleware([
+            new AddGlows($this-&gt;recorder),
+            new AddEnvironmentInformation(),
+        ]);
+    }
+
+    /**
+     * @param FlareMiddleware|array&lt;FlareMiddleware&gt;|class-string&lt;FlareMiddleware&gt;|callable $middleware
+     *
+     * @return $this
+     */
+    public function registerMiddleware($middleware): self
+    {
+        if (! is_array($middleware)) {
+            $middleware = [$middleware];
+        }
+
+        $this-&gt;middleware = array_merge($this-&gt;middleware, $middleware);
+
+        return $this;
+    }
+
+    /**
+     * @return array&lt;int,FlareMiddleware|class-string&lt;FlareMiddleware&gt;&gt;
+     */
+    public function getMiddlewares(): array
+    {
+        return $this-&gt;middleware;
+    }
+
+    /**
+     * @param string $name
+     * @param string $messageLevel
+     * @param array&lt;int, mixed&gt; $metaData
+     *
+     * @return $this
+     */
+    public function glow(
+        string $name,
+        string $messageLevel = MessageLevels::INFO,
+        array $metaData = []
+    ): self {
+        $this-&gt;recorder-&gt;record(new Glow($name, $messageLevel, $metaData));
+
+        return $this;
+    }
+
+    public function handleException(Throwable $throwable): void
+    {
+        $this-&gt;report($throwable);
+
+        if ($this-&gt;previousExceptionHandler &amp;&amp; is_callable($this-&gt;previousExceptionHandler)) {
+            call_user_func($this-&gt;previousExceptionHandler, $throwable);
+        }
+    }
+
+    /**
+     * @return mixed
+     */
+    public function handleError(mixed $code, string $message, string $file = &#039;&#039;, int $line = 0)
+    {
+        $exception = new ErrorException($message, 0, $code, $file, $line);
+
+        $this-&gt;report($exception);
+
+        if ($this-&gt;previousErrorHandler) {
+            return call_user_func(
+                $this-&gt;previousErrorHandler,
+                $code,
+                $message,
+                $file,
+                $line
+            );
+        }
+    }
+
+    public function applicationPath(string $applicationPath): self
+    {
+        $this-&gt;applicationPath = $applicationPath;
+
+        return $this;
+    }
+
+    public function report(Throwable $throwable, ?callable $callback = null, ?Report $report = null, ?bool $handled = null): ?Report
+    {
+        if (! $this-&gt;shouldSendReport($throwable)) {
+            return null;
+        }
+
+        $report ??= $this-&gt;createReport($throwable);
+
+        if ($handled) {
+            $report-&gt;handled();
+        }
+
+        if (! is_null($callback)) {
+            call_user_func($callback, $report);
+        }
+
+        $this-&gt;recorder-&gt;reset();
+
+        $this-&gt;sendReportToApi($report);
+
+        return $report;
+    }
+
+    public function reportHandled(Throwable $throwable): ?Report
+    {
+        return $this-&gt;report($throwable, null, null, true);
+    }
+
+    protected function shouldSendReport(Throwable $throwable): bool
+    {
+        if (isset($this-&gt;reportErrorLevels) &amp;&amp; $throwable instanceof Error) {
+            return (bool) ($this-&gt;reportErrorLevels &amp; $throwable-&gt;getCode());
+        }
+
+        if (isset($this-&gt;reportErrorLevels) &amp;&amp; $throwable instanceof ErrorException) {
+            return (bool) ($this-&gt;reportErrorLevels &amp; $throwable-&gt;getSeverity());
+        }
+
+        if ($this-&gt;filterExceptionsCallable &amp;&amp; $throwable instanceof Exception) {
+            return (bool) (call_user_func($this-&gt;filterExceptionsCallable, $throwable));
+        }
+
+        return true;
+    }
+
+    public function reportMessage(string $message, string $logLevel, ?callable $callback = null): void
+    {
+        $report = $this-&gt;createReportFromMessage($message, $logLevel);
+
+        if (! is_null($callback)) {
+            call_user_func($callback, $report);
+        }
+
+        $this-&gt;sendReportToApi($report);
+    }
+
+    public function sendTestReport(Throwable $throwable): void
+    {
+        $this-&gt;api-&gt;sendTestReport($this-&gt;createReport($throwable));
+    }
+
+    protected function sendReportToApi(Report $report): void
+    {
+        if ($this-&gt;filterReportsCallable) {
+            if (! call_user_func($this-&gt;filterReportsCallable, $report)) {
+                return;
+            }
+        }
+
+        try {
+            $this-&gt;api-&gt;report($report);
+        } catch (Exception $exception) {
+        }
+    }
+
+    public function reset(): void
+    {
+        $this-&gt;api-&gt;sendQueuedReports();
+
+        $this-&gt;userProvidedContext = [];
+
+        $this-&gt;recorder-&gt;reset();
+    }
+
+    protected function applyAdditionalParameters(Report $report): void
+    {
+        $report
+            -&gt;stage($this-&gt;stage)
+            -&gt;messageLevel($this-&gt;messageLevel)
+            -&gt;setApplicationPath($this-&gt;applicationPath)
+            -&gt;userProvidedContext($this-&gt;userProvidedContext);
+    }
+
+    public function anonymizeIp(): self
+    {
+        $this-&gt;registerMiddleware(new RemoveRequestIp());
+
+        return $this;
+    }
+
+    /**
+     * @param array&lt;int, string&gt; $fieldNames
+     *
+     * @return $this
+     */
+    public function censorRequestBodyFields(array $fieldNames): self
+    {
+        $this-&gt;registerMiddleware(new CensorRequestBodyFields($fieldNames));
+
+        return $this;
+    }
+
+    public function createReport(Throwable $throwable): Report
+    {
+        $report = Report::createForThrowable(
+            $throwable,
+            $this-&gt;contextDetector-&gt;detectCurrentContext(),
+            $this-&gt;applicationPath,
+            $this-&gt;version(),
+            $this-&gt;argumentReducers,
+            $this-&gt;withStackFrameArguments,
+            $this-&gt;overriddenGroupings,
+        );
+
+        return $this-&gt;applyMiddlewareToReport($report);
+    }
+
+    public function createReportFromMessage(string $message, string $logLevel): Report
+    {
+        $report = Report::createForMessage(
+            $message,
+            $logLevel,
+            $this-&gt;contextDetector-&gt;detectCurrentContext(),
+            $this-&gt;applicationPath,
+            $this-&gt;argumentReducers,
+            $this-&gt;withStackFrameArguments
+        );
+
+        return $this-&gt;applyMiddlewareToReport($report);
+    }
+
+    protected function applyMiddlewareToReport(Report $report): Report
+    {
+        $this-&gt;applyAdditionalParameters($report);
+        $middleware = array_map(function ($singleMiddleware) {
+            return is_string($singleMiddleware)
+                ? new $singleMiddleware
+                : $singleMiddleware;
+        }, $this-&gt;middleware);
+
+
+        $report = (new Pipeline())
+            -&gt;send($report)
+            -&gt;through($middleware)
+            -&gt;then(fn ($report) =&gt; $report);
+
+        return $report;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/spatie/flare-client-php/src/FlareMiddleware/AddDocumentationLinks.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/spatie/flare-client-php/src/Concerns -->
+
+</body>
+</html>

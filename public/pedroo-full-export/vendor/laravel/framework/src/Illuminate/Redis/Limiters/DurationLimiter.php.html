@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Redis/Limiters/DurationLimiter.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Redis\Limiters;
+
+use Illuminate\Contracts\Redis\LimiterTimeoutException;
+use Illuminate\Support\Sleep;
+
+class DurationLimiter
+{
+    /**
+     * The Redis factory implementation.
+     *
+     * @var \Illuminate\Redis\Connections\Connection
+     */
+    private $redis;
+
+    /**
+     * The unique name of the lock.
+     *
+     * @var string
+     */
+    private $name;
+
+    /**
+     * The allowed number of concurrent tasks.
+     *
+     * @var int
+     */
+    private $maxLocks;
+
+    /**
+     * The number of seconds a slot should be maintained.
+     *
+     * @var int
+     */
+    private $decay;
+
+    /**
+     * The timestamp of the end of the current duration.
+     *
+     * @var int
+     */
+    public $decaysAt;
+
+    /**
+     * The number of remaining slots.
+     *
+     * @var int
+     */
+    public $remaining;
+
+    /**
+     * Create a new duration limiter instance.
+     *
+     * @param  \Illuminate\Redis\Connections\Connection  $redis
+     * @param  string  $name
+     * @param  int  $maxLocks
+     * @param  int  $decay
+     */
+    public function __construct($redis, $name, $maxLocks, $decay)
+    {
+        $this-&gt;name = $name;
+        $this-&gt;decay = $decay;
+        $this-&gt;redis = $redis;
+        $this-&gt;maxLocks = $maxLocks;
+    }
+
+    /**
+     * Attempt to acquire the lock for the given number of seconds.
+     *
+     * @param  int  $timeout
+     * @param  callable|null  $callback
+     * @param  int  $sleep
+     * @return mixed
+     *
+     * @throws \Illuminate\Contracts\Redis\LimiterTimeoutException
+     */
+    public function block($timeout, $callback = null, $sleep = 750)
+    {
+        $starting = time();
+
+        while (! $this-&gt;acquire()) {
+            if (time() - $timeout &gt;= $starting) {
+                throw new LimiterTimeoutException;
+            }
+
+            Sleep::usleep($sleep * 1000);
+        }
+
+        if (is_callable($callback)) {
+            return $callback();
+        }
+
+        return true;
+    }
+
+    /**
+     * Attempt to acquire the lock.
+     *
+     * @return bool
+     */
+    public function acquire()
+    {
+        $results = $this-&gt;redis-&gt;eval(
+            $this-&gt;luaScript(), 1, $this-&gt;name, microtime(true), time(), $this-&gt;decay, $this-&gt;maxLocks
+        );
+
+        $this-&gt;decaysAt = $results[1];
+
+        $this-&gt;remaining = max(0, $results[2]);
+
+        return (bool) $results[0];
+    }
+
+    /**
+     * Determine if the key has been &quot;accessed&quot; too many times.
+     *
+     * @return bool
+     */
+    public function tooManyAttempts()
+    {
+        [$this-&gt;decaysAt, $this-&gt;remaining] = $this-&gt;redis-&gt;eval(
+            $this-&gt;tooManyAttemptsLuaScript(), 1, $this-&gt;name, microtime(true), time(), $this-&gt;decay, $this-&gt;maxLocks
+        );
+
+        return $this-&gt;remaining &lt;= 0;
+    }
+
+    /**
+     * Clear the limiter.
+     *
+     * @return void
+     */
+    public function clear()
+    {
+        $this-&gt;redis-&gt;del($this-&gt;name);
+    }
+
+    /**
+     * Get the Lua script for acquiring a lock.
+     *
+     * KEYS[1] - The limiter name
+     * ARGV[1] - Current time in microseconds
+     * ARGV[2] - Current time in seconds
+     * ARGV[3] - Duration of the bucket
+     * ARGV[4] - Allowed number of tasks
+     *
+     * @return string
+     */
+    protected function luaScript()
+    {
+        return &lt;&lt;&lt;&#039;LUA&#039;
+local function reset()
+    redis.call(&#039;HMSET&#039;, KEYS[1], &#039;start&#039;, ARGV[2], &#039;end&#039;, ARGV[2] + ARGV[3], &#039;count&#039;, 1)
+    return redis.call(&#039;EXPIRE&#039;, KEYS[1], ARGV[3] * 2)
+end
+
+if redis.call(&#039;EXISTS&#039;, KEYS[1]) == 0 then
+    return {reset(), ARGV[2] + ARGV[3], ARGV[4] - 1}
+end
+
+if ARGV[1] &gt;= redis.call(&#039;HGET&#039;, KEYS[1], &#039;start&#039;) and ARGV[1] &lt;= redis.call(&#039;HGET&#039;, KEYS[1], &#039;end&#039;) then
+    return {
+        tonumber(redis.call(&#039;HINCRBY&#039;, KEYS[1], &#039;count&#039;, 1)) &lt;= tonumber(ARGV[4]),
+        redis.call(&#039;HGET&#039;, KEYS[1], &#039;end&#039;),
+        ARGV[4] - redis.call(&#039;HGET&#039;, KEYS[1], &#039;count&#039;)
+    }
+end
+
+return {reset(), ARGV[2] + ARGV[3], ARGV[4] - 1}
+LUA;
+    }
+
+    /**
+     * Get the Lua script to determine if the key has been &quot;accessed&quot; too many times.
+     *
+     * KEYS[1] - The limiter name
+     * ARGV[1] - Current time in microseconds
+     * ARGV[2] - Current time in seconds
+     * ARGV[3] - Duration of the bucket
+     * ARGV[4] - Allowed number of tasks
+     *
+     * @return string
+     */
+    protected function tooManyAttemptsLuaScript()
+    {
+        return &lt;&lt;&lt;&#039;LUA&#039;
+
+if redis.call(&#039;EXISTS&#039;, KEYS[1]) == 0 then
+    return {0, ARGV[2] + ARGV[3]}
+end
+
+if ARGV[1] &gt;= redis.call(&#039;HGET&#039;, KEYS[1], &#039;start&#039;) and ARGV[1] &lt;= redis.call(&#039;HGET&#039;, KEYS[1], &#039;end&#039;) then
+    return {
+        redis.call(&#039;HGET&#039;, KEYS[1], &#039;end&#039;),
+        ARGV[4] - redis.call(&#039;HGET&#039;, KEYS[1], &#039;count&#039;)
+    }
+end
+
+return {0, ARGV[2] + ARGV[3]}
+LUA;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Redis/Limiters/DurationLimiterBuilder.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Reflection -->
+
+</body>
+</html>

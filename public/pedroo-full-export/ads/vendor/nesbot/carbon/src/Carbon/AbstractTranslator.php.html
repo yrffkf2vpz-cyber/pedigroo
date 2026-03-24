@@ -1,0 +1,1317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/nesbot/carbon/src/Carbon/AbstractTranslator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/**
+ * This file is part of the Carbon package.
+ *
+ * (c) Brian Nesbitt &lt;brian@nesbot.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Carbon;
+
+use Carbon\MessageFormatter\MessageFormatterMapper;
+use Closure;
+use ReflectionException;
+use ReflectionFunction;
+use ReflectionProperty;
+use Symfony\Component\Translation\Formatter\MessageFormatterInterface;
+use Symfony\Component\Translation\Loader\ArrayLoader;
+use Symfony\Component\Translation\Translator as SymfonyTranslator;
+use Throwable;
+
+abstract class AbstractTranslator extends SymfonyTranslator
+{
+    public const REGION_CODE_LENGTH = 2;
+
+    /**
+     * Translator singletons for each language.
+     *
+     * @var array
+     */
+    protected static array $singletons = [];
+
+    /**
+     * List of custom localized messages.
+     *
+     * @var array
+     */
+    protected array $messages = [];
+
+    /**
+     * List of custom directories that contain translation files.
+     *
+     * @var string[]
+     */
+    protected array $directories = [];
+
+    /**
+     * Set to true while constructing.
+     */
+    protected bool $initializing = false;
+
+    /**
+     * List of locales aliases.
+     *
+     * @var array&lt;string, string&gt;
+     */
+    protected array $aliases = [
+        &#039;me&#039; =&gt; &#039;sr_Latn_ME&#039;,
+        &#039;scr&#039; =&gt; &#039;sh&#039;,
+    ];
+
+    /**
+     * Return a singleton instance of Translator.
+     *
+     * @param string|null $locale optional initial locale (&quot;en&quot; - english by default)
+     *
+     * @return static
+     */
+    public static function get(?string $locale = null): static
+    {
+        $locale = $locale ?: &#039;en&#039;;
+        $key = static::class === Translator::class ? $locale : static::class.&#039;|&#039;.$locale;
+        $count = \count(static::$singletons);
+
+        // Remember only the last 10 translators created
+        if ($count &gt; 10) {
+            foreach (\array_slice(array_keys(static::$singletons), 0, $count - 10) as $index) {
+                unset(static::$singletons[$index]);
+            }
+        }
+
+        static::$singletons[$key] ??= new static($locale);
+
+        return static::$singletons[$key];
+    }
+
+    public function __construct($locale, ?MessageFormatterInterface $formatter = null, $cacheDir = null, $debug = false)
+    {
+        $this-&gt;initialize($locale, $formatter, $cacheDir, $debug);
+    }
+
+    /**
+     * Returns the list of directories translation files are searched in.
+     */
+    public function getDirectories(): array
+    {
+        return $this-&gt;directories;
+    }
+
+    /**
+     * Set list of directories translation files are searched in.
+     *
+     * @param array $directories new directories list
+     *
+     * @return $this
+     */
+    public function setDirectories(array $directories): static
+    {
+        $this-&gt;directories = $directories;
+
+        return $this;
+    }
+
+    /**
+     * Add a directory to the list translation files are searched in.
+     *
+     * @param string $directory new directory
+     *
+     * @return $this
+     */
+    public function addDirectory(string $directory): static
+    {
+        $this-&gt;directories[] = $directory;
+
+        return $this;
+    }
+
+    /**
+     * Remove a directory from the list translation files are searched in.
+     *
+     * @param string $directory directory path
+     *
+     * @return $this
+     */
+    public function removeDirectory(string $directory): static
+    {
+        $search = rtrim(strtr($directory, &#039;\\&#039;, &#039;/&#039;), &#039;/&#039;);
+
+        return $this-&gt;setDirectories(array_filter(
+            $this-&gt;getDirectories(),
+            static fn ($item) =&gt; rtrim(strtr($item, &#039;\\&#039;, &#039;/&#039;), &#039;/&#039;) !== $search,
+        ));
+    }
+
+    /**
+     * Reset messages of a locale (all locale if no locale passed).
+     * Remove custom messages and reload initial messages from matching
+     * file in Lang directory.
+     */
+    public function resetMessages(?string $locale = null): bool
+    {
+        if ($locale === null) {
+            $this-&gt;messages = [];
+            $this-&gt;catalogues = [];
+            $this-&gt;modifyResources(static function (array $resources): array {
+                foreach ($resources as &amp;$list) {
+                    array_splice($list, 1);
+                }
+
+                return $resources;
+            });
+
+            return true;
+        }
+
+        $this-&gt;assertValidLocale($locale);
+
+        foreach ($this-&gt;getDirectories() as $directory) {
+            $file = \sprintf(&#039;%s/%s.php&#039;, rtrim($directory, &#039;\\/&#039;), $locale);
+            $data = @include $file;
+
+            if ($data !== false) {
+                $this-&gt;messages[$locale] = $data;
+                unset($this-&gt;catalogues[$locale]);
+                $this-&gt;modifyResources(static function (array $resources) use ($locale): array {
+                    unset($resources[$locale]);
+
+                    return $resources;
+                });
+                $this-&gt;addResource(&#039;array&#039;, $this-&gt;messages[$locale], $locale);
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns the list of files matching a given locale prefix (or all if empty).
+     *
+     * @param string $prefix prefix required to filter result
+     *
+     * @return array
+     */
+    public function getLocalesFiles(string $prefix = &#039;&#039;): array
+    {
+        $files = [];
+
+        foreach ($this-&gt;getDirectories() as $directory) {
+            foreach (self::getPhpFilesInDirectory(rtrim($directory, &#039;\\/&#039;), $prefix) as $file) {
+                $files[] = $file;
+            }
+        }
+
+        return array_unique($files);
+    }
+
+    /**
+     * Returns the list of internally available locales and already loaded custom locales.
+     * (It will ignore custom translator dynamic loading.)
+     *
+     * @param string $prefix prefix required to filter result
+     *
+     * @return array
+     */
+    public function getAvailableLocales(string $prefix = &#039;&#039;): array
+    {
+        return array_unique(array_merge(
+            array_map(
+                static fn (string $file) =&gt; substr($file, strrpos($file, &#039;/&#039;) + 1, -4),
+                $this-&gt;getLocalesFiles($prefix),
+            ),
+            array_keys($this-&gt;messages),
+        ));
+    }
+
+    protected function translate(?string $id, array $parameters = [], ?string $domain = null, ?string $locale = null): string
+    {
+        $domain ??= &#039;messages&#039;;
+        $catalogue = $this-&gt;getCatalogue($locale);
+        $format = $this instanceof TranslatorStrongTypeInterface
+            ? $this-&gt;getFromCatalogue($catalogue, (string) $id, $domain)
+            : $this-&gt;getCatalogue($locale)-&gt;get((string) $id, $domain); // @codeCoverageIgnore
+
+        if ($format instanceof Closure) {
+            // @codeCoverageIgnoreStart
+            try {
+                $count = (new ReflectionFunction($format))-&gt;getNumberOfRequiredParameters();
+            } catch (ReflectionException) {
+                $count = 0;
+            }
+            // @codeCoverageIgnoreEnd
+
+            return $format(
+                ...array_values($parameters),
+                ...array_fill(0, max(0, $count - \count($parameters)), null)
+            );
+        }
+
+        return parent::trans($id, $parameters, $domain, $locale);
+    }
+
+    /**
+     * Init messages language from matching file in Lang directory.
+     *
+     * @param string $locale
+     *
+     * @return bool
+     */
+    protected function loadMessagesFromFile(string $locale): bool
+    {
+        return isset($this-&gt;messages[$locale]) || $this-&gt;resetMessages($locale);
+    }
+
+    /**
+     * Set messages of a locale and take file first if present.
+     *
+     * @param string $locale
+     * @param array  $messages
+     *
+     * @return $this
+     */
+    public function setMessages(string $locale, array $messages): static
+    {
+        $this-&gt;loadMessagesFromFile($locale);
+        $this-&gt;addResource(&#039;array&#039;, $messages, $locale);
+        $this-&gt;messages[$locale] = array_merge(
+            $this-&gt;messages[$locale] ?? [],
+            $messages
+        );
+
+        return $this;
+    }
+
+    /**
+     * Set messages of the current locale and take file first if present.
+     *
+     * @param array $messages
+     *
+     * @return $this
+     */
+    public function setTranslations(array $messages): static
+    {
+        return $this-&gt;setMessages($this-&gt;getLocale(), $messages);
+    }
+
+    /**
+     * Get messages of a locale, if none given, return all the
+     * languages.
+     */
+    public function getMessages(?string $locale = null): array
+    {
+        return $locale === null ? $this-&gt;messages : $this-&gt;messages[$locale];
+    }
+
+    /**
+     * Set the current translator locale and indicate if the source locale file exists
+     *
+     * @param string $locale locale ex. en
+     */
+    public function setLocale($locale): void
+    {
+        $locale = preg_replace_callback(&#039;/[-_]([a-z]{2,}|\d{2,})/&#039;, function ($matches) {
+            // _2-letters or YUE is a region, _3+-letters is a variant
+            $upper = strtoupper($matches[1]);
+
+            if ($upper === &#039;YUE&#039; || $upper === &#039;ISO&#039; || \strlen($upper) &lt;= static::REGION_CODE_LENGTH) {
+                return &quot;_$upper&quot;;
+            }
+
+            return &#039;_&#039;.ucfirst($matches[1]);
+        }, strtolower($locale));
+
+        $previousLocale = $this-&gt;getLocale();
+
+        if ($previousLocale === $locale &amp;&amp; isset($this-&gt;messages[$locale])) {
+            return;
+        }
+
+        unset(static::$singletons[$previousLocale]);
+
+        if ($locale === &#039;auto&#039;) {
+            $completeLocale = setlocale(LC_TIME, &#039;0&#039;);
+            $locale = preg_replace(&#039;/^([^_.-]+).*$/&#039;, &#039;$1&#039;, $completeLocale);
+            $locales = $this-&gt;getAvailableLocales($locale);
+
+            $completeLocaleChunks = preg_split(&#039;/[_.-]+/&#039;, $completeLocale);
+
+            $getScore = static fn ($language) =&gt; self::compareChunkLists(
+                $completeLocaleChunks,
+                preg_split(&#039;/[_.-]+/&#039;, $language),
+            );
+
+            usort($locales, static fn ($first, $second) =&gt; $getScore($second) &lt;=&gt; $getScore($first));
+
+            $locale = $locales[0] ?? &#039;en&#039;;
+        }
+
+        if (isset($this-&gt;aliases[$locale])) {
+            $locale = $this-&gt;aliases[$locale];
+        }
+
+        // If the language is not provided by a Carbon file
+        // and the tag contains a region (ex: en_CA), then
+        // first load the macro (ex: en) to have a fallback
+        if (
+            str_contains($locale, &#039;_&#039;)
+            &amp;&amp; !\in_array($locale, self::getInternallySupportedLocales(), true)
+            &amp;&amp; $this-&gt;loadMessagesFromFile($macroLocale = preg_replace(&#039;/^([^_]+).*$/&#039;, &#039;$1&#039;, $locale))
+        ) {
+            parent::setLocale($macroLocale);
+        }
+
+        if (!$this-&gt;loadMessagesFromFile($locale) &amp;&amp; !$this-&gt;initializing) {
+            return;
+        }
+
+        parent::setLocale($locale);
+    }
+
+    /**
+     * Show locale on var_dump().
+     *
+     * @return array
+     */
+    public function __debugInfo()
+    {
+        return [
+            &#039;locale&#039; =&gt; $this-&gt;getLocale(),
+        ];
+    }
+
+    public function __serialize(): array
+    {
+        return [
+            &#039;locale&#039; =&gt; $this-&gt;getLocale(),
+        ];
+    }
+
+    public function __unserialize(array $data): void
+    {
+        $this-&gt;initialize($data[&#039;locale&#039;] ?? &#039;en&#039;);
+    }
+
+    private function initialize($locale, ?MessageFormatterInterface $formatter = null, $cacheDir = null, $debug = false): void
+    {
+        parent::setLocale($locale);
+        $this-&gt;initializing = true;
+        $this-&gt;directories = [self::getDefaultLangDirectory()];
+        $this-&gt;addLoader(&#039;array&#039;, new ArrayLoader());
+        parent::__construct($locale, new MessageFormatterMapper($formatter), $cacheDir, $debug);
+        $this-&gt;initializing = false;
+    }
+
+    private static function compareChunkLists($referenceChunks, $chunks)
+    {
+        $score = 0;
+
+        foreach ($referenceChunks as $index =&gt; $chunk) {
+            if (!isset($chunks[$index])) {
+                $score++;
+
+                continue;
+            }
+
+            if (strtolower($chunks[$index]) === strtolower($chunk)) {
+                $score += 10;
+            }
+        }
+
+        return $score;
+    }
+
+    /** @codeCoverageIgnore */
+    private function modifyResources(callable $callback): void
+    {
+        try {
+            $resourcesProperty = new ReflectionProperty(SymfonyTranslator::class, &#039;resources&#039;);
+            $resources = $resourcesProperty-&gt;getValue($this);
+            $resourcesProperty-&gt;setValue($this, $callback($resources));
+        } catch (Throwable) {
+            // Clear resources if available, if not, then nothing to clean
+        }
+    }
+
+    private static function getPhpFilesInDirectory(string $directory, string $prefix): array
+    {
+        if ($directory !== self::getDefaultLangDirectory()) {
+            return glob(&quot;$directory/$prefix*.php&quot;) ?: [];
+        }
+
+        // If it&#039;s the internal Carbon directory we use a static list
+        // which is faster than scanning the folder with glob()
+        $locales = self::getInternallySupportedLocales();
+
+        if ($prefix !== &#039;&#039;) {
+            $locales = array_values(array_filter(
+                self::getInternallySupportedLocales(),
+                static fn (string $locale) =&gt; str_starts_with($locale, $prefix),
+            ));
+        }
+
+        return array_map(
+            static fn (string $locale) =&gt; &quot;$directory/$locale.php&quot;,
+            $locales,
+        );
+    }
+
+    private static function getDefaultLangDirectory(): string
+    {
+        return __DIR__.&#039;/Lang&#039;;
+    }
+
+    /** @return list&lt;string&gt; */
+    private static function getInternallySupportedLocales(): array
+    {
+        return [
+            &#039;aa&#039;,
+            &#039;aa_DJ&#039;,
+            &#039;aa_ER&#039;,
+            &#039;aa_ER@saaho&#039;,
+            &#039;aa_ET&#039;,
+            &#039;af&#039;,
+            &#039;af_NA&#039;,
+            &#039;af_ZA&#039;,
+            &#039;agq&#039;,
+            &#039;agr&#039;,
+            &#039;agr_PE&#039;,
+            &#039;ak&#039;,
+            &#039;ak_GH&#039;,
+            &#039;am&#039;,
+            &#039;am_ET&#039;,
+            &#039;an&#039;,
+            &#039;an_ES&#039;,
+            &#039;anp&#039;,
+            &#039;anp_IN&#039;,
+            &#039;ar&#039;,
+            &#039;ar_AE&#039;,
+            &#039;ar_BH&#039;,
+            &#039;ar_DJ&#039;,
+            &#039;ar_DZ&#039;,
+            &#039;ar_EG&#039;,
+            &#039;ar_EH&#039;,
+            &#039;ar_ER&#039;,
+            &#039;ar_IL&#039;,
+            &#039;ar_IN&#039;,
+            &#039;ar_IQ&#039;,
+            &#039;ar_JO&#039;,
+            &#039;ar_KM&#039;,
+            &#039;ar_KW&#039;,
+            &#039;ar_LB&#039;,
+            &#039;ar_LY&#039;,
+            &#039;ar_MA&#039;,
+            &#039;ar_MR&#039;,
+            &#039;ar_OM&#039;,
+            &#039;ar_PS&#039;,
+            &#039;ar_QA&#039;,
+            &#039;ar_SA&#039;,
+            &#039;ar_SD&#039;,
+            &#039;ar_SO&#039;,
+            &#039;ar_SS&#039;,
+            &#039;ar_SY&#039;,
+            &#039;ar_Shakl&#039;,
+            &#039;ar_TD&#039;,
+            &#039;ar_TN&#039;,
+            &#039;ar_YE&#039;,
+            &#039;as&#039;,
+            &#039;as_IN&#039;,
+            &#039;asa&#039;,
+            &#039;ast&#039;,
+            &#039;ast_ES&#039;,
+            &#039;ayc&#039;,
+            &#039;ayc_PE&#039;,
+            &#039;az&#039;,
+            &#039;az_AZ&#039;,
+            &#039;az_Arab&#039;,
+            &#039;az_Cyrl&#039;,
+            &#039;az_IR&#039;,
+            &#039;az_Latn&#039;,
+            &#039;bas&#039;,
+            &#039;be&#039;,
+            &#039;be_BY&#039;,
+            &#039;be_BY@latin&#039;,
+            &#039;bem&#039;,
+            &#039;bem_ZM&#039;,
+            &#039;ber&#039;,
+            &#039;ber_DZ&#039;,
+            &#039;ber_MA&#039;,
+            &#039;bez&#039;,
+            &#039;bg&#039;,
+            &#039;bg_BG&#039;,
+            &#039;bhb&#039;,
+            &#039;bhb_IN&#039;,
+            &#039;bho&#039;,
+            &#039;bho_IN&#039;,
+            &#039;bi&#039;,
+            &#039;bi_VU&#039;,
+            &#039;bm&#039;,
+            &#039;bn&#039;,
+            &#039;bn_BD&#039;,
+            &#039;bn_IN&#039;,
+            &#039;bo&#039;,
+            &#039;bo_CN&#039;,
+            &#039;bo_IN&#039;,
+            &#039;br&#039;,
+            &#039;br_FR&#039;,
+            &#039;brx&#039;,
+            &#039;brx_IN&#039;,
+            &#039;bs&#039;,
+            &#039;bs_BA&#039;,
+            &#039;bs_Cyrl&#039;,
+            &#039;bs_Latn&#039;,
+            &#039;byn&#039;,
+            &#039;byn_ER&#039;,
+            &#039;ca&#039;,
+            &#039;ca_AD&#039;,
+            &#039;ca_ES&#039;,
+            &#039;ca_ES_Valencia&#039;,
+            &#039;ca_FR&#039;,
+            &#039;ca_IT&#039;,
+            &#039;ccp&#039;,
+            &#039;ccp_IN&#039;,
+            &#039;ce&#039;,
+            &#039;ce_RU&#039;,
+            &#039;cgg&#039;,
+            &#039;chr&#039;,
+            &#039;chr_US&#039;,
+            &#039;ckb&#039;,
+            &#039;cmn&#039;,
+            &#039;cmn_TW&#039;,
+            &#039;crh&#039;,
+            &#039;crh_UA&#039;,
+            &#039;cs&#039;,
+            &#039;cs_CZ&#039;,
+            &#039;csb&#039;,
+            &#039;csb_PL&#039;,
+            &#039;cu&#039;,
+            &#039;cv&#039;,
+            &#039;cv_RU&#039;,
+            &#039;cy&#039;,
+            &#039;cy_GB&#039;,
+            &#039;da&#039;,
+            &#039;da_DK&#039;,
+            &#039;da_GL&#039;,
+            &#039;dav&#039;,
+            &#039;de&#039;,
+            &#039;de_AT&#039;,
+            &#039;de_BE&#039;,
+            &#039;de_CH&#039;,
+            &#039;de_DE&#039;,
+            &#039;de_IT&#039;,
+            &#039;de_LI&#039;,
+            &#039;de_LU&#039;,
+            &#039;dje&#039;,
+            &#039;doi&#039;,
+            &#039;doi_IN&#039;,
+            &#039;dsb&#039;,
+            &#039;dsb_DE&#039;,
+            &#039;dua&#039;,
+            &#039;dv&#039;,
+            &#039;dv_MV&#039;,
+            &#039;dyo&#039;,
+            &#039;dz&#039;,
+            &#039;dz_BT&#039;,
+            &#039;ebu&#039;,
+            &#039;ee&#039;,
+            &#039;ee_TG&#039;,
+            &#039;el&#039;,
+            &#039;el_CY&#039;,
+            &#039;el_GR&#039;,
+            &#039;en&#039;,
+            &#039;en_001&#039;,
+            &#039;en_150&#039;,
+            &#039;en_AG&#039;,
+            &#039;en_AI&#039;,
+            &#039;en_AS&#039;,
+            &#039;en_AT&#039;,
+            &#039;en_AU&#039;,
+            &#039;en_BB&#039;,
+            &#039;en_BE&#039;,
+            &#039;en_BI&#039;,
+            &#039;en_BM&#039;,
+            &#039;en_BS&#039;,
+            &#039;en_BW&#039;,
+            &#039;en_BZ&#039;,
+            &#039;en_CA&#039;,
+            &#039;en_CC&#039;,
+            &#039;en_CH&#039;,
+            &#039;en_CK&#039;,
+            &#039;en_CM&#039;,
+            &#039;en_CX&#039;,
+            &#039;en_CY&#039;,
+            &#039;en_DE&#039;,
+            &#039;en_DG&#039;,
+            &#039;en_DK&#039;,
+            &#039;en_DM&#039;,
+            &#039;en_ER&#039;,
+            &#039;en_FI&#039;,
+            &#039;en_FJ&#039;,
+            &#039;en_FK&#039;,
+            &#039;en_FM&#039;,
+            &#039;en_GB&#039;,
+            &#039;en_GD&#039;,
+            &#039;en_GG&#039;,
+            &#039;en_GH&#039;,
+            &#039;en_GI&#039;,
+            &#039;en_GM&#039;,
+            &#039;en_GU&#039;,
+            &#039;en_GY&#039;,
+            &#039;en_HK&#039;,
+            &#039;en_IE&#039;,
+            &#039;en_IL&#039;,
+            &#039;en_IM&#039;,
+            &#039;en_IN&#039;,
+            &#039;en_IO&#039;,
+            &#039;en_ISO&#039;,
+            &#039;en_JE&#039;,
+            &#039;en_JM&#039;,
+            &#039;en_KE&#039;,
+            &#039;en_KI&#039;,
+            &#039;en_KN&#039;,
+            &#039;en_KY&#039;,
+            &#039;en_LC&#039;,
+            &#039;en_LR&#039;,
+            &#039;en_LS&#039;,
+            &#039;en_MG&#039;,
+            &#039;en_MH&#039;,
+            &#039;en_MO&#039;,
+            &#039;en_MP&#039;,
+            &#039;en_MS&#039;,
+            &#039;en_MT&#039;,
+            &#039;en_MU&#039;,
+            &#039;en_MW&#039;,
+            &#039;en_MY&#039;,
+            &#039;en_NA&#039;,
+            &#039;en_NF&#039;,
+            &#039;en_NG&#039;,
+            &#039;en_NL&#039;,
+            &#039;en_NR&#039;,
+            &#039;en_NU&#039;,
+            &#039;en_NZ&#039;,
+            &#039;en_PG&#039;,
+            &#039;en_PH&#039;,
+            &#039;en_PK&#039;,
+            &#039;en_PN&#039;,
+            &#039;en_PR&#039;,
+            &#039;en_PW&#039;,
+            &#039;en_RW&#039;,
+            &#039;en_SB&#039;,
+            &#039;en_SC&#039;,
+            &#039;en_SD&#039;,
+            &#039;en_SE&#039;,
+            &#039;en_SG&#039;,
+            &#039;en_SH&#039;,
+            &#039;en_SI&#039;,
+            &#039;en_SL&#039;,
+            &#039;en_SS&#039;,
+            &#039;en_SX&#039;,
+            &#039;en_SZ&#039;,
+            &#039;en_TC&#039;,
+            &#039;en_TK&#039;,
+            &#039;en_TO&#039;,
+            &#039;en_TT&#039;,
+            &#039;en_TV&#039;,
+            &#039;en_TZ&#039;,
+            &#039;en_UG&#039;,
+            &#039;en_UM&#039;,
+            &#039;en_US&#039;,
+            &#039;en_US_Posix&#039;,
+            &#039;en_VC&#039;,
+            &#039;en_VG&#039;,
+            &#039;en_VI&#039;,
+            &#039;en_VU&#039;,
+            &#039;en_WS&#039;,
+            &#039;en_ZA&#039;,
+            &#039;en_ZM&#039;,
+            &#039;en_ZW&#039;,
+            &#039;eo&#039;,
+            &#039;es&#039;,
+            &#039;es_419&#039;,
+            &#039;es_AR&#039;,
+            &#039;es_BO&#039;,
+            &#039;es_BR&#039;,
+            &#039;es_BZ&#039;,
+            &#039;es_CL&#039;,
+            &#039;es_CO&#039;,
+            &#039;es_CR&#039;,
+            &#039;es_CU&#039;,
+            &#039;es_DO&#039;,
+            &#039;es_EA&#039;,
+            &#039;es_EC&#039;,
+            &#039;es_ES&#039;,
+            &#039;es_GQ&#039;,
+            &#039;es_GT&#039;,
+            &#039;es_HN&#039;,
+            &#039;es_IC&#039;,
+            &#039;es_MX&#039;,
+            &#039;es_NI&#039;,
+            &#039;es_PA&#039;,
+            &#039;es_PE&#039;,
+            &#039;es_PH&#039;,
+            &#039;es_PR&#039;,
+            &#039;es_PY&#039;,
+            &#039;es_SV&#039;,
+            &#039;es_US&#039;,
+            &#039;es_UY&#039;,
+            &#039;es_VE&#039;,
+            &#039;et&#039;,
+            &#039;et_EE&#039;,
+            &#039;eu&#039;,
+            &#039;eu_ES&#039;,
+            &#039;ewo&#039;,
+            &#039;fa&#039;,
+            &#039;fa_AF&#039;,
+            &#039;fa_IR&#039;,
+            &#039;ff&#039;,
+            &#039;ff_CM&#039;,
+            &#039;ff_GN&#039;,
+            &#039;ff_MR&#039;,
+            &#039;ff_SN&#039;,
+            &#039;fi&#039;,
+            &#039;fi_FI&#039;,
+            &#039;fil&#039;,
+            &#039;fil_PH&#039;,
+            &#039;fo&#039;,
+            &#039;fo_DK&#039;,
+            &#039;fo_FO&#039;,
+            &#039;fr&#039;,
+            &#039;fr_BE&#039;,
+            &#039;fr_BF&#039;,
+            &#039;fr_BI&#039;,
+            &#039;fr_BJ&#039;,
+            &#039;fr_BL&#039;,
+            &#039;fr_CA&#039;,
+            &#039;fr_CD&#039;,
+            &#039;fr_CF&#039;,
+            &#039;fr_CG&#039;,
+            &#039;fr_CH&#039;,
+            &#039;fr_CI&#039;,
+            &#039;fr_CM&#039;,
+            &#039;fr_DJ&#039;,
+            &#039;fr_DZ&#039;,
+            &#039;fr_FR&#039;,
+            &#039;fr_GA&#039;,
+            &#039;fr_GF&#039;,
+            &#039;fr_GN&#039;,
+            &#039;fr_GP&#039;,
+            &#039;fr_GQ&#039;,
+            &#039;fr_HT&#039;,
+            &#039;fr_KM&#039;,
+            &#039;fr_LU&#039;,
+            &#039;fr_MA&#039;,
+            &#039;fr_MC&#039;,
+            &#039;fr_MF&#039;,
+            &#039;fr_MG&#039;,
+            &#039;fr_ML&#039;,
+            &#039;fr_MQ&#039;,
+            &#039;fr_MR&#039;,
+            &#039;fr_MU&#039;,
+            &#039;fr_NC&#039;,
+            &#039;fr_NE&#039;,
+            &#039;fr_PF&#039;,
+            &#039;fr_PM&#039;,
+            &#039;fr_RE&#039;,
+            &#039;fr_RW&#039;,
+            &#039;fr_SC&#039;,
+            &#039;fr_SN&#039;,
+            &#039;fr_SY&#039;,
+            &#039;fr_TD&#039;,
+            &#039;fr_TG&#039;,
+            &#039;fr_TN&#039;,
+            &#039;fr_VU&#039;,
+            &#039;fr_WF&#039;,
+            &#039;fr_YT&#039;,
+            &#039;fur&#039;,
+            &#039;fur_IT&#039;,
+            &#039;fy&#039;,
+            &#039;fy_DE&#039;,
+            &#039;fy_NL&#039;,
+            &#039;ga&#039;,
+            &#039;ga_IE&#039;,
+            &#039;gd&#039;,
+            &#039;gd_GB&#039;,
+            &#039;gez&#039;,
+            &#039;gez_ER&#039;,
+            &#039;gez_ET&#039;,
+            &#039;gl&#039;,
+            &#039;gl_ES&#039;,
+            &#039;gom&#039;,
+            &#039;gom_Latn&#039;,
+            &#039;gsw&#039;,
+            &#039;gsw_CH&#039;,
+            &#039;gsw_FR&#039;,
+            &#039;gsw_LI&#039;,
+            &#039;gu&#039;,
+            &#039;gu_IN&#039;,
+            &#039;guz&#039;,
+            &#039;gv&#039;,
+            &#039;gv_GB&#039;,
+            &#039;ha&#039;,
+            &#039;ha_GH&#039;,
+            &#039;ha_NE&#039;,
+            &#039;ha_NG&#039;,
+            &#039;hak&#039;,
+            &#039;hak_TW&#039;,
+            &#039;haw&#039;,
+            &#039;he&#039;,
+            &#039;he_IL&#039;,
+            &#039;hi&#039;,
+            &#039;hi_IN&#039;,
+            &#039;hif&#039;,
+            &#039;hif_FJ&#039;,
+            &#039;hne&#039;,
+            &#039;hne_IN&#039;,
+            &#039;hr&#039;,
+            &#039;hr_BA&#039;,
+            &#039;hr_HR&#039;,
+            &#039;hsb&#039;,
+            &#039;hsb_DE&#039;,
+            &#039;ht&#039;,
+            &#039;ht_HT&#039;,
+            &#039;hu&#039;,
+            &#039;hu_HU&#039;,
+            &#039;hy&#039;,
+            &#039;hy_AM&#039;,
+            &#039;i18n&#039;,
+            &#039;ia&#039;,
+            &#039;ia_FR&#039;,
+            &#039;id&#039;,
+            &#039;id_ID&#039;,
+            &#039;ig&#039;,
+            &#039;ig_NG&#039;,
+            &#039;ii&#039;,
+            &#039;ik&#039;,
+            &#039;ik_CA&#039;,
+            &#039;in&#039;,
+            &#039;is&#039;,
+            &#039;is_IS&#039;,
+            &#039;it&#039;,
+            &#039;it_CH&#039;,
+            &#039;it_IT&#039;,
+            &#039;it_SM&#039;,
+            &#039;it_VA&#039;,
+            &#039;iu&#039;,
+            &#039;iu_CA&#039;,
+            &#039;iw&#039;,
+            &#039;ja&#039;,
+            &#039;ja_JP&#039;,
+            &#039;jgo&#039;,
+            &#039;jmc&#039;,
+            &#039;jv&#039;,
+            &#039;ka&#039;,
+            &#039;ka_GE&#039;,
+            &#039;kab&#039;,
+            &#039;kab_DZ&#039;,
+            &#039;kam&#039;,
+            &#039;kde&#039;,
+            &#039;kea&#039;,
+            &#039;khq&#039;,
+            &#039;ki&#039;,
+            &#039;kk&#039;,
+            &#039;kk_KZ&#039;,
+            &#039;kkj&#039;,
+            &#039;kl&#039;,
+            &#039;kl_GL&#039;,
+            &#039;kln&#039;,
+            &#039;km&#039;,
+            &#039;km_KH&#039;,
+            &#039;kn&#039;,
+            &#039;kn_IN&#039;,
+            &#039;ko&#039;,
+            &#039;ko_KP&#039;,
+            &#039;ko_KR&#039;,
+            &#039;kok&#039;,
+            &#039;kok_IN&#039;,
+            &#039;ks&#039;,
+            &#039;ks_IN&#039;,
+            &#039;ks_IN@devanagari&#039;,
+            &#039;ksb&#039;,
+            &#039;ksf&#039;,
+            &#039;ksh&#039;,
+            &#039;ku&#039;,
+            &#039;ku_TR&#039;,
+            &#039;kw&#039;,
+            &#039;kw_GB&#039;,
+            &#039;ky&#039;,
+            &#039;ky_KG&#039;,
+            &#039;lag&#039;,
+            &#039;lb&#039;,
+            &#039;lb_LU&#039;,
+            &#039;lg&#039;,
+            &#039;lg_UG&#039;,
+            &#039;li&#039;,
+            &#039;li_NL&#039;,
+            &#039;lij&#039;,
+            &#039;lij_IT&#039;,
+            &#039;lkt&#039;,
+            &#039;ln&#039;,
+            &#039;ln_AO&#039;,
+            &#039;ln_CD&#039;,
+            &#039;ln_CF&#039;,
+            &#039;ln_CG&#039;,
+            &#039;lo&#039;,
+            &#039;lo_LA&#039;,
+            &#039;lrc&#039;,
+            &#039;lrc_IQ&#039;,
+            &#039;lt&#039;,
+            &#039;lt_LT&#039;,
+            &#039;lu&#039;,
+            &#039;luo&#039;,
+            &#039;luy&#039;,
+            &#039;lv&#039;,
+            &#039;lv_LV&#039;,
+            &#039;lzh&#039;,
+            &#039;lzh_TW&#039;,
+            &#039;mag&#039;,
+            &#039;mag_IN&#039;,
+            &#039;mai&#039;,
+            &#039;mai_IN&#039;,
+            &#039;mas&#039;,
+            &#039;mas_TZ&#039;,
+            &#039;mer&#039;,
+            &#039;mfe&#039;,
+            &#039;mfe_MU&#039;,
+            &#039;mg&#039;,
+            &#039;mg_MG&#039;,
+            &#039;mgh&#039;,
+            &#039;mgo&#039;,
+            &#039;mhr&#039;,
+            &#039;mhr_RU&#039;,
+            &#039;mi&#039;,
+            &#039;mi_NZ&#039;,
+            &#039;miq&#039;,
+            &#039;miq_NI&#039;,
+            &#039;mjw&#039;,
+            &#039;mjw_IN&#039;,
+            &#039;mk&#039;,
+            &#039;mk_MK&#039;,
+            &#039;ml&#039;,
+            &#039;ml_IN&#039;,
+            &#039;mn&#039;,
+            &#039;mn_MN&#039;,
+            &#039;mni&#039;,
+            &#039;mni_IN&#039;,
+            &#039;mo&#039;,
+            &#039;mr&#039;,
+            &#039;mr_IN&#039;,
+            &#039;ms&#039;,
+            &#039;ms_BN&#039;,
+            &#039;ms_MY&#039;,
+            &#039;ms_SG&#039;,
+            &#039;mt&#039;,
+            &#039;mt_MT&#039;,
+            &#039;mua&#039;,
+            &#039;my&#039;,
+            &#039;my_MM&#039;,
+            &#039;mzn&#039;,
+            &#039;nan&#039;,
+            &#039;nan_TW&#039;,
+            &#039;nan_TW@latin&#039;,
+            &#039;naq&#039;,
+            &#039;nb&#039;,
+            &#039;nb_NO&#039;,
+            &#039;nb_SJ&#039;,
+            &#039;nd&#039;,
+            &#039;nds&#039;,
+            &#039;nds_DE&#039;,
+            &#039;nds_NL&#039;,
+            &#039;ne&#039;,
+            &#039;ne_IN&#039;,
+            &#039;ne_NP&#039;,
+            &#039;nhn&#039;,
+            &#039;nhn_MX&#039;,
+            &#039;niu&#039;,
+            &#039;niu_NU&#039;,
+            &#039;nl&#039;,
+            &#039;nl_AW&#039;,
+            &#039;nl_BE&#039;,
+            &#039;nl_BQ&#039;,
+            &#039;nl_CW&#039;,
+            &#039;nl_NL&#039;,
+            &#039;nl_SR&#039;,
+            &#039;nl_SX&#039;,
+            &#039;nmg&#039;,
+            &#039;nn&#039;,
+            &#039;nn_NO&#039;,
+            &#039;nnh&#039;,
+            &#039;no&#039;,
+            &#039;nr&#039;,
+            &#039;nr_ZA&#039;,
+            &#039;nso&#039;,
+            &#039;nso_ZA&#039;,
+            &#039;nus&#039;,
+            &#039;nyn&#039;,
+            &#039;oc&#039;,
+            &#039;oc_FR&#039;,
+            &#039;om&#039;,
+            &#039;om_ET&#039;,
+            &#039;om_KE&#039;,
+            &#039;or&#039;,
+            &#039;or_IN&#039;,
+            &#039;os&#039;,
+            &#039;os_RU&#039;,
+            &#039;pa&#039;,
+            &#039;pa_Arab&#039;,
+            &#039;pa_Guru&#039;,
+            &#039;pa_IN&#039;,
+            &#039;pa_PK&#039;,
+            &#039;pap&#039;,
+            &#039;pap_AW&#039;,
+            &#039;pap_CW&#039;,
+            &#039;pl&#039;,
+            &#039;pl_PL&#039;,
+            &#039;prg&#039;,
+            &#039;ps&#039;,
+            &#039;ps_AF&#039;,
+            &#039;pt&#039;,
+            &#039;pt_AO&#039;,
+            &#039;pt_BR&#039;,
+            &#039;pt_CH&#039;,
+            &#039;pt_CV&#039;,
+            &#039;pt_GQ&#039;,
+            &#039;pt_GW&#039;,
+            &#039;pt_LU&#039;,
+            &#039;pt_MO&#039;,
+            &#039;pt_MZ&#039;,
+            &#039;pt_PT&#039;,
+            &#039;pt_ST&#039;,
+            &#039;pt_TL&#039;,
+            &#039;qu&#039;,
+            &#039;qu_BO&#039;,
+            &#039;qu_EC&#039;,
+            &#039;quz&#039;,
+            &#039;quz_PE&#039;,
+            &#039;raj&#039;,
+            &#039;raj_IN&#039;,
+            &#039;rm&#039;,
+            &#039;rn&#039;,
+            &#039;ro&#039;,
+            &#039;ro_MD&#039;,
+            &#039;ro_RO&#039;,
+            &#039;rof&#039;,
+            &#039;ru&#039;,
+            &#039;ru_BY&#039;,
+            &#039;ru_KG&#039;,
+            &#039;ru_KZ&#039;,
+            &#039;ru_MD&#039;,
+            &#039;ru_RU&#039;,
+            &#039;ru_UA&#039;,
+            &#039;rw&#039;,
+            &#039;rw_RW&#039;,
+            &#039;rwk&#039;,
+            &#039;sa&#039;,
+            &#039;sa_IN&#039;,
+            &#039;sah&#039;,
+            &#039;sah_RU&#039;,
+            &#039;saq&#039;,
+            &#039;sat&#039;,
+            &#039;sat_IN&#039;,
+            &#039;sbp&#039;,
+            &#039;sc&#039;,
+            &#039;sc_IT&#039;,
+            &#039;sd&#039;,
+            &#039;sd_IN&#039;,
+            &#039;sd_IN@devanagari&#039;,
+            &#039;se&#039;,
+            &#039;se_FI&#039;,
+            &#039;se_NO&#039;,
+            &#039;se_SE&#039;,
+            &#039;seh&#039;,
+            &#039;ses&#039;,
+            &#039;sg&#039;,
+            &#039;sgs&#039;,
+            &#039;sgs_LT&#039;,
+            &#039;sh&#039;,
+            &#039;shi&#039;,
+            &#039;shi_Latn&#039;,
+            &#039;shi_Tfng&#039;,
+            &#039;shn&#039;,
+            &#039;shn_MM&#039;,
+            &#039;shs&#039;,
+            &#039;shs_CA&#039;,
+            &#039;si&#039;,
+            &#039;si_LK&#039;,
+            &#039;sid&#039;,
+            &#039;sid_ET&#039;,
+            &#039;sk&#039;,
+            &#039;sk_SK&#039;,
+            &#039;sl&#039;,
+            &#039;sl_SI&#039;,
+            &#039;sm&#039;,
+            &#039;sm_WS&#039;,
+            &#039;smn&#039;,
+            &#039;sn&#039;,
+            &#039;so&#039;,
+            &#039;so_DJ&#039;,
+            &#039;so_ET&#039;,
+            &#039;so_KE&#039;,
+            &#039;so_SO&#039;,
+            &#039;sq&#039;,
+            &#039;sq_AL&#039;,
+            &#039;sq_MK&#039;,
+            &#039;sq_XK&#039;,
+            &#039;sr&#039;,
+            &#039;sr_Cyrl&#039;,
+            &#039;sr_Cyrl_BA&#039;,
+            &#039;sr_Cyrl_ME&#039;,
+            &#039;sr_Cyrl_XK&#039;,
+            &#039;sr_Latn&#039;,
+            &#039;sr_Latn_BA&#039;,
+            &#039;sr_Latn_ME&#039;,
+            &#039;sr_Latn_XK&#039;,
+            &#039;sr_ME&#039;,
+            &#039;sr_RS&#039;,
+            &#039;sr_RS@latin&#039;,
+            &#039;ss&#039;,
+            &#039;ss_ZA&#039;,
+            &#039;st&#039;,
+            &#039;st_ZA&#039;,
+            &#039;sv&#039;,
+            &#039;sv_AX&#039;,
+            &#039;sv_FI&#039;,
+            &#039;sv_SE&#039;,
+            &#039;sw&#039;,
+            &#039;sw_CD&#039;,
+            &#039;sw_KE&#039;,
+            &#039;sw_TZ&#039;,
+            &#039;sw_UG&#039;,
+            &#039;szl&#039;,
+            &#039;szl_PL&#039;,
+            &#039;ta&#039;,
+            &#039;ta_IN&#039;,
+            &#039;ta_LK&#039;,
+            &#039;ta_MY&#039;,
+            &#039;ta_SG&#039;,
+            &#039;tcy&#039;,
+            &#039;tcy_IN&#039;,
+            &#039;te&#039;,
+            &#039;te_IN&#039;,
+            &#039;teo&#039;,
+            &#039;teo_KE&#039;,
+            &#039;tet&#039;,
+            &#039;tg&#039;,
+            &#039;tg_TJ&#039;,
+            &#039;th&#039;,
+            &#039;th_TH&#039;,
+            &#039;the&#039;,
+            &#039;the_NP&#039;,
+            &#039;ti&#039;,
+            &#039;ti_ER&#039;,
+            &#039;ti_ET&#039;,
+            &#039;tig&#039;,
+            &#039;tig_ER&#039;,
+            &#039;tk&#039;,
+            &#039;tk_TM&#039;,
+            &#039;tl&#039;,
+            &#039;tl_PH&#039;,
+            &#039;tlh&#039;,
+            &#039;tn&#039;,
+            &#039;tn_ZA&#039;,
+            &#039;to&#039;,
+            &#039;to_TO&#039;,
+            &#039;tpi&#039;,
+            &#039;tpi_PG&#039;,
+            &#039;tr&#039;,
+            &#039;tr_CY&#039;,
+            &#039;tr_TR&#039;,
+            &#039;ts&#039;,
+            &#039;ts_ZA&#039;,
+            &#039;tt&#039;,
+            &#039;tt_RU&#039;,
+            &#039;tt_RU@iqtelif&#039;,
+            &#039;twq&#039;,
+            &#039;tzl&#039;,
+            &#039;tzm&#039;,
+            &#039;tzm_Latn&#039;,
+            &#039;ug&#039;,
+            &#039;ug_CN&#039;,
+            &#039;uk&#039;,
+            &#039;uk_UA&#039;,
+            &#039;unm&#039;,
+            &#039;unm_US&#039;,
+            &#039;ur&#039;,
+            &#039;ur_IN&#039;,
+            &#039;ur_PK&#039;,
+            &#039;uz&#039;,
+            &#039;uz_Arab&#039;,
+            &#039;uz_Cyrl&#039;,
+            &#039;uz_Latn&#039;,
+            &#039;uz_UZ&#039;,
+            &#039;uz_UZ@cyrillic&#039;,
+            &#039;vai&#039;,
+            &#039;vai_Latn&#039;,
+            &#039;vai_Vaii&#039;,
+            &#039;ve&#039;,
+            &#039;ve_ZA&#039;,
+            &#039;vi&#039;,
+            &#039;vi_VN&#039;,
+            &#039;vo&#039;,
+            &#039;vun&#039;,
+            &#039;wa&#039;,
+            &#039;wa_BE&#039;,
+            &#039;wae&#039;,
+            &#039;wae_CH&#039;,
+            &#039;wal&#039;,
+            &#039;wal_ET&#039;,
+            &#039;wo&#039;,
+            &#039;wo_SN&#039;,
+            &#039;xh&#039;,
+            &#039;xh_ZA&#039;,
+            &#039;xog&#039;,
+            &#039;yav&#039;,
+            &#039;yi&#039;,
+            &#039;yi_US&#039;,
+            &#039;yo&#039;,
+            &#039;yo_BJ&#039;,
+            &#039;yo_NG&#039;,
+            &#039;yue&#039;,
+            &#039;yue_HK&#039;,
+            &#039;yue_Hans&#039;,
+            &#039;yue_Hant&#039;,
+            &#039;yuw&#039;,
+            &#039;yuw_PG&#039;,
+            &#039;zgh&#039;,
+            &#039;zh&#039;,
+            &#039;zh_CN&#039;,
+            &#039;zh_HK&#039;,
+            &#039;zh_Hans&#039;,
+            &#039;zh_Hans_HK&#039;,
+            &#039;zh_Hans_MO&#039;,
+            &#039;zh_Hans_SG&#039;,
+            &#039;zh_Hant&#039;,
+            &#039;zh_Hant_HK&#039;,
+            &#039;zh_Hant_MO&#039;,
+            &#039;zh_Hant_TW&#039;,
+            &#039;zh_MO&#039;,
+            &#039;zh_SG&#039;,
+            &#039;zh_TW&#039;,
+            &#039;zh_YUE&#039;,
+            &#039;zu&#039;,
+            &#039;zu_ZA&#039;,
+        ];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/nesbot/carbon/src/Carbon/Callback.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/nesbot/carbon/src/Carbon/Cli -->
+
+</body>
+</html>

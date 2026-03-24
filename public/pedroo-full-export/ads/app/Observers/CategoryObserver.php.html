@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/app/Observers/CategoryObserver.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+/*
+ * LaraClassifier - Classified Ads Web Application
+ * Copyright (c) BeDigit. All Rights Reserved
+ *
+ * Website: https://laraclassifier.com
+ * Author: Mayeul Akpovi (BeDigit - https://bedigit.com)
+ *
+ * LICENSE
+ * -------
+ * This software is provided under a license agreement and may only be used or copied
+ * in accordance with its terms, including the inclusion of the above copyright notice.
+ * As this software is sold exclusively on CodeCanyon,
+ * please review the full license details here: https://codecanyon.net/licenses/standard
+ */
+
+namespace App\Observers;
+
+use App\Helpers\Common\Files\Storage\StorageDisk;
+use App\Models\Category;
+use App\Models\CategoryField;
+use App\Models\Language;
+use App\Models\MenuItem;
+use App\Models\Post;
+use App\Models\Scopes\ActiveScope;
+use App\Observers\Traits\CategoryTrait;
+use App\Observers\Traits\HasNestedColumns;
+
+class CategoryObserver extends BaseObserver
+{
+	use HasNestedColumns, CategoryTrait;
+	
+	/**
+	 * Listen to the Entry creating event.
+	 *
+	 * @param Category $category
+	 * @return void
+	 */
+	public function creating(Category $category)
+	{
+		// Fix required columns
+		$category = $this-&gt;fixRequiredColumns($category);
+		
+		// Apply the nested created actions
+		return $this-&gt;creatingNestedItem($category);
+	}
+	
+	/**
+	 * Listen to the Entry updating event.
+	 *
+	 * @param Category $category
+	 * @return void
+	 */
+	public function updating(Category $category)
+	{
+		// Fix required columns
+		$category = $this-&gt;fixRequiredColumns($category);
+		
+		// Apply the nested updating actions
+		return $this-&gt;updatingNestedItem($category);
+	}
+	
+	/**
+	 * Listen to the Entry deleting event.
+	 *
+	 * @param Category $category
+	 * @return void
+	 */
+	public function deleting($category)
+	{
+		// Apply the nested deleting actions
+		$this-&gt;deletingNestedItem($category);
+		
+		// Storage Disk Init.
+		$disk = StorageDisk::getDisk();
+		
+		// Delete all the Category&#039;s Custom Fields
+		$catFields = CategoryField::where(&#039;category_id&#039;, $category-&gt;id)-&gt;get();
+		if ($catFields-&gt;count() &gt; 0) {
+			foreach ($catFields as $catField) {
+				$catField-&gt;delete();
+			}
+		}
+		
+		// Delete all the Category&#039;s Posts
+		$posts = Post::where(&#039;category_id&#039;, $category-&gt;id);
+		if ($posts-&gt;count() &gt; 0) {
+			foreach ($posts-&gt;cursor() as $post) {
+				$post-&gt;delete();
+			}
+		}
+		
+		// Don&#039;t delete the default pictures
+		$defaultPicture = &#039;app/default/categories/fa-folder-default.png&#039;;
+		$skin = config(&#039;settings.style.skin&#039;, &#039;default&#039;);
+		$skinPicture = &#039;app/default/categories/fa-folder-&#039; . $skin . &#039;.png&#039;;
+		$skinDirectory = &#039;app/categories/&#039; . $skin . &#039;/&#039;;
+		if (
+			!empty($category-&gt;image_path)
+			&amp;&amp; !str_contains($category-&gt;image_path, $defaultPicture)
+			&amp;&amp; !str_contains($category-&gt;image_path, $skinPicture)
+			&amp;&amp; !str_contains($category-&gt;image_path, $skinDirectory)
+			&amp;&amp; $disk-&gt;exists($category-&gt;image_path)
+		) {
+			$disk-&gt;delete($category-&gt;image_path);
+		}
+		
+		// Delete the category&#039;s children recursively
+		$this-&gt;deleteChildrenRecursively($category);
+	}
+	
+	/**
+	 * Listen to the Entry updated event.
+	 *
+	 * @param Category $category
+	 * @return void
+	 */
+	public function updated(Category $category)
+	{
+		// Activate|Deactivate category with its children or parent (if they exist)
+		
+		/*
+		 * If the category is activated, check if it has a parent;
+		 * If yes, active the parent also *ONLY* if it was disabled.
+		 * NOTE: The *ONLY* means to prevent any infinite recursion.
+		 */
+		if ($category-&gt;active == 1) {
+			if (!empty($category-&gt;parent_id)) {
+				$parentCat = Category::find($category-&gt;parent_id);
+				if ($parentCat-&gt;active != 1) {
+					$parentCat-&gt;active = 1;
+					$parentCat-&gt;save();
+				}
+			}
+			
+			// If the &quot;activateChildren&quot; field is checked,
+			// then activate all the category&#039;s children.
+			if (request()-&gt;has(&#039;activateChildren&#039;) &amp;&amp; (bool)request()-&gt;input(&#039;activateChildren&#039;)) {
+				$subCats = Category::childrenOf($category-&gt;id)-&gt;get();
+				if ($subCats-&gt;count() &gt; 0) {
+					foreach ($subCats as $subCat) {
+						if ($subCat-&gt;active != 1) {
+							$subCat-&gt;active = 1;
+							$subCat-&gt;save();
+						}
+					}
+				}
+			}
+		} else {
+			/*
+			 * If the category is disabled, check if it has children;
+			 * If yes, browses each child and disables it *ONLY* if it&#039;s not disabled.
+			 * NOTE: The *ONLY* means to prevent any infinite recursion.
+			 */
+			$subCats = Category::childrenOf($category-&gt;id)-&gt;get();
+			if ($subCats-&gt;count() &gt; 0) {
+				foreach ($subCats as $subCat) {
+					if ($subCat-&gt;active != 0) {
+						$subCat-&gt;active = 0;
+						$subCat-&gt;save();
+					}
+				}
+			}
+		}
+		
+		// Update menu items when category slug or name changes
+		if ($category-&gt;isDirty([&#039;slug&#039;, &#039;name&#039;, &#039;active&#039;])) {
+			$this-&gt;updateRelatedMenuItems($category);
+		}
+	}
+	
+	/**
+	 * Listen to the Entry saved event.
+	 *
+	 * @param Category $category
+	 * @return void
+	 */
+	public function saved(Category $category)
+	{
+		// Convert Adjacent List to Nested Set
+		// $this-&gt;adjacentToNestedByItem($category);
+	}
+	
+	/**
+	 * Listen to the Entry deleted event.
+	 *
+	 * @param Category $category
+	 * @return void
+	 */
+	public function deleted(Category $category)
+	{
+		// Convert Adjacent List to Nested Set
+		// $this-&gt;adjacentToNestedByItem($category);
+		
+		// Remove menu items when category is deleted
+		$this-&gt;removeRelatedMenuItems($category);
+	}
+	
+	// PRIVATE
+	
+	/**
+	 * @param \App\Models\Category $category
+	 * @return void
+	 */
+	private function updateRelatedMenuItems(Category $category): void
+	{
+		$prefix = &#039;category.&#039;;
+		$routeName = &quot;{$prefix}{$category-&gt;getOriginal(&#039;slug&#039;)}&quot;;
+		
+		// Find menu items that reference this category
+		$menuItems = MenuItem::query()
+			-&gt;with([&#039;menu&#039;])
+			-&gt;where(&#039;url_type&#039;, &#039;route&#039;)
+			-&gt;where(&#039;route_name&#039;, $routeName)
+			-&gt;get();
+		
+		foreach ($menuItems as $menuItem) {
+			if (!$category-&gt;active) {
+				// Deactivate menu item if category is deactivated
+				$menuItem-&gt;update([&#039;active&#039; =&gt; 0]);
+			} else {
+				// Update route name if slug changed
+				if ($category-&gt;isDirty(&#039;slug&#039;)) {
+					$menuItem-&gt;update([&#039;route_name&#039; =&gt; &quot;{$prefix}{$category-&gt;slug}&quot;]);
+				}
+				
+				// Update label/title if name changed
+				if ($category-&gt;isDirty(&#039;name&#039;)) {
+					$currentLabel = method_exists($menuItem, &#039;getLabelTranslations&#039;) ? $menuItem-&gt;getLabelTranslations() : [];
+					
+					$languages = Language::query()-&gt;withoutGlobalScopes([ActiveScope::class])-&gt;get([&#039;code&#039;]);
+					if ($languages-&gt;count() &gt; 0) {
+						foreach ($languages as $language) {
+							$currentLabel[$language-&gt;code] = $category-&gt;getTranslation(&#039;name&#039;, $language-&gt;code);
+						}
+					}
+					
+					if (!empty($currentLabel)) {
+						$menuItem-&gt;setTranslations(&#039;label&#039;, $currentLabel);
+						$menuItem-&gt;save();
+					}
+				}
+			}
+		}
+	}
+	
+	/**
+	 * @param \App\Models\Category $category
+	 * @return void
+	 */
+	private function removeRelatedMenuItems(Category $category): void
+	{
+		$prefix = &#039;category.&#039;;
+		$routeName = &quot;{$prefix}{$category-&gt;slug}&quot;;
+		
+		$menuItems = MenuItem::query()
+			-&gt;with([&#039;menu&#039;])
+			-&gt;where(&#039;url_type&#039;, &#039;route&#039;)
+			-&gt;where(&#039;route_name&#039;, $routeName)
+			-&gt;get();
+		
+		foreach ($menuItems as $menuItem) {
+			$menuItem-&gt;delete();
+		}
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/app/Observers/CityObserver.php -->
+<!-- PEDROO_NEXT_DIR: /ads/app/Observers/Traits -->
+
+</body>
+</html>

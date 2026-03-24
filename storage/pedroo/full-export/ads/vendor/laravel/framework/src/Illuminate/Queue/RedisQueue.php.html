@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/laravel/framework/src/Illuminate/Queue/RedisQueue.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Queue;
+
+use Illuminate\Contracts\Queue\ClearableQueue;
+use Illuminate\Contracts\Queue\Queue as QueueContract;
+use Illuminate\Contracts\Redis\Factory as Redis;
+use Illuminate\Queue\Jobs\RedisJob;
+use Illuminate\Redis\Connections\PhpRedisClusterConnection;
+use Illuminate\Redis\Connections\PredisClusterConnection;
+use Illuminate\Support\Str;
+
+class RedisQueue extends Queue implements QueueContract, ClearableQueue
+{
+    /**
+     * The Redis factory implementation.
+     *
+     * @var \Illuminate\Contracts\Redis\Factory
+     */
+    protected $redis;
+
+    /**
+     * The connection name.
+     *
+     * @var string
+     */
+    protected $connection;
+
+    /**
+     * The name of the default queue.
+     *
+     * @var string
+     */
+    protected $default;
+
+    /**
+     * The expiration time of a job.
+     *
+     * @var int|null
+     */
+    protected $retryAfter = 60;
+
+    /**
+     * The maximum number of seconds to block for a job.
+     *
+     * @var int|null
+     */
+    protected $blockFor = null;
+
+    /**
+     * The batch size to use when migrating delayed / expired jobs onto the primary queue.
+     *
+     * Negative values are infinite.
+     *
+     * @var int
+     */
+    protected $migrationBatchSize = -1;
+
+    /**
+     * Indicates if a secondary queue had a job available between checks of the primary queue.
+     *
+     * Only applicable when monitoring multiple named queues with a single instance.
+     *
+     * @var bool
+     */
+    protected $secondaryQueueHadJob = false;
+
+    /**
+     * Create a new Redis queue instance.
+     *
+     * @param  \Illuminate\Contracts\Redis\Factory  $redis
+     * @param  string  $default
+     * @param  string|null  $connection
+     * @param  int  $retryAfter
+     * @param  int|null  $blockFor
+     * @param  bool  $dispatchAfterCommit
+     * @param  int  $migrationBatchSize
+     */
+    public function __construct(
+        Redis $redis,
+        $default = &#039;default&#039;,
+        $connection = null,
+        $retryAfter = 60,
+        $blockFor = null,
+        $dispatchAfterCommit = false,
+        $migrationBatchSize = -1,
+    ) {
+        $this-&gt;redis = $redis;
+        $this-&gt;default = $default;
+        $this-&gt;blockFor = $blockFor;
+        $this-&gt;connection = $connection;
+        $this-&gt;retryAfter = $retryAfter;
+        $this-&gt;dispatchAfterCommit = $dispatchAfterCommit;
+        $this-&gt;migrationBatchSize = $migrationBatchSize;
+    }
+
+    /**
+     * Get the size of the queue.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function size($queue = null)
+    {
+        $queue = $this-&gt;getQueue($queue);
+
+        return $this-&gt;getConnection()-&gt;eval(
+            LuaScripts::size(), 3, $queue, $queue.&#039;:delayed&#039;, $queue.&#039;:reserved&#039;
+        );
+    }
+
+    /**
+     * Get the number of pending jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function pendingSize($queue = null)
+    {
+        return $this-&gt;getConnection()-&gt;llen($this-&gt;getQueue($queue));
+    }
+
+    /**
+     * Get the number of delayed jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function delayedSize($queue = null)
+    {
+        return $this-&gt;getConnection()-&gt;zcard($this-&gt;getQueue($queue).&#039;:delayed&#039;);
+    }
+
+    /**
+     * Get the number of reserved jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function reservedSize($queue = null)
+    {
+        return $this-&gt;getConnection()-&gt;zcard($this-&gt;getQueue($queue).&#039;:reserved&#039;);
+    }
+
+    /**
+     * Get the creation timestamp of the oldest pending job, excluding delayed jobs.
+     *
+     * @param  string|null  $queue
+     * @return int|null
+     */
+    public function creationTimeOfOldestPendingJob($queue = null)
+    {
+        $payload = $this-&gt;getConnection()-&gt;lindex($this-&gt;getQueue($queue), 0);
+
+        if (! $payload) {
+            return null;
+        }
+
+        $data = json_decode($payload, true);
+
+        return $data[&#039;createdAt&#039;] ?? null;
+    }
+
+    /**
+     * Push an array of jobs onto the queue.
+     *
+     * @param  array  $jobs
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return void
+     */
+    public function bulk($jobs, $data = &#039;&#039;, $queue = null)
+    {
+        $connection = $this-&gt;getConnection();
+
+        $bulk = function () use ($jobs, $data, $queue) {
+            foreach ((array) $jobs as $job) {
+                if (isset($job-&gt;delay)) {
+                    $this-&gt;later($job-&gt;delay, $job, $data, $queue);
+                } else {
+                    $this-&gt;push($job, $data, $queue);
+                }
+            }
+        };
+
+        if ($connection instanceof PhpRedisClusterConnection) {
+            $connection-&gt;transaction($bulk);
+        } elseif ($connection instanceof PredisClusterConnection) {
+            $connection-&gt;pipeline($bulk);
+        } else {
+            $connection-&gt;pipeline(fn () =&gt; $connection-&gt;transaction($bulk));
+        }
+    }
+
+    /**
+     * Push a new job onto the queue.
+     *
+     * @param  object|string  $job
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    public function push($job, $data = &#039;&#039;, $queue = null)
+    {
+        return $this-&gt;enqueueUsing(
+            $job,
+            $this-&gt;createPayload($job, $this-&gt;getQueue($queue), $data),
+            $queue,
+            null,
+            function ($payload, $queue) {
+                return $this-&gt;pushRaw($payload, $queue);
+            }
+        );
+    }
+
+    /**
+     * Push a raw payload onto the queue.
+     *
+     * @param  string  $payload
+     * @param  string|null  $queue
+     * @param  array  $options
+     * @return mixed
+     */
+    public function pushRaw($payload, $queue = null, array $options = [])
+    {
+        $this-&gt;getConnection()-&gt;eval(
+            LuaScripts::push(), 2, $this-&gt;getQueue($queue),
+            $this-&gt;getQueue($queue).&#039;:notify&#039;, $payload
+        );
+
+        return json_decode($payload, true)[&#039;id&#039;] ?? null;
+    }
+
+    /**
+     * Push a new job onto the queue after a delay.
+     *
+     * @param  \DateTimeInterface|\DateInterval|int  $delay
+     * @param  object|string  $job
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    public function later($delay, $job, $data = &#039;&#039;, $queue = null)
+    {
+        return $this-&gt;enqueueUsing(
+            $job,
+            $this-&gt;createPayload($job, $this-&gt;getQueue($queue), $data, $delay),
+            $queue,
+            $delay,
+            function ($payload, $queue, $delay) {
+                return $this-&gt;laterRaw($delay, $payload, $queue);
+            }
+        );
+    }
+
+    /**
+     * Push a raw job onto the queue after (n) seconds.
+     *
+     * @param  \DateTimeInterface|\DateInterval|int  $delay
+     * @param  string  $payload
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    protected function laterRaw($delay, $payload, $queue = null)
+    {
+        $this-&gt;getConnection()-&gt;eval(
+            LuaScripts::later(), 1, $this-&gt;getQueue($queue).&#039;:delayed&#039;,
+            $this-&gt;availableAt($delay), $payload
+        );
+
+        return json_decode($payload, true)[&#039;id&#039;] ?? null;
+    }
+
+    /**
+     * Create a payload string from the given job and data.
+     *
+     * @param  string  $job
+     * @param  string  $queue
+     * @param  mixed  $data
+     * @return array
+     */
+    protected function createPayloadArray($job, $queue, $data = &#039;&#039;)
+    {
+        return array_merge(parent::createPayloadArray($job, $queue, $data), [
+            &#039;id&#039; =&gt; $this-&gt;getRandomId(),
+            &#039;attempts&#039; =&gt; 0,
+        ]);
+    }
+
+    /**
+     * Pop the next job off of the queue.
+     *
+     * @param  string|null  $queue
+     * @return \Illuminate\Contracts\Queue\Job|null
+     */
+    public function pop($queue = null, $index = 0)
+    {
+        $this-&gt;migrate($prefixed = $this-&gt;getQueue($queue));
+
+        $block = ! $this-&gt;secondaryQueueHadJob &amp;&amp; $index == 0;
+
+        [$job, $reserved] = $this-&gt;retrieveNextJob($prefixed, $block);
+
+        if ($index == 0) {
+            $this-&gt;secondaryQueueHadJob = false;
+        }
+
+        if ($reserved) {
+            if ($index &gt; 0) {
+                $this-&gt;secondaryQueueHadJob = true;
+            }
+
+            return new RedisJob(
+                $this-&gt;container, $this, $job,
+                $reserved, $this-&gt;connectionName, $queue ?: $this-&gt;default
+            );
+        }
+    }
+
+    /**
+     * Migrate any delayed or expired jobs onto the primary queue.
+     *
+     * @param  string  $queue
+     * @return void
+     */
+    protected function migrate($queue)
+    {
+        $this-&gt;migrateExpiredJobs($queue.&#039;:delayed&#039;, $queue);
+
+        if (! is_null($this-&gt;retryAfter)) {
+            $this-&gt;migrateExpiredJobs($queue.&#039;:reserved&#039;, $queue);
+        }
+    }
+
+    /**
+     * Migrate the delayed jobs that are ready to the regular queue.
+     *
+     * @param  string  $from
+     * @param  string  $to
+     * @return array
+     */
+    public function migrateExpiredJobs($from, $to)
+    {
+        return $this-&gt;getConnection()-&gt;eval(
+            LuaScripts::migrateExpiredJobs(), 3, $from, $to, $to.&#039;:notify&#039;, $this-&gt;currentTime(), $this-&gt;migrationBatchSize
+        );
+    }
+
+    /**
+     * Retrieve the next job from the queue.
+     *
+     * @param  string  $queue
+     * @param  bool  $block
+     * @return array
+     */
+    protected function retrieveNextJob($queue, $block = true)
+    {
+        $nextJob = $this-&gt;getConnection()-&gt;eval(
+            LuaScripts::pop(), 3, $queue, $queue.&#039;:reserved&#039;, $queue.&#039;:notify&#039;,
+            $this-&gt;availableAt($this-&gt;retryAfter)
+        );
+
+        if (empty($nextJob)) {
+            return [null, null];
+        }
+
+        [$job, $reserved] = $nextJob;
+
+        if (! $job &amp;&amp; ! is_null($this-&gt;blockFor) &amp;&amp; $block &amp;&amp;
+            $this-&gt;getConnection()-&gt;blpop([$queue.&#039;:notify&#039;], $this-&gt;blockFor)) {
+            return $this-&gt;retrieveNextJob($queue, false);
+        }
+
+        return [$job, $reserved];
+    }
+
+    /**
+     * Delete a reserved job from the queue.
+     *
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\Jobs\RedisJob  $job
+     * @return void
+     */
+    public function deleteReserved($queue, $job)
+    {
+        $this-&gt;getConnection()-&gt;zrem($this-&gt;getQueue($queue).&#039;:reserved&#039;, $job-&gt;getReservedJob());
+    }
+
+    /**
+     * Delete a reserved job from the reserved queue and release it.
+     *
+     * @param  string  $queue
+     * @param  \Illuminate\Queue\Jobs\RedisJob  $job
+     * @param  int  $delay
+     * @return void
+     */
+    public function deleteAndRelease($queue, $job, $delay)
+    {
+        $queue = $this-&gt;getQueue($queue);
+
+        $this-&gt;getConnection()-&gt;eval(
+            LuaScripts::release(), 2, $queue.&#039;:delayed&#039;, $queue.&#039;:reserved&#039;,
+            $job-&gt;getReservedJob(), $this-&gt;availableAt($delay)
+        );
+    }
+
+    /**
+     * Delete all of the jobs from the queue.
+     *
+     * @param  string  $queue
+     * @return int
+     */
+    public function clear($queue)
+    {
+        $queue = $this-&gt;getQueue($queue);
+
+        return $this-&gt;getConnection()-&gt;eval(
+            LuaScripts::clear(), 4, $queue, $queue.&#039;:delayed&#039;,
+            $queue.&#039;:reserved&#039;, $queue.&#039;:notify&#039;
+        );
+    }
+
+    /**
+     * Get a random ID string.
+     *
+     * @return string
+     */
+    protected function getRandomId()
+    {
+        return Str::random(32);
+    }
+
+    /**
+     * Get the queue or return the default.
+     *
+     * @param  string|null  $queue
+     * @return string
+     */
+    public function getQueue($queue)
+    {
+        return &#039;queues:&#039;.($queue ?: $this-&gt;default);
+    }
+
+    /**
+     * Get the connection for the queue.
+     *
+     * @return \Illuminate\Redis\Connections\Connection
+     */
+    public function getConnection()
+    {
+        return $this-&gt;redis-&gt;connection($this-&gt;connection);
+    }
+
+    /**
+     * Get the underlying Redis instance.
+     *
+     * @return \Illuminate\Contracts\Redis\Factory
+     */
+    public function getRedis()
+    {
+        return $this-&gt;redis;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/laravel/framework/src/Illuminate/Queue/SerializesAndRestoresModelIdentifiers.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/laravel/framework/src/Illuminate/Queue/Attributes -->
+
+</body>
+</html>

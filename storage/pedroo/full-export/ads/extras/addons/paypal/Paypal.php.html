@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/extras/addons/paypal/Paypal.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace extras\addons\paypal;
+
+use App\Helpers\Common\Num;
+use App\Models\Package;
+use App\Models\Post;
+use App\Models\User;
+use App\Helpers\Services\Payment;
+use extras\addons\paypal\app\Traits\InstallTrait;
+use Illuminate\Http\Request;
+use PayPalCheckoutSdk\Core\PayPalHttpClient;
+use PayPalCheckoutSdk\Core\ProductionEnvironment;
+use PayPalCheckoutSdk\Core\SandboxEnvironment;
+use PayPalCheckoutSdk\Orders\OrdersCaptureRequest;
+use PayPalCheckoutSdk\Orders\OrdersCreateRequest;
+use PayPalHttp\HttpException;
+use Throwable;
+
+class Paypal extends Payment
+{
+	use InstallTrait;
+	
+	/**
+	 * Send Payment
+	 *
+	 * @param \Illuminate\Http\Request $request
+	 * @param \App\Models\Post|\App\Models\User $payable
+	 * @param array $resData
+	 * @return \Illuminate\Http\JsonResponse|\Illuminate\Http\RedirectResponse
+	 * @throws \Exception
+	 */
+	public static function sendPayment(Request $request, Post|User $payable, array $resData = [])
+	{
+		// Set the right URLs
+		parent::setRightUrls($resData);
+		
+		// Get the Package
+		$package = Package::find($request-&gt;input(&#039;package_id&#039;));
+		
+		// Don&#039;t make a payment if &#039;price&#039; = 0 or null
+		if (empty($package) || $package-&gt;price &lt;= 0) {
+			return redirect()-&gt;to(parent::$uri[&#039;previousUrl&#039;] . &#039;?error=package&#039;)-&gt;withInput();
+		}
+		
+		// Don&#039;t make payment if the selected Package is not compatible with payable (Post|User)
+		if (!parent::isPayableCompatibleWithPackage($payable, $package)) {
+			return redirect()-&gt;to(parent::$uri[&#039;previousUrl&#039;] . &#039;?error=packageType&#039;)-&gt;withInput();
+		}
+		
+		// Get the amount
+		$amount = Num::toFloat($package-&gt;price);
+		
+		$referenceId = md5($payable-&gt;id . $package-&gt;id . $package-&gt;type . uniqid(&#039;&#039;, true));
+		
+		// Get the current session ID
+		$sessionId = session()-&gt;getId();
+		
+		// Get the payment callback URL
+		$paymentReturnUrl = parent::$uri[&#039;paymentReturnUrl&#039;];
+		$paymentReturnUrl .= str_contains($paymentReturnUrl, &#039;?&#039;) ? &#039;&amp;&#039; : &#039;?&#039;;
+		$paymentReturnUrl .= &#039;sessionId=&#039; . $sessionId;
+		
+		// Get the payment cancel callback URL
+		$paymentCancelUrl = parent::$uri[&#039;paymentCancelUrl&#039;];
+		$paymentCancelUrl .= str_contains($paymentCancelUrl, &#039;?&#039;) ? &#039;&amp;&#039; : &#039;?&#039;;
+		$paymentCancelUrl .= &#039;sessionId=&#039; . $sessionId;
+		
+		// API Parameters
+		$providerParams = [
+			&#039;intent&#039;              =&gt; &#039;CAPTURE&#039;,
+			&#039;purchase_units&#039;      =&gt; [
+				[
+					&#039;reference_id&#039; =&gt; $referenceId, // Unique value
+					&#039;description&#039;  =&gt; str($package-&gt;name)-&gt;limit(122)-&gt;toString(), // Maximum length: 127.
+					&#039;amount&#039;       =&gt; [
+						&#039;value&#039;         =&gt; $amount,
+						&#039;currency_code&#039; =&gt; $package-&gt;currency_code,
+					],
+				],
+			],
+			&#039;application_context&#039; =&gt; [
+				&#039;cancel_url&#039; =&gt; $paymentCancelUrl,
+				&#039;return_url&#039; =&gt; $paymentReturnUrl,
+				&#039;brand_name&#039; =&gt; config(&#039;app.name&#039;),
+			],
+		];
+		
+		// Local Parameters
+		$localParams = parent::getLocalParameters($request, $payable, $package);
+		
+		// Try to make the Payment
+		try {
+			// Creating an environment
+			$clientId = config(&#039;payment.paypal.clientId&#039;);
+			$clientSecret = config(&#039;payment.paypal.clientSecret&#039;);
+			
+			if (config(&#039;payment.paypal.mode&#039;) == &#039;sandbox&#039;) {
+				$environment = new SandboxEnvironment($clientId, $clientSecret);
+			} else {
+				$environment = new ProductionEnvironment($clientId, $clientSecret);
+			}
+			$client = new PayPalHttpClient($environment);
+			
+			// Creating an Order
+			$request = new OrdersCreateRequest();
+			$request-&gt;prefer(&#039;return=representation&#039;);
+			$request-&gt;body = $providerParams;
+			
+			// Make the payment
+			// Call API with your client and get a response for your call
+			$response = $client-&gt;execute($request);
+			
+			// Payment by Credit Card when Card info is provided from the form.
+			if (
+				isset($response-&gt;statusCode)
+				&amp;&amp; isset($response-&gt;result-&gt;status)
+				&amp;&amp; $response-&gt;statusCode == 201
+				&amp;&amp; $response-&gt;result-&gt;status == &#039;CREATED&#039;
+			) {
+				
+				// Save the Transaction ID at the Provider
+				if (isset($response-&gt;result-&gt;id)) {
+					$localParams[&#039;transaction_id&#039;] = $response-&gt;result-&gt;id;
+				}
+				
+				if (isset($response-&gt;result-&gt;links)) {
+					$link = null;
+					for ($i = 0; $i &lt; count($response-&gt;result-&gt;links); ++$i) {
+						$link = $response-&gt;result-&gt;links[$i];
+						if ($link-&gt;rel == &#039;approve&#039;) {
+							break;
+						}
+					}
+					
+					$isValidPaymentUrl = (
+						!empty($link-&gt;href)
+						&amp;&amp; is_string($link-&gt;href)
+						&amp;&amp; str_starts_with(strtolower($link-&gt;href), &#039;http&#039;)
+					);
+					if ($isValidPaymentUrl) {
+						// Save local parameters into session
+						session()-&gt;put(&#039;params&#039;, $localParams);
+						session()-&gt;save(); // If redirection to an external URL is done using PHP header() function
+						
+						// Make the payment
+						// Redirect the user to the PayPal payment page
+						redirectUrl($link-&gt;href);
+					}
+				}
+				
+				$errorMessage = trans(&#039;paypal::messages.payment_page_url_not_found&#039;);
+				
+				// Apply actions when Payment failed
+				return parent::paymentFailureActions($payable, $errorMessage);
+				
+			} else {
+				
+				// Apply actions when Payment failed
+				return parent::paymentFailureActions($payable, &#039;Error during PayPal order creation.&#039;);
+				
+			}
+		} catch (HttpException|Throwable $e) {
+			
+			// Apply actions when API failed
+			return parent::paymentApiErrorActions($payable, $e);
+			
+		}
+	}
+	
+	/**
+	 * NOTE: Not managed by a route.
+	 * Check the method: \App\Http\Controllers\Api\Payment\MakePayment::paymentConfirmation()
+	 *
+	 * @param \App\Models\Post|\App\Models\User $payable
+	 * @param array $params
+	 * @return \Illuminate\Http\JsonResponse|\Illuminate\Http\RedirectResponse
+	 * @throws \Exception
+	 */
+	public static function paymentConfirmation(Post|User $payable, array $params)
+	{
+		// Replace patterns in URLs
+		parent::$uri = parent::replacePatternsInUrls($payable, parent::$uri);
+		
+		// Get Charge ID
+		$approvedOrderId = $params[&#039;transaction_id&#039;] ?? null;
+		
+		// Try to make the Payment
+		try {
+			// Creating an environment
+			$clientId = config(&#039;payment.paypal.clientId&#039;);
+			$clientSecret = config(&#039;payment.paypal.clientSecret&#039;);
+			
+			if (config(&#039;payment.paypal.mode&#039;) == &#039;sandbox&#039;) {
+				$environment = new SandboxEnvironment($clientId, $clientSecret);
+			} else {
+				$environment = new ProductionEnvironment($clientId, $clientSecret);
+			}
+			$client = new PayPalHttpClient($environment);
+			
+			// Capturing an Order,
+			// Before capture, Order should be approved by the buyer using the approval URL returned to the creation order response.
+			$request = new OrdersCaptureRequest($approvedOrderId);
+			$request-&gt;prefer(&#039;return=representation&#039;);
+			
+			// Make the payment
+			// Call API with your client and get a response for your call
+			$response = $client-&gt;execute($request);
+			
+			// Check the Payment
+			if (
+				isset($response-&gt;statusCode)
+				&amp;&amp; isset($response-&gt;result-&gt;status)
+				&amp;&amp; $response-&gt;statusCode == 201
+				&amp;&amp; $response-&gt;result-&gt;status == &#039;COMPLETED&#039;
+			) {
+				
+				// Save the Transaction ID at the Provider
+				if (isset($response-&gt;result-&gt;id)) {
+					$params[&#039;transaction_id&#039;] = $response-&gt;result-&gt;id;
+				}
+				
+				// Apply actions after successful Payment
+				return parent::paymentConfirmationActions($payable, $params);
+				
+			} else {
+				
+				// Apply actions when Payment failed
+				return parent::paymentFailureActions($payable);
+				
+			}
+		} catch (Throwable $e) {
+			
+			// Apply actions when API failed
+			return parent::paymentApiErrorActions($payable, $e);
+			
+		}
+	}
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/extras/addons/paypal/PaypalServiceProvider.php -->
+<!-- PEDROO_NEXT_DIR: /ads/extras/addons/paypal/app -->
+
+</body>
+</html>

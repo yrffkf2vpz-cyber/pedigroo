@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/laravel/framework/src/Illuminate/Queue/SqsQueue.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Illuminate\Queue;
+
+use Aws\Sqs\SqsClient;
+use Illuminate\Contracts\Queue\ClearableQueue;
+use Illuminate\Contracts\Queue\Queue as QueueContract;
+use Illuminate\Queue\Jobs\SqsJob;
+use Illuminate\Support\Str;
+
+class SqsQueue extends Queue implements QueueContract, ClearableQueue
+{
+    /**
+     * The Amazon SQS instance.
+     *
+     * @var \Aws\Sqs\SqsClient
+     */
+    protected $sqs;
+
+    /**
+     * The name of the default queue.
+     *
+     * @var string
+     */
+    protected $default;
+
+    /**
+     * The queue URL prefix.
+     *
+     * @var string
+     */
+    protected $prefix;
+
+    /**
+     * The queue name suffix.
+     *
+     * @var string
+     */
+    protected $suffix;
+
+    /**
+     * Create a new Amazon SQS queue instance.
+     *
+     * @param  \Aws\Sqs\SqsClient  $sqs
+     * @param  string  $default
+     * @param  string  $prefix
+     * @param  string  $suffix
+     * @param  bool  $dispatchAfterCommit
+     */
+    public function __construct(
+        SqsClient $sqs,
+        $default,
+        $prefix = &#039;&#039;,
+        $suffix = &#039;&#039;,
+        $dispatchAfterCommit = false,
+    ) {
+        $this-&gt;sqs = $sqs;
+        $this-&gt;prefix = $prefix;
+        $this-&gt;default = $default;
+        $this-&gt;suffix = $suffix;
+        $this-&gt;dispatchAfterCommit = $dispatchAfterCommit;
+    }
+
+    /**
+     * Get the size of the queue.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function size($queue = null)
+    {
+        $response = $this-&gt;sqs-&gt;getQueueAttributes([
+            &#039;QueueUrl&#039; =&gt; $this-&gt;getQueue($queue),
+            &#039;AttributeNames&#039; =&gt; [
+                &#039;ApproximateNumberOfMessages&#039;,
+                &#039;ApproximateNumberOfMessagesDelayed&#039;,
+                &#039;ApproximateNumberOfMessagesNotVisible&#039;,
+            ],
+        ]);
+
+        $a = $response[&#039;Attributes&#039;];
+
+        return (int) $a[&#039;ApproximateNumberOfMessages&#039;]
+            + (int) $a[&#039;ApproximateNumberOfMessagesDelayed&#039;]
+            + (int) $a[&#039;ApproximateNumberOfMessagesNotVisible&#039;];
+    }
+
+    /**
+     * Get the number of pending jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function pendingSize($queue = null)
+    {
+        $response = $this-&gt;sqs-&gt;getQueueAttributes([
+            &#039;QueueUrl&#039; =&gt; $this-&gt;getQueue($queue),
+            &#039;AttributeNames&#039; =&gt; [&#039;ApproximateNumberOfMessages&#039;],
+        ]);
+
+        return (int) $response[&#039;Attributes&#039;][&#039;ApproximateNumberOfMessages&#039;] ?? 0;
+    }
+
+    /**
+     * Get the number of delayed jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function delayedSize($queue = null)
+    {
+        $response = $this-&gt;sqs-&gt;getQueueAttributes([
+            &#039;QueueUrl&#039; =&gt; $this-&gt;getQueue($queue),
+            &#039;AttributeNames&#039; =&gt; [&#039;ApproximateNumberOfMessagesDelayed&#039;],
+        ]);
+
+        return (int) $response[&#039;Attributes&#039;][&#039;ApproximateNumberOfMessagesDelayed&#039;] ?? 0;
+    }
+
+    /**
+     * Get the number of reserved jobs.
+     *
+     * @param  string|null  $queue
+     * @return int
+     */
+    public function reservedSize($queue = null)
+    {
+        $response = $this-&gt;sqs-&gt;getQueueAttributes([
+            &#039;QueueUrl&#039; =&gt; $this-&gt;getQueue($queue),
+            &#039;AttributeNames&#039; =&gt; [&#039;ApproximateNumberOfMessagesNotVisible&#039;],
+        ]);
+
+        return (int) $response[&#039;Attributes&#039;][&#039;ApproximateNumberOfMessagesNotVisible&#039;] ?? 0;
+    }
+
+    /**
+     * Get the creation timestamp of the oldest pending job, excluding delayed jobs.
+     *
+     * Not supported by SQS, returns null.
+     *
+     * @param  string|null  $queue
+     * @return int|null
+     */
+    public function creationTimeOfOldestPendingJob($queue = null)
+    {
+        // Not supported by SQS...
+        return null;
+    }
+
+    /**
+     * Push a new job onto the queue.
+     *
+     * @param  string  $job
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    public function push($job, $data = &#039;&#039;, $queue = null)
+    {
+        return $this-&gt;enqueueUsing(
+            $job,
+            $this-&gt;createPayload($job, $queue ?: $this-&gt;default, $data),
+            $queue,
+            null,
+            function ($payload, $queue) use ($job) {
+                return $this-&gt;pushRaw($payload, $queue, $this-&gt;getQueueableOptions($job, $queue, $payload));
+            }
+        );
+    }
+
+    /**
+     * Push a raw payload onto the queue.
+     *
+     * @param  string  $payload
+     * @param  string|null  $queue
+     * @param  array  $options
+     * @return mixed
+     */
+    public function pushRaw($payload, $queue = null, array $options = [])
+    {
+        return $this-&gt;sqs-&gt;sendMessage([
+            &#039;QueueUrl&#039; =&gt; $this-&gt;getQueue($queue), &#039;MessageBody&#039; =&gt; $payload, ...$options,
+        ])-&gt;get(&#039;MessageId&#039;);
+    }
+
+    /**
+     * Push a new job onto the queue after (n) seconds.
+     *
+     * @param  \DateTimeInterface|\DateInterval|int  $delay
+     * @param  string  $job
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return mixed
+     */
+    public function later($delay, $job, $data = &#039;&#039;, $queue = null)
+    {
+        return $this-&gt;enqueueUsing(
+            $job,
+            $this-&gt;createPayload($job, $queue ?: $this-&gt;default, $data, $delay),
+            $queue,
+            $delay,
+            function ($payload, $queue, $delay) use ($job) {
+                return $this-&gt;pushRaw($payload, $queue, $this-&gt;getQueueableOptions($job, $queue, $payload, $delay));
+            }
+        );
+    }
+
+    /**
+     * Get the queueable options from the job.
+     *
+     * @param  mixed  $job
+     * @param  string|null  $queue
+     * @param  string  $payload
+     * @param  \DateTimeInterface|\DateInterval|int|null  $delay
+     * @return array{DelaySeconds?: int, MessageGroupId?: string, MessageDeduplicationId?: string}
+     */
+    public function getQueueableOptions($job, $queue, $payload, $delay = null): array
+    {
+        // Make sure we have a queue name to properly determine if it&#039;s a FIFO queue...
+        $queue ??= $this-&gt;default;
+
+        $isObject = is_object($job);
+        $isFifo = str_ends_with((string) $queue, &#039;.fifo&#039;);
+
+        $options = [];
+
+        // DelaySeconds cannot be used with FIFO queues. AWS will return an error...
+        if (! empty($delay) &amp;&amp; ! $isFifo) {
+            $options[&#039;DelaySeconds&#039;] = $this-&gt;secondsUntil($delay);
+        }
+
+        // If the job is a string job on a standard queue, there are no more options...
+        if (! $isObject &amp;&amp; ! $isFifo) {
+            return $options;
+        }
+
+        $transformToString = fn ($value) =&gt; (string) $value;
+
+        // The message group ID is required for FIFO queues and is optional for
+        // standard queues. Job objects contain a group ID. With string jobs
+        // sent to FIFO queues, assign these to the same message group ID.
+        $messageGroupId = null;
+
+        if ($isObject) {
+            $messageGroupId = transform($job-&gt;messageGroup ?? (method_exists($job, &#039;messageGroup&#039;) ? $job-&gt;messageGroup() : null), $transformToString);
+        } elseif ($isFifo) {
+            $messageGroupId = transform($queue, $transformToString);
+        }
+
+        $options[&#039;MessageGroupId&#039;] = $messageGroupId;
+
+        // The message deduplication ID is only valid for FIFO queues. Every job
+        // without the method will be considered unique. To use content-based
+        // deduplication enable it in AWS and have the method return empty.
+        $messageDeduplicationId = null;
+
+        if ($isFifo) {
+            $messageDeduplicationId = match (true) {
+                $isObject &amp;&amp; isset($job-&gt;deduplicator) &amp;&amp; is_callable($job-&gt;deduplicator) =&gt; transform(call_user_func($job-&gt;deduplicator, $payload, $queue), $transformToString),
+                $isObject &amp;&amp; method_exists($job, &#039;deduplicationId&#039;) =&gt; transform($job-&gt;deduplicationId($payload, $queue), $transformToString),
+                default =&gt; (string) Str::orderedUuid(),
+            };
+        }
+
+        $options[&#039;MessageDeduplicationId&#039;] = $messageDeduplicationId;
+
+        return array_filter($options);
+    }
+
+    /**
+     * Push an array of jobs onto the queue.
+     *
+     * @param  array  $jobs
+     * @param  mixed  $data
+     * @param  string|null  $queue
+     * @return void
+     */
+    public function bulk($jobs, $data = &#039;&#039;, $queue = null)
+    {
+        foreach ((array) $jobs as $job) {
+            if (isset($job-&gt;delay)) {
+                $this-&gt;later($job-&gt;delay, $job, $data, $queue);
+            } else {
+                $this-&gt;push($job, $data, $queue);
+            }
+        }
+    }
+
+    /**
+     * Pop the next job off of the queue.
+     *
+     * @param  string|null  $queue
+     * @return \Illuminate\Contracts\Queue\Job|null
+     */
+    public function pop($queue = null)
+    {
+        $response = $this-&gt;sqs-&gt;receiveMessage([
+            &#039;QueueUrl&#039; =&gt; $queue = $this-&gt;getQueue($queue),
+            &#039;AttributeNames&#039; =&gt; [&#039;ApproximateReceiveCount&#039;],
+        ]);
+
+        if (! is_null($response[&#039;Messages&#039;]) &amp;&amp; count($response[&#039;Messages&#039;]) &gt; 0) {
+            return new SqsJob(
+                $this-&gt;container, $this-&gt;sqs, $response[&#039;Messages&#039;][0],
+                $this-&gt;connectionName, $queue
+            );
+        }
+    }
+
+    /**
+     * Delete all of the jobs from the queue.
+     *
+     * @param  string  $queue
+     * @return int
+     */
+    public function clear($queue)
+    {
+        return tap($this-&gt;size($queue), function () use ($queue) {
+            $this-&gt;sqs-&gt;purgeQueue([
+                &#039;QueueUrl&#039; =&gt; $this-&gt;getQueue($queue),
+            ]);
+        });
+    }
+
+    /**
+     * Get the queue or return the default.
+     *
+     * @param  string|null  $queue
+     * @return string
+     */
+    public function getQueue($queue)
+    {
+        $queue = $queue ?: $this-&gt;default;
+
+        return filter_var($queue, FILTER_VALIDATE_URL) === false
+            ? $this-&gt;suffixQueue($queue, $this-&gt;suffix)
+            : $queue;
+    }
+
+    /**
+     * Add the given suffix to the given queue name.
+     *
+     * @param  string  $queue
+     * @param  string  $suffix
+     * @return string
+     */
+    protected function suffixQueue($queue, $suffix = &#039;&#039;)
+    {
+        if (str_ends_with($queue, &#039;.fifo&#039;)) {
+            $queue = Str::beforeLast($queue, &#039;.fifo&#039;);
+
+            return rtrim($this-&gt;prefix, &#039;/&#039;).&#039;/&#039;.Str::finish($queue, $suffix).&#039;.fifo&#039;;
+        }
+
+        return rtrim($this-&gt;prefix, &#039;/&#039;).&#039;/&#039;.Str::finish($queue, $this-&gt;suffix);
+    }
+
+    /**
+     * Get the underlying SQS instance.
+     *
+     * @return \Aws\Sqs\SqsClient
+     */
+    public function getSqs()
+    {
+        return $this-&gt;sqs;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/laravel/framework/src/Illuminate/Queue/SyncQueue.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/laravel/framework/src/Illuminate/Queue/Attributes -->
+
+</body>
+</html>

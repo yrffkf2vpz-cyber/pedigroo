@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/pestphp/pest-plugin-mutate/src/MutationTest.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Pest\Mutate;
+
+use ParaTest\Options;
+use Pest\Mutate\Event\Facade;
+use Pest\Mutate\Plugins\Mutate;
+use Pest\Mutate\Repositories\TelemetryRepository;
+use Pest\Mutate\Support\Configuration\Configuration;
+use Pest\Mutate\Support\MutationTestResult;
+use Pest\Support\Container;
+use Symfony\Component\Process\Exception\ProcessTimedOutException;
+use Symfony\Component\Process\Process;
+
+class MutationTest
+{
+    private MutationTestResult $result = MutationTestResult::None;
+
+    private ?float $start = null;
+
+    private ?float $finish = null;
+
+    private Process $process;
+
+    public function __construct(public readonly Mutation $mutation) {}
+
+    public function getId(): string
+    {
+        return $this-&gt;mutation-&gt;id;
+    }
+
+    public function result(): MutationTestResult
+    {
+        return $this-&gt;result;
+    }
+
+    public function updateResult(MutationTestResult $result): void
+    {
+        $this-&gt;result = $result;
+    }
+
+    /**
+     * @param  array&lt;string, array&lt;int, array&lt;int, string&gt;&gt;&gt;  $coveredLines
+     * @param  array&lt;int, string&gt;  $originalArguments
+     */
+    public function start(array $coveredLines, Configuration $configuration, array $originalArguments, ?int $processId = null): bool
+    {
+        // TODO: we should pass the tests to run in another way, maybe via cache, mutation or env variable
+        $filters = [];
+        foreach (range($this-&gt;mutation-&gt;startLine, $this-&gt;mutation-&gt;endLine) as $lineNumber) {
+            foreach ($coveredLines[$this-&gt;mutation-&gt;file-&gt;getRealPath()][$lineNumber] ?? [] as $test) {
+                preg_match(&#039;/\\\\([a-zA-Z0-9]*)::(__pest_evaluable_)?([^#]*)&quot;?/&#039;, $test, $matches);
+                if ($matches[2] === &#039;__pest_evaluable_&#039;) {
+                    $filters[] = $matches[1].&#039;::(.*)&#039;.str_replace([&#039;__&#039;, &#039;_&#039;], [&#039;.{1,2}&#039;, &#039;.&#039;], $matches[3]);
+                } else {
+                    $filters[] = $matches[1].&#039;::(.*)&#039;.$matches[3];
+                }
+            }
+        }
+        $filters = array_unique($filters);
+
+        if ($filters === []) {
+            $this-&gt;updateResult(MutationTestResult::Uncovered);
+
+            Facade::instance()-&gt;emitter()-&gt;mutationUncovered($this);
+
+            return false;
+        }
+
+        $envs = [
+            Mutate::ENV_MUTATION_TESTING =&gt; $this-&gt;mutation-&gt;file-&gt;getRealPath(),
+            Mutate::ENV_MUTATION_FILE =&gt; $this-&gt;mutation-&gt;modifiedSourcePath,
+        ];
+
+        if ($processId !== null) {
+            $envs[&#039;PARATEST&#039;] = &#039;1&#039;;
+            $envs[Options::ENV_KEY_TOKEN] = $processId;
+            $envs[Options::ENV_KEY_UNIQUE_TOKEN] = uniqid($processId.&#039;_&#039;);
+            $envs[&#039;LARAVEL_PARALLEL_TESTING&#039;] = 1;
+        }
+
+        // remove coverage arguments from the original arguments
+        $filteredArguments = array_filter($originalArguments, fn (string $argument): bool =&gt; ! str_starts_with($argument, &#039;--coverage&#039;));
+
+        // TODO: filter arguments to remove unnecessary stuff (Teamcity, Coverage, etc.)
+        $process = new Process(
+            command: [
+                ...$filteredArguments,
+                &#039;--bail&#039;,
+                &#039;--filter=&quot;&#039;.implode(&#039;|&#039;, $filters).&#039;&quot;&#039;,
+            ],
+            env: $envs,
+            timeout: $this-&gt;calculateTimeout(),
+        );
+
+        $this-&gt;start = microtime(true);
+
+        $process-&gt;start();
+
+        $this-&gt;process = $process;
+
+        return true;
+    }
+
+    private function calculateTimeout(): int
+    {
+        $initialTestSuiteDuration = Container::getInstance()-&gt;get(TelemetryRepository::class) // @phpstan-ignore-line
+            -&gt;getInitialTestSuiteDuration();
+
+        return (int) ($initialTestSuiteDuration + max(5, $initialTestSuiteDuration * 0.2));
+    }
+
+    public function hasFinished(): bool
+    {
+        try {
+            if ($this-&gt;process-&gt;isRunning()) {
+                $this-&gt;process-&gt;checkTimeout();
+
+                return false;
+            }
+        } catch (ProcessTimedOutException) {
+            $this-&gt;updateResult(MutationTestResult::Timeout);
+
+            Facade::instance()-&gt;emitter()-&gt;mutationTimedOut($this);
+
+            $this-&gt;finish = microtime(true);
+
+            return true;
+        }
+
+        if ($this-&gt;process-&gt;isSuccessful()) {
+            $this-&gt;updateResult(MutationTestResult::Untested);
+
+            Facade::instance()-&gt;emitter()-&gt;mutationEscaped($this);
+
+            $this-&gt;finish = microtime(true);
+
+            return true;
+        }
+
+        $this-&gt;updateResult(MutationTestResult::Tested);
+
+        Facade::instance()-&gt;emitter()-&gt;mutationTested($this);
+
+        $this-&gt;finish = microtime(true);
+
+        return true;
+    }
+
+    public function duration(): float
+    {
+        if ($this-&gt;start === null) {
+            return 0;
+        }
+        if ($this-&gt;finish === null) {
+            return 0;
+        }
+
+        return $this-&gt;finish - $this-&gt;start;
+    }
+
+    /**
+     * @param  array&lt;string, string&gt;  $results
+     */
+    public function lastRunResult(array $results): MutationTestResult
+    {
+        return MutationTestResult::from($results[$this-&gt;getId()] ?? &#039;none&#039;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/pestphp/pest-plugin-mutate/src/MutationTestCollection.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/pestphp/pest-plugin-mutate/src/Boostrappers -->
+
+</body>
+</html>

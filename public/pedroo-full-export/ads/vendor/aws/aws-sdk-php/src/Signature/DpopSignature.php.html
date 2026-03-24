@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/Signature/DpopSignature.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\Signature;
+
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\UriInterface;
+use Random\RandomException;
+
+final class DpopSignature
+{
+    public const ALLOW_LISTED_SERVICES = [&#039;signin&#039; =&gt; true];
+    private const EXT_OPENSSL = &#039;openssl&#039;;
+    private const CURVE_NAME = &#039;prime256v1&#039;;
+    private const HEADER_DPOP = &#039;DPop&#039;;
+    private const HEADER_TYP = &#039;dpop+jwt&#039;;
+    private const HEADER_ALG = &#039;ES256&#039;;
+    private const HEADER_JWK_KTY = &#039;EC&#039;;
+    private const HEADER_JWK_CRV = &#039;P-256&#039;;
+    private const PAYLOAD_HTM = &#039;POST&#039;;
+    private const JWK_SCHEMA = [
+        &#039;kty&#039; =&gt; self::HEADER_JWK_KTY,
+        &#039;crv&#039; =&gt; self::HEADER_JWK_CRV,
+    ];
+    private const HEADER_SCHEMA = [
+        &#039;typ&#039; =&gt; self::HEADER_TYP,
+        &#039;alg&#039; =&gt; self::HEADER_ALG,
+        &#039;jwk&#039; =&gt; self::JWK_SCHEMA
+    ];
+    private const PAYLOAD_SCHEMA = [
+        &#039;htm&#039; =&gt; self::PAYLOAD_HTM,
+    ];
+
+    /**
+     * Creates a new DpopSignature instance for the specified service
+     *
+     * @param string $serviceName The name of the AWS service (must be in the allow list)
+     *
+     * @throws \RuntimeException If the OpenSSL extension is not loaded
+     * @throws \InvalidArgumentException If the service is not in the allow list
+     */
+    public function __construct(string $serviceName)
+    {
+        if (!extension_loaded(self::EXT_OPENSSL)) {
+            throw new \RuntimeException(
+                &#039;the `openssl` extension is required to generate DPop signatures. &#039;
+                . &#039;Please install or enable the `openssl` extension.&#039;
+            );
+        }
+
+        if (!isset(self::ALLOW_LISTED_SERVICES[$serviceName])) {
+            throw new \InvalidArgumentException(
+                &quot;The &#039;{$serviceName}&#039; service does not support DPop signatures. &quot;
+                . &#039;Please configure a signature version this service supports.&#039;
+            );
+        }
+    }
+
+    /**
+     * Signs an HTTP request with a DPoP header
+     *
+     * @param RequestInterface $request The HTTP request to sign
+     * @param \OpenSSLAsymmetricKey $key The private key for signing
+     *
+     * @return RequestInterface The request with the DPoP header added
+     * @throws \RuntimeException|\Exception If signature generation fails
+     */
+    public function signRequest(
+        RequestInterface $request,
+        \OpenSSLAsymmetricKey $key,
+    ) {
+        $dpopHeaderValue = $this-&gt;generateDpopProof($key, $request-&gt;getUri());
+
+        return $request-&gt;withHeader(self::HEADER_DPOP, $dpopHeaderValue);
+    }
+
+    /**
+     * Generates the DPoP JWT header value for the request
+     *
+     * @param \OpenSSLAsymmetricKey $key The private key for signing
+     * @param UriInterface $uri The URI of the request
+     *
+     * @return string The complete DPoP JWT token
+     * @throws \RuntimeException|\Exception If signature generation fails
+     */
+    private function generateDpopProof(
+        \OpenSSLAsymmetricKey $key,
+        UriInterface $uri
+    ): string
+    {
+        $keyDetails = openssl_pkey_get_details($key);
+        if (($keyDetails[&#039;ec&#039;][&#039;curve_name&#039;] ?? &#039;&#039;) !== self::CURVE_NAME) {
+            throw new \InvalidArgumentException(
+                &#039;DPoP signature keys must use P-256 curve. &#039;
+                . &#039;Please check your configuration and try again.&#039;
+            );
+        }
+
+        [&#039;x&#039; =&gt; $x, &#039;y&#039; =&gt; $y] = $keyDetails[&#039;ec&#039;];
+        $header = $this-&gt;buildDpopHeader($x, $y);
+        $payload = $this-&gt;buildDpopPayload((string) $uri);
+
+        $message = $this-&gt;base64url_encode(json_encode($header))
+            . &#039;.&#039; . $this-&gt;base64url_encode(json_encode($payload));
+        $signature = &#039;&#039;;
+        if (!openssl_sign($message, $signature, $key, OPENSSL_ALGO_SHA256)) {
+            $error = openssl_error_string();
+
+            throw new \RuntimeException(
+                &#039;Failed to generate signature.&#039; . ($error ? &quot;: $error&quot; : &#039;.&#039;)
+            );
+        }
+
+        $signature = $this-&gt;derToRaw($signature);
+
+        return $message . &#039;.&#039; . $this-&gt;base64url_encode($signature);
+    }
+
+    /**
+     * Builds the DPoP JWT header with the public key coordinates
+     *
+     * @param string $x The x-coordinate of the EC public key
+     * @param string $y The y-coordinate of the EC public key
+     *
+     * @return array The complete DPoP header with JWK
+     */
+    private function buildDpopHeader(string $x, string $y): array
+    {
+        return array_merge_recursive(self::HEADER_SCHEMA, [
+            &#039;jwk&#039; =&gt; [
+                &#039;x&#039; =&gt; $this-&gt;base64url_encode($x),
+                &#039;y&#039; =&gt; $this-&gt;base64url_encode($y)
+            ]
+        ]);
+    }
+
+    /**
+     * Builds the DPoP JWT payload with request-specific claims
+     *
+     * @param string $uri The target URI for the HTTP request
+     *
+     * @return array The complete DPoP payload with jti, htm, htu, and iat claims
+     * @throws RandomException
+     */
+    private function buildDpopPayload(string $uri): array
+    {
+        return array_merge(self::PAYLOAD_SCHEMA, [
+            &#039;jti&#039; =&gt; $this-&gt;uuidv4(),
+            &#039;htu&#039; =&gt; $uri,
+            &#039;iat&#039; =&gt; time()
+        ]);
+    }
+
+    /**
+     * Generates a version 4 UUID
+     *
+     * @return string A UUID v4 string
+     * @throws RandomException
+     */
+    private function uuidv4(): string
+    {
+        $data = random_bytes(16);
+        $data[6] = chr(ord($data[6]) &amp; 0x0f | 0x40);
+        $data[8] = chr(ord($data[8]) &amp; 0x3f | 0x80);
+
+        return vsprintf(&#039;%s%s-%s-%s-%s-%s%s%s&#039;, str_split(bin2hex($data), 4));
+    }
+
+    /**
+     * Encodes data to Base64URL format (RFC 4648)
+     *
+     * @param string $data The data to encode
+     *
+     * @return string Base64URL encoded string (no padding, URL-safe characters)
+     */
+    private function base64url_encode(string $data): string
+    {
+        return rtrim(strtr(base64_encode($data), &#039;+/&#039;, &#039;-_&#039;), &#039;=&#039;);
+    }
+
+    /**
+     * Convert DER-encoded ECDSA signature to raw R||S format (64 bytes for ES256)
+     *
+     * @param string $derSignature DER-encoded signature from openssl_sign
+     *
+     * @return string Raw signature (64 bytes: 32 bytes R + 32 bytes S)
+     * @throws \Exception If the DER signature is invalid
+     */
+    private function derToRaw(string $derSignature): string
+    {
+        $hex = bin2hex($derSignature);
+        $pos = 0;
+        
+        // Parse SEQUENCE tag (0x30)
+        if (substr($hex, $pos, 2) !== &#039;30&#039;) {
+            throw new \Exception(&#039;Invalid DER signature format: missing SEQUENCE tag&#039;);
+        }
+        $pos += 2;
+        
+        // Parse SEQUENCE length
+        $seqLen = hexdec(substr($hex, $pos, 2));
+        $pos += 2;
+        
+        // Parse first INTEGER tag (0x02) for R
+        if (substr($hex, $pos, 2) !== &#039;02&#039;) {
+            throw new \Exception(&#039;Invalid DER signature format: missing R INTEGER tag&#039;);
+        }
+        $pos += 2;
+        
+        // Parse R length
+        $rLen = hexdec(substr($hex, $pos, 2));
+        $pos += 2;
+        
+        // Extract R value
+        $r = substr($hex, $pos, $rLen * 2);
+        if (strlen($r) !== $rLen * 2) {
+            throw new \Exception(&#039;Invalid DER signature: R length mismatch&#039;);
+        }
+        $pos += $rLen * 2;
+        
+        // Parse second INTEGER tag (0x02) for S  
+        if (substr($hex, $pos, 2) !== &#039;02&#039;) {
+            throw new \Exception(&#039;Invalid DER signature format: missing S INTEGER tag&#039;);
+        }
+        $pos += 2;
+        
+        // Parse S length
+        $sLen = hexdec(substr($hex, $pos, 2));
+        $pos += 2;
+        
+        // Extract S value
+        $s = substr($hex, $pos, $sLen * 2);
+        if (strlen($s) !== $sLen * 2) {
+            throw new \Exception(&#039;Invalid DER signature: S length mismatch&#039;);
+        }
+        
+        // Remove leading zeros (if any) and pad to 32 bytes
+        $r = str_pad(ltrim($r, &#039;0&#039;), 64, &#039;0&#039;, STR_PAD_LEFT);
+        $s = str_pad(ltrim($s, &#039;0&#039;), 64, &#039;0&#039;, STR_PAD_LEFT);
+        
+        // Ensure exactly 32 bytes each
+        if (strlen($r) !== 64 || strlen($s) !== 64) {
+            throw new \Exception(&#039;Invalid signature component length&#039;);
+        }
+        
+        return hex2bin($r . $s);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/Signature/S3ExpressSignature.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/Signin -->
+
+</body>
+</html>

@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/brick/math/src/Internal/Calculator/NativeCalculator.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+namespace Brick\Math\Internal\Calculator;
+
+use Brick\Math\Internal\Calculator;
+use Override;
+
+use function assert;
+use function in_array;
+use function intdiv;
+use function is_int;
+use function ltrim;
+use function str_pad;
+use function str_repeat;
+use function strcmp;
+use function strlen;
+use function substr;
+
+use const PHP_INT_SIZE;
+use const STR_PAD_LEFT;
+
+/**
+ * Calculator implementation using only native PHP code.
+ *
+ * @internal
+ */
+final readonly class NativeCalculator extends Calculator
+{
+    /**
+     * The max number of digits the platform can natively add, subtract, multiply or divide without overflow.
+     * For multiplication, this represents the max sum of the lengths of both operands.
+     *
+     * In addition, it is assumed that an extra digit can hold a carry (1) without overflowing.
+     * Example: 32-bit: max number 1,999,999,999 (9 digits + carry)
+     *          64-bit: max number 1,999,999,999,999,999,999 (18 digits + carry)
+     */
+    private int $maxDigits;
+
+    /**
+     * @pure
+     *
+     * @codeCoverageIgnore
+     */
+    public function __construct()
+    {
+        $this-&gt;maxDigits = match (PHP_INT_SIZE) {
+            4 =&gt; 9,
+            8 =&gt; 18,
+        };
+    }
+
+    #[Override]
+    public function add(string $a, string $b): string
+    {
+        /**
+         * @var numeric-string $a
+         * @var numeric-string $b
+         */
+        $result = $a + $b;
+
+        if (is_int($result)) {
+            return (string) $result;
+        }
+
+        if ($a === &#039;0&#039;) {
+            return $b;
+        }
+
+        if ($b === &#039;0&#039;) {
+            return $a;
+        }
+
+        [$aNeg, $bNeg, $aDig, $bDig] = $this-&gt;init($a, $b);
+
+        $result = $aNeg === $bNeg ? $this-&gt;doAdd($aDig, $bDig) : $this-&gt;doSub($aDig, $bDig);
+
+        if ($aNeg) {
+            $result = $this-&gt;neg($result);
+        }
+
+        return $result;
+    }
+
+    #[Override]
+    public function sub(string $a, string $b): string
+    {
+        return $this-&gt;add($a, $this-&gt;neg($b));
+    }
+
+    #[Override]
+    public function mul(string $a, string $b): string
+    {
+        /**
+         * @var numeric-string $a
+         * @var numeric-string $b
+         */
+        $result = $a * $b;
+
+        if (is_int($result)) {
+            return (string) $result;
+        }
+
+        if ($a === &#039;0&#039; || $b === &#039;0&#039;) {
+            return &#039;0&#039;;
+        }
+
+        if ($a === &#039;1&#039;) {
+            return $b;
+        }
+
+        if ($b === &#039;1&#039;) {
+            return $a;
+        }
+
+        if ($a === &#039;-1&#039;) {
+            return $this-&gt;neg($b);
+        }
+
+        if ($b === &#039;-1&#039;) {
+            return $this-&gt;neg($a);
+        }
+
+        [$aNeg, $bNeg, $aDig, $bDig] = $this-&gt;init($a, $b);
+
+        $result = $this-&gt;doMul($aDig, $bDig);
+
+        if ($aNeg !== $bNeg) {
+            $result = $this-&gt;neg($result);
+        }
+
+        return $result;
+    }
+
+    #[Override]
+    public function divQ(string $a, string $b): string
+    {
+        return $this-&gt;divQR($a, $b)[0];
+    }
+
+    #[Override]
+    public function divR(string $a, string $b): string
+    {
+        return $this-&gt;divQR($a, $b)[1];
+    }
+
+    #[Override]
+    public function divQR(string $a, string $b): array
+    {
+        if ($a === &#039;0&#039;) {
+            return [&#039;0&#039;, &#039;0&#039;];
+        }
+
+        if ($a === $b) {
+            return [&#039;1&#039;, &#039;0&#039;];
+        }
+
+        if ($b === &#039;1&#039;) {
+            return [$a, &#039;0&#039;];
+        }
+
+        if ($b === &#039;-1&#039;) {
+            return [$this-&gt;neg($a), &#039;0&#039;];
+        }
+
+        /** @var numeric-string $a */
+        $na = $a * 1; // cast to number
+
+        if (is_int($na)) {
+            /** @var numeric-string $b */
+            $nb = $b * 1;
+
+            if (is_int($nb)) {
+                // the only division that may overflow is PHP_INT_MIN / -1,
+                // which cannot happen here as we&#039;ve already handled a divisor of -1 above.
+                $q = intdiv($na, $nb);
+                $r = $na % $nb;
+
+                return [
+                    (string) $q,
+                    (string) $r,
+                ];
+            }
+        }
+
+        [$aNeg, $bNeg, $aDig, $bDig] = $this-&gt;init($a, $b);
+
+        [$q, $r] = $this-&gt;doDiv($aDig, $bDig);
+
+        if ($aNeg !== $bNeg) {
+            $q = $this-&gt;neg($q);
+        }
+
+        if ($aNeg) {
+            $r = $this-&gt;neg($r);
+        }
+
+        return [$q, $r];
+    }
+
+    #[Override]
+    public function pow(string $a, int $e): string
+    {
+        if ($e === 0) {
+            return &#039;1&#039;;
+        }
+
+        if ($e === 1) {
+            return $a;
+        }
+
+        $odd = $e % 2;
+        $e -= $odd;
+
+        $aa = $this-&gt;mul($a, $a);
+
+        $result = $this-&gt;pow($aa, $e / 2);
+
+        if ($odd === 1) {
+            $result = $this-&gt;mul($result, $a);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Algorithm from: https://www.geeksforgeeks.org/modular-exponentiation-power-in-modular-arithmetic/.
+     */
+    #[Override]
+    public function modPow(string $base, string $exp, string $mod): string
+    {
+        // normalize to Euclidean representative so modPow() stays consistent with mod()
+        $base = $this-&gt;mod($base, $mod);
+
+        // special case: the algorithm below fails with power 0 mod 1 (returns 1 instead of 0)
+        if ($exp === &#039;0&#039; &amp;&amp; $mod === &#039;1&#039;) {
+            return &#039;0&#039;;
+        }
+
+        $x = $base;
+
+        $res = &#039;1&#039;;
+
+        // numbers are positive, so we can use remainder instead of modulo
+        $x = $this-&gt;divR($x, $mod);
+
+        while ($exp !== &#039;0&#039;) {
+            if (in_array($exp[-1], [&#039;1&#039;, &#039;3&#039;, &#039;5&#039;, &#039;7&#039;, &#039;9&#039;])) { // odd
+                $res = $this-&gt;divR($this-&gt;mul($res, $x), $mod);
+            }
+
+            $exp = $this-&gt;divQ($exp, &#039;2&#039;);
+            $x = $this-&gt;divR($this-&gt;mul($x, $x), $mod);
+        }
+
+        return $res;
+    }
+
+    /**
+     * Adapted from https://cp-algorithms.com/num_methods/roots_newton.html.
+     */
+    #[Override]
+    public function sqrt(string $n): string
+    {
+        if ($n === &#039;0&#039;) {
+            return &#039;0&#039;;
+        }
+
+        // initial approximation
+        $x = str_repeat(&#039;9&#039;, intdiv(strlen($n), 2) ?: 1);
+
+        $decreased = false;
+
+        for (; ;) {
+            $nx = $this-&gt;divQ($this-&gt;add($x, $this-&gt;divQ($n, $x)), &#039;2&#039;);
+
+            if ($x === $nx || $this-&gt;cmp($nx, $x) &gt; 0 &amp;&amp; $decreased) {
+                break;
+            }
+
+            $decreased = $this-&gt;cmp($nx, $x) &lt; 0;
+            $x = $nx;
+        }
+
+        return $x;
+    }
+
+    /**
+     * Performs the addition of two non-signed large integers.
+     *
+     * @pure
+     */
+    private function doAdd(string $a, string $b): string
+    {
+        [$a, $b, $length] = $this-&gt;pad($a, $b);
+
+        $carry = 0;
+        $result = &#039;&#039;;
+
+        for ($i = $length - $this-&gt;maxDigits; ; $i -= $this-&gt;maxDigits) {
+            $blockLength = $this-&gt;maxDigits;
+
+            if ($i &lt; 0) {
+                $blockLength += $i;
+                $i = 0;
+            }
+
+            /** @var numeric-string $blockA */
+            $blockA = substr($a, $i, $blockLength);
+
+            /** @var numeric-string $blockB */
+            $blockB = substr($b, $i, $blockLength);
+
+            $sum = (string) ($blockA + $blockB + $carry);
+            $sumLength = strlen($sum);
+
+            if ($sumLength &gt; $blockLength) {
+                $sum = substr($sum, 1);
+                $carry = 1;
+            } else {
+                if ($sumLength &lt; $blockLength) {
+                    $sum = str_repeat(&#039;0&#039;, $blockLength - $sumLength) . $sum;
+                }
+                $carry = 0;
+            }
+
+            $result = $sum . $result;
+
+            if ($i === 0) {
+                break;
+            }
+        }
+
+        if ($carry === 1) {
+            $result = &#039;1&#039; . $result;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Performs the subtraction of two non-signed large integers.
+     *
+     * @pure
+     */
+    private function doSub(string $a, string $b): string
+    {
+        if ($a === $b) {
+            return &#039;0&#039;;
+        }
+
+        // Ensure that we always subtract to a positive result: biggest minus smallest.
+        $cmp = $this-&gt;doCmp($a, $b);
+
+        $invert = ($cmp === -1);
+
+        if ($invert) {
+            $c = $a;
+            $a = $b;
+            $b = $c;
+        }
+
+        [$a, $b, $length] = $this-&gt;pad($a, $b);
+
+        $carry = 0;
+        $result = &#039;&#039;;
+
+        $complement = 10 ** $this-&gt;maxDigits;
+
+        for ($i = $length - $this-&gt;maxDigits; ; $i -= $this-&gt;maxDigits) {
+            $blockLength = $this-&gt;maxDigits;
+
+            if ($i &lt; 0) {
+                $blockLength += $i;
+                $i = 0;
+            }
+
+            /** @var numeric-string $blockA */
+            $blockA = substr($a, $i, $blockLength);
+
+            /** @var numeric-string $blockB */
+            $blockB = substr($b, $i, $blockLength);
+
+            $sum = $blockA - $blockB - $carry;
+
+            if ($sum &lt; 0) {
+                $sum += $complement;
+                $carry = 1;
+            } else {
+                $carry = 0;
+            }
+
+            $sum = (string) $sum;
+            $sumLength = strlen($sum);
+
+            if ($sumLength &lt; $blockLength) {
+                $sum = str_repeat(&#039;0&#039;, $blockLength - $sumLength) . $sum;
+            }
+
+            $result = $sum . $result;
+
+            if ($i === 0) {
+                break;
+            }
+        }
+
+        // Carry cannot be 1 when the loop ends, as a &gt; b
+        assert($carry === 0);
+
+        $result = ltrim($result, &#039;0&#039;);
+
+        if ($invert) {
+            $result = $this-&gt;neg($result);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Performs the multiplication of two non-signed large integers.
+     *
+     * @pure
+     */
+    private function doMul(string $a, string $b): string
+    {
+        $x = strlen($a);
+        $y = strlen($b);
+
+        $maxDigits = intdiv($this-&gt;maxDigits, 2);
+        $complement = 10 ** $maxDigits;
+
+        $result = &#039;0&#039;;
+
+        for ($i = $x - $maxDigits; ; $i -= $maxDigits) {
+            $blockALength = $maxDigits;
+
+            if ($i &lt; 0) {
+                $blockALength += $i;
+                $i = 0;
+            }
+
+            $blockA = (int) substr($a, $i, $blockALength);
+
+            $line = &#039;&#039;;
+            $carry = 0;
+
+            for ($j = $y - $maxDigits; ; $j -= $maxDigits) {
+                $blockBLength = $maxDigits;
+
+                if ($j &lt; 0) {
+                    $blockBLength += $j;
+                    $j = 0;
+                }
+
+                $blockB = (int) substr($b, $j, $blockBLength);
+
+                $mul = $blockA * $blockB + $carry;
+                $value = $mul % $complement;
+                $carry = ($mul - $value) / $complement;
+
+                $value = (string) $value;
+                $value = str_pad($value, $maxDigits, &#039;0&#039;, STR_PAD_LEFT);
+
+                $line = $value . $line;
+
+                if ($j === 0) {
+                    break;
+                }
+            }
+
+            if ($carry !== 0) {
+                $line = $carry . $line;
+            }
+
+            $line = ltrim($line, &#039;0&#039;);
+
+            if ($line !== &#039;&#039;) {
+                $line .= str_repeat(&#039;0&#039;, $x - $blockALength - $i);
+                $result = $this-&gt;add($result, $line);
+            }
+
+            if ($i === 0) {
+                break;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Performs the division of two non-signed large integers.
+     *
+     * @return string[] The quotient and remainder.
+     *
+     * @pure
+     */
+    private function doDiv(string $a, string $b): array
+    {
+        $cmp = $this-&gt;doCmp($a, $b);
+
+        if ($cmp === -1) {
+            return [&#039;0&#039;, $a];
+        }
+
+        $x = strlen($a);
+        $y = strlen($b);
+
+        // we now know that a &gt;= b &amp;&amp; x &gt;= y
+
+        $q = &#039;0&#039;; // quotient
+        $r = $a; // remainder
+        $z = $y; // focus length, always $y or $y+1
+
+        /** @var numeric-string $b */
+        $nb = $b * 1; // cast to number
+        // performance optimization in cases where the remainder will never cause int overflow
+        if (is_int(($nb - 1) * 10 + 9)) {
+            $r = (int) substr($a, 0, $z - 1);
+
+            for ($i = $z - 1; $i &lt; $x; $i++) {
+                $n = $r * 10 + (int) $a[$i];
+                /** @var int $nb */
+                $q .= intdiv($n, $nb);
+                $r = $n % $nb;
+            }
+
+            return [ltrim($q, &#039;0&#039;) ?: &#039;0&#039;, (string) $r];
+        }
+
+        for (; ;) {
+            $focus = substr($a, 0, $z);
+
+            $cmp = $this-&gt;doCmp($focus, $b);
+
+            if ($cmp === -1) {
+                if ($z === $x) { // remainder &lt; dividend
+                    break;
+                }
+
+                $z++;
+            }
+
+            $zeros = str_repeat(&#039;0&#039;, $x - $z);
+
+            $q = $this-&gt;add($q, &#039;1&#039; . $zeros);
+            $a = $this-&gt;sub($a, $b . $zeros);
+
+            $r = $a;
+
+            if ($r === &#039;0&#039;) { // remainder == 0
+                break;
+            }
+
+            $x = strlen($a);
+
+            if ($x &lt; $y) { // remainder &lt; dividend
+                break;
+            }
+
+            $z = $y;
+        }
+
+        return [$q, $r];
+    }
+
+    /**
+     * Compares two non-signed large numbers.
+     *
+     * @return -1|0|1
+     *
+     * @pure
+     */
+    private function doCmp(string $a, string $b): int
+    {
+        $x = strlen($a);
+        $y = strlen($b);
+
+        $cmp = $x &lt;=&gt; $y;
+
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+
+        return strcmp($a, $b) &lt;=&gt; 0; // enforce -1|0|1
+    }
+
+    /**
+     * Pads the left of one of the given numbers with zeros if necessary to make both numbers the same length.
+     *
+     * The numbers must only consist of digits, without leading minus sign.
+     *
+     * @return array{string, string, int}
+     *
+     * @pure
+     */
+    private function pad(string $a, string $b): array
+    {
+        $x = strlen($a);
+        $y = strlen($b);
+
+        if ($x &gt; $y) {
+            $b = str_repeat(&#039;0&#039;, $x - $y) . $b;
+
+            return [$a, $b, $x];
+        }
+
+        if ($x &lt; $y) {
+            $a = str_repeat(&#039;0&#039;, $y - $x) . $a;
+
+            return [$a, $b, $y];
+        }
+
+        return [$a, $b, $x];
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/brick/math/src/Internal/CalculatorRegistry.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/carbonphp -->
+
+</body>
+</html>

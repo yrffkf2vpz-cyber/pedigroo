@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/symfony/http-client/RetryableHttpClient.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier &lt;fabien@symfony.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\HttpClient;
+
+use Psr\Log\LoggerInterface;
+use Symfony\Component\HttpClient\Response\AsyncContext;
+use Symfony\Component\HttpClient\Response\AsyncResponse;
+use Symfony\Component\HttpClient\Retry\GenericRetryStrategy;
+use Symfony\Component\HttpClient\Retry\RetryStrategyInterface;
+use Symfony\Contracts\HttpClient\ChunkInterface;
+use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+use Symfony\Contracts\Service\ResetInterface;
+
+/**
+ * Automatically retries failing HTTP requests.
+ *
+ * @author Jérémy Derussé &lt;jeremy@derusse.com&gt;
+ */
+class RetryableHttpClient implements HttpClientInterface, ResetInterface
+{
+    use AsyncDecoratorTrait;
+
+    private RetryStrategyInterface $strategy;
+    private array $baseUris = [];
+
+    /**
+     * @param int $maxRetries The maximum number of times to retry
+     */
+    public function __construct(
+        HttpClientInterface $client,
+        ?RetryStrategyInterface $strategy = null,
+        private int $maxRetries = 3,
+        private ?LoggerInterface $logger = null,
+    ) {
+        $this-&gt;client = $client;
+        $this-&gt;strategy = $strategy ?? new GenericRetryStrategy();
+    }
+
+    public function withOptions(array $options): static
+    {
+        if (\array_key_exists(&#039;base_uri&#039;, $options)) {
+            if (\is_array($options[&#039;base_uri&#039;])) {
+                $this-&gt;baseUris = $options[&#039;base_uri&#039;];
+                unset($options[&#039;base_uri&#039;]);
+            } else {
+                $this-&gt;baseUris = [];
+            }
+        }
+
+        $clone = clone $this;
+        $clone-&gt;maxRetries = (int) ($options[&#039;max_retries&#039;] ?? $this-&gt;maxRetries);
+        unset($options[&#039;max_retries&#039;]);
+
+        $clone-&gt;client = $this-&gt;client-&gt;withOptions($options);
+
+        return $clone;
+    }
+
+    public function request(string $method, string $url, array $options = []): ResponseInterface
+    {
+        $baseUris = \array_key_exists(&#039;base_uri&#039;, $options) ? $options[&#039;base_uri&#039;] : $this-&gt;baseUris;
+        $baseUris = \is_array($baseUris) ? $baseUris : [];
+        $options = self::shiftBaseUri($options, $baseUris);
+
+        $maxRetries = (int) ($options[&#039;max_retries&#039;] ?? $this-&gt;maxRetries);
+        unset($options[&#039;max_retries&#039;]);
+
+        if ($maxRetries &lt;= 0) {
+            return new AsyncResponse($this-&gt;client, $method, $url, $options);
+        }
+
+        return new AsyncResponse($this-&gt;client, $method, $url, $options, function (ChunkInterface $chunk, AsyncContext $context) use ($method, $url, $options, $maxRetries, &amp;$baseUris) {
+            static $retryCount = 0;
+            static $content = &#039;&#039;;
+            static $firstChunk;
+
+            $exception = null;
+            try {
+                if ($context-&gt;getInfo(&#039;canceled&#039;) || $chunk-&gt;isTimeout() || null !== $chunk-&gt;getInformationalStatus()) {
+                    yield $chunk;
+
+                    return;
+                }
+            } catch (TransportExceptionInterface $exception) {
+                // catch TransportExceptionInterface to send it to the strategy
+            }
+            if (null !== $exception) {
+                // always retry request that fail to resolve DNS
+                if (&#039;&#039; !== $context-&gt;getInfo(&#039;primary_ip&#039;)) {
+                    $shouldRetry = $this-&gt;strategy-&gt;shouldRetry($context, null, $exception);
+                    if (null === $shouldRetry) {
+                        throw new \LogicException(\sprintf(&#039;The &quot;%s::shouldRetry()&quot; method must not return null when called with an exception.&#039;, $this-&gt;strategy::class));
+                    }
+
+                    if (false === $shouldRetry) {
+                        yield from $this-&gt;passthru($context, $firstChunk, $content, $chunk);
+
+                        return;
+                    }
+                }
+            } elseif ($chunk-&gt;isFirst()) {
+                if (false === $shouldRetry = $this-&gt;strategy-&gt;shouldRetry($context, null, null)) {
+                    yield from $this-&gt;passthru($context, $firstChunk, $content, $chunk);
+
+                    return;
+                }
+
+                // Body is needed to decide
+                if (null === $shouldRetry) {
+                    $firstChunk = $chunk;
+                    $content = &#039;&#039;;
+
+                    return;
+                }
+            } else {
+                if (!$chunk-&gt;isLast()) {
+                    $content .= $chunk-&gt;getContent();
+
+                    return;
+                }
+
+                if (null === $shouldRetry = $this-&gt;strategy-&gt;shouldRetry($context, $content, null)) {
+                    throw new \LogicException(\sprintf(&#039;The &quot;%s::shouldRetry()&quot; method must not return null when called with a body.&#039;, $this-&gt;strategy::class));
+                }
+
+                if (false === $shouldRetry) {
+                    yield from $this-&gt;passthru($context, $firstChunk, $content, $chunk);
+
+                    return;
+                }
+            }
+
+            $context-&gt;getResponse()-&gt;cancel();
+
+            $delay = $this-&gt;getDelayFromHeader($context-&gt;getHeaders()) ?? $this-&gt;strategy-&gt;getDelay($context, !$exception &amp;&amp; $chunk-&gt;isLast() ? $content : null, $exception);
+            ++$retryCount;
+            $content = &#039;&#039;;
+            $firstChunk = null;
+
+            $this-&gt;logger?-&gt;info(&#039;Try #{count} after {delay}ms&#039;.($exception ? &#039;: &#039;.$exception-&gt;getMessage() : &#039;, status code: &#039;.$context-&gt;getStatusCode()), [
+                &#039;count&#039; =&gt; $retryCount,
+                &#039;delay&#039; =&gt; $delay,
+            ]);
+
+            $context-&gt;setInfo(&#039;retry_count&#039;, $retryCount);
+            $context-&gt;replaceRequest($method, $url, self::shiftBaseUri($options, $baseUris));
+            $context-&gt;pause($delay / 1000);
+
+            if ($retryCount &gt;= $maxRetries) {
+                $context-&gt;passthru();
+            }
+        });
+    }
+
+    private function getDelayFromHeader(array $headers): ?int
+    {
+        if (null !== $after = $headers[&#039;retry-after&#039;][0] ?? null) {
+            if (is_numeric($after)) {
+                return (int) ($after * 1000);
+            }
+
+            if (false !== $time = strtotime($after)) {
+                return max(0, $time - time()) * 1000;
+            }
+        }
+
+        return null;
+    }
+
+    private function passthru(AsyncContext $context, ?ChunkInterface $firstChunk, string &amp;$content, ChunkInterface $lastChunk): \Generator
+    {
+        $context-&gt;passthru();
+
+        if (null !== $firstChunk) {
+            yield $firstChunk;
+        }
+
+        if (&#039;&#039; !== $content) {
+            $chunk = $context-&gt;createChunk($content);
+            $content = &#039;&#039;;
+
+            yield $chunk;
+        }
+
+        yield $lastChunk;
+    }
+
+    private static function shiftBaseUri(array $options, array &amp;$baseUris): array
+    {
+        if ($baseUris) {
+            $baseUri = 1 &lt; \count($baseUris) ? array_shift($baseUris) : current($baseUris);
+            $options[&#039;base_uri&#039;] = \is_array($baseUri) ? $baseUri[array_rand($baseUri)] : $baseUri;
+        } elseif (\is_array($options[&#039;base_uri&#039;] ?? null)) {
+            unset($options[&#039;base_uri&#039;]);
+        }
+
+        return $options;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/symfony/http-client/ScopingHttpClient.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/symfony/http-client/Caching -->
+
+</body>
+</html>

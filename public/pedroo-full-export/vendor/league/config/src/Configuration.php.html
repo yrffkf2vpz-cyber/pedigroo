@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/league/config/src/Configuration.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the league/config package.
+ *
+ * (c) Colin O&#039;Dell &lt;colinodell@gmail.com&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace League\Config;
+
+use Dflydev\DotAccessData\Data;
+use Dflydev\DotAccessData\DataInterface;
+use Dflydev\DotAccessData\Exception\DataException;
+use Dflydev\DotAccessData\Exception\InvalidPathException;
+use Dflydev\DotAccessData\Exception\MissingPathException;
+use League\Config\Exception\UnknownOptionException;
+use League\Config\Exception\ValidationException;
+use Nette\Schema\Expect;
+use Nette\Schema\Processor;
+use Nette\Schema\Schema;
+use Nette\Schema\ValidationException as NetteValidationException;
+
+final class Configuration implements ConfigurationBuilderInterface, ConfigurationInterface
+{
+    /** @psalm-readonly */
+    private Data $userConfig;
+
+    /**
+     * @var array&lt;string, Schema&gt;
+     *
+     * @psalm-allow-private-mutation
+     */
+    private array $configSchemas = [];
+
+    /** @psalm-allow-private-mutation */
+    private Data $finalConfig;
+
+    /**
+     * @var array&lt;string, mixed&gt;
+     *
+     * @psalm-allow-private-mutation
+     */
+    private array $cache = [];
+
+    /** @psalm-readonly */
+    private ConfigurationInterface $reader;
+
+    /**
+     * @param array&lt;string, Schema&gt; $baseSchemas
+     */
+    public function __construct(array $baseSchemas = [])
+    {
+        $this-&gt;configSchemas = $baseSchemas;
+        $this-&gt;userConfig    = new Data();
+        $this-&gt;finalConfig   = new Data();
+
+        $this-&gt;reader = new ReadOnlyConfiguration($this);
+    }
+
+    /**
+     * Registers a new configuration schema at the given top-level key
+     *
+     * @psalm-allow-private-mutation
+     */
+    public function addSchema(string $key, Schema $schema): void
+    {
+        $this-&gt;invalidate();
+
+        $this-&gt;configSchemas[$key] = $schema;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @psalm-allow-private-mutation
+     */
+    public function merge(array $config = []): void
+    {
+        $this-&gt;invalidate();
+
+        $this-&gt;userConfig-&gt;import($config, DataInterface::REPLACE);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @psalm-allow-private-mutation
+     */
+    public function set(string $key, $value): void
+    {
+        $this-&gt;invalidate();
+
+        try {
+            $this-&gt;userConfig-&gt;set($key, $value);
+        } catch (DataException $ex) {
+            throw new UnknownOptionException($ex-&gt;getMessage(), $key, (int) $ex-&gt;getCode(), $ex);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @psalm-external-mutation-free
+     */
+    public function get(string $key)
+    {
+        if (\array_key_exists($key, $this-&gt;cache)) {
+            return $this-&gt;cache[$key];
+        }
+
+        try {
+            $this-&gt;build(self::getTopLevelKey($key));
+
+            return $this-&gt;cache[$key] = $this-&gt;finalConfig-&gt;get($key);
+        } catch (InvalidPathException | MissingPathException $ex) {
+            throw new UnknownOptionException($ex-&gt;getMessage(), $key, (int) $ex-&gt;getCode(), $ex);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @psalm-external-mutation-free
+     */
+    public function exists(string $key): bool
+    {
+        if (\array_key_exists($key, $this-&gt;cache)) {
+            return true;
+        }
+
+        try {
+            $this-&gt;build(self::getTopLevelKey($key));
+
+            return $this-&gt;finalConfig-&gt;has($key);
+        } catch (InvalidPathException | UnknownOptionException $ex) {
+            return false;
+        }
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function reader(): ConfigurationInterface
+    {
+        return $this-&gt;reader;
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    private function invalidate(): void
+    {
+        $this-&gt;cache       = [];
+        $this-&gt;finalConfig = new Data();
+    }
+
+    /**
+     * Applies the schema against the configuration to return the final configuration
+     *
+     * @throws ValidationException|UnknownOptionException|InvalidPathException
+     *
+     * @psalm-allow-private-mutation
+     */
+    private function build(string $topLevelKey): void
+    {
+        if ($this-&gt;finalConfig-&gt;has($topLevelKey)) {
+            return;
+        }
+
+        if (! isset($this-&gt;configSchemas[$topLevelKey])) {
+            throw new UnknownOptionException(\sprintf(&#039;Missing config schema for &quot;%s&quot;&#039;, $topLevelKey), $topLevelKey);
+        }
+
+        try {
+            $userData = [$topLevelKey =&gt; $this-&gt;userConfig-&gt;get($topLevelKey)];
+        } catch (DataException $ex) {
+            $userData = [];
+        }
+
+        try {
+            $schema    = $this-&gt;configSchemas[$topLevelKey];
+            $processor = new Processor();
+
+            $processed = $processor-&gt;process(Expect::structure([$topLevelKey =&gt; $schema]), $userData);
+
+            $this-&gt;raiseAnyDeprecationNotices($processor-&gt;getWarnings());
+
+            $this-&gt;finalConfig-&gt;import((array) self::convertStdClassesToArrays($processed));
+        } catch (NetteValidationException $ex) {
+            throw new ValidationException($ex);
+        }
+    }
+
+    /**
+     * Recursively converts stdClass instances to arrays
+     *
+     * @phpstan-template T
+     *
+     * @param T $data
+     *
+     * @return mixed
+     *
+     * @phpstan-return ($data is \stdClass ? array&lt;string, mixed&gt; : T)
+     *
+     * @psalm-pure
+     */
+    private static function convertStdClassesToArrays($data)
+    {
+        if ($data instanceof \stdClass) {
+            $data = (array) $data;
+        }
+
+        if (\is_array($data)) {
+            foreach ($data as $k =&gt; $v) {
+                $data[$k] = self::convertStdClassesToArrays($v);
+            }
+        }
+
+        return $data;
+    }
+
+    /**
+     * @param string[] $warnings
+     */
+    private function raiseAnyDeprecationNotices(array $warnings): void
+    {
+        foreach ($warnings as $warning) {
+            @\trigger_error($warning, \E_USER_DEPRECATED);
+        }
+    }
+
+    /**
+     * @throws InvalidPathException
+     */
+    private static function getTopLevelKey(string $path): string
+    {
+        if (\strlen($path) === 0) {
+            throw new InvalidPathException(&#039;Path cannot be an empty string&#039;);
+        }
+
+        $path = \str_replace([&#039;.&#039;, &#039;/&#039;], &#039;.&#039;, $path);
+
+        $firstDelimiter = \strpos($path, &#039;.&#039;);
+        if ($firstDelimiter === false) {
+            return $path;
+        }
+
+        return \substr($path, 0, $firstDelimiter);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/league/config/src/ConfigurationAwareInterface.php -->
+<!-- PEDROO_NEXT_DIR: /vendor/league/config/src/Exception -->
+
+</body>
+</html>

@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/vendor/phpunit/phpunit/src/Runner/Phpt/TestCase.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+/*
+ * This file is part of PHPUnit.
+ *
+ * (c) Sebastian Bergmann &lt;sebastian@phpunit.de&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace PHPUnit\Runner\Phpt;
+
+use const DEBUG_BACKTRACE_IGNORE_ARGS;
+use const DIRECTORY_SEPARATOR;
+use function array_merge;
+use function basename;
+use function debug_backtrace;
+use function dirname;
+use function explode;
+use function extension_loaded;
+use function file_exists;
+use function file_get_contents;
+use function is_array;
+use function is_file;
+use function ltrim;
+use function ob_get_clean;
+use function ob_start;
+use function preg_match;
+use function preg_replace;
+use function preg_split;
+use function realpath;
+use function sprintf;
+use function str_contains;
+use function str_starts_with;
+use function strncasecmp;
+use function substr;
+use function trim;
+use function unlink;
+use function unserialize;
+use PHPUnit\Event\Code\Phpt;
+use PHPUnit\Event\Code\ThrowableBuilder;
+use PHPUnit\Event\Facade as EventFacade;
+use PHPUnit\Event\NoPreviousThrowableException;
+use PHPUnit\Framework\Assert;
+use PHPUnit\Framework\AssertionFailedError;
+use PHPUnit\Framework\ExecutionOrderDependency;
+use PHPUnit\Framework\ExpectationFailedException;
+use PHPUnit\Framework\IncompleteTestError;
+use PHPUnit\Framework\PhptAssertionFailedError;
+use PHPUnit\Framework\Reorderable;
+use PHPUnit\Framework\SelfDescribing;
+use PHPUnit\Framework\Test;
+use PHPUnit\Runner\CodeCoverage;
+use PHPUnit\Runner\CodeCoverageFileExistsException;
+use PHPUnit\Runner\Exception;
+use PHPUnit\Util\PHP\Job;
+use PHPUnit\Util\PHP\JobRunnerRegistry;
+use SebastianBergmann\CodeCoverage\Data\RawCodeCoverageData;
+use SebastianBergmann\CodeCoverage\InvalidArgumentException;
+use SebastianBergmann\CodeCoverage\ReflectionException;
+use SebastianBergmann\CodeCoverage\Test\TestSize\TestSize;
+use SebastianBergmann\CodeCoverage\Test\TestStatus\TestStatus;
+use SebastianBergmann\CodeCoverage\TestIdMissingException;
+use SebastianBergmann\CodeCoverage\UnintentionallyCoveredCodeException;
+use staabm\SideEffectsDetector\SideEffect;
+use staabm\SideEffectsDetector\SideEffectsDetector;
+use Throwable;
+
+/**
+ * @no-named-arguments Parameter names are not covered by the backward compatibility promise for PHPUnit
+ *
+ * @internal This class is not covered by the backward compatibility promise for PHPUnit
+ *
+ * @see https://qa.php.net/phpt_details.php
+ */
+final readonly class TestCase implements Reorderable, SelfDescribing, Test
+{
+    /**
+     * @var non-empty-string
+     */
+    private string $filename;
+
+    /**
+     * @param non-empty-string $filename
+     */
+    public function __construct(string $filename)
+    {
+        $this-&gt;filename = $filename;
+
+        $this-&gt;ensureCoverageFileDoesNotExist();
+    }
+
+    public function count(): int
+    {
+        return 1;
+    }
+
+    /**
+     * @throws \PHPUnit\Framework\Exception
+     * @throws \SebastianBergmann\Template\InvalidArgumentException
+     * @throws Exception
+     * @throws InvalidArgumentException
+     * @throws NoPreviousThrowableException
+     * @throws ReflectionException
+     * @throws TestIdMissingException
+     * @throws UnintentionallyCoveredCodeException
+     */
+    public function run(): void
+    {
+        $emitter = EventFacade::emitter();
+        $parser  = new Parser;
+
+        $emitter-&gt;testPreparationStarted(
+            $this-&gt;valueObjectForEvents(),
+        );
+
+        try {
+            $sections = $parser-&gt;parse($this-&gt;filename);
+        } catch (Exception $e) {
+            $emitter-&gt;testPrepared($this-&gt;valueObjectForEvents());
+            $emitter-&gt;testErrored($this-&gt;valueObjectForEvents(), ThrowableBuilder::from($e));
+            $emitter-&gt;testFinished($this-&gt;valueObjectForEvents(), 0);
+
+            return;
+        }
+
+        $code                 = (new Renderer)-&gt;render($this-&gt;filename, $sections[&#039;FILE&#039;]);
+        $xfail                = false;
+        $environmentVariables = [];
+        $phpSettings          = $parser-&gt;parseIniSection($this-&gt;settings(CodeCoverage::instance()-&gt;isActive()));
+        $input                = null;
+        $arguments            = [];
+
+        $emitter-&gt;testPrepared($this-&gt;valueObjectForEvents());
+
+        if (isset($sections[&#039;INI&#039;])) {
+            $phpSettings = $parser-&gt;parseIniSection($sections[&#039;INI&#039;], $phpSettings);
+        }
+
+        if (isset($sections[&#039;ENV&#039;])) {
+            $environmentVariables = $parser-&gt;parseEnvSection($sections[&#039;ENV&#039;]);
+        }
+
+        if ($this-&gt;shouldTestBeSkipped($sections, $phpSettings)) {
+            return;
+        }
+
+        if (isset($sections[&#039;XFAIL&#039;])) {
+            $xfail = trim($sections[&#039;XFAIL&#039;]);
+        }
+
+        if (isset($sections[&#039;STDIN&#039;])) {
+            $input = $sections[&#039;STDIN&#039;];
+        }
+
+        if (isset($sections[&#039;ARGS&#039;])) {
+            $arguments = explode(&#039; &#039;, $sections[&#039;ARGS&#039;]);
+        }
+
+        if (CodeCoverage::instance()-&gt;isActive()) {
+            $codeCoverageCacheDirectory = null;
+
+            if (CodeCoverage::instance()-&gt;codeCoverage()-&gt;cachesStaticAnalysis()) {
+                $codeCoverageCacheDirectory = CodeCoverage::instance()-&gt;codeCoverage()-&gt;cacheDirectory();
+            }
+
+            (new Renderer)-&gt;renderForCoverage(
+                $code,
+                CodeCoverage::instance()-&gt;codeCoverage()-&gt;collectsBranchAndPathCoverage(),
+                $codeCoverageCacheDirectory,
+                $this-&gt;coverageFiles(),
+            );
+        }
+
+        $jobResult = JobRunnerRegistry::run(
+            new Job(
+                $code,
+                $this-&gt;stringifyIni($phpSettings),
+                $environmentVariables,
+                $arguments,
+                $input,
+                true,
+            ),
+        );
+
+        EventFacade::emitter()-&gt;childProcessFinished($jobResult-&gt;stdout(), $jobResult-&gt;stderr());
+
+        $output = $jobResult-&gt;stdout();
+
+        if (CodeCoverage::instance()-&gt;isActive()) {
+            $coverage = $this-&gt;cleanupForCoverage();
+
+            CodeCoverage::instance()-&gt;codeCoverage()-&gt;start($this-&gt;filename, TestSize::large());
+
+            CodeCoverage::instance()-&gt;codeCoverage()-&gt;append(
+                $coverage,
+                $this-&gt;filename,
+                true,
+                TestStatus::unknown(),
+            );
+        }
+
+        $passed = true;
+
+        try {
+            $this-&gt;assertPhptExpectation($sections, $output);
+        } catch (AssertionFailedError $e) {
+            $failure = $e;
+
+            if ($xfail !== false) {
+                $failure = new IncompleteTestError($xfail, 0, $e);
+            } elseif ($e instanceof ExpectationFailedException) {
+                $comparisonFailure = $e-&gt;getComparisonFailure();
+
+                if ($comparisonFailure !== null) {
+                    $diff = $comparisonFailure-&gt;getDiff();
+                } else {
+                    $diff = $e-&gt;getMessage();
+                }
+
+                $hint    = $this-&gt;locationHintFromDiff($diff, $sections);
+                $trace   = array_merge($hint, debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS));
+                $failure = new PhptAssertionFailedError(
+                    $e-&gt;getMessage(),
+                    0,
+                    (string) $trace[0][&#039;file&#039;],
+                    (int) $trace[0][&#039;line&#039;],
+                    $trace,
+                    $comparisonFailure !== null ? $diff : &#039;&#039;,
+                );
+            }
+
+            if ($failure instanceof IncompleteTestError) {
+                $emitter-&gt;testMarkedAsIncomplete($this-&gt;valueObjectForEvents(), ThrowableBuilder::from($failure));
+            } else {
+                $emitter-&gt;testFailed($this-&gt;valueObjectForEvents(), ThrowableBuilder::from($failure), null);
+            }
+
+            $passed = false;
+        } catch (Throwable $t) {
+            $emitter-&gt;testErrored($this-&gt;valueObjectForEvents(), ThrowableBuilder::from($t));
+
+            $passed = false;
+        }
+
+        if ($passed) {
+            $emitter-&gt;testPassed($this-&gt;valueObjectForEvents());
+        }
+
+        $this-&gt;runClean($sections, CodeCoverage::instance()-&gt;isActive());
+
+        $emitter-&gt;testFinished($this-&gt;valueObjectForEvents(), 1);
+    }
+
+    /**
+     * Returns the name of the test case.
+     */
+    public function getName(): string
+    {
+        return $this-&gt;toString();
+    }
+
+    /**
+     * Returns a string representation of the test case.
+     */
+    public function toString(): string
+    {
+        return $this-&gt;filename;
+    }
+
+    public function sortId(): string
+    {
+        return $this-&gt;filename;
+    }
+
+    /**
+     * @return list&lt;ExecutionOrderDependency&gt;
+     */
+    public function provides(): array
+    {
+        return [];
+    }
+
+    /**
+     * @return list&lt;ExecutionOrderDependency&gt;
+     */
+    public function requires(): array
+    {
+        return [];
+    }
+
+    /**
+     * @internal This method is not covered by the backward compatibility promise for PHPUnit
+     */
+    public function valueObjectForEvents(): Phpt
+    {
+        return new Phpt($this-&gt;filename);
+    }
+
+    /**
+     * @param array&lt;non-empty-string, non-empty-string&gt; $sections
+     *
+     * @throws Exception
+     * @throws ExpectationFailedException
+     */
+    private function assertPhptExpectation(array $sections, string $output): void
+    {
+        $assertions = [
+            &#039;EXPECT&#039;      =&gt; &#039;assertEquals&#039;,
+            &#039;EXPECTF&#039;     =&gt; &#039;assertStringMatchesFormat&#039;,
+            &#039;EXPECTREGEX&#039; =&gt; &#039;assertMatchesRegularExpression&#039;,
+        ];
+
+        $actual = preg_replace(&#039;/\r\n/&#039;, &quot;\n&quot;, trim($output));
+
+        foreach ($assertions as $sectionName =&gt; $sectionAssertion) {
+            if (isset($sections[$sectionName])) {
+                $sectionContent = preg_replace(&#039;/\r\n/&#039;, &quot;\n&quot;, trim($sections[$sectionName]));
+                $expected       = $sectionName === &#039;EXPECTREGEX&#039; ? &quot;/{$sectionContent}/&quot; : $sectionContent;
+
+                /** @phpstan-ignore staticMethod.dynamicName */
+                Assert::$sectionAssertion($expected, $actual);
+
+                return;
+            }
+        }
+
+        throw new InvalidPhptFileException;
+    }
+
+    /**
+     * @param array&lt;non-empty-string, non-empty-string&gt;                         $sections
+     * @param array&lt;non-empty-string, array&lt;non-empty-string&gt;|non-empty-string&gt; $settings
+     */
+    private function shouldTestBeSkipped(array $sections, array $settings): bool
+    {
+        if (!isset($sections[&#039;SKIPIF&#039;])) {
+            return false;
+        }
+
+        $skipIfCode = (new Renderer)-&gt;render($this-&gt;filename, $sections[&#039;SKIPIF&#039;]);
+
+        if ($this-&gt;shouldRunInSubprocess($sections, $skipIfCode)) {
+            $jobResult = JobRunnerRegistry::run(
+                new Job(
+                    $skipIfCode,
+                    $this-&gt;stringifyIni($settings),
+                ),
+            );
+
+            $output = $jobResult-&gt;stdout();
+
+            EventFacade::emitter()-&gt;childProcessFinished($output, $jobResult-&gt;stderr());
+        } else {
+            $output = $this-&gt;runCodeInLocalSandbox($skipIfCode);
+        }
+
+        $this-&gt;triggerRunnerWarningOnPhpErrors(&#039;SKIPIF&#039;, $output);
+
+        if (strncasecmp(&#039;skip&#039;, ltrim($output), 4) === 0) {
+            $message = &#039;&#039;;
+
+            if (preg_match(&#039;/^\s*skip\s*(.+)\s*/i&#039;, $output, $skipMatch)) {
+                $message = substr($skipMatch[1], 2);
+            }
+
+            EventFacade::emitter()-&gt;testSkipped(
+                $this-&gt;valueObjectForEvents(),
+                $message,
+            );
+
+            EventFacade::emitter()-&gt;testFinished($this-&gt;valueObjectForEvents(), 0);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array&lt;non-empty-string, non-empty-string&gt; $sections
+     */
+    private function shouldRunInSubprocess(array $sections, string $cleanCode): bool
+    {
+        if (isset($sections[&#039;INI&#039;])) {
+            // to get per-test INI settings, we need a dedicated subprocess
+            return true;
+        }
+
+        $detector    = new SideEffectsDetector;
+        $sideEffects = $detector-&gt;getSideEffects($cleanCode);
+
+        if ($sideEffects === []) {
+            // no side-effects
+            return false;
+        }
+
+        foreach ($sideEffects as $sideEffect) {
+            if ($sideEffect === SideEffect::STANDARD_OUTPUT) {
+                // stdout is fine, we will catch it using output-buffering
+                continue;
+            }
+
+            if ($sideEffect === SideEffect::INPUT_OUTPUT) {
+                // IO is fine, as it doesn&#039;t pollute the main process
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private function runCodeInLocalSandbox(string $code): string
+    {
+        $code = preg_replace(&#039;/^&lt;\?(?:php)?|\?&gt;\s*+$/&#039;, &#039;&#039;, $code);
+        $code = preg_replace(&#039;/declare\S?\([^)]+\)\S?;/&#039;, &#039;&#039;, $code);
+
+        // wrap in immediately invoked function to isolate local-side-effects of $code from our own process
+        $code = &#039;(function() {&#039; . $code . &#039;})();&#039;;
+        ob_start();
+        @eval($code);
+
+        return ob_get_clean();
+    }
+
+    /**
+     * @param array&lt;non-empty-string, non-empty-string&gt; $sections
+     */
+    private function runClean(array $sections, bool $collectCoverage): void
+    {
+        if (!isset($sections[&#039;CLEAN&#039;])) {
+            return;
+        }
+
+        $cleanCode = (new Renderer)-&gt;render($this-&gt;filename, $sections[&#039;CLEAN&#039;]);
+
+        if ($this-&gt;shouldRunInSubprocess($sections, $cleanCode)) {
+            $jobResult = JobRunnerRegistry::run(
+                new Job(
+                    $cleanCode,
+                    $this-&gt;settings($collectCoverage),
+                ),
+            );
+
+            $output = $jobResult-&gt;stdout();
+
+            EventFacade::emitter()-&gt;childProcessFinished($jobResult-&gt;stdout(), $jobResult-&gt;stderr());
+        } else {
+            $output = $this-&gt;runCodeInLocalSandbox($cleanCode);
+        }
+
+        $this-&gt;triggerRunnerWarningOnPhpErrors(&#039;CLEAN&#039;, $output);
+    }
+
+    /**
+     * @phpstan-ignore return.internalClass
+     */
+    private function cleanupForCoverage(): RawCodeCoverageData
+    {
+        /**
+         * @phpstan-ignore staticMethod.internalClass
+         */
+        $coverage = RawCodeCoverageData::fromXdebugWithoutPathCoverage([]);
+        $files    = $this-&gt;coverageFiles();
+
+        $buffer = false;
+
+        if (is_file($files[&#039;coverage&#039;])) {
+            $buffer = @file_get_contents($files[&#039;coverage&#039;]);
+        }
+
+        if ($buffer !== false) {
+            $coverage = @unserialize(
+                $buffer,
+                [
+                    &#039;allowed_classes&#039; =&gt; [
+                        /** @phpstan-ignore classConstant.internalClass */
+                        RawCodeCoverageData::class,
+                    ],
+                ],
+            );
+
+            if ($coverage === false) {
+                /**
+                 * @phpstan-ignore staticMethod.internalClass
+                 */
+                $coverage = RawCodeCoverageData::fromXdebugWithoutPathCoverage([]);
+            }
+        }
+
+        foreach ($files as $file) {
+            @unlink($file);
+        }
+
+        return $coverage;
+    }
+
+    /**
+     * @return array{coverage: non-empty-string, job: non-empty-string}
+     */
+    private function coverageFiles(): array
+    {
+        $baseDir  = dirname(realpath($this-&gt;filename)) . DIRECTORY_SEPARATOR;
+        $basename = basename($this-&gt;filename, &#039;phpt&#039;);
+
+        return [
+            &#039;coverage&#039; =&gt; $baseDir . $basename . &#039;coverage&#039;,
+            &#039;job&#039;      =&gt; $baseDir . $basename . &#039;php&#039;,
+        ];
+    }
+
+    /**
+     * @param array&lt;non-empty-string, array&lt;non-empty-string&gt;|non-empty-string&gt; $ini
+     *
+     * @return list&lt;non-empty-string&gt;
+     */
+    private function stringifyIni(array $ini): array
+    {
+        $settings = [];
+
+        foreach ($ini as $key =&gt; $value) {
+            if (is_array($value)) {
+                foreach ($value as $val) {
+                    $settings[] = $key . &#039;=&#039; . $val;
+                }
+
+                continue;
+            }
+
+            $settings[] = $key . &#039;=&#039; . $value;
+        }
+
+        return $settings;
+    }
+
+    /**
+     * @param array&lt;non-empty-string, non-empty-string&gt; $sections
+     *
+     * @return non-empty-list&lt;array{file: non-empty-string, line: int}&gt;
+     */
+    private function locationHintFromDiff(string $message, array $sections): array
+    {
+        $needle       = &#039;&#039;;
+        $previousLine = &#039;&#039;;
+        $block        = &#039;message&#039;;
+
+        foreach (preg_split(&#039;/\r\n|\r|\n/&#039;, $message) as $line) {
+            $line = trim($line);
+
+            if ($block === &#039;message&#039; &amp;&amp; $line === &#039;--- Expected&#039;) {
+                $block = &#039;expected&#039;;
+            }
+
+            if ($block === &#039;expected&#039; &amp;&amp; $line === &#039;@@ @@&#039;) {
+                $block = &#039;diff&#039;;
+            }
+
+            if ($block === &#039;diff&#039;) {
+                if (str_starts_with($line, &#039;+&#039;)) {
+                    $needle = $this-&gt;cleanDiffLine($previousLine);
+
+                    break;
+                }
+
+                if (str_starts_with($line, &#039;-&#039;)) {
+                    $needle = $this-&gt;cleanDiffLine($line);
+
+                    break;
+                }
+            }
+
+            if ($line !== &#039;&#039;) {
+                $previousLine = $line;
+            }
+        }
+
+        return $this-&gt;locationHint($needle, $sections);
+    }
+
+    private function cleanDiffLine(string $line): string
+    {
+        if (preg_match(&#039;/^[\-+]([\&#039;\&quot;]?)(.*)\1$/&#039;, $line, $matches)) {
+            $line = $matches[2];
+        }
+
+        return $line;
+    }
+
+    /**
+     * @param array&lt;non-empty-string, non-empty-string&gt; $sections
+     *
+     * @return non-empty-list&lt;array{file: non-empty-string, line: int}&gt;
+     */
+    private function locationHint(string $needle, array $sections): array
+    {
+        $needle = trim($needle);
+
+        if ($needle === &#039;&#039;) {
+            return [[
+                &#039;file&#039; =&gt; realpath($this-&gt;filename),
+                &#039;line&#039; =&gt; 1,
+            ]];
+        }
+
+        $search = [
+            // &#039;FILE&#039;,
+            &#039;EXPECT&#039;,
+            &#039;EXPECTF&#039;,
+            &#039;EXPECTREGEX&#039;,
+        ];
+
+        foreach ($search as $section) {
+            if (!isset($sections[$section])) {
+                continue;
+            }
+
+            if (isset($sections[$section . &#039;_EXTERNAL&#039;])) {
+                $externalFile = trim($sections[$section . &#039;_EXTERNAL&#039;]);
+
+                return [
+                    [
+                        &#039;file&#039; =&gt; realpath(dirname($this-&gt;filename) . DIRECTORY_SEPARATOR . $externalFile),
+                        &#039;line&#039; =&gt; 1,
+                    ],
+                    [
+                        &#039;file&#039; =&gt; realpath($this-&gt;filename),
+                        &#039;line&#039; =&gt; ($sections[$section . &#039;_EXTERNAL_offset&#039;] ?? 0) + 1,
+                    ],
+                ];
+            }
+
+            $sectionOffset = $sections[$section . &#039;_offset&#039;] ?? 0;
+            $offset        = $sectionOffset + 1;
+
+            foreach (preg_split(&#039;/\r\n|\r|\n/&#039;, $sections[$section]) as $line) {
+                if (str_contains($line, $needle)) {
+                    return [
+                        [
+                            &#039;file&#039; =&gt; realpath($this-&gt;filename),
+                            &#039;line&#039; =&gt; $offset,
+                        ],
+                    ];
+                }
+
+                $offset++;
+            }
+        }
+
+        return [
+            [
+                &#039;file&#039; =&gt; realpath($this-&gt;filename),
+                &#039;line&#039; =&gt; 1,
+            ],
+        ];
+    }
+
+    /**
+     * @return list&lt;string&gt;
+     */
+    private function settings(bool $collectCoverage): array
+    {
+        $settings = [
+            &#039;allow_url_fopen=1&#039;,
+            &#039;auto_append_file=&#039;,
+            &#039;auto_prepend_file=&#039;,
+            &#039;disable_functions=&#039;,
+            &#039;display_errors=1&#039;,
+            &#039;docref_ext=.html&#039;,
+            &#039;docref_root=&#039;,
+            &#039;error_append_string=&#039;,
+            &#039;error_prepend_string=&#039;,
+            &#039;error_reporting=-1&#039;,
+            &#039;html_errors=0&#039;,
+            &#039;log_errors=0&#039;,
+            &#039;open_basedir=&#039;,
+            &#039;output_buffering=Off&#039;,
+            &#039;output_handler=&#039;,
+            &#039;report_zend_debug=0&#039;,
+        ];
+
+        if (extension_loaded(&#039;pcov&#039;)) {
+            if ($collectCoverage) {
+                $settings[] = &#039;pcov.enabled=1&#039;;
+            } else {
+                $settings[] = &#039;pcov.enabled=0&#039;;
+            }
+        }
+
+        if (extension_loaded(&#039;xdebug&#039;)) {
+            if ($collectCoverage) {
+                $settings[] = &#039;xdebug.mode=coverage&#039;;
+            }
+        }
+
+        return $settings;
+    }
+
+    private function triggerRunnerWarningOnPhpErrors(string $section, string $output): void
+    {
+        if (str_contains($output, &#039;Parse error:&#039;)) {
+            EventFacade::emitter()-&gt;testRunnerTriggeredPhpunitWarning(
+                sprintf(
+                    &#039;%s section triggered a parse error: %s&#039;,
+                    $section,
+                    $output,
+                ),
+            );
+        }
+
+        if (str_contains($output, &#039;Fatal error:&#039;)) {
+            EventFacade::emitter()-&gt;testRunnerTriggeredPhpunitWarning(
+                sprintf(
+                    &#039;%s section triggered a fatal error: %s&#039;,
+                    $section,
+                    $output,
+                ),
+            );
+        }
+    }
+
+    /**
+     * @throws CodeCoverageFileExistsException
+     */
+    private function ensureCoverageFileDoesNotExist(): void
+    {
+        $files = $this-&gt;coverageFiles();
+
+        if (file_exists($files[&#039;coverage&#039;])) {
+            throw new CodeCoverageFileExistsException(
+                sprintf(
+                    &#039;File %s exists, PHPT test %s will not be executed&#039;,
+                    $files[&#039;coverage&#039;],
+                    $this-&gt;filename,
+                ),
+            );
+        }
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /vendor/phpunit/phpunit/src/Runner/Phpt/templates/phpt.tpl -->
+<!-- PEDROO_NEXT_DIR: /vendor/phpunit/phpunit/src/Runner/Phpt/Exception -->
+
+</body>
+</html>

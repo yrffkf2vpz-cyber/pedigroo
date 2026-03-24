@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/aws/aws-sdk-php/src/DynamoDb/WriteRequestBatch.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+namespace Aws\DynamoDb;
+
+use Aws\CommandInterface;
+use Aws\CommandPool;
+use Aws\Exception\AwsException;
+use Aws\ResultInterface;
+
+/**
+ * The WriteRequestBatch is an object that is capable of efficiently sending
+ * DynamoDB BatchWriteItem requests from queued up put and delete item requests.
+ * requests. The batch attempts to send the requests with the fewest requests
+ * to DynamoDB as possible and also re-queues any unprocessed items to ensure
+ * that all items are sent.
+ */
+class WriteRequestBatch
+{
+    /** @var DynamoDbClient DynamoDB client used to perform write operations. */
+    private $client;
+
+    /** @var array Configuration options for the batch. */
+    private $config;
+
+    /** @var array Queue of pending put/delete requests in the batch. */
+    private $queue;
+
+    /**
+     * Creates a WriteRequestBatch object that is capable of efficiently sending
+     * DynamoDB BatchWriteItem requests from queued up Put and Delete requests.
+     *
+     * @param DynamoDbClient $client DynamoDB client used to send batches.
+     * @param array          $config Batch configuration options.
+     *     - table: (string) DynamoDB table used by the batch, this can be
+     *       overridden for each individual put() or delete() call.
+     *     - batch_size: (int) The size of each batch (default: 25). The batch
+     *       size must be between 2 and 25. If you are sending batches of large
+     *       items, you may consider lowering the batch size, otherwise, you
+     *       should use 25.
+     *     - pool_size: (int) This number dictates how many BatchWriteItem
+     *       requests you would like to do in parallel. For example, if the
+     *       &quot;batch_size&quot; is 25, and &quot;pool_size&quot; is 3, then you would send 3
+     *       BatchWriteItem requests at a time, each with 25 items. Please keep
+     *       your throughput in mind when choosing the &quot;pool_size&quot; option.
+     *     - autoflush: (bool) This option allows the batch to automatically
+     *       flush once there are enough items (i.e., &quot;batch_size&quot; * &quot;pool_size&quot;)
+     *       in the queue. This defaults to true, so you must set this to false
+     *       to stop autoflush.
+     *     - before: (callable) Executed before every BatchWriteItem operation.
+     *       It should accept an \Aws\CommandInterface object as its argument.
+     *     - error: Executed if an error was encountered executing a,
+     *       BatchWriteItem operation, otherwise errors are ignored. It should
+     *       accept an \Aws\Exception\AwsException as its argument.
+     *
+     * @throws \InvalidArgumentException if the batch size is not between 2 and 25.
+     */
+    public function __construct(DynamoDbClient $client, array $config = [])
+    {
+        // Apply defaults
+        $config += [
+            &#039;table&#039;      =&gt; null,
+            &#039;batch_size&#039; =&gt; 25,
+            &#039;pool_size&#039;  =&gt; 1,
+            &#039;autoflush&#039;  =&gt; true,
+            &#039;before&#039;     =&gt; null,
+            &#039;error&#039;      =&gt; null
+        ];
+
+        // Ensure the batch size is valid
+        if ($config[&#039;batch_size&#039;] &gt; 25 || $config[&#039;batch_size&#039;] &lt; 2) {
+            throw new \InvalidArgumentException(&#039;&quot;batch_size&quot; must be between 2 and 25.&#039;);
+        }
+
+        // Ensure the callbacks are valid
+        if ($config[&#039;before&#039;] &amp;&amp; !is_callable($config[&#039;before&#039;])) {
+            throw new \InvalidArgumentException(&#039;&quot;before&quot; must be callable.&#039;);
+        }
+        if ($config[&#039;error&#039;] &amp;&amp; !is_callable($config[&#039;error&#039;])) {
+            throw new \InvalidArgumentException(&#039;&quot;error&quot; must be callable.&#039;);
+        }
+
+        // If autoflush is enabled, set the threshold
+        if ($config[&#039;autoflush&#039;]) {
+            $config[&#039;threshold&#039;] = $config[&#039;batch_size&#039;] * $config[&#039;pool_size&#039;];
+        }
+
+        $this-&gt;client = $client;
+        $this-&gt;config = $config;
+        $this-&gt;queue = [];
+    }
+
+    /**
+     * Adds a put item request to the batch.
+     *
+     * @param array       $item  Data for an item to put. Format:
+     *     [
+     *         &#039;attribute1&#039; =&gt; [&#039;type&#039; =&gt; &#039;value&#039;],
+     *         &#039;attribute2&#039; =&gt; [&#039;type&#039; =&gt; &#039;value&#039;],
+     *         ...
+     *     ]
+     * @param string|null $table The name of the table. This must be specified
+     *                           unless the &quot;table&quot; option was provided in the
+     *                           config of the WriteRequestBatch.
+     *
+     * @return $this
+     */
+    public function put(array $item, $table = null)
+    {
+        $this-&gt;queue[] = [
+            &#039;table&#039; =&gt; $this-&gt;determineTable($table),
+            &#039;data&#039;  =&gt; [&#039;PutRequest&#039; =&gt; [&#039;Item&#039; =&gt; $item]],
+        ];
+
+        $this-&gt;autoFlush();
+
+        return $this;
+    }
+
+    /**
+     * Adds a delete item request to the batch.
+     *
+     * @param array       $key   Key of an item to delete. Format:
+     *     [
+     *         &#039;key1&#039; =&gt; [&#039;type&#039; =&gt; &#039;value&#039;],
+     *         ...
+     *     ]
+     * @param string|null $table The name of the table. This must be specified
+     *                           unless the &quot;table&quot; option was provided in the
+     *                           config of the WriteRequestBatch.
+     *
+     * @return $this
+     */
+    public function delete(array $key, $table = null)
+    {
+        $this-&gt;queue[] = [
+            &#039;table&#039; =&gt; $this-&gt;determineTable($table),
+            &#039;data&#039;  =&gt; [&#039;DeleteRequest&#039; =&gt; [&#039;Key&#039; =&gt; $key]],
+        ];
+
+        $this-&gt;autoFlush();
+
+        return $this;
+    }
+
+    /**
+     * Flushes the batch by combining all the queued put and delete requests
+     * into BatchWriteItem commands and executing them. Unprocessed items are
+     * automatically re-queued.
+     *
+     * @param bool $untilEmpty If true, flushing will continue until the queue
+     *                         is completely empty. This will make sure that
+     *                         unprocessed items are all eventually sent.
+     *
+     * @return $this
+     */
+    public function flush($untilEmpty = true)
+    {
+        // Send BatchWriteItem requests until the queue is empty
+        $keepFlushing = true;
+        while ($this-&gt;queue &amp;&amp; $keepFlushing) {
+            $commands = $this-&gt;prepareCommands();
+            $pool = new CommandPool($this-&gt;client, $commands, [
+                &#039;before&#039; =&gt; $this-&gt;config[&#039;before&#039;],
+                &#039;concurrency&#039; =&gt; $this-&gt;config[&#039;pool_size&#039;],
+                &#039;fulfilled&#039;   =&gt; function (ResultInterface $result) {
+                    // Re-queue any unprocessed items
+                    if ($result-&gt;hasKey(&#039;UnprocessedItems&#039;)) {
+                        $this-&gt;retryUnprocessed($result[&#039;UnprocessedItems&#039;]);
+                    }
+                },
+                &#039;rejected&#039; =&gt; function ($reason) {
+                    if ($reason instanceof AwsException) {
+                        $code = $reason-&gt;getAwsErrorCode();
+                        if ($code === &#039;ProvisionedThroughputExceededException&#039;) {
+                            $this-&gt;retryUnprocessed($reason-&gt;getCommand()[&#039;RequestItems&#039;]);
+                        } elseif (is_callable($this-&gt;config[&#039;error&#039;])) {
+                            $this-&gt;config[&#039;error&#039;]($reason);
+                        }
+                    }
+                }
+            ]);
+            $pool-&gt;promise()-&gt;wait();
+            $keepFlushing = (bool) $untilEmpty;
+        }
+
+        return $this;
+    }
+
+    /**
+     * Creates BatchWriteItem commands from the items in the queue.
+     *
+     * @return CommandInterface[]
+     */
+    private function prepareCommands()
+    {
+        // Chunk the queue into batches
+        $batches = array_chunk($this-&gt;queue, $this-&gt;config[&#039;batch_size&#039;]);
+        $this-&gt;queue = [];
+
+        // Create BatchWriteItem commands for each batch
+        $commands = [];
+        foreach ($batches as $batch) {
+            $requests = [];
+            foreach ($batch as $item) {
+                if (!isset($requests[$item[&#039;table&#039;]])) {
+                    $requests[$item[&#039;table&#039;]] = [];
+                }
+                $requests[$item[&#039;table&#039;]][] = $item[&#039;data&#039;];
+            }
+            $commands[] = $this-&gt;client-&gt;getCommand(
+                &#039;BatchWriteItem&#039;,
+                [&#039;RequestItems&#039; =&gt; $requests]
+            );
+        }
+
+        return $commands;
+    }
+
+    /**
+     * Re-queues unprocessed results with the correct data.
+     *
+     * @param array $unprocessed Unprocessed items from a result.
+     */
+    private function retryUnprocessed(array $unprocessed)
+    {
+        foreach ($unprocessed as $table =&gt; $requests) {
+            foreach ($requests as $request) {
+                $this-&gt;queue[] = [
+                    &#039;table&#039; =&gt; $table,
+                    &#039;data&#039;  =&gt; $request,
+                ];
+            }
+        }
+    }
+
+    /**
+     * If autoflush is enabled and the threshold is met, flush the batch
+     */
+    private function autoFlush()
+    {
+        if ($this-&gt;config[&#039;autoflush&#039;]
+            &amp;&amp; count($this-&gt;queue) &gt;= $this-&gt;config[&#039;threshold&#039;]
+        ) {
+            // Flush only once. Unprocessed items are handled in a later flush.
+            $this-&gt;flush(false);
+        }
+    }
+
+    /**
+     * Determine the table name by looking at what was provided and what the
+     * WriteRequestBatch was originally configured with.
+     *
+     * @param string|null $table The table name.
+     *
+     * @return string
+     * @throws \RuntimeException if there was no table specified.
+     */
+    private function determineTable($table)
+    {
+        $table = $table ?: $this-&gt;config[&#039;table&#039;];
+        if (!$table) {
+            throw new \RuntimeException(&#039;There was no table specified.&#039;);
+        }
+
+        return $table;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/aws/aws-sdk-php/src/DynamoDbStreams/DynamoDbStreamsClient.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/aws/aws-sdk-php/src/DynamoDb/Exception -->
+
+</body>
+</html>

@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/monolog/monolog/src/Monolog/Handler/FingersCrossedHandler.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php declare(strict_types=1);
+
+/*
+ * This file is part of the Monolog package.
+ *
+ * (c) Jordi Boggiano &lt;j.boggiano@seld.be&gt;
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Monolog\Handler;
+
+use Closure;
+use Monolog\Handler\FingersCrossed\ErrorLevelActivationStrategy;
+use Monolog\Handler\FingersCrossed\ActivationStrategyInterface;
+use Monolog\Level;
+use Monolog\Logger;
+use Monolog\ResettableInterface;
+use Monolog\Formatter\FormatterInterface;
+use Psr\Log\LogLevel;
+use Monolog\LogRecord;
+
+/**
+ * Buffers all records until a certain level is reached
+ *
+ * The advantage of this approach is that you don&#039;t get any clutter in your log files.
+ * Only requests which actually trigger an error (or whatever your actionLevel is) will be
+ * in the logs, but they will contain all records, not only those above the level threshold.
+ *
+ * You can then have a passthruLevel as well which means that at the end of the request,
+ * even if it did not get activated, it will still send through log records of e.g. at least a
+ * warning level.
+ *
+ * You can find the various activation strategies in the
+ * Monolog\Handler\FingersCrossed\ namespace.
+ *
+ * @author Jordi Boggiano &lt;j.boggiano@seld.be&gt;
+ */
+class FingersCrossedHandler extends Handler implements ProcessableHandlerInterface, ResettableInterface, FormattableHandlerInterface
+{
+    use ProcessableHandlerTrait;
+
+    /**
+     * Handler or factory Closure($record, $this)
+     *
+     * @phpstan-var (Closure(LogRecord|null, HandlerInterface): HandlerInterface)|HandlerInterface
+     */
+    protected Closure|HandlerInterface $handler;
+
+    protected ActivationStrategyInterface $activationStrategy;
+
+    protected bool $buffering = true;
+
+    protected int $bufferSize;
+
+    /** @var LogRecord[] */
+    protected array $buffer = [];
+
+    protected bool $stopBuffering;
+
+    protected Level|null $passthruLevel = null;
+
+    protected bool $bubble;
+
+    /**
+     * @phpstan-param (Closure(LogRecord|null, HandlerInterface): HandlerInterface)|HandlerInterface $handler
+     *
+     * @param Closure|HandlerInterface          $handler            Handler or factory Closure($record|null, $fingersCrossedHandler).
+     * @param int|string|Level|LogLevel::*|null $activationStrategy Strategy which determines when this handler takes action, or a level name/value at which the handler is activated
+     * @param int                               $bufferSize         How many entries should be buffered at most, beyond that the oldest items are removed from the buffer.
+     * @param bool                              $bubble             Whether the messages that are handled can bubble up the stack or not
+     * @param bool                              $stopBuffering      Whether the handler should stop buffering after being triggered (default true)
+     * @param int|string|Level|LogLevel::*|null $passthruLevel      Minimum level to always flush to handler on close, even if strategy not triggered
+     *
+     * @phpstan-param value-of&lt;Level::VALUES&gt;|value-of&lt;Level::NAMES&gt;|Level|LogLevel::*|ActivationStrategyInterface|null $activationStrategy
+     * @phpstan-param value-of&lt;Level::VALUES&gt;|value-of&lt;Level::NAMES&gt;|Level|LogLevel::*|null $passthruLevel
+     */
+    public function __construct(Closure|HandlerInterface $handler, int|string|Level|ActivationStrategyInterface|null $activationStrategy = null, int $bufferSize = 0, bool $bubble = true, bool $stopBuffering = true, int|string|Level|null $passthruLevel = null)
+    {
+        if (null === $activationStrategy) {
+            $activationStrategy = new ErrorLevelActivationStrategy(Level::Warning);
+        }
+
+        // convert simple int activationStrategy to an object
+        if (!$activationStrategy instanceof ActivationStrategyInterface) {
+            $activationStrategy = new ErrorLevelActivationStrategy($activationStrategy);
+        }
+
+        $this-&gt;handler = $handler;
+        $this-&gt;activationStrategy = $activationStrategy;
+        $this-&gt;bufferSize = $bufferSize;
+        $this-&gt;bubble = $bubble;
+        $this-&gt;stopBuffering = $stopBuffering;
+
+        if ($passthruLevel !== null) {
+            $this-&gt;passthruLevel = Logger::toMonologLevel($passthruLevel);
+        }
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function isHandling(LogRecord $record): bool
+    {
+        return true;
+    }
+
+    /**
+     * Manually activate this logger regardless of the activation strategy
+     */
+    public function activate(): void
+    {
+        if ($this-&gt;stopBuffering) {
+            $this-&gt;buffering = false;
+        }
+
+        $this-&gt;getHandler(end($this-&gt;buffer) ?: null)-&gt;handleBatch($this-&gt;buffer);
+        $this-&gt;buffer = [];
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function handle(LogRecord $record): bool
+    {
+        if (\count($this-&gt;processors) &gt; 0) {
+            $record = $this-&gt;processRecord($record);
+        }
+
+        if ($this-&gt;buffering) {
+            $this-&gt;buffer[] = $record;
+            if ($this-&gt;bufferSize &gt; 0 &amp;&amp; \count($this-&gt;buffer) &gt; $this-&gt;bufferSize) {
+                array_shift($this-&gt;buffer);
+            }
+            if ($this-&gt;activationStrategy-&gt;isHandlerActivated($record)) {
+                $this-&gt;activate();
+            }
+        } else {
+            $this-&gt;getHandler($record)-&gt;handle($record);
+        }
+
+        return false === $this-&gt;bubble;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function close(): void
+    {
+        $this-&gt;flushBuffer();
+
+        $this-&gt;getHandler()-&gt;close();
+    }
+
+    public function reset(): void
+    {
+        $this-&gt;flushBuffer();
+
+        $this-&gt;resetProcessors();
+
+        if ($this-&gt;getHandler() instanceof ResettableInterface) {
+            $this-&gt;getHandler()-&gt;reset();
+        }
+    }
+
+    /**
+     * Clears the buffer without flushing any messages down to the wrapped handler.
+     *
+     * It also resets the handler to its initial buffering state.
+     */
+    public function clear(): void
+    {
+        $this-&gt;buffer = [];
+        $this-&gt;reset();
+    }
+
+    /**
+     * Resets the state of the handler. Stops forwarding records to the wrapped handler.
+     */
+    private function flushBuffer(): void
+    {
+        if (null !== $this-&gt;passthruLevel) {
+            $passthruLevel = $this-&gt;passthruLevel;
+            $this-&gt;buffer = array_filter($this-&gt;buffer, static function ($record) use ($passthruLevel) {
+                return $passthruLevel-&gt;includes($record-&gt;level);
+            });
+            if (\count($this-&gt;buffer) &gt; 0) {
+                $this-&gt;getHandler(end($this-&gt;buffer))-&gt;handleBatch($this-&gt;buffer);
+            }
+        }
+
+        $this-&gt;buffer = [];
+        $this-&gt;buffering = true;
+    }
+
+    /**
+     * Return the nested handler
+     *
+     * If the handler was provided as a factory, this will trigger the handler&#039;s instantiation.
+     */
+    public function getHandler(LogRecord|null $record = null): HandlerInterface
+    {
+        if (!$this-&gt;handler instanceof HandlerInterface) {
+            $handler = ($this-&gt;handler)($record, $this);
+            if (!$handler instanceof HandlerInterface) {
+                throw new \RuntimeException(&quot;The factory Closure should return a HandlerInterface&quot;);
+            }
+            $this-&gt;handler = $handler;
+        }
+
+        return $this-&gt;handler;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setFormatter(FormatterInterface $formatter): HandlerInterface
+    {
+        $handler = $this-&gt;getHandler();
+        if ($handler instanceof FormattableHandlerInterface) {
+            $handler-&gt;setFormatter($formatter);
+
+            return $this;
+        }
+
+        throw new \UnexpectedValueException(&#039;The nested handler of type &#039;.\get_class($handler).&#039; does not support formatters.&#039;);
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getFormatter(): FormatterInterface
+    {
+        $handler = $this-&gt;getHandler();
+        if ($handler instanceof FormattableHandlerInterface) {
+            return $handler-&gt;getFormatter();
+        }
+
+        throw new \UnexpectedValueException(&#039;The nested handler of type &#039;.\get_class($handler).&#039; does not support formatters.&#039;);
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/monolog/monolog/src/Monolog/Handler/FirePHPHandler.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/monolog/monolog/src/Monolog/Handler/Curl -->
+
+</body>
+</html>

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>/ads/vendor/egulias/email-validator/src/Validation/DNSCheckValidation.php</title>
+<style>
+body { font-family: monospace; white-space: pre; }
+</style>
+</head>
+<body>
+&lt;?php
+
+namespace Egulias\EmailValidator\Validation;
+
+use Egulias\EmailValidator\EmailLexer;
+use Egulias\EmailValidator\Result\InvalidEmail;
+use Egulias\EmailValidator\Result\Reason\DomainAcceptsNoMail;
+use Egulias\EmailValidator\Result\Reason\LocalOrReservedDomain;
+use Egulias\EmailValidator\Result\Reason\NoDNSRecord as ReasonNoDNSRecord;
+use Egulias\EmailValidator\Result\Reason\UnableToGetDNSRecord;
+use Egulias\EmailValidator\Warning\NoDNSMXRecord;
+use Egulias\EmailValidator\Warning\Warning;
+
+class DNSCheckValidation implements EmailValidation
+{
+
+    /**
+     * Reserved Top Level DNS Names (https://tools.ietf.org/html/rfc2606#section-2),
+     * mDNS and private DNS Namespaces (https://tools.ietf.org/html/rfc6762#appendix-G)
+     * 
+     * @var string[]
+     */
+    public const RESERVED_DNS_TOP_LEVEL_NAMES = [
+        // Reserved Top Level DNS Names
+        &#039;test&#039;,
+        &#039;example&#039;,
+        &#039;invalid&#039;,
+        &#039;localhost&#039;,
+
+        // mDNS
+        &#039;local&#039;,
+
+        // Private DNS Namespaces
+        &#039;intranet&#039;,
+        &#039;internal&#039;,
+        &#039;private&#039;,
+        &#039;corp&#039;,
+        &#039;home&#039;,
+        &#039;lan&#039;,
+    ];
+
+    /**
+     * @var Warning[]
+     */
+    private $warnings = [];
+
+    /**
+     * @var InvalidEmail|null
+     */
+    private $error;
+
+    /**
+     * @var array
+     */
+    private $mxRecords = [];
+
+    /**
+     * @var DNSGetRecordWrapper
+     */
+    private $dnsGetRecord;
+
+    public function __construct(?DNSGetRecordWrapper $dnsGetRecord = null)
+    {
+        if (!function_exists(&#039;idn_to_ascii&#039;)) {
+            throw new \LogicException(sprintf(&#039;The %s class requires the Intl extension.&#039;, __CLASS__));
+        }
+
+        if ($dnsGetRecord == null) {
+            $dnsGetRecord = new DNSGetRecordWrapper();
+        }
+
+        $this-&gt;dnsGetRecord = $dnsGetRecord;
+    }
+
+    public function isValid(string $email, EmailLexer $emailLexer): bool
+    {
+        // use the input to check DNS if we cannot extract something similar to a domain
+        $host = $email;
+
+        // Arguable pattern to extract the domain. Not aiming to validate the domain nor the email
+        if (false !== $lastAtPos = strrpos($email, &#039;@&#039;)) {
+            $host = substr($email, $lastAtPos + 1);
+        }
+
+        // Get the domain parts
+        $hostParts = explode(&#039;.&#039;, $host);
+
+        $isLocalDomain = count($hostParts) &lt;= 1;
+        $isReservedTopLevel = in_array($hostParts[(count($hostParts) - 1)], self::RESERVED_DNS_TOP_LEVEL_NAMES, true);
+
+        // Exclude reserved top level DNS names
+        if ($isLocalDomain || $isReservedTopLevel) {
+            $this-&gt;error = new InvalidEmail(new LocalOrReservedDomain(), $host);
+            return false;
+        }
+
+        return $this-&gt;checkDns($host);
+    }
+
+    public function getError(): ?InvalidEmail
+    {
+        return $this-&gt;error;
+    }
+
+    /**
+     * @return Warning[]
+     */
+    public function getWarnings(): array
+    {
+        return $this-&gt;warnings;
+    }
+
+    /**
+     * @param string $host
+     *
+     * @return bool
+     */
+    protected function checkDns($host)
+    {
+        $variant = INTL_IDNA_VARIANT_UTS46;
+
+        $host = rtrim(idn_to_ascii($host, IDNA_DEFAULT, $variant), &#039;.&#039;);
+
+        $hostParts = explode(&#039;.&#039;, $host);
+        $host = array_pop($hostParts);
+
+        while (count($hostParts) &gt; 0) {
+            $host = array_pop($hostParts) . &#039;.&#039; . $host;
+
+            if ($this-&gt;validateDnsRecords($host)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    /**
+     * Validate the DNS records for given host.
+     *
+     * @param string $host A set of DNS records in the format returned by dns_get_record.
+     *
+     * @return bool True on success.
+     */
+    private function validateDnsRecords($host): bool
+    {
+        $dnsRecordsResult = $this-&gt;dnsGetRecord-&gt;getRecords($host, DNS_A + DNS_MX);
+
+        if ($dnsRecordsResult-&gt;withError()) {
+            $this-&gt;error = new InvalidEmail(new UnableToGetDNSRecord(), &#039;&#039;);
+            return false;
+        }
+
+        $dnsRecords = $dnsRecordsResult-&gt;getRecords();
+
+        // Combined check for A+MX+AAAA can fail with SERVFAIL, even in the presence of valid A/MX records
+        $aaaaRecordsResult = $this-&gt;dnsGetRecord-&gt;getRecords($host, DNS_AAAA);
+
+        if (! $aaaaRecordsResult-&gt;withError()) {
+            $dnsRecords = array_merge($dnsRecords, $aaaaRecordsResult-&gt;getRecords());
+        }
+
+        // No MX, A or AAAA DNS records
+        if ($dnsRecords === []) {
+            $this-&gt;error = new InvalidEmail(new ReasonNoDNSRecord(), &#039;&#039;);
+            return false;
+        }
+
+        // For each DNS record
+        foreach ($dnsRecords as $dnsRecord) {
+            if (!$this-&gt;validateMXRecord($dnsRecord)) {
+                // No MX records (fallback to A or AAAA records)
+                if (empty($this-&gt;mxRecords)) {
+                    $this-&gt;warnings[NoDNSMXRecord::CODE] = new NoDNSMXRecord();
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Validate an MX record
+     *
+     * @param array $dnsRecord Given DNS record.
+     *
+     * @return bool True if valid.
+     */
+    private function validateMxRecord($dnsRecord): bool
+    {
+        if (!isset($dnsRecord[&#039;type&#039;])) {
+            $this-&gt;error = new InvalidEmail(new ReasonNoDNSRecord(), &#039;&#039;);
+            return false;
+        }
+
+        if ($dnsRecord[&#039;type&#039;] !== &#039;MX&#039;) {
+            return true;
+        }
+
+        // &quot;Null MX&quot; record indicates the domain accepts no mail (https://tools.ietf.org/html/rfc7505)
+        if (empty($dnsRecord[&#039;target&#039;]) || $dnsRecord[&#039;target&#039;] === &#039;.&#039;) {
+            $this-&gt;error = new InvalidEmail(new DomainAcceptsNoMail(), &quot;&quot;);
+            return false;
+        }
+
+        $this-&gt;mxRecords[] = $dnsRecord;
+
+        return true;
+    }
+}
+
+
+<hr>
+<!-- PEDROO_NEXT_FILE: /ads/vendor/egulias/email-validator/src/Validation/DNSGetRecordWrapper.php -->
+<!-- PEDROO_NEXT_DIR: /ads/vendor/egulias/email-validator/src/Validation/Exception -->
+
+</body>
+</html>
